@@ -1,0 +1,19 @@
+﻿# config/ofa_rules.toml
+version       = 1
+effective_date = "2026-04-19"
+
+[[rules]]
+type    = "RequireConsentSig"
+schema_version = 1
+
+[[rules]]
+type    = "EnforceUserSlippage"
+max_excess_bps = 50
+
+[[rules]]
+type    = "EnforceBundleOrder"
+user_tx_before_omega = true
+
+[[rules]]
+type    = "PrivateRelayOnly"
+allowed_relays = ["flashbots","bloxroute","titan","eden"]

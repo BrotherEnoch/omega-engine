@@ -1,0 +1,43 @@
+﻿# crates/omega-flashloan/Cargo.toml
+[package]
+name    = "omega-flashloan"
+version = "12.0.0"
+edition = "2021"
+
+# omega-flashloan provides:
+#   1. Per-provider liquidity availability queries (cached, synchronous).
+#   2. Premium calculations for Aave v3, Balancer, and Uniswap v3 flash loans.
+#   3. Provider selection: choose the cheapest available provider for a given
+#      amount and collateral, or return Err(MissFlashloan) when none can fill.
+#   4. Calldata encoding helpers for each provider's flashloan callback ABI.
+#
+# Dependency graph (§22.1):
+#   omega-flashloan ← omega-core
+#   omega-strategies ← omega-flashloan
+#
+# tokio is NOT required.  Provider availability is updated from a DashMap
+# that omega-oracle writes to and omega-flashloan reads from synchronously.
+# No I/O is performed inside this crate.
+
+[dependencies]
+omega-core = { path = "../omega-core" }
+
+# EVM primitive types — provider addresses, U256 amounts
+alloy-primitives = { workspace = true }
+
+# Error handling
+anyhow    = { workspace = true }
+thiserror = { workspace = true }
+
+# Serialisation — liquidity snapshots, provider config
+serde      = { workspace = true }
+serde_json = { workspace = true }
+
+# Telemetry
+tracing = { workspace = true }
+
+# Concurrent liquidity map — updated by oracle, read by strategies
+dashmap = { workspace = true }
+
+# Timestamps — liquidity snapshot age for staleness checks
+chrono = { workspace = true }

@@ -1,0 +1,37 @@
+﻿# crates/omega-risk/Cargo.toml
+[package]
+name    = "omega-risk"
+version = "12.0.0"
+edition = "2021"
+
+[dependencies]
+omega-core   = { path = "../omega-core" }
+omega-oracle = { path = "../omega-oracle" }
+
+# Error handling
+anyhow      = "1"
+thiserror   = "1"
+
+# Logging
+tracing     = "0.1"
+
+# Serialization — CheckContext snapshots, circuit-breaker state
+serde       = { version = "1", features = ["derive"] }
+serde_json  = "1"
+
+# Concurrency / lock-free
+parking_lot     = "0.12"
+arc-swap        = "1"
+dashmap         = "5"
+crossbeam-utils = "0.8"
+hex         = "0.4"
+
+# Metrics
+prometheus  = "0.13"
+once_cell   = "1"
+
+# Time
+chrono      = { version = "0.4", features = ["serde"] }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt", "macros"] }

@@ -1,0 +1,30 @@
+﻿# crates/omega-compliance/Cargo.toml
+[package]
+name    = "omega-compliance"
+version = "12.0.0"
+edition = "2021"
+
+[dependencies]
+omega-core = { path = "../omega-core" }
+
+# Error handling
+anyhow    = { workspace = true }
+thiserror = { workspace = true }
+
+# Serialisation — versioned rule sets, compliance reports
+serde      = { workspace = true }
+serde_json = { workspace = true }
+
+# Telemetry
+tracing = { workspace = true }
+
+# Timestamps — rule version activation timestamps, consent expiry
+chrono = { workspace = true }
+
+# NOTE: tokio is NOT listed here.
+# omega-compliance is a synchronous validation library.  All checks
+# are pure functions with no I/O — they run in the caller's async
+# context without requiring a Tokio runtime themselves.
+
+[dev-dependencies]
+alloy-primitives = { workspace = true }

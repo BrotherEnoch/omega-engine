@@ -1,0 +1,62 @@
+﻿# crates/omega-rpc/Cargo.toml
+[package]
+name    = "omega-rpc"
+version = "12.0.0"
+edition = "2021"
+
+[dependencies]
+omega-core   = { path = "../omega-core" }
+omega-health = { path = "../omega-health" }
+
+# ─────────────────────────────────────────────────────────────────
+# ALLOY — Full transport stack (ONLY PERMITTED HERE per §22.1)
+#
+# omega-core uses alloy-primitives only; all transport surface
+# is confined to this crate.
+#
+# Required features:
+#   providers      — Provider trait, ProviderBuilder
+#   transport-ws   — WsConnect WebSocket transport
+#   pubsub         — PubSubFrontend for eth_subscribe streams
+#   rpc-types      — Block, Transaction, Filter, Log structs
+#   rpc-types-eth  — Ethereum-specific types (eth_call, eth_blockNumber)
+#   contract       — for ABI-decoded log parsing (lending protocol events)
+# ─────────────────────────────────────────────────────────────────
+alloy = { workspace = true, features = [
+    "providers",
+    "transport-ws",
+    "pubsub",
+    "rpc-types",
+    "rpc-types-eth",
+    "contract",
+] }
+
+# Async runtime
+tokio        = { workspace = true }
+tokio-stream = { workspace = true }
+futures      = { workspace = true }
+
+# Error handling
+anyhow    = { workspace = true }
+thiserror = { workspace = true }
+
+# Serialisation
+serde      = { workspace = true }
+serde_json = { workspace = true }
+
+# Telemetry
+tracing = { workspace = true }
+
+# EVM primitive types (addresses, B256 — shared with omega-core)
+alloy-primitives = { workspace = true }
+
+# Concurrent metrics / rate limiter state
+dashmap = { workspace = true }
+
+# Timestamps on block header events
+chrono = { workspace = true }
+
+# HTTP client for MEV-Share SSE stream (§subscriptions run_mev_share_stream)
+# Streaming body support required — do NOT enable default-features (pulls in
+# native-tls which conflicts with the node deployment environment).
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream", "json"] }

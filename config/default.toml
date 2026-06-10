@@ -1,0 +1,84 @@
+﻿# config/default.toml
+[chain]
+chain_id          = 42161
+name              = "arbitrum"
+block_time_ms     = 250
+rpc_url           = ""        # overridden by env
+
+[lanes]
+microtx_max_slots    = 16
+normal_max_slots     = 4
+microtx_latency_ms   = 150
+normal_latency_ms    = 2000
+revm_gas_threshold   = 200_000
+
+[gas_model]
+l2_exec_buffer       = 1.10
+l1_data_buffer_min   = 1.30
+l1_data_buffer_max   = 2.00
+extraction_gas       = 45_000
+l1_ema_window        = 20
+
+[zk]
+prover_tier          = "t1_software"
+microtx_sla_ms       = 1200
+normal_sla_ms        = 4000
+proof_queue_throttle = 128
+proof_queue_suspend  = 256
+proof_queue_halt     = 512
+
+[relay]
+phase_1_relays       = ["flashbots","bloxroute"]
+phase_2plus_relays   = ["flashbots","bloxroute","titan","eden"]
+blind_fallback       = true
+max_bundles_per_relay_per_second = 4
+stagger_ms           = 10
+
+[la]
+hot_tier_hf          = 1.01
+warm_tier_hf         = 1.05
+cold_tier_hf         = 1.20
+max_positions        = 600_000
+staleness_blocks     = 5
+la_end_to_end_sla_ms = 80
+warm_start_path      = "/var/omega/la-positions.bin"
+
+[gas_war]
+dao_fee_bps               = 500
+emergency_bundle_mult     = 2.0
+conservative_bundle_mult  = 0.7
+max_priority_fee_gwei     = 500
+builder_blacklist_path    = "config/builder_blacklist.toml"
+
+[ml]
+learning_rate         = 0.01
+validation_ratio      = 0.20
+validate_every_n      = 1000
+revert_threshold      = 0.05
+ceiling_value         = 5.0
+floor_value           = 0.30
+checkpoint_dir        = "/var/omega/checkpoints"
+keep_checkpoints      = 10
+
+[canary]
+enabled              = true
+min_profit_eth       = 0.0001
+gas_budget           = 50_000
+check_interval_ms    = 500
+alert_on_miss        = 3
+
+[rollout]
+initial_tier         = 0.10
+scale_up_ev_threshold= 0.70
+scale_down_ev_threshold = 0.50
+emergency_ev_threshold  = 0.30
+scale_up_blocks      = 48
+scale_down_blocks    = 24
+
+[observability]
+la_events_always_sampled = true
+sample_rate_low      = 1.00   # below 10 BPs/sec
+sample_rate_mid      = 0.50   # 10-15 BPs/sec
+sample_rate_high     = 0.10   # above 15 BPs/sec
+ring_buffer_capacity = 65_536
+high_priority_capacity = 4_096

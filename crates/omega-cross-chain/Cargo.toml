@@ -1,0 +1,51 @@
+﻿# crates/omega-cross-chain/Cargo.toml
+[package]
+name    = "omega-cross-chain"
+version = "12.0.0"
+edition = "2021"
+
+# ARCHITECTURAL BOUNDARY (spec §11.5, §V2):
+#
+#   Cross-chain liquidation arbitrage is EXPLICITLY DEFERRED in v12.
+#   Atomic cross-chain execution requires a bridge with finality < 80ms
+#   (the LA window).  No production atomic bridge meets this requirement
+#   as of v12 (April 2026).
+#
+#   This crate exists to:
+#     1. Document the architectural boundary in code (not just prose).
+#     2. Provide the `CrossChainCapability` type so the orchestrator can
+#        query the status without hard-coding "not supported" across the
+#        codebase.
+#     3. Expose `BridgeFinality` and `AtomicBridgeRequirement` so future
+#        engineers have concrete types to fill in when a qualifying bridge
+#        becomes production-available.
+#     4. Prevent the workspace from having a declared member with no source.
+#
+#   When re-evaluation occurs:
+#     - A production atomic bridge with < 50ms finality must be available.
+#     - omega-rpc must add a bridge subscription stream.
+#     - omega-strategies must add a CrossChainLA strategy variant.
+#     - This crate gains a real bridge client and proof verifier.
+
+[dependencies]
+omega-core = { path = "../omega-core" }
+
+# Serialisation — capability and status types are JSON-serialisable for
+# the control-plane GET /api/v1/cross-chain/status endpoint.
+serde      = { workspace = true }
+serde_json = { workspace = true }
+
+# Error handling
+anyhow    = { workspace = true }
+thiserror = { workspace = true }
+
+# Telemetry
+tracing = { workspace = true }
+
+# Timestamps — re-evaluation schedule tracking
+chrono = { workspace = true }
+
+# NOTE: tokio is NOT listed.
+# omega-cross-chain is a pure types and capability-query crate.
+# It has no async I/O in v12.  Tokio will be required in a future
+# version when a bridge client is wired.

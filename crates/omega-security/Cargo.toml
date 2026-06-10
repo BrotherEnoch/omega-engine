@@ -1,0 +1,45 @@
+﻿# crates/omega-security/Cargo.toml
+[package]
+name    = "omega-security"
+version = "12.0.0"
+edition = "2021"
+
+[dependencies]
+omega-core = { path = "../omega-core" }
+
+# Async runtime (key rotation window uses tokio::time)
+tokio      = { version = "1", features = ["full", "sync", "time", "rt-multi-thread"] }
+
+# Error handling
+anyhow     = "1"
+thiserror  = "1"
+
+# Logging
+tracing    = "0.1"
+
+# Serialization
+serde      = { version = "1", features = ["derive"] }
+serde_json = "1"
+bincode    = "1"
+
+# Cryptography
+secp256k1  = { version = "0.28", features = ["recovery", "rand-std", "global-context"] }
+sha3       = "0.10"
+hex        = "0.4"
+rand       = "0.8"
+
+# Concurrency / lock-free
+dashmap    = "5"
+parking_lot = "0.12"
+arc-swap   = "1"
+crossbeam-utils = "0.8"
+
+# Metrics
+prometheus = "0.13"
+once_cell  = "1"
+
+# Time
+chrono     = { version = "0.4", features = ["serde"] }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt", "macros", "test-util"] }

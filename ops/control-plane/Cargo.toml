@@ -1,0 +1,62 @@
+﻿# ops/control-plane/Cargo.toml
+[package]
+name    = "omega-control-plane"
+default-run = "omega-control-plane"
+version = "12.0.0"
+edition = "2021"
+
+[[bin]]
+name = "omega-control-plane"
+path = "src/main.rs"
+
+[dependencies]
+omega-core             = { path = "../../crates/omega-core" }
+omega-control-contracts = { path = "../../crates/omega-control-contracts" }
+omega-health           = { path = "../../crates/omega-health" }
+omega-gas-war          = { path = "../../crates/omega-gas-war" }
+omega-loss-attribution = { path = "../../crates/omega-loss-attribution" }
+
+# HTTP API — ws feature required for WebSocket handler (§17.1)
+axum       = { workspace = true, features = ["ws", "macros"] }
+tower      = { workspace = true }
+tower-http = { workspace = true, features = ["trace"] }
+
+# gRPC — tonic server for OmegaControl service (§17 proto)
+tonic  = { workspace = true }
+# prost is the protobuf runtime used by tonic's generated code
+prost  = "0.12"
+
+# Async runtime
+tokio        = { workspace = true }
+tokio-stream = { workspace = true }
+
+# Concurrent data structures — relay win-rate map, metric channels
+dashmap = { workspace = true }
+
+# Serialisation
+serde      = { workspace = true }
+serde_json = { workspace = true }
+
+# Error handling
+anyhow    = { workspace = true }
+thiserror = { workspace = true }
+
+# Telemetry
+tracing            = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+# Timestamps
+chrono = { workspace = true }
+
+# Config hot-reload (TOML parsing)
+toml = "0.8"
+
+# CLI
+clap = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"
+
+[build-dependencies]
+# Compile the proto file at build time.
+tonic-build = "0.11"

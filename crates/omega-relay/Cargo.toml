@@ -1,0 +1,81 @@
+﻿# crates/omega-relay/Cargo.toml
+[package]
+name        = "omega-relay"
+version     = "12.0.0"
+edition     = "2021"
+authors     = ["OmegaEngine Engineering"]
+description = "Relay submission layer — backpressure, reputation, reorg-guard, builder blacklist (v12)"
+license     = "UNLICENSED"
+
+[lib]
+name = "omega_relay"
+path = "src/lib.rs"
+
+[features]
+# Expose MockRelayClient to downstream test harnesses without enabling all
+# dev-dependencies in production builds.
+test-utils = []
+
+[dependencies]
+# ── Workspace siblings ────────────────────────────────────────────────────────
+# omega-core   = { path = "../omega-core" }
+# omega-health = { path = "../omega-health" }
+
+# ── Async runtime ─────────────────────────────────────────────────────────────
+tokio        = { version = "1", features = ["full"] }
+tokio-util   = { version = "0.7", features = ["time"] }
+futures      = "0.3"
+async-trait  = "0.1"
+
+# ── Concurrency ───────────────────────────────────────────────────────────────
+dashmap      = "5"
+parking_lot  = "0.12"
+crossbeam    = "0.8"
+rayon        = "1"
+
+# ── Rate limiting ─────────────────────────────────────────────────────────────
+governor     = "0.6"
+nonzero_ext  = "0.3"
+
+# ── Serialization ─────────────────────────────────────────────────────────────
+serde        = { version = "1", features = ["derive"] }
+serde_json   = "1"
+toml         = "0.8"
+bincode      = "1"
+
+# ── HTTP relay client ─────────────────────────────────────────────────────────
+reqwest      = { version = "0.12", features = ["json", "rustls-tls"], default-features = false }
+tokio-tungstenite = { version = "0.21", features = ["rustls-tls-native-roots"] }
+
+# ── Crypto / hashing ──────────────────────────────────────────────────────────
+sha3         = "0.10"
+hex          = "0.4"
+alloy-primitives = { version = "0.7", features = ["serde"] }
+
+# ── Randomness ────────────────────────────────────────────────────────────────
+rand         = "0.8"
+
+# ── Observability ─────────────────────────────────────────────────────────────
+tracing      = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+prometheus   = { version = "0.13", features = ["process"] }
+
+# ── Time ──────────────────────────────────────────────────────────────────────
+chrono       = { version = "0.4", features = ["serde"] }
+
+# ── Error handling ────────────────────────────────────────────────────────────
+thiserror    = "1"
+anyhow       = "1"
+
+# ── Config ────────────────────────────────────────────────────────────────────
+config       = { version = "0.14", features = ["toml"] }
+
+[dev-dependencies]
+tokio        = { version = "1", features = ["full", "test-util"] }
+tempfile     = "3"
+proptest     = "1"
+criterion    = { version = "0.5", features = ["async_tokio"] }
+
+[[bench]]
+name    = "relay_throughput"
+harness = false

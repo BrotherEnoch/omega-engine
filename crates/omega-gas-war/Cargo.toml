@@ -1,0 +1,49 @@
+﻿# crates/omega-gas-war/Cargo.toml
+[package]
+name    = "omega-gas-war"
+version = "12.0.0"
+edition = "2021"
+
+[dependencies]
+omega-core  = { path = "../omega-core" }
+
+# NOTE: omega-relay is NOT a dependency of omega-gas-war.
+# Per §22.1, omega-gas-war depends on omega-core and omega-relay depends
+# on omega-gas-war — not the reverse.  The Gas War Engine produces
+# BundleVariants and relay ordering; it does not call relay submission
+# directly.  The relay submission loop in omega-relay consumes the output.
+# Removing this prevents a dependency cycle.
+
+# Ethereum primitives — U256 used in bundle_variants.rs for gas/fee fields
+alloy-primitives = { workspace = true }
+
+# Error handling
+anyhow    = { workspace = true }
+thiserror = { workspace = true }
+
+# Serialisation — builder blacklist TOML, relay metric snapshots
+serde      = { workspace = true }
+serde_json = { workspace = true }
+
+# Telemetry
+tracing = { workspace = true }
+
+# PRNG — randomised round-robin relay ordering (§11.2, fix I2)
+rand = { workspace = true }
+
+# DashMap — per-relay rolling-window inclusion rate (§relay_la_metrics)
+# Use workspace version (aligned with omega-health and omega-strategies)
+dashmap = { workspace = true }
+
+# Timestamps — relay metric entries carry timestamps for decay
+chrono = { workspace = true }
+
+# Config loading — builder blacklist TOML parsing (§12.3)
+toml = "0.8"
+
+# Arc-swap — hot-reloadable blacklist without write-locking the submission path
+arc-swap = { workspace = true }
+
+[dev-dependencies]
+# Temporary directories for builder_blacklist TOML read/reload tests
+tempfile = "3"

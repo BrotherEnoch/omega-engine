@@ -1,0 +1,52 @@
+﻿# crates/omega-strategies/Cargo.toml
+[package]
+name    = "omega-strategies"
+version = "12.0.0"
+edition = "2021"
+
+[dependencies]
+omega-core             = { path = "../omega-core" }
+omega-gas-war          = { path = "../omega-gas-war" }
+omega-loss-attribution = { path = "../omega-loss-attribution" }
+
+# ARCHITECTURAL NOTE (§22.1):
+# omega-strategies depends on omega-core, omega-gas-war, and
+# omega-loss-attribution.  It does NOT depend on omega-oracle,
+# omega-risk, or omega-flashloan — those are injected as trait objects
+# so omega-strategies stays compilable without the full dependency tree.
+# omega-rpc is also excluded — strategies never call RPC directly.
+
+# EVM primitive types (shared with omega-core — no full alloy transport)
+alloy-primitives = { workspace = true }
+
+# In-process EVM execution (revm simulator, §4)
+revm = { workspace = true }
+
+# Async runtime
+tokio        = { workspace = true }
+async-trait  = { workspace = true }
+futures      = { workspace = true }
+
+# Error handling
+anyhow    = { workspace = true }
+thiserror = { workspace = true }
+
+# Serialisation
+serde      = { workspace = true }
+serde_json = { workspace = true }
+
+# Telemetry
+tracing = { workspace = true }
+
+# Timestamps (blueprint construction time, nonce sequencing)
+chrono = { workspace = true }
+
+# Concurrent structures (sequencer restart handler, §11.3)
+dashmap  = { workspace = true }
+arc-swap = { workspace = true }
+
+# PRNG (cascade relay order randomisation, §11.2)
+rand = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }

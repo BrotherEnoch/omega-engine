@@ -1,0 +1,39 @@
+﻿# crates/omega-health/Cargo.toml
+[package]
+name    = "omega-health"
+version = "12.0.0"
+edition = "2021"
+
+[dependencies]
+omega-core = { path = "../omega-core" }
+
+# Async runtime — propagation and monitor loops run on Tokio tasks
+tokio = { workspace = true }
+
+# Serialisation — HealthLogEntry persistence
+serde      = { workspace = true }
+serde_json = { workspace = true }
+
+# Timestamps
+chrono = { workspace = true }
+
+# Telemetry
+tracing = { workspace = true }
+
+# Error handling
+anyhow    = { workspace = true }
+thiserror = { workspace = true }
+
+# Lock-free state for HaltFlag and LayerHealthImpl.
+# arc-swap gives us fast read-path on the layer map without a Mutex.
+arc-swap = { workspace = true }
+
+# dashmap for the layer registry: concurrent reads from 14 layer polling loops
+dashmap = { workspace = true }
+
+# EVM primitive types — required by ReorgGuard (TxHash, B256)
+alloy-primitives = { workspace = true }
+
+[dev-dependencies]
+# Temporary directory support for HealthLog persistence tests
+tempfile = "3"

@@ -1,0 +1,40 @@
+﻿# crates/omega-oracle/Cargo.toml
+[package]
+name    = "omega-oracle"
+version = "12.0.0"
+edition = "2021"
+
+[dependencies]
+omega-core   = { path = "../omega-core" }
+omega-rpc    = { path = "../omega-rpc" }
+omega-health = { path = "../omega-health" }
+
+# EVM primitive types only — full alloy transport is restricted to omega-rpc (§22.1)
+alloy-primitives = { workspace = true }
+
+# Async runtime
+tokio   = { workspace = true }
+futures = { workspace = true }
+
+# Serialisation — OracleSignal payload JSON, per-chain state snapshots
+serde      = { workspace = true }
+serde_json = { workspace = true }
+
+# Error handling
+anyhow    = { workspace = true }
+thiserror = { workspace = true }
+
+# Telemetry
+tracing = { workspace = true }
+
+# Concurrent price cache (per-token, per-chain)
+dashmap = { workspace = true }
+
+# Lock-free EIL double-buffer snapshot swap (§6)
+arc-swap = { workspace = true }
+
+# Timestamps — staleness tracking, signal versioning
+chrono = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }

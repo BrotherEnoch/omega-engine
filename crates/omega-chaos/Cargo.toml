@@ -1,0 +1,35 @@
+﻿# crates/omega-chaos/Cargo.toml
+[package]
+name    = "omega-chaos"
+version = "12.0.0"
+edition = "2021"
+
+# omega-chaos is test-only per §22.1: "omega-chaos ← all (test only)".
+# It is declared as a workspace member so it can be run with
+# `cargo test -p omega-chaos` and `cargo run -p omega-chaos`, but it
+# is NEVER imported by any production crate.
+
+[dependencies]
+omega-core   = { path = "../omega-core" }
+omega-health = { path = "../omega-health" }
+
+# Async runtime — chaos scenarios run as async tasks
+tokio = { workspace = true }
+
+# Error handling
+anyhow    = { workspace = true }
+thiserror = { workspace = true }
+
+# Serialisation — scenario configs and run reports
+serde      = { workspace = true }
+serde_json = { workspace = true }
+
+# Telemetry
+tracing            = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+# Timestamps — scenario timing and report generation
+chrono = { workspace = true }
+
+# PRNG — fault injection randomisation
+rand = { workspace = true }

@@ -1,0 +1,126 @@
+# Cargo.toml
+# Root Cargo.toml — add default-run to resolve the ambiguity error.
+#
+# The [workspace] table itself cannot carry default-run; it belongs in the
+# *package* manifest of whichever ops binary you want `cargo run` to launch
+# without --bin.  Add this one line to ops/control-plane/Cargo.toml:
+#
+#   [package]
+#   name        = "omega-control-plane"
+#   default-run = "omega-control-plane"   # ? ADD THIS LINE
+#   ...
+#
+# No change is required to the root Cargo.toml for that fix.
+# The workspace manifest below is reproduced unchanged so you have the
+# full picture; the only actionable edit is in ops/control-plane/Cargo.toml.
+
+[workspace]
+resolver = "2"
+
+members = [
+    "crates/omega-core",
+    "crates/omega-health",
+    "crates/omega-rpc",
+    "crates/omega-oracle",
+    "crates/omega-security",
+    "crates/omega-compliance",
+    "crates/omega-risk",
+    "crates/omega-dag",
+    "crates/omega-zk",
+    "crates/omega-flashloan",
+    "crates/omega-relay",
+    "crates/omega-gas-war",
+    "crates/omega-loss-attribution",
+    "crates/omega-address-rotation",
+    "crates/omega-strategies",
+    "crates/omega-cross-chain",
+    "crates/omega-hot-path",
+    "crates/omega-observability",
+    "crates/omega-chaos",
+    "crates/omega-prl",
+    "ops/control-plane",
+    "ops/shadow",
+    "ops/backtest",
+    "ops/calibrate",
+]
+
+[workspace.dependencies]
+
+# ---------------------------------------------
+# CORE ASYNC RUNTIME
+# ---------------------------------------------
+tokio       = { version = "1",    features = ["full"] }
+futures     = "0.3"
+async-trait = "0.1"
+
+# ---------------------------------------------
+# STREAMING / RPC FOUNDATION
+# ---------------------------------------------
+tokio-stream = "0.1"
+
+alloy = { version = "0.3", default-features = false, features = ["serde"] }
+alloy-primitives = { version = "0.7", features = ["serde"] }
+
+# ---------------------------------------------
+# EVM / EXECUTION LAYER
+# ---------------------------------------------
+revm = { version = "8", features = ["serde"] }
+
+# ---------------------------------------------
+# SERIALIZATION
+# ---------------------------------------------
+serde      = { version = "1", features = ["derive"] }
+serde_json = "1"
+bincode    = "1"
+
+# ---------------------------------------------
+# ERROR HANDLING
+# ---------------------------------------------
+anyhow    = "1"
+thiserror = "1"
+
+# ---------------------------------------------
+# OBSERVABILITY / TELEMETRY
+# ---------------------------------------------
+tracing            = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+
+# ---------------------------------------------
+# DATA STRUCTURES
+# ---------------------------------------------
+dashmap        = "5"
+indexmap       = "2"
+petgraph       = { version = "0.6", features = ["serde-1"] }
+priority-queue = "1"
+
+# ---------------------------------------------
+# CONCURRENCY / MEMORY MODEL
+# ---------------------------------------------
+crossbeam-channel = "0.5"
+arc-swap          = "1"
+loom              = "0.7"
+
+# ---------------------------------------------
+# TIME / UTILITIES
+# ---------------------------------------------
+chrono = { version = "0.4", features = ["serde"] }
+uuid   = { version = "1",   features = ["v4", "serde"] }
+rand   = "0.8"
+
+# ---------------------------------------------
+# NETWORK / SERVICES
+# ---------------------------------------------
+axum       = { version = "0.7", features = ["ws", "macros"] }
+tower      = "0.4"
+tower-http = "0.5"
+tonic      = "0.11"
+
+# ---------------------------------------------
+# CLI (v12: env + derive only)
+# ---------------------------------------------
+clap = { version = "4", features = ["derive", "env"] }
+
+# ---------------------------------------------
+# MEMORY / EXECUTION POOLS
+# ---------------------------------------------
+deadpool = { version = "0.10", features = ["rt_tokio_1"] }

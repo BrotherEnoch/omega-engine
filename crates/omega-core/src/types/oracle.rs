@@ -1,0 +1,202 @@
+// crates/omega-core/src/types/oracle.rs
+//
+// Oracle domain types used across the Omega crate graph.
+//
+// These types represent the processed, validated oracle data that the
+// oracle layer (omega-oracle) exposes to strategy scoring.  They are
+// distinct from raw OracleSignal payloads (types/signal.rs) — signals
+// are the wire format; these are the domain model.
+//
+// Spec references:
+//   §7   — dual-component gas model: FeeSnapshot fields
+//   §11  — LA tier classification: PositionSnapshot health factor
+//   §11.1 — hot/warm/cold/archived tier thresholds
+//   §11.4 — reorg guard: PositionSnapshot.block_number used to detect
+//            orphaned blueprints
+
+use alloy_primitives::{Address, U256};
+use serde::{Deserialize, Serialize};
+
+// ─────────────────────────────────────────────────────────────────────────────
+// OraclePrice
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Spot price for a single token, sourced and validated by omega-oracle.
+///
+/// Prices are expressed as 18-decimal fixed-point integers (e18) to
+/// avoid floating-point precision loss in profit calculations.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OraclePrice {
+    /// Token contract address.
+    pub token: Address,
+
+    /// Price in USD × 10^18.  Zero indicates the price feed is stale
+    /// or unavailable — strategies must reject zero-priced tokens.
+    pub price_usd_e18: U256,
+
+    /// Block number at which this price was last observed.
+    pub block_number: u64,
+
+    /// Unix timestamp (ms) when oracle-layer received this update.
+    pub received_at_unix_ms: u64,
+
+    /// Whether this price came from a primary (on-chain TWAP) or
+    /// fallback (Chainlink / Pyth) source.  Strategies may apply a
+    /// confidence discount on fallback-sourced prices.
+    pub is_fallback: bool,
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// LaTier
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Liquidation Arbitrage monitoring tier for a lending position (§11.1).
+///
+/// Tier drives the recompute frequency and resource allocation:
+///
+/// | Tier     | HF range      | Update trigger                          |
+/// |----------|---------------|-----------------------------------------|
+/// | Hot      | < 1.01        | Every oracle update — immediate         |
+/// | Warm     | 1.01 – 1.05   | Batched every 200ms OR move > 0.5%     |
+/// | Cold     | 1.05 – 1.20   | Lazy every 2 s                          |
+/// | Archived | > 1.20        | Lazy on 500-block cycle; eviction cand. |
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LaTier {
+    Hot,
+    Warm,
+    Cold,
+    Archived,
+}
+
+impl LaTier {
+    /// Classify a position by its health factor (18-decimal fixed-point).
+    ///
+    /// `hf_e18` is the health factor × 10^18 as stored on Aave/Compound/
+    /// Morpho.  Thresholds match §11.1 exactly:
+    ///   Hot      < 1.01 × 10^18
+    ///   Warm     1.01–1.05 × 10^18
+    ///   Cold     1.05–1.20 × 10^18
+    ///   Archived > 1.20 × 10^18
+    pub fn from_hf_e18(hf_e18: U256) -> Self {
+        // 1e18 = 1.0 as a fixed-point multiplier
+        const E18: u128 = 1_000_000_000_000_000_000;
+
+        // Thresholds in e18 notation
+        let hot_threshold = U256::from(E18 + E18 / 100); // 1.01e18
+        let warm_threshold = U256::from(E18 + 5 * E18 / 100); // 1.05e18
+        let cold_threshold = U256::from(E18 + 20 * E18 / 100); // 1.20e18
+
+        if hf_e18 < hot_threshold {
+            LaTier::Hot
+        } else if hf_e18 < warm_threshold {
+            LaTier::Warm
+        } else if hf_e18 < cold_threshold {
+            LaTier::Cold
+        } else {
+            LaTier::Archived
+        }
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// PositionSnapshot
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Snapshot of a single lending position for LA scoring (§11).
+///
+/// Produced by omega-oracle from on-chain position data (Aave v3
+/// `getUserAccountData`, Compound `getAccountLiquidity`, etc.) and
+/// cached in the EIL double-buffer.
+///
+/// ## Key invariant
+///
+/// A blueprint built from a PositionSnapshot is only valid while the
+/// snapshot's `block_number` is within the revm trust window (§6).
+/// The LA reorg guard (§11.4) tracks `block_number` to detect orphaned
+/// blueprints.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PositionSnapshot {
+    /// Borrower's wallet address.
+    pub borrower: Address,
+
+    /// Lending protocol contract address (Aave v3 pool, Compound
+    /// comptroller, Morpho, Euler v2).
+    pub protocol: Address,
+
+    /// Health factor × 10^18.  Below 1e18 → liquidatable.
+    pub hf_e18: U256,
+
+    /// Total collateral value in USD × 10^18.
+    pub collateral_usd_e18: U256,
+
+    /// Total debt value in USD × 10^18.
+    pub debt_usd_e18: U256,
+
+    /// Liquidation bonus in basis points (e.g. 500 = 5%).
+    pub liquidation_bonus_bps: u16,
+
+    /// Monitoring tier derived from `hf_e18` at snapshot time (§11.1).
+    pub tier: LaTier,
+
+    /// Block number at which this snapshot was taken.
+    /// Used by the reorg guard (§11.4) and sequencer restart handler
+    /// (§11.3) as the deduplication anchor.
+    pub block_number: u64,
+
+    /// Monotonic state version from the EIL (§6).
+    pub state_version: u64,
+}
+
+impl PositionSnapshot {
+    /// Stable deduplication key for the sequencer restart DashMap (§11.3).
+    ///
+    /// Key = keccak256(borrower ++ protocol) encoded as hex.
+    /// Does NOT include block_number so that the same position is
+    /// deduplicated across blocks within the 60-block restart window.
+    pub fn dedup_key(&self) -> String {
+        use alloy_primitives::keccak256;
+        let mut buf = Vec::with_capacity(40);
+        buf.extend_from_slice(self.borrower.as_slice());
+        buf.extend_from_slice(self.protocol.as_slice());
+        hex::encode(keccak256(&buf).as_slice())
+    }
+
+    /// Returns `true` when this position is currently liquidatable
+    /// (health factor below 1.0 × 10^18).
+    #[inline]
+    pub fn is_liquidatable(&self) -> bool {
+        const E18: u128 = 1_000_000_000_000_000_000;
+        self.hf_e18 < U256::from(E18)
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// FeeSnapshot
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Current Arbitrum fee oracle reading (§7, §12.2).
+///
+/// Both components are required for the dual-component gas model:
+///   total_gas_cost = (l2_exec_gas × base_fee) + (l1_data_gas × l1_data_fee)
+///
+/// Priority fee (tip) is submitted to the Arbitrum sequencer separately
+/// and does not affect the gas cost calculation — it affects inclusion
+/// probability.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FeeSnapshot {
+    /// EIP-1559 base fee in gwei (L2 execution cost component).
+    pub base_fee_gwei: u64,
+
+    /// L1 data fee per gas unit in gwei (calldata cost component).
+    /// Sourced from Arbitrum's ArbGasInfo precompile.
+    pub l1_data_fee_gwei: u64,
+
+    /// Current competitive priority fee in gwei (§12.2).
+    /// The Gas War Engine uses this to set `priority_fee_gwei` on
+    /// blueprints, bounded by the 500 gwei ceiling.
+    pub priority_fee_gwei: u64,
+
+    /// Block number at which this fee oracle was sampled.
+    pub block_number: u64,
+}

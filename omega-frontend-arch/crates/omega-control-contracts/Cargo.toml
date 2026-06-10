@@ -1,0 +1,15 @@
+[package]
+name        = "omega-control-contracts"
+version     = "0.12.0"
+edition     = "2021"
+description = "Shared frontend/backend contract types for OmegaEngine v12."
+
+[dependencies]
+serde      = { workspace = true }
+serde_json = { workspace = true }
+chrono     = { workspace = true }
+thiserror  = { workspace = true }
+strum      = { workspace = true }
+
+[features]
+proto = []

@@ -1,0 +1,57 @@
+﻿# crates/omega-observability/Cargo.toml
+[package]
+name    = "omega-observability"
+version = "12.0.0"
+edition = "2021"
+
+# omega-observability is the always-on telemetry layer (spec §16).
+#
+# ## Design constraint (§22.1)
+#
+#   omega-observability MUST have deliberately minimal dependencies so
+#   that telemetry never becomes a source of cascading failures.
+#   The Observability layer is a monitoring-only leaf node in the §22.1
+#   dependency graph — it has NO dependents.  If it fails, nothing else
+#   fails with it.
+#
+# ## What this crate provides
+#
+#   events.rs    — OmegaEvent enum: the canonical tagged union of all
+#                  always-sampled events emitted by every layer (§16).
+#
+#   ring_buffer.rs — Lock-free ring buffer for high-frequency event
+#                    ingestion without back-pressure on callers.
+#
+#   sampler.rs   — 100% sampling enforcement for LA events; configurable
+#                  sampling rate for lower-priority events.
+#
+#   exporter.rs  — Async task that drains the ring buffer and writes to
+#                  the structured log stream (ELK hot/warm, §16).
+
+[dependencies]
+omega-core = { path = "../omega-core" }
+
+# Async runtime — exporter drain loop and shutdown signal
+tokio = { workspace = true }
+
+# Error handling
+anyhow    = { workspace = true }
+thiserror = { workspace = true }
+
+# Serialisation — OmegaEvent JSON lines for ELK
+serde      = { workspace = true }
+serde_json = { workspace = true }
+
+# Telemetry (omega-observability emits its own internal tracing spans
+# for exporter lag and ring-buffer overflow, distinct from the events
+# it forwards)
+tracing = { workspace = true }
+
+# Timestamps — event timestamps, exporter flush timing
+chrono = { workspace = true }
+
+# NOTE: alloy-primitives is NOT listed.
+# OmegaEvent carries blueprint_hash as String (hex) rather than B256 so
+# that omega-observability has zero EVM dependencies.  The conversion
+# happens at the call site (emit_*) where alloy-primitives is already
+# available.  This keeps the observability layer truly dependency-minimal.

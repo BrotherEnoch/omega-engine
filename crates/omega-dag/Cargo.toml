@@ -1,0 +1,33 @@
+﻿# crates/omega-dag/Cargo.toml
+[package]
+name    = "omega-dag"
+version = "12.0.0"
+edition = "2021"
+
+[dependencies]
+omega-core = { path = "../omega-core" }
+
+# B256 (blueprint hash type) used throughout scheduler.rs and types.rs.
+# alloy-primitives is a workspace dependency (v0.7.7) already resolved by
+# omega-health and omega-cross-chain; no version conflict.
+alloy-primitives = { workspace = true }
+
+# DAG algorithm library — cycle detection (is_cyclic_directed), topological
+# sort, stable node indices for eviction without index invalidation.
+petgraph = "0.6"
+
+# Error handling
+anyhow    = { workspace = true }
+thiserror = { workspace = true }
+
+# Serialisation — DagSnapshot and EvictionRecord for the observability API
+serde      = { workspace = true }
+serde_json = { workspace = true }
+
+# Timestamps — EvictionRecord.timestamp, DagSnapshot.timestamp
+chrono = { workspace = true }
+
+# Telemetry
+tracing = { workspace = true }
+
+[dev-dependencies]

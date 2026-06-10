@@ -1,0 +1,20 @@
+﻿// .github/workflows/ci.yml
+# .github/workflows/ci.yml
+name: CI
+on: [push, pull_request]
+jobs:
+  rust:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo check --workspace
+      - run: cargo test --workspace
+      - run: cargo clippy --workspace -- -D warnings
+      - run: cargo fmt --all --check
+  contracts:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: foundry-rs/foundry-toolchain@v1
+      - run: cd contracts && forge build && forge test

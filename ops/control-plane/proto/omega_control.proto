@@ -1,0 +1,134 @@
+﻿// ops/control-plane/proto/omega_control.proto
+//
+// OmegaControl gRPC service — internal observability and command interface.
+//
+// Transport: plaintext gRPC on :50051 (TLS terminated at the sidecar).
+// Authentication: Bearer token in `authorization` metadata key.
+//
+// Command governance:
+//   PauseStrategy, ResumeStrategy, ClearHalt — L2 fast-approve required.
+//   AdjustRollout                             — L2 fast-approve required.
+//   All Get* RPCs                             — L1 (Bearer token only).
+
+syntax = "proto3";
+package omega;
+
+service OmegaControl {
+  // ── Observability ─────────────────────────────────────────────────────────
+  // Point-in-time health snapshot across all 16 layers.
+  rpc GetSystemHealth  (Empty)        returns (HealthReport);
+  // Server-streaming health events — caller receives one event per FSM
+  // transition.  Stream runs until the client cancels.
+  rpc WatchHealth      (Empty)        returns (stream HealthEvent);
+  // Net-profit breakdown for a strategy / chain combination (§15).
+  rpc GetPnL           (PnLRequest)   returns (PnLReport);
+  // Per-layer p50/p95/p99 latency vs budget (§4).
+  rpc GetLatency       (Empty)        returns (LatencyReport);
+  // Microtx / normal / ZK / relay queue depths.
+  rpc GetQueueDepths   (Empty)        returns (QueueReport);
+  // Per-relay, per-strategy 24h win rates (§relay_la_metrics).
+  rpc GetWinRates      (Empty)        returns (WinRateReport);
+
+  // ── Commands (L2 fast-approve required) ──────────────────────────────────
+  // Pause a strategy (no new blueprints produced; in-flight allowed to settle).
+  rpc PauseStrategy    (StrategyId)   returns (CommandResult);
+  // Resume a previously paused strategy.
+  rpc ResumeStrategy   (StrategyId)   returns (CommandResult);
+  // Clear the halt flag on a specific layer after governance review (§3).
+  rpc ClearHalt        (LayerIdMsg)   returns (CommandResult);
+  // Adjust the EV-weighted rollout tier (§19).
+  rpc AdjustRollout    (RolloutTier)  returns (CommandResult);
+}
+
+// ── Shared ────────────────────────────────────────────────────────────────────
+message Empty {}
+
+message CommandResult {
+  bool   ok      = 1;
+  string message = 2;
+}
+
+// ── Health ────────────────────────────────────────────────────────────────────
+message HealthReport {
+  repeated LayerHealth layers       = 1;
+  bool                 system_halted = 2;
+  string               generated_at  = 3;  // RFC-3339 UTC
+}
+
+message LayerHealth {
+  string layer_id = 1;  // canonical snake_case (§LayerId::Display)
+  string state    = 2;  // "HEALTHY" | "DEGRADED" | "HALTED"
+  string reason   = 3;  // last set_state reason, or "" if Healthy
+}
+
+message HealthEvent {
+  string layer_id  = 1;
+  string from      = 2;
+  string to        = 3;
+  string reason    = 4;
+  string timestamp = 5;  // RFC-3339 UTC
+}
+
+// ── PnL ───────────────────────────────────────────────────────────────────────
+message PnLRequest {
+  string chain_id    = 1;  // "42161" | "1" | "8453"
+  string strategy_id = 2;  // "SA" | "MSA" | "LA" | "MEV" | "" (all)
+}
+
+message PnLReport {
+  double gross_profit_eth = 1;
+  double gas_cost_eth     = 2;
+  double net_profit_eth   = 3;
+  double dao_fee_eth      = 4;   // 5% of net (§15.1)
+  double pil_share_eth    = 5;   // 95% of net
+  string period           = 6;   // "24h" | "7d" | "30d"
+}
+
+// ── Latency ───────────────────────────────────────────────────────────────────
+message LatencyReport {
+  repeated LayerLatency layers = 1;
+}
+
+message LayerLatency {
+  string layer_id  = 1;
+  double p50_us    = 2;
+  double p95_us    = 3;
+  double p99_us    = 4;
+  double budget_us = 5;  // SLA budget; >budget means this layer is over-latency
+}
+
+// ── Queue depths ──────────────────────────────────────────────────────────────
+message QueueReport {
+  int32 microtx_slots    = 1;  // available Microtx execution slots (§4)
+  int32 normal_slots     = 2;  // available Normal execution slots
+  int32 zk_queue_depth   = 3;  // pending ZK proof requests
+  int32 relay_queue_depth = 4; // bundles awaiting relay submission
+}
+
+// ── Win rates ─────────────────────────────────────────────────────────────────
+message WinRateReport {
+  repeated RelayWinRate relays = 1;
+}
+
+message RelayWinRate {
+  string relay      = 1;
+  string strategy   = 2;  // "SA" | "MSA" | "LA" | "MEV"
+  string chain      = 3;  // "arbitrum" | "ethereum" | "base"
+  double rate_24h   = 4;  // [0.0, 1.0]
+  int64  sample_count = 5;
+}
+
+// ── Commands ──────────────────────────────────────────────────────────────────
+message StrategyId {
+  string id = 1;  // "SA" | "MSA" | "LA" | "MEV" | "CNRY"
+}
+
+message LayerIdMsg {
+  string id = 1;  // canonical snake_case LayerId (§LayerId::Display)
+}
+
+message RolloutTier {
+  // EV-weighted rollout percentage [0.0, 1.0] (§19).
+  // 0.0 = no new opportunities processed; 1.0 = full capacity.
+  double fraction = 1;
+}

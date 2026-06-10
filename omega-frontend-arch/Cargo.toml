@@ -1,0 +1,36 @@
+# omega-frontend-arch/Cargo.toml
+#
+# Workspace manifest for OmegaEngine v12 frontend.
+#
+# Dependency policy:
+#   - Pure-Rust, WASM-safe deps (serde, chrono, strum, thiserror) live here
+#     as workspace deps so all crates share a single resolved version.
+#   - WASM/browser-specific deps (wasm-bindgen, js-sys, web-sys, leptos)
+#     are declared directly in the crates that need them. Workspace deps
+#     cannot be optional, and these are only required by omega-ui.
+
+[workspace]
+resolver = "2"
+members = [
+    "crates/omega-control-contracts",
+    "crates/omega-frontend",
+    "crates/omega-ui",
+    "crates/omega-runtime",
+]
+
+[workspace.dependencies]
+serde      = { version = "1",    features = ["derive"] }
+serde_json = { version = "1" }
+chrono     = { version = "0.4",  features = ["serde"] }
+thiserror  = { version = "1" }
+strum      = { version = "0.26", features = ["derive"] }
+
+# ── Profiles ──────────────────────────────────────────────────────────────────
+[profile.dev]
+# Fewer codegen units = faster incremental linking for this small crate set.
+codegen-units = 4
+
+[profile.release]
+opt-level     = "z"     # minimise WASM binary size
+lto           = true    # cross-crate link-time optimisation
+codegen-units = 1       # single unit = best optimisation, slowest compile

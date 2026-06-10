@@ -1,0 +1,40 @@
+# crates/omega-core/Cargo.toml
+[package]
+name    = "omega-core"
+version = "12.0.0"
+edition = "2021"
+
+[dependencies]
+# Serialization
+serde      = { workspace = true }
+serde_json = { workspace = true }
+bincode    = { workspace = true }
+
+# Error handling
+anyhow    = { workspace = true }
+thiserror = { workspace = true }
+
+# Utilities
+uuid   = { workspace = true }
+chrono = { workspace = true }
+
+# ARCHITECTURAL NOTE (v12 spec §22.1):
+# omega-core uses alloy-primitives directly — NOT the full `alloy` crate.
+# The full alloy transport stack (providers, RPC, signers) is restricted
+# to omega-rpc.  alloy-primitives gives us B256, Address, Bytes, U256,
+# keccak256 — exactly what core types need, with zero transport surface.
+# The `serde` feature is required: without it, FixedBytes<N>, Address,
+# and Bytes do not implement Serialize/Deserialize.
+alloy-primitives = { workspace = true }
+
+# Async trait support for StrategyTrait
+async-trait = { workspace = true }
+
+# Telemetry
+tracing = { workspace = true }
+
+# Hex encoding for PositionSnapshot::dedup_key (§11.3 DashMap key).
+# hex is a minimal no-std crate — no transitive deps that would violate
+# the zero-transport-surface constraint.
+hex = "0.4"
+strum = { version = "0.28.0", features = ["derive"] }

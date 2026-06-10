@@ -1,0 +1,77 @@
+# crates/omega-prl/Cargo.toml
+[package]
+name        = "omega-prl"
+version     = "1.0.0"
+edition     = "2021"
+description = "OmegaEngine v12 Pattern Recognition Layer — deterministic, lock-minimized, NUMA-aware"
+authors     = ["OmegaEngine Engineering"]
+
+[lib]
+name = "omega_pattern_recognition"
+path = "src/lib.rs"
+
+[dependencies]
+# ── Workspace siblings ────────────────────────────────────────────────────────
+omega-core          = { path = "../omega-core" }
+omega-health        = { path = "../omega-health" }
+omega-observability = { path = "../omega-observability" }
+
+# ── Async + concurrency ───────────────────────────────────────────────────────
+tokio       = { workspace = true }
+arc-swap    = { workspace = true }
+dashmap     = { workspace = true }
+crossbeam   = { version = "0.8" }
+parking_lot = { version = "0.12" }
+rayon       = { version = "1" }             # parallel replay across domain shards
+
+# ── Serialisation / WAL ───────────────────────────────────────────────────────
+bincode   = { workspace = true }
+serde     = { workspace = true }
+zstd      = { version = "0.13" }
+crc32fast = { version = "1" }
+
+# ── SIMD / numerics ───────────────────────────────────────────────────────────
+wide          = { version = "0.7" }
+ndarray       = { version = "0.15" }         # ONNX input tensor construction
+packed_simd_2 = { version = "0.3", optional = true }
+
+# ── ML inference ─────────────────────────────────────────────────────────────
+ort = { version = "2.0.0-rc.12", optional = true }
+
+# ── Collections ───────────────────────────────────────────────────────────────
+# serde feature enables Serialize/Deserialize for SmallVec (§8.2 PatternSignature)
+smallvec = { version = "1", features = ["const_generics", "serde"] }
+arrayvec = { version = "0.7" }
+
+# ── Metrics ───────────────────────────────────────────────────────────────────
+prometheus = { version = "0.13", features = ["process"] }
+
+# ── Observability ─────────────────────────────────────────────────────────────
+tracing = { workspace = true }
+
+# ── Time ──────────────────────────────────────────────────────────────────────
+quanta = { version = "0.12" }
+
+# ── Error handling ────────────────────────────────────────────────────────────
+thiserror = { workspace = true }
+anyhow    = { workspace = true }
+
+# ── Hashing ───────────────────────────────────────────────────────────────────
+ahash = { version = "0.8" }
+
+[features]
+default      = ["simd-avx2"]
+onnx-runtime = ["dep:ort"]
+simd-avx2    = []
+simd-avx512  = ["packed_simd_2"]
+
+[dev-dependencies]
+tokio    = { workspace = true, features = ["test-util"] }
+proptest = { version = "1" }
+criterion = { version = "0.5", features = ["html_reports"] }
+
+[[bench]]
+name    = "prl_throughput"
+harness = false
+
+# NOTE: [profile.*] blocks belong in the workspace root Cargo.toml only.

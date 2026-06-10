@@ -1,0 +1,46 @@
+﻿# crates/omega-hot-path/Cargo.toml
+[package]
+name    = "omega-hot-path"
+version = "12.0.0"
+edition = "2021"
+
+# omega-hot-path is the <1ms execution lane for SA (Phase 1 Microtx) and
+# LA hot-tier (HF < 1.01, §11.1).  It owns:
+#   - HotPathGate: admission control — only hot_path_eligible blueprints enter
+#   - MicrotxSimulator: in-process revm wrapper, <1ms target latency
+#   - HotPathMetrics: latency histogram, slot utilisation, EV tracking
+#
+# Dependency graph (§22.1):
+#   omega-hot-path ← omega-core, omega-zk
+#
+# NOTE: omega-zk is NOT listed here because hot-path blueprints do not
+# require ZK proofs before relay submission (the ZK gate is at the Vault
+# level, not the submission level).  omega-hot-path is intentionally
+# dependency-minimal to keep compile times low.
+
+[dependencies]
+omega-core = { path = "../omega-core" }
+
+# EVM primitive types — blueprint_hash (B256), U256 profit arithmetic
+alloy-primitives = { workspace = true }
+
+# Async runtime — HotPathGate runs on a Tokio task receiving blueprints
+# from a channel; MicrotxSimulator::run is async to yield between batches
+tokio = { workspace = true }
+
+# Error handling
+anyhow    = { workspace = true }
+thiserror = { workspace = true }
+
+# Serialisation — HotPathMetrics snapshot for observability
+serde      = { workspace = true }
+serde_json = { workspace = true }
+
+# Telemetry
+tracing = { workspace = true }
+
+# Timestamps
+chrono = { workspace = true }
+
+# Lock-free metrics counters — read from observability without locking
+arc-swap = { workspace = true }

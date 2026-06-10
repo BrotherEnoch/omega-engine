@@ -1,0 +1,11 @@
+[package]
+name = "omega-control-contracts"
+version = "12.0.0"
+edition = "2021"
+
+[dependencies]
+chrono = { workspace = true }
+omega-core = { path = "../omega-core" }
+prost = "0.12"
+serde = { workspace = true }
+serde_json = { workspace = true }

@@ -1,0 +1,5 @@
+﻿# config/base.toml
+[chain]
+chain_id    = 8453
+name        = "base"
+block_time_ms = 2000

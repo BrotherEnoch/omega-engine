@@ -1,0 +1,34 @@
+﻿# ops/backtest/Cargo.toml
+[package]
+name    = "omega-backtest"
+version = "12.0.0"
+edition = "2021"
+
+[[bin]]
+name = "omega-backtest"
+path = "src/main.rs"
+
+[dependencies]
+omega-core             = { path = "../../crates/omega-core" }
+omega-loss-attribution = { path = "../../crates/omega-loss-attribution" }
+
+# CLI
+clap = { workspace = true }
+
+# Async runtime
+tokio = { workspace = true }
+
+# Serialisation
+serde      = { workspace = true }
+serde_json = { workspace = true }
+
+# Error handling
+anyhow    = { workspace = true }
+thiserror = { workspace = true }
+
+# Telemetry
+tracing            = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+# Timestamps
+chrono = { workspace = true }

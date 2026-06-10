@@ -1,0 +1,37 @@
+﻿# ops/shadow/Cargo.toml
+[package]
+name    = "omega-shadow"
+version = "12.0.0"
+edition = "2021"
+
+[[bin]]
+name = "omega-shadow"
+path = "src/main.rs"
+
+[dependencies]
+omega-core   = { path = "../../crates/omega-core" }
+omega-health = { path = "../../crates/omega-health" }
+
+# CLI
+clap = { workspace = true }
+
+# Async runtime
+tokio = { workspace = true }
+
+# Serialisation
+serde      = { workspace = true }
+serde_json = { workspace = true }
+
+# Telemetry
+tracing            = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+# Error handling
+anyhow    = { workspace = true }
+thiserror = { workspace = true }
+
+# Timestamps
+chrono = { workspace = true }
+
+# File I/O for daily JSON shards and HTML scorecard
+# (std::fs is sufficient — no extra dep required)

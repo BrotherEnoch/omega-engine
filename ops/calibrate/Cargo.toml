@@ -1,0 +1,36 @@
+﻿# ops/calibrate/Cargo.toml
+[package]
+name    = "omega-calibrate"
+version = "12.0.0"
+edition = "2021"
+
+[[bin]]
+name = "omega-calibrate"
+path = "src/main.rs"
+
+[dependencies]
+omega-core = { path = "../../crates/omega-core" }
+
+# CLI
+clap = { workspace = true }
+
+# Async runtime
+tokio = { workspace = true }
+
+# Serialisation — calibration output is JSON
+serde      = { workspace = true }
+serde_json = { workspace = true }
+
+# Error handling
+anyhow    = { workspace = true }
+thiserror = { workspace = true }
+
+# Telemetry
+tracing            = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+# Timestamps
+chrono = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"

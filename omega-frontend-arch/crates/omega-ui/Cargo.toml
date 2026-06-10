@@ -1,0 +1,74 @@
+# omega-frontend-arch/crates/omega-ui/Cargo.toml
+[package]
+name        = "omega-ui"
+version     = "0.12.0"
+edition     = "2021"
+description = "OmegaEngine v12 Leptos CSR health dashboard. Compiles to WASM."
+authors     = ["Omega Team"]
+repository  = "https://github.com/omega-engine/omega-frontend-arch"
+license     = "MIT OR Apache-2.0"
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Explicit bin target (prevents Trunk / cargo ambiguity)
+# ──────────────────────────────────────────────────────────────────────────────
+
+[[bin]]
+name = "omega-ui"
+path = "src/main.rs"
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Library (used by wasm + internal modules)
+# ──────────────────────────────────────────────────────────────────────────────
+
+[lib]
+name = "omega_ui"
+crate-type = ["cdylib", "rlib"]
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Workspace + core deps
+# ──────────────────────────────────────────────────────────────────────────────
+
+[dependencies]
+serde_json              = { workspace = true }
+chrono                  = { workspace = true }
+
+serde = { version = "1", features = ["derive"] }
+
+omega-control-contracts = { path = "../omega-control-contracts" }
+omega-frontend          = { path = "../omega-frontend" }
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Leptos CSR (WASM frontend runtime)
+# ──────────────────────────────────────────────────────────────────────────────
+
+leptos = { version = "0.6", features = ["csr"] }
+
+# ──────────────────────────────────────────────────────────────────────────────
+# WASM / browser interop
+# ──────────────────────────────────────────────────────────────────────────────
+
+wasm-bindgen         = "0.2"
+wasm-bindgen-futures = "0.4"
+js-sys               = "0.3"
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Utilities
+# ──────────────────────────────────────────────────────────────────────────────
+
+gloo-timers = { version = "0.3", features = ["futures"] }
+console_error_panic_hook = "0.1"
+
+# ──────────────────────────────────────────────────────────────────────────────
+# web-sys (keep minimal for faster WASM compile + fewer feature conflicts)
+# ──────────────────────────────────────────────────────────────────────────────
+
+[dependencies.web-sys]
+version = "0.3"
+features = [
+    "Window",
+    "WebSocket",
+    "MessageEvent",
+    "CloseEvent",
+    "ErrorEvent",
+    "console",
+]

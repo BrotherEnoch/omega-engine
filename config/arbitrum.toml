@@ -1,0 +1,8 @@
+﻿# config/arbitrum.toml
+[chain]
+chain_id    = 42161
+name        = "arbitrum"
+block_time_ms = 250
+
+[la]
+protocols   = ["aave_v3","compound_v3","morpho_blue"]   # euler_v2 added in phase 3.1
