@@ -1,8 +1,4 @@
 // crates/omega-ui/src/components/alerts.rs
-//
-// Alert banner list. Renders zero, one, or more banners depending on
-// active engine conditions (halted layers, gas model pause, vault timelock).
-
 use leptos::*;
 use omega_frontend::render::{RenderFrame, Severity};
 
@@ -18,7 +14,6 @@ pub fn Alerts(frame: ReadSignal<RenderFrame>) -> impl IntoView {
                 children=|alert| {
                     let cls = match alert.severity {
                         Severity::Critical => "alert alert-critical",
-                        Severity::Warning  => "alert alert-warning",
                         _                  => "alert alert-warning",
                     };
                     let badge = match alert.severity {

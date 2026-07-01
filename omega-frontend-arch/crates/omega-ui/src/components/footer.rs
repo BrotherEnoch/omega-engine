@@ -1,6 +1,7 @@
 // crates/omega-ui/src/components/footer.rs
 //
-// Status bar footer: live counts of operational / degraded / halted layers.
+// Summary bar: live counts of operational / degraded / halted layers,
+// styled as the reference design's summary-bar + bottom footer strip.
 
 use leptos::*;
 use omega_frontend::render::{RenderFrame, Severity};
@@ -16,20 +17,24 @@ pub fn Footer(frame: ReadSignal<RenderFrame>) -> impl IntoView {
         <footer class="footer">
             <div class="foot-item">
                 <span class="dot-ok">"●"</span>
-                <span>{move || format!("{:02} / {} OPERATIONAL", ok_count(), total())}</span>
+                {move || format!("{} HEALTHY", ok_count())}
             </div>
             <span class="foot-sep">"│"</span>
             <div class="foot-item">
                 <span class="dot-warn">"●"</span>
-                <span>{move || format!("{:02} DEGRADED", warn_count())}</span>
+                {move || format!("{} DEGRADED", warn_count())}
             </div>
             <span class="foot-sep">"│"</span>
             <div class="foot-item">
                 <span class="dot-halt">"●"</span>
-                <span>{move || format!("{:02} HALTED", halt_count())}</span>
+                {move || format!("{} HALTED", halt_count())}
+            </div>
+            <span class="foot-sep">"│"</span>
+            <div class="foot-item" style="color:var(--label);font-weight:400">
+                {move || format!("{} TOTAL", total())}
             </div>
             <span class="foot-spacer"></span>
-            <span class="foot-copy">"OMEGA ENGINE © 2026  —  CONFIDENTIAL  —  INSTITUTIONAL USE ONLY"</span>
+            <span class="foot-copy">"OMEGA ENGINE v12 — CONTROL PLANE"</span>
         </footer>
     }
 }

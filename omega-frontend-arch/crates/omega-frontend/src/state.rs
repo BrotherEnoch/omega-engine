@@ -1,346 +1,529 @@
 // omega-frontend-arch/crates/omega-frontend/src/state.rs
-//! Immutable engine state with monotonic revision counter.
-//!
-//! ## Invariants
-//! - Every mutation produces a **new** `EngineState` with `revision + 1`.
-//! - A stale snapshot (revision ≤ current) is silently dropped.
-//! - The current state is never mutated in-place.
-//!
-//! ## Optimisations (vs initial version)
-//! - `layer_health` is now a fixed-size array `[Option<LayerHealth>; 16]`
-//!   indexed by `LayerId as usize`. Cloning is stack-only — no heap allocation,
-//!   no HashMap rehash, no pointer-chasing. 16 HashMap lookups per render frame
-//!   become 16 direct array reads.
-//! - `EngineState` is wrapped in `Arc` by the sync layer. `with_*` helpers use
-//!   `Arc::make_mut` (copy-on-write) so only the mutated field is cloned when
-//!   there is more than one reference holder.
-
-use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
-
 use omega_control_contracts::{
-    health::{HealthStatus, LayerId, LayerHealth},
-    rest::{BlacklistResponse, CeilingStatusResponse, DaoFeeResponse, GasModelCheckpoint},
+    health::{HealthStatus, LayerId},
+    rest::{
+        BlacklistResponse, CeilingStatusResponse, DaoFeeResponse,
+        GasModelCheckpoint, HealthSnapshot, LayerHealthEntry,
+    },
     ws::{WsConnectionStatus, WsEvent},
 };
+use serde::{Deserialize, Serialize};
+use strum::IntoEnumIterator;
 
-// ---------------------------------------------------------------------------
-// Layer array helpers
-// ---------------------------------------------------------------------------
+use crate::observability::ObservabilityLog;
 
-/// Number of layers — must match `LayerId` variant count.
-const LAYER_COUNT: usize = 16;
+// ── EngineStore ───────────────────────────────────────────────────────────────
 
-/// Convert a `LayerId` to its array index (stable, matches enum declaration order).
-#[inline]
-fn layer_index(layer: LayerId) -> usize {
-    layer as usize
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum RealtimeStatus {
+    Disconnected,
+    Connecting,
+    Anonymous,
+    Authenticated,
+    Lagged,
 }
 
-// ---------------------------------------------------------------------------
-// EngineStateInner — the heap-allocated payload behind Arc
-// ---------------------------------------------------------------------------
-
-/// Inner state payload. Kept behind `Arc` so `with_*` helpers are copy-on-write:
-/// if the Arc has exactly one reference, mutation is in-place; otherwise a
-/// single clone of only the changed field is needed.
-#[derive(Debug, Clone)]
-struct EngineStateInner {
-    revision:                  u64,
-    updated_at:                DateTime<Utc>,
-
-    // Fixed-size array — zero heap allocation on clone.
-    layer_health:              [Option<LayerHealth>; LAYER_COUNT],
-    overall_health:            HealthStatus,
-
-    checkpoints:               Vec<GasModelCheckpoint>,
-    active_checkpoint_version: Option<u64>,
-    ceiling_status:            Option<CeilingStatusResponse>,
-    dao_fee:                   Option<DaoFeeResponse>,
-    blacklist:                 Option<BlacklistResponse>,
-    ws_status:                 WsConnectionStatus,
-    last_ws_seq:               Option<u64>,
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct EngineStore {
+    pub revision:                 u64,
+    pub realtime_status:          RealtimeStatus,
+    pub health:                   Option<HealthSnapshot>,
+    pub dao_fee:                  Option<DaoFeeResponse>,
+    pub builder_blacklist:        Option<BlacklistResponse>,
+    pub model_paused:             Option<bool>,
+    pub consecutive_ceiling_hits: Option<u64>,
+    pub last_event_at:            Option<DateTime<Utc>>,
+    pub last_event:               Option<WsEvent>,
 }
 
-impl Default for EngineStateInner {
+impl Default for EngineStore {
     fn default() -> Self {
         Self {
-            revision:                  0,
-            updated_at:                Utc::now(),
-            layer_health:              std::array::from_fn(|_| None),
-            overall_health:            HealthStatus::Unknown,
-            checkpoints:               Vec::new(),
-            active_checkpoint_version: None,
-            ceiling_status:            None,
-            dao_fee:                   None,
-            blacklist:                 None,
-            ws_status:                 WsConnectionStatus::Disconnected,
-            last_ws_seq:               None,
+            revision:                 0,
+            realtime_status:          RealtimeStatus::Disconnected,
+            health:                   None,
+            dao_fee:                  None,
+            builder_blacklist:        None,
+            model_paused:             None,
+            consecutive_ceiling_hits: None,
+            last_event_at:            None,
+            last_event:               None,
         }
     }
 }
 
-// ---------------------------------------------------------------------------
-// EngineState — public handle (Arc-backed, cheap to clone)
-// ---------------------------------------------------------------------------
-
-/// Immutable engine state handle. Cheap to clone — cloning increments an
-/// atomic reference count, not the payload.
-///
-/// Use `Arc::make_mut` internally for copy-on-write mutation.
-#[derive(Debug, Clone, Default)]
-pub struct EngineState(Arc<EngineStateInner>);
-
-impl EngineState {
-    // -----------------------------------------------------------------------
-    // Public field accessors (read-through to inner)
-    // -----------------------------------------------------------------------
-
-    pub fn revision(&self)         -> u64              { self.0.revision }
-    pub fn updated_at(&self)       -> DateTime<Utc>    { self.0.updated_at }
-    pub fn overall_health(&self)   -> HealthStatus     { self.0.overall_health }
-    pub fn ws_status(&self)        -> &WsConnectionStatus { &self.0.ws_status }
-    pub fn checkpoints(&self)      -> &[GasModelCheckpoint] { &self.0.checkpoints }
-    pub fn active_checkpoint_version(&self) -> Option<u64> { self.0.active_checkpoint_version }
-    pub fn ceiling_status(&self)   -> Option<&CeilingStatusResponse> { self.0.ceiling_status.as_ref() }
-    pub fn dao_fee(&self)          -> Option<&DaoFeeResponse>        { self.0.dao_fee.as_ref() }
-    pub fn blacklist(&self)        -> Option<&BlacklistResponse>     { self.0.blacklist.as_ref() }
-    pub fn last_ws_seq(&self)      -> Option<u64>      { self.0.last_ws_seq }
-
-    // -----------------------------------------------------------------------
-    // Snapshot acceptance
-    // -----------------------------------------------------------------------
-
-    /// Accept a new health snapshot. Returns `None` if stale (revision ≤ current).
-    pub fn accept_health_snapshot(
-        &self,
-        snapshot: &omega_control_contracts::rest::HealthSnapshot,
-    ) -> Option<EngineState> {
-        let mut next = EngineStateInner::clone(&self.0);
-        next.revision      += 1;
-        next.updated_at     = snapshot.generated_at;
-        next.overall_health = if snapshot.system_halted {
-            HealthStatus::Halted
-        } else {
-            HealthStatus::from_backend_str(snapshot.overall_state())
-        };
-        // Reset array then fill from snapshot.
-        next.layer_health   = std::array::from_fn(|_| None);
-        for entry in &snapshot.layers {
-            if let Some(lh) = LayerHealth::from_entry(entry) {
-                let index = layer_index(lh.layer);
-                next.layer_health[index] = Some(lh);
-            }
-        }
-        Some(EngineState(Arc::new(next)))
+impl EngineStore {
+    pub fn ingest_health(&mut self, health: HealthSnapshot) {
+        self.health = Some(health);
+        self.bump();
     }
 
-    // -----------------------------------------------------------------------
-    // WebSocket event application
-    // -----------------------------------------------------------------------
+    pub fn ingest_dao_fee(&mut self, dao_fee: DaoFeeResponse) {
+        self.dao_fee = Some(dao_fee);
+        self.bump();
+    }
 
-    /// Apply a WebSocket event. Returns `None` for no-ops (Ping).
-    pub fn apply_ws_event(&self, seq: u64, event: &WsEvent) -> Option<EngineState> {
-        // Gap detection: missed events → trigger re-sync.
-        if let Some(last) = self.0.last_ws_seq {
-            if seq > last + 1 {
-                let mut gap = EngineStateInner::clone(&self.0);
-                gap.ws_status = WsConnectionStatus::Reconnecting { attempt: 0 };
-                return Some(EngineState(Arc::new(gap)));
-            }
+    pub fn ingest_builder_blacklist(&mut self, blacklist: BlacklistResponse) {
+        self.builder_blacklist = Some(blacklist);
+        self.bump();
+    }
+
+    pub fn set_realtime_status(&mut self, status: RealtimeStatus) {
+        if self.realtime_status != status {
+            self.realtime_status = status;
+            self.bump();
         }
+    }
 
-        let mut next = EngineStateInner::clone(&self.0);
-        next.revision   += 1;
-        next.updated_at  = Utc::now();
-        next.last_ws_seq = Some(seq);
+    pub fn apply_event(&mut self, event: WsEvent) {
+        self.last_event_at = Some(Utc::now());
 
-        match event {
-            WsEvent::HealthUpdate(hu) => {
-                next.overall_health = hu.overall;
-                for change in &hu.changes {
-                    let slot = &mut next.layer_health[layer_index(change.layer)];
-                    if let Some(lh) = slot {
-                        lh.status  = change.current;
-                        lh.message = change.message.clone();
+        match &event {
+            WsEvent::LayerEvent(ev) => {
+                if let Some(layer) = ev.layer_id() {
+                    let key = layer_backend_key(layer);
+                    if let Some(health) = &mut self.health {
+                        if let Some(entry) =
+                            health.layers.iter_mut().find(|e| e.layer == key)
+                        {
+                            entry.state          = ev.status.clone();
+                            entry.is_operational = ev.health_status() != HealthStatus::Halted;
+                            entry.message        = Some(ev.message.clone());
+                        }
+                        health.system_halted =
+                            health.layers.iter().any(|e| e.state == "HALTED");
                     }
                 }
-                if hu.revision > next.revision {
-                    next.revision = hu.revision;
-                }
             }
-
-            WsEvent::GasModelReverted(ev) => {
-                next.active_checkpoint_version = Some(ev.checkpoint_version);
-            }
-
             WsEvent::GasModelCeilingEscalation(ev) => {
-                let slot = &mut next.layer_health[layer_index(LayerId::LossAttribution)];
-                if let Some(lh) = slot {
-                    lh.status  = HealthStatus::Degraded;
-                    lh.message = Some(format!(
-                        "GAS_MODEL_CEILING_REACHED: {} hits on {}",
-                        ev.ceiling_hit_count, ev.feature_key
-                    ));
-                }
+                let prev = self.consecutive_ceiling_hits.unwrap_or(0);
+                self.consecutive_ceiling_hits = Some(prev.saturating_add(ev.ceiling_hit_count));
             }
-
-            WsEvent::HaltPropagation(halt) => {
-                for &layer in &halt.affected_layers {
-                    let slot = &mut next.layer_health[layer_index(layer)];
-                    if let Some(lh) = slot {
-                        lh.status  = HealthStatus::Halted;
-                        lh.message = Some(halt.reason.clone());
-                    }
-                }
-                next.overall_health = HealthStatus::Halted;
-            }
-
-            // Observability-only events — no state change beyond seq/revision.
-            WsEvent::LaReorgRisk(_)
+            WsEvent::GasModelReverted(_)
             | WsEvent::EmergencyBundleSkipped(_)
             | WsEvent::ProfitSplit(_)
-            | WsEvent::SimulationError(_) => {}
-
-            WsEvent::Ping { .. } => return None,
+            | WsEvent::LaReorgRisk(_)
+            | WsEvent::SimulationError(_)
+            | WsEvent::BlueprintConfirmed(_)
+            | WsEvent::Ping(_) => {}
         }
 
-        Some(EngineState(Arc::new(next)))
+        self.last_event = Some(event);
+        self.bump();
     }
 
-    // -----------------------------------------------------------------------
-    // Ancillary data setters — copy-on-write via Arc::make_mut
-    // -----------------------------------------------------------------------
-
-    pub fn with_checkpoints(&self, checkpoints: Vec<GasModelCheckpoint>) -> EngineState {
-        let mut next = EngineStateInner::clone(&self.0);
-        next.revision += 1;
-        next.updated_at = Utc::now();
-        next.active_checkpoint_version = checkpoints.iter().map(|c| c.version).max();
-        next.checkpoints = checkpoints;
-        EngineState(Arc::new(next))
+    fn bump(&mut self) {
+        self.revision = self.revision.saturating_add(1);
     }
+}
 
-    pub fn with_dao_fee(&self, resp: DaoFeeResponse) -> EngineState {
-        let mut next = EngineStateInner::clone(&self.0);
-        next.revision += 1;
-        next.updated_at = Utc::now();
-        next.dao_fee = Some(resp);
-        EngineState(Arc::new(next))
+// ── EngineState ───────────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct EngineState {
+    revision:       u64,
+    ws_status:      WsConnectionStatus,
+    health:         Option<HealthSnapshot>,
+    checkpoints:    Vec<GasModelCheckpoint>,
+    dao_fee:        Option<DaoFeeResponse>,
+    blacklist:      Option<BlacklistResponse>,
+    ceiling_status: Option<CeilingStatusResponse>,
+    /// Live observability event ring buffer.
+    pub obs_log:    ObservabilityLog,
+}
+
+impl Default for EngineState {
+    fn default() -> Self {
+        Self {
+            revision:       0,
+            ws_status:      WsConnectionStatus::Disconnected,
+            health:         None,
+            checkpoints:    Vec::new(),
+            dao_fee:        None,
+            blacklist:      None,
+            ceiling_status: None,
+            obs_log:        ObservabilityLog::with_capacity(200),
+        }
     }
+}
 
-    pub fn with_blacklist(&self, resp: BlacklistResponse) -> EngineState {
-        let mut next = EngineStateInner::clone(&self.0);
-        next.revision += 1;
-        next.updated_at = Utc::now();
-        next.blacklist = Some(resp);
-        EngineState(Arc::new(next))
-    }
+// ── Public read interface ─────────────────────────────────────────────────────
 
-    pub fn with_ceiling_status(&self, resp: CeilingStatusResponse) -> EngineState {
-        let mut next = EngineStateInner::clone(&self.0);
-        next.revision += 1;
-        next.updated_at = Utc::now();
-        next.ceiling_status = Some(resp);
-        EngineState(Arc::new(next))
-    }
+impl EngineState {
+    pub fn revision(&self) -> u64 { self.revision }
 
-    pub fn with_ws_status(&self, status: WsConnectionStatus) -> EngineState {
-        let mut next = EngineStateInner::clone(&self.0);
-        next.revision += 1;
-        next.updated_at = Utc::now();
-        next.ws_status = status;
-        EngineState(Arc::new(next))
-    }
+    pub fn ws_status(&self) -> WsConnectionStatus { self.ws_status.clone() }
 
-    // -----------------------------------------------------------------------
-    // Queries — O(1) array reads
-    // -----------------------------------------------------------------------
-
-    /// Returns the `LayerHealth` for a specific layer (O(1) array read).
-    #[inline]
-    pub fn layer_health(&self, layer: LayerId) -> Option<&LayerHealth> {
-        self.0.layer_health[layer_index(layer)].as_ref()
-    }
-
-    /// Returns the health status of a layer, or `Unknown` if not yet received.
-    #[inline]
     pub fn layer_status(&self, layer: LayerId) -> HealthStatus {
-        self.0.layer_health[layer_index(layer)]
+        let key = layer_backend_key(layer);
+        self.health
             .as_ref()
-            .map(|lh| lh.status)
+            .and_then(|h| h.layers.iter().find(|e| e.layer == key))
+            .map(|e| parse_health_status(&e.state))
             .unwrap_or(HealthStatus::Unknown)
     }
 
-    /// Returns `true` if any layer is currently halted.
-    pub fn any_halted(&self) -> bool {
-        self.0.layer_health.iter()
-            .filter_map(|s| s.as_ref())
-            .any(|lh| lh.status == HealthStatus::Halted)
+    pub fn layer_health(&self, layer: LayerId) -> Option<&LayerHealthEntry> {
+        let key = layer_backend_key(layer);
+        self.health
+            .as_ref()
+            .and_then(|h| h.layers.iter().find(|e| e.layer == key))
     }
 
-    /// Returns `true` if the gas model is paused (ceiling escalation active).
+    pub fn overall_health(&self) -> HealthStatus {
+        LayerId::iter()
+            .map(|l| self.layer_status(l))
+            .fold(HealthStatus::Unknown, worst_status)
+    }
+
+    pub fn any_halted(&self) -> bool {
+        self.health.as_ref().map(|h| h.system_halted).unwrap_or(false)
+    }
+
     pub fn gas_model_paused(&self) -> bool {
-        self.0.ceiling_status.as_ref().map(|cs| cs.any_paused).unwrap_or(false)
+        self.ceiling_status
+            .as_ref()
+            .map(|cs| cs.paused)
+            .unwrap_or(false)
+    }
+
+    pub fn checkpoints(&self) -> &[GasModelCheckpoint] { &self.checkpoints }
+
+    pub fn active_checkpoint_version(&self) -> Option<u64> {
+        self.checkpoints.iter().map(|c| c.version).max()
+    }
+
+    pub fn ceiling_status(&self) -> Option<&CeilingStatusResponse> {
+        self.ceiling_status.as_ref()
+    }
+
+    pub fn dao_fee(&self) -> Option<&DaoFeeResponse> { self.dao_fee.as_ref() }
+
+    pub fn blacklist(&self) -> Option<&BlacklistResponse> { self.blacklist.as_ref() }
+}
+
+// ── Mutation interface ────────────────────────────────────────────────────────
+
+impl EngineState {
+    /// Unconditionally replace the health snapshot, bypassing the
+    /// generated_at staleness check. Used exclusively by ws_client.
+    pub fn force_health_snapshot(&mut self, snap: HealthSnapshot) {
+        self.health   = Some(snap);
+        self.revision = self.revision.saturating_add(1);
+    }
+
+    /// Record an observability event into the ring buffer.
+    pub fn record_obs_event(&mut self, event: &WsEvent) {
+        self.obs_log.record_ws_event(event);
+        self.revision = self.revision.saturating_add(1);
+    }
+
+    pub fn accept_health_snapshot(&self, snap: &HealthSnapshot) -> Option<Self> {
+        if let Some(current) = &self.health {
+            if snap.generated_at <= current.generated_at {
+                return None;
+            }
+        }
+        let mut next  = self.clone();
+        next.health   = Some(snap.clone());
+        next.revision = next.revision.saturating_add(1);
+        Some(next)
+    }
+
+    pub fn with_ws_status(&self, status: WsConnectionStatus) -> Self {
+        let mut next   = self.clone();
+        next.ws_status = status;
+        next.revision  = next.revision.saturating_add(1);
+        next
+    }
+
+    pub fn with_checkpoints(&self, checkpoints: Vec<GasModelCheckpoint>) -> Self {
+        let mut next     = self.clone();
+        next.checkpoints = checkpoints;
+        next.revision    = next.revision.saturating_add(1);
+        next
+    }
+
+    pub fn with_dao_fee(&self, dao_fee: DaoFeeResponse) -> Self {
+        let mut next  = self.clone();
+        next.dao_fee  = Some(dao_fee);
+        next.revision = next.revision.saturating_add(1);
+        next
+    }
+
+    pub fn with_blacklist(&self, blacklist: BlacklistResponse) -> Self {
+        let mut next   = self.clone();
+        next.blacklist = Some(blacklist);
+        next.revision  = next.revision.saturating_add(1);
+        next
+    }
+
+    pub fn with_ceiling_status(&self, ceiling_status: CeilingStatusResponse) -> Self {
+        let mut next        = self.clone();
+        next.ceiling_status = Some(ceiling_status);
+        next.revision       = next.revision.saturating_add(1);
+        next
+    }
+
+    pub fn apply_ws_event(&self, _seq: u64, event: &WsEvent) -> Option<Self> {
+        match event {
+            WsEvent::LayerEvent(ev) => {
+                let layer = ev.layer_id()?;
+                let key   = layer_backend_key(layer);
+                let mut next = self.clone();
+                if let Some(health) = &mut next.health {
+                    if let Some(entry) =
+                        health.layers.iter_mut().find(|e| e.layer == key)
+                    {
+                        entry.state          = ev.status.clone();
+                        entry.is_operational = ev.health_status() != HealthStatus::Halted;
+                        entry.message        = Some(ev.message.clone());
+                        health.system_halted =
+                            health.layers.iter().any(|e| e.state == "HALTED");
+                        next.revision = next.revision.saturating_add(1);
+                        return Some(next);
+                    }
+                }
+                None
+            }
+            WsEvent::GasModelReverted(_)
+            | WsEvent::GasModelCeilingEscalation(_)
+            | WsEvent::EmergencyBundleSkipped(_)
+            | WsEvent::ProfitSplit(_)
+            | WsEvent::LaReorgRisk(_)
+            | WsEvent::SimulationError(_)
+            | WsEvent::BlueprintConfirmed(_)
+            | WsEvent::Ping(_) => None,
+        }
     }
 }
 
-// ---------------------------------------------------------------------------
-// Tests
-// ---------------------------------------------------------------------------
+// ── LayerId → backend key ─────────────────────────────────────────────────────
+
+/// Maps a `LayerId` to the exact string the backend uses to identify that
+/// layer in JSON ("layer" field of `LayerHealthEntry`/`HealthSnapshot`,
+/// and the "layer" field of WS `LayerEvent` payloads).
+///
+/// These RHS strings MUST match `LayerId`'s canonical v12 `Display` output
+/// exactly (see `crates/omega-core/src/types/health.rs` —
+/// `#[strum(serialize_all = "SCREAMING_SNAKE_CASE")]` on the real variant
+/// names), because that Display impl is literally what
+/// `ops/control-plane`'s `get_health` handler calls
+/// (`l.layer_id().to_string()`) to build the `layer` field every
+/// `HealthSnapshot` carries. Using a pre-v12 alias name on the RHS here
+/// (e.g. "SYSTEM_HEALTH" instead of "HEALTH") silently breaks every
+/// lookup in `layer_status()`/`layer_health()` — the search for a
+/// matching `entry.layer == key` never finds a match, and every layer
+/// falls back to `HealthStatus::Unknown` regardless of what the backend
+/// actually reports.
+///
+/// LHS match patterns may freely use either canonical names or pre-v12
+/// aliases (`LayerId::SystemHealth`, `LayerId::ExternalData`, `LayerId::Eil`,
+/// `LayerId::Strategy`, `LayerId::Flashloan`, `LayerId::Orchestrator`,
+/// `LayerId::Vault` are all const aliases that resolve to a canonical
+/// variant at compile time — see `omega_core::LayerId`'s
+/// `#[allow(non_upper_case_globals)] impl LayerId` block). `ChaosGuard`
+/// (alias for `Security`) is intentionally NOT listed as a separate arm
+/// here: since it resolves to the exact same variant as the `Security`
+/// arm above it, an additional `LayerId::ChaosGuard` arm would be
+/// unreachable and was previously a duplicate-vs-missing-Oracle bug.
+fn layer_backend_key(layer: LayerId) -> &'static str {
+    match layer {
+        LayerId::SystemHealth    => "HEALTH",
+        LayerId::ExternalData    => "RPC",
+        LayerId::Oracle          => "ORACLE",
+        LayerId::Eil             => "COMPLIANCE",
+        LayerId::Risk            => "RISK",
+        LayerId::Security        => "SECURITY",
+        LayerId::Dag             => "DAG",
+        LayerId::Zk              => "ZK",
+        LayerId::HotPath         => "HOT_PATH",
+        LayerId::Strategy        => "STRATEGIES",
+        LayerId::Flashloan       => "FLASH_LOAN",
+        LayerId::Orchestrator    => "GAS_WAR",
+        LayerId::Relay           => "RELAY",
+        LayerId::Vault           => "ADDRESS_ROTATION",
+        LayerId::Observability   => "OBSERVABILITY",
+        LayerId::LossAttribution => "LOSS_ATTRIBUTION",
+    }
+}
+
+fn parse_health_status(s: &str) -> HealthStatus {
+    match s {
+        "HEALTHY" | "OK" => HealthStatus::Ok,
+        "DEGRADED"       => HealthStatus::Degraded,
+        "HALTED"         => HealthStatus::Halted,
+        "RECOVERING"     => HealthStatus::Recovering,
+        _                => HealthStatus::Unknown,
+    }
+}
+
+fn worst_status(a: HealthStatus, b: HealthStatus) -> HealthStatus {
+    use HealthStatus::*;
+    match (a, b) {
+        (Halted, _) | (_, Halted)         => Halted,
+        (Degraded, _) | (_, Degraded)     => Degraded,
+        (Recovering, _) | (_, Recovering) => Recovering,
+        (Ok, _) | (_, Ok)                 => Ok,
+        _                                 => Unknown,
+    }
+}
+
+// ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use omega_control_contracts::rest::HealthSnapshot;
+    use omega_control_contracts::ws::LayerEventPayload;
 
-    fn make_snapshot() -> HealthSnapshot {
+    fn snap_with(layer_key: &str, status: &str) -> HealthSnapshot {
         HealthSnapshot {
-            generated_at:  Utc::now(),
-            layers:        vec![],
-            system_halted: false,
+            generated_at:  chrono::Utc::now(),
+            layers:        vec![LayerHealthEntry {
+                layer:          layer_key.into(),
+                state:          status.into(),
+                is_operational: status != "HALTED",
+                message:        None,
+            }],
+            system_halted: status == "HALTED",
         }
     }
 
     #[test]
-    fn accept_newer_snapshot_increments_revision() {
+    fn default_state_all_layers_unknown() {
         let state = EngineState::default();
-        let next = state.accept_health_snapshot(&make_snapshot()).unwrap();
+        for layer in LayerId::iter() {
+            assert_eq!(state.layer_status(layer), HealthStatus::Unknown);
+        }
+    }
+
+    #[test]
+    fn accept_snapshot_sets_layer_status() {
+        let state = EngineState::default();
+        let snap  = snap_with("RELAY", "HEALTHY");
+        let next  = state.accept_health_snapshot(&snap).unwrap();
+        assert_eq!(next.layer_status(LayerId::Relay), HealthStatus::Ok);
+    }
+
+    #[test]
+    fn stale_snapshot_returns_none() {
+        let state = EngineState::default();
+        let snap1 = snap_with("RELAY", "HEALTHY");
+        let next1 = state.accept_health_snapshot(&snap1).unwrap();
+        assert!(next1.accept_health_snapshot(&snap1).is_none());
+    }
+
+    #[test]
+    fn ws_status_transition() {
+        let state = EngineState::default();
+        let next  = state.with_ws_status(WsConnectionStatus::Connected);
+        assert_eq!(next.ws_status(), WsConnectionStatus::Connected);
         assert_eq!(next.revision(), 1);
     }
 
     #[test]
-    fn ping_event_returns_none() {
+    fn apply_ws_event_layer_event_halts() {
         let state = EngineState::default();
-        assert!(state.apply_ws_event(1, &WsEvent::Ping { nonce: 42 }).is_none());
+        let snap  = snap_with("RELAY", "HEALTHY");
+        let state = state.accept_health_snapshot(&snap).unwrap();
+        let event = WsEvent::LayerEvent(LayerEventPayload {
+            layer: "L12".into(), status: "HALTED".into(),
+            message: "circuit breaker tripped".into(), version: 1, latency_ns: 0,
+        });
+        let next = state.apply_ws_event(1, &event).unwrap();
+        assert_eq!(next.layer_status(LayerId::Relay), HealthStatus::Halted);
+        assert!(next.any_halted());
     }
 
     #[test]
-    fn ws_gap_triggers_reconnect_status() {
-        let state = EngineState(Arc::new(EngineStateInner {
-            last_ws_seq: Some(5),
-            ..EngineStateInner::default()
+    fn force_health_snapshot_bypasses_timestamp() {
+        let mut state = EngineState::default();
+        let snap = snap_with("RELAY", "HEALTHY");
+        state.force_health_snapshot(snap);
+        assert_eq!(state.layer_status(LayerId::Relay), HealthStatus::Ok);
+    }
+
+    #[test]
+    fn record_obs_event_increments_revision() {
+        use omega_control_contracts::ws::GasModelRevertedEvent;
+        let mut state = EngineState::default();
+        let rev0 = state.revision();
+        state.record_obs_event(&WsEvent::GasModelReverted(GasModelRevertedEvent {
+            checkpoint_version: 1, win_rate: 0.7, sample_count: 1000,
         }));
-        let next = state.apply_ws_event(10, &WsEvent::Ping { nonce: 0 }).unwrap();
-        assert!(matches!(next.ws_status(), WsConnectionStatus::Reconnecting { .. }));
+        assert!(state.revision() > rev0);
+        assert_eq!(state.obs_log.metrics.gas_model_reverts, 1);
     }
 
     #[test]
-    fn layer_status_is_o1_array_read() {
-        // Confirm no HashMap — just verify correct default
+    fn blueprint_confirmed_is_no_op_in_apply_ws_event() {
+        use omega_control_contracts::ws::BlueprintConfirmedEvent;
         let state = EngineState::default();
-        assert_eq!(state.layer_status(LayerId::LossAttribution), HealthStatus::Unknown);
+        let event = WsEvent::BlueprintConfirmed(BlueprintConfirmedEvent {
+            blueprint_hash: "0x1".into(),
+            strategy_id:    "SA".into(),
+            block_number:   1,
+            profit_net_eth: 0.001,
+        });
+        // BlueprintConfirmed produces no state change — returns None
+        assert!(state.apply_ws_event(1, &event).is_none());
     }
 
     #[test]
-    fn arc_state_clone_is_cheap() {
-        // Cloning EngineState should not clone the inner payload
-        let state = EngineState::default();
-        let clone = state.clone();
-        // Both point to the same Arc — strong_count == 2
-        assert_eq!(Arc::strong_count(&state.0), 2);
-        assert_eq!(Arc::strong_count(&clone.0), 2);
+    fn blueprint_confirmed_does_not_enter_obs_log() {
+        use omega_control_contracts::ws::BlueprintConfirmedEvent;
+        let mut state = EngineState::default();
+        let rev0 = state.revision();
+        state.record_obs_event(&WsEvent::BlueprintConfirmed(BlueprintConfirmedEvent {
+            blueprint_hash: "0x1".into(),
+            strategy_id:    "SA".into(),
+            block_number:   1,
+            profit_net_eth: 0.001,
+        }));
+        // revision still bumps (record_obs_event always bumps)
+        assert!(state.revision() > rev0);
+        // but no ring buffer entry is created
+        assert_eq!(state.obs_log.len(), 0);
+    }
+
+    #[test]
+    fn layer_backend_key_all_variants_covered() {
+        for layer in LayerId::iter() {
+            assert!(!layer_backend_key(layer).is_empty());
+        }
+    }
+
+    #[test]
+    fn layer_backend_key_matches_canonical_backend_strings() {
+        assert_eq!(layer_backend_key(LayerId::SystemHealth),    "HEALTH");
+        assert_eq!(layer_backend_key(LayerId::ExternalData),    "RPC");
+        assert_eq!(layer_backend_key(LayerId::Oracle),          "ORACLE");
+        assert_eq!(layer_backend_key(LayerId::Eil),             "COMPLIANCE");
+        assert_eq!(layer_backend_key(LayerId::Risk),            "RISK");
+        assert_eq!(layer_backend_key(LayerId::Security),        "SECURITY");
+        assert_eq!(layer_backend_key(LayerId::Dag),             "DAG");
+        assert_eq!(layer_backend_key(LayerId::Zk),              "ZK");
+        assert_eq!(layer_backend_key(LayerId::HotPath),         "HOT_PATH");
+        assert_eq!(layer_backend_key(LayerId::Strategy),        "STRATEGIES");
+        assert_eq!(layer_backend_key(LayerId::Flashloan),       "FLASH_LOAN");
+        assert_eq!(layer_backend_key(LayerId::Orchestrator),    "GAS_WAR");
+        assert_eq!(layer_backend_key(LayerId::Relay),           "RELAY");
+        assert_eq!(layer_backend_key(LayerId::Vault),           "ADDRESS_ROTATION");
+        assert_eq!(layer_backend_key(LayerId::Observability),   "OBSERVABILITY");
+        assert_eq!(layer_backend_key(LayerId::LossAttribution), "LOSS_ATTRIBUTION");
+    }
+
+    #[test]
+    fn layer_backend_key_produces_no_duplicates() {
+        let mut seen = std::collections::HashSet::new();
+        for layer in LayerId::iter() {
+            let key = layer_backend_key(layer);
+            assert!(
+                seen.insert(key),
+                "layer_backend_key produced a duplicate key {key:?} for {layer:?}"
+            );
+        }
     }
 }
-

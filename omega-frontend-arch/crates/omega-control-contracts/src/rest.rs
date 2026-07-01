@@ -11,19 +11,6 @@ use serde::{Deserialize, Serialize};
 // Generic
 // ---------------------------------------------------------------------------
 
-/// Generic error body returned on 4xx/5xx.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ApiError {
-    pub error:   String,
-    pub message: String,
-}
-
-impl ApiError {
-    pub fn new(error: impl Into<String>, message: impl Into<String>) -> Self {
-        Self { error: error.into(), message: message.into() }
-    }
-}
-
 /// Generic success body returned by mutation endpoints.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ApiOk {
@@ -33,10 +20,21 @@ pub struct ApiOk {
 pub const OK: ApiOk = ApiOk { status: "ok" };
 
 // ---------------------------------------------------------------------------
+// Errors
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ApiError {
+    pub error:   String,
+    pub message: String,
+}
+
+// ---------------------------------------------------------------------------
 // Health  — matches GET /api/v1/health backend handler exactly
 // ---------------------------------------------------------------------------
 
-/// A single layer entry as returned by the backend.
+/// A single layer entry as returned by the backend REST endpoint and
+/// kept live by WebSocket `layer_event` messages.
 ///
 /// Field names: `layer` (string id), `state` (string status), `is_operational`.
 /// The backend serialises LayerId and HealthState as strings via `.to_string()`.
@@ -56,6 +54,10 @@ pub struct LayerHealthEntry {
     pub state: String,
     /// True when the layer is not halted or degraded.
     pub is_operational: bool,
+    /// Optional diagnostic message from the layer.
+    /// Absent in REST snapshots; populated from WS `layer_event` messages.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
 }
 
 impl LayerHealthEntry {
@@ -74,11 +76,11 @@ impl LayerHealthEntry {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct HealthSnapshot {
     /// UTC timestamp when this snapshot was generated.
-    pub generated_at:   DateTime<Utc>,
+    pub generated_at:  DateTime<Utc>,
     /// Per-layer health entries (16 layers in v12).
-    pub layers:         Vec<LayerHealthEntry>,
+    pub layers:        Vec<LayerHealthEntry>,
     /// True if any layer is in the HALTED state.
-    pub system_halted:  bool,
+    pub system_halted: bool,
 }
 
 impl HealthSnapshot {
@@ -98,7 +100,7 @@ impl HealthSnapshot {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ConfigReloadRequest {
     pub from_disk: bool,
-    pub body: Option<serde_json::Value>,
+    pub body:      Option<serde_json::Value>,
 }
 
 // ---------------------------------------------------------------------------
@@ -106,7 +108,11 @@ pub struct ConfigReloadRequest {
 // ---------------------------------------------------------------------------
 
 /// A single checkpoint entry as returned by `checkpoint::list_checkpoints`.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+///
+/// `PartialEq` uses bitwise f64 equality, which is correct here because these
+/// values are wire-round-tripped and never computed from floating-point arithmetic
+/// on the frontend side.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct GasModelCheckpoint {
     pub version:           u64,
     pub win_rate:          f64,
@@ -126,27 +132,41 @@ pub struct RevertResponse {
 
 // ---------------------------------------------------------------------------
 // Ceiling status  — matches GET /api/v1/la/gas-model/ceiling-status
+//
+// This is the JSON actually emitted by CeilingEscalationTracker::snapshot()
+// in ops/control-plane (confirmed live via curl against a running server):
+//
+//   {"paused":false,"consecutive_ceiling_hits":0,"escalation_threshold":100,
+//    "trigger_key":null,"last_hit_at":null,"paused_at":null}
+//
+// An earlier `features: Vec<FeatureCeilingStatus>` / `any_paused` shape
+// here never matched what the handler returns (it calls Json(snapshot)
+// directly on the tracker's own type, not this struct), which broke the
+// frontend's poll with "missing field `features`". This struct now
+// mirrors the tracker's real output exactly.
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct FeatureCeilingStatus {
-    pub feature_key:       String,
-    pub multiplier:        f64,
-    pub ceiling_hit_count: u64,
-    pub paused:            bool,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct CeilingStatusResponse {
-    pub features:   Vec<FeatureCeilingStatus>,
-    pub any_paused: bool,
+    /// True when the gas model is currently paused due to ceiling escalation.
+    pub paused: bool,
+    /// Current consecutive-hit count toward the escalation threshold.
+    pub consecutive_ceiling_hits: u64,
+    /// Configured threshold (ml.ceiling_escalation_threshold) that triggers a pause.
+    pub escalation_threshold: u64,
+    /// Feature/key that triggered the most recent ceiling hit, if any.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trigger_key: Option<String>,
+    /// Timestamp of the most recent ceiling hit, if any.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_hit_at: Option<DateTime<Utc>>,
+    /// Timestamp the model was paused, if currently paused.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub paused_at: Option<DateTime<Utc>>,
 }
 
 // ---------------------------------------------------------------------------
 // Vault / DAO fee  — matches GET /api/v1/vault/dao-fee backend handler exactly
-//
-// Backend builds this from VaultConfig:
-//   dao_fee_bps, dao_fee_pct, per_transfer_cap_eth, daily_cap_eth, confirmation_depth
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -165,9 +185,6 @@ pub struct DaoFeeResponse {
 
 // ---------------------------------------------------------------------------
 // Builder blacklist  — matches GET /api/v1/builders/blacklist backend exactly
-//
-// Backend builds this directly from BuilderBlacklist:
-//   entry_count, path (display string), is_empty
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -196,24 +213,22 @@ mod tests {
     }
 
     #[test]
-    fn api_error_round_trip() {
-        let e = ApiError::new("NOT_FOUND", "checkpoint 99 does not exist");
-        let s = serde_json::to_string(&e).unwrap();
-        let e2: ApiError = serde_json::from_str(&s).unwrap();
-        assert_eq!(e, e2);
-    }
-
-    #[test]
     fn health_snapshot_round_trip() {
         let snap = HealthSnapshot {
             generated_at:  Utc::now(),
             layers: vec![
-                LayerHealthEntry { layer: "RELAY".into(), state: "HEALTHY".into(), is_operational: true },
-                LayerHealthEntry { layer: "LOSS_ATTRIBUTION".into(), state: "HALTED".into(), is_operational: false },
+                LayerHealthEntry {
+                    layer: "RELAY".into(), state: "HEALTHY".into(),
+                    is_operational: true,  message: None,
+                },
+                LayerHealthEntry {
+                    layer: "LOSS_ATTRIBUTION".into(), state: "HALTED".into(),
+                    is_operational: false, message: None,
+                },
             ],
             system_halted: true,
         };
-        let s  = serde_json::to_string(&snap).unwrap();
+        let s   = serde_json::to_string(&snap).unwrap();
         let s2: HealthSnapshot = serde_json::from_str(&s).unwrap();
         assert_eq!(s2.layers.len(), 2);
         assert!(s2.system_halted);
@@ -222,12 +237,34 @@ mod tests {
 
     #[test]
     fn layer_health_entry_helpers() {
-        let halted = LayerHealthEntry { layer: "HOT_PATH".into(), state: "HALTED".into(), is_operational: false };
+        let halted = LayerHealthEntry {
+            layer: "HOT_PATH".into(), state: "HALTED".into(),
+            is_operational: false, message: None,
+        };
         assert!(halted.is_halted());
         assert!(!halted.is_healthy());
-        let healthy = LayerHealthEntry { layer: "RELAY".into(), state: "HEALTHY".into(), is_operational: true };
+
+        let healthy = LayerHealthEntry {
+            layer: "RELAY".into(), state: "HEALTHY".into(),
+            is_operational: true, message: None,
+        };
         assert!(healthy.is_healthy());
         assert!(!healthy.is_halted());
+    }
+
+    #[test]
+    fn layer_health_entry_message_round_trip() {
+        let with_msg = LayerHealthEntry {
+            layer: "HOT_PATH".into(), state: "DEGRADED".into(),
+            is_operational: true, message: Some("tick=1569787 interval=200ms".into()),
+        };
+        let s  = serde_json::to_string(&with_msg).unwrap();
+        let e2: LayerHealthEntry = serde_json::from_str(&s).unwrap();
+        assert_eq!(e2.message.as_deref(), Some("tick=1569787 interval=200ms"));
+
+        let no_msg_json = r#"{"layer":"RELAY","state":"HEALTHY","is_operational":true}"#;
+        let e3: LayerHealthEntry = serde_json::from_str(no_msg_json).unwrap();
+        assert!(e3.message.is_none());
     }
 
     #[test]
@@ -242,17 +279,59 @@ mod tests {
 
     #[test]
     fn blacklist_response_round_trip() {
-        let b = BlacklistResponse { entry_count: 3, path: "config/blacklist.toml".into(), is_empty: false };
-        let s = serde_json::to_string(&b).unwrap();
+        let b  = BlacklistResponse { entry_count: 3, path: "config/blacklist.toml".into(), is_empty: false };
+        let s  = serde_json::to_string(&b).unwrap();
         let b2: BlacklistResponse = serde_json::from_str(&s).unwrap();
         assert_eq!(b, b2);
     }
 
     #[test]
     fn revert_response_field_name() {
-        // Field must be reverted_to_version not reverted_to or version
         let r = RevertResponse { reverted_to_version: 7, win_rate: 0.72, sample_count: 7000 };
         let v: serde_json::Value = serde_json::from_str(&serde_json::to_string(&r).unwrap()).unwrap();
         assert!(v.get("reverted_to_version").is_some(), "field name must be reverted_to_version");
     }
+
+    #[test]
+    fn gas_model_checkpoint_partial_eq() {
+        use chrono::TimeZone;
+        let c = GasModelCheckpoint {
+            version: 3, win_rate: 0.71, sample_count: 5000,
+            baseline_win_rate: 0.65,
+            saved_at: Utc.timestamp_opt(1_700_000_000, 0).unwrap(),
+        };
+        assert_eq!(c.clone(), c);
+    }
+
+    /// Confirms CeilingStatusResponse deserialises the exact payload the
+    /// live backend sends (captured via curl against a running
+    /// ops/control-plane instance) — this is the regression test for the
+    /// "missing field `features`" bug.
+    #[test]
+    fn ceiling_status_matches_live_backend_payload() {
+        let json = r#"{"paused":false,"consecutive_ceiling_hits":0,"escalation_threshold":100,"trigger_key":null,"last_hit_at":null,"paused_at":null}"#;
+        let cs: CeilingStatusResponse = serde_json::from_str(json).unwrap();
+        assert!(!cs.paused);
+        assert_eq!(cs.consecutive_ceiling_hits, 0);
+        assert_eq!(cs.escalation_threshold, 100);
+        assert!(cs.trigger_key.is_none());
+        assert!(cs.last_hit_at.is_none());
+        assert!(cs.paused_at.is_none());
+    }
+
+    #[test]
+    fn ceiling_status_round_trip_with_values() {
+        let cs = CeilingStatusResponse {
+            paused: true,
+            consecutive_ceiling_hits: 4,
+            escalation_threshold: 100,
+            trigger_key: Some("ARBITRUM_LA".into()),
+            last_hit_at: Some(Utc::now()),
+            paused_at: Some(Utc::now()),
+        };
+        let s   = serde_json::to_string(&cs).unwrap();
+        let cs2: CeilingStatusResponse = serde_json::from_str(&s).unwrap();
+        assert_eq!(cs, cs2);
+    }
 }
+

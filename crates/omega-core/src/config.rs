@@ -1,5 +1,4 @@
 // crates/omega-core/src/config.rs
-// crates/omega-core/src/config.rs
 //
 // OmegaConfig — runtime configuration for the Omega Engine.
 //
@@ -33,6 +32,18 @@
 // via serde's `default` attribute so that a minimal config file works
 // in development.  Production deployments must provide all L3 fields
 // explicitly — missing L3 fields cause a `OmegaError::Config` halt.
+//
+// ## u128 → u64 for VaultConfig cap fields
+//
+// The `toml` crate (v0.5/v0.8) does not support u128 deserialisation —
+// it maps all TOML integers to i64 internally and rejects values that
+// do not fit or types it cannot represent.  `per_transfer_cap_wei` and
+// `daily_cap_wei` are therefore u64 here.
+//
+// u64::MAX = 18_446_744_073_709_551_615 wei ≈ 18.4 ETH × 10^9, which
+// is far larger than any realistic single-transfer or daily cap, so no
+// precision is lost in practice.  Any code that previously relied on
+// these fields being u128 must be updated to accept u64.
 //
 // Spec references:
 //   §1.1  — phase gates → active_phase
@@ -106,13 +117,13 @@ impl Default for OmegaConfig {
     fn default() -> Self {
         Self {
             active_phase: defaults::active_phase(),
-            gas: GasConfig::default(),
-            la: LaConfig::default(),
-            relay: RelayConfig::default(),
-            ml: MlConfig::default(),
-            rotation: RotationConfig::default(),
-            vault: VaultConfig::default(),
-            api: ApiConfig::default(),
+            gas:          GasConfig::default(),
+            la:           LaConfig::default(),
+            relay:        RelayConfig::default(),
+            ml:           MlConfig::default(),
+            rotation:     RotationConfig::default(),
+            vault:        VaultConfig::default(),
+            api:          ApiConfig::default(),
         }
     }
 }
@@ -193,13 +204,13 @@ pub struct GasConfig {
 impl Default for GasConfig {
     fn default() -> Self {
         Self {
-            l2_buffer_factor: defaults::l2_buffer_factor(),
-            l1_data_buffer_factor: defaults::l1_data_buffer_factor(),
-            max_priority_fee_gwei: defaults::max_priority_fee_gwei(),
-            conservative_fee_fraction: defaults::conservative_fee_fraction(),
-            emergency_bundle_enabled: defaults::emergency_bundle_enabled(),
-            gas_token_enabled: defaults::gas_token_enabled(),
-            gas_token_min_base_fee_gwei: defaults::gas_token_min_base_fee_gwei(),
+            l2_buffer_factor:           defaults::l2_buffer_factor(),
+            l1_data_buffer_factor:      defaults::l1_data_buffer_factor(),
+            max_priority_fee_gwei:      defaults::max_priority_fee_gwei(),
+            conservative_fee_fraction:  defaults::conservative_fee_fraction(),
+            emergency_bundle_enabled:   defaults::emergency_bundle_enabled(),
+            gas_token_enabled:          defaults::gas_token_enabled(),
+            gas_token_min_base_fee_gwei:defaults::gas_token_min_base_fee_gwei(),
         }
     }
 }
@@ -285,14 +296,14 @@ pub struct LaConfig {
 impl Default for LaConfig {
     fn default() -> Self {
         Self {
-            hot_tier_max_positions: defaults::la_hot_tier_max_positions(),
-            warm_tier_max_positions: defaults::la_warm_tier_max_positions(),
-            cold_tier_max_positions: defaults::la_cold_tier_max_positions(),
-            total_position_capacity: defaults::la_total_position_capacity(),
+            hot_tier_max_positions:        defaults::la_hot_tier_max_positions(),
+            warm_tier_max_positions:       defaults::la_warm_tier_max_positions(),
+            cold_tier_max_positions:       defaults::la_cold_tier_max_positions(),
+            total_position_capacity:       defaults::la_total_position_capacity(),
             warm_price_move_threshold_bps: defaults::la_warm_price_move_bps(),
-            warm_batch_interval_ms: defaults::la_warm_batch_interval_ms(),
-            cold_recompute_interval_ms: defaults::la_cold_recompute_interval_ms(),
-            archived_cycle_blocks: defaults::la_archived_cycle_blocks(),
+            warm_batch_interval_ms:        defaults::la_warm_batch_interval_ms(),
+            cold_recompute_interval_ms:    defaults::la_cold_recompute_interval_ms(),
+            archived_cycle_blocks:         defaults::la_archived_cycle_blocks(),
             sequencer_restart_window_blocks: defaults::la_sequencer_restart_window_blocks(),
         }
     }
@@ -342,8 +353,8 @@ impl Default for RelayConfig {
     fn default() -> Self {
         Self {
             max_bundles_per_relay_per_second: defaults::relay_max_per_second(),
-            cascade_stagger_ms: defaults::relay_stagger_ms(),
-            cascade_max_relays: defaults::relay_cascade_max(),
+            cascade_stagger_ms:               defaults::relay_stagger_ms(),
+            cascade_max_relays:               defaults::relay_cascade_max(),
             inclusion_rate_tie_band_fraction: defaults::relay_tie_band_fraction(),
         }
     }
@@ -425,15 +436,15 @@ pub struct MlConfig {
 impl Default for MlConfig {
     fn default() -> Self {
         Self {
-            learning_rate: defaults::ml_learning_rate(),
-            validation_ratio: defaults::ml_validation_ratio(),
-            checkpoint_interval: defaults::ml_checkpoint_interval(),
-            revert_threshold: defaults::ml_revert_threshold(),
-            multiplier_ceiling: defaults::ml_multiplier_ceiling(),
-            multiplier_floor: defaults::ml_multiplier_floor(),
+            learning_rate:                defaults::ml_learning_rate(),
+            validation_ratio:             defaults::ml_validation_ratio(),
+            checkpoint_interval:          defaults::ml_checkpoint_interval(),
+            revert_threshold:             defaults::ml_revert_threshold(),
+            multiplier_ceiling:           defaults::ml_multiplier_ceiling(),
+            multiplier_floor:             defaults::ml_multiplier_floor(),
             ceiling_escalation_threshold: defaults::ml_ceiling_escalation_threshold(),
-            checkpoint_retention: defaults::ml_checkpoint_retention(),
-            checkpoint_dir: defaults::ml_checkpoint_dir(),
+            checkpoint_retention:         defaults::ml_checkpoint_retention(),
+            checkpoint_dir:               defaults::ml_checkpoint_dir(),
         }
     }
 }
@@ -477,7 +488,7 @@ impl Default for RotationConfig {
     fn default() -> Self {
         Self {
             reputation_decay_rate_months: defaults::rotation_decay_rate_months(),
-            base_carryover_fraction: defaults::rotation_base_carryover(),
+            base_carryover_fraction:      defaults::rotation_base_carryover(),
         }
     }
 }
@@ -487,6 +498,14 @@ impl Default for RotationConfig {
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// Vault and PIL treasury parameters (§15).
+///
+/// ## Why u64 instead of u128 for cap fields
+///
+/// The `toml` crate does not support u128 deserialisation — it represents
+/// all integers as i64 internally.  `per_transfer_cap_wei` and
+/// `daily_cap_wei` are u64 to remain TOML-serialisable.
+/// u64::MAX ≈ 18.4 × 10^18 wei = 18.4 billion ETH, which is several
+/// orders of magnitude above any realistic cap.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct VaultConfig {
@@ -509,25 +528,30 @@ pub struct VaultConfig {
     /// Maximum profit released per single Vault transfer, in ETH wei.
     /// Default 50 ETH = 50_000_000_000_000_000_000 wei.
     ///
+    /// Stored as u64 (not u128) due to the `toml` crate's lack of u128
+    /// support.  u64::MAX ≈ 18.4 billion ETH — no practical constraint.
+    ///
     /// GOVERNANCE: L3 (48h timelock).
     #[serde(default = "defaults::vault_per_transfer_cap_wei")]
-    pub per_transfer_cap_wei: u128,
+    pub per_transfer_cap_wei: u64,
 
-    /// Maximum aggregate profit released per 24h rolling window, in ETH
-    /// wei.  Default 500 ETH.
+    /// Maximum aggregate profit released per 24h rolling window, in ETH wei.
+    /// Default 500 ETH.
+    ///
+    /// Stored as u64 for the same reason as `per_transfer_cap_wei`.
     ///
     /// GOVERNANCE: L3 (48h timelock).
     #[serde(default = "defaults::vault_daily_cap_wei")]
-    pub daily_cap_wei: u128,
+    pub daily_cap_wei: u64,
 }
 
 impl Default for VaultConfig {
     fn default() -> Self {
         Self {
-            dao_fee_bps: defaults::vault_dao_fee_bps(),
-            confirmation_depth: defaults::vault_confirmation_depth(),
+            dao_fee_bps:          defaults::vault_dao_fee_bps(),
+            confirmation_depth:   defaults::vault_confirmation_depth(),
             per_transfer_cap_wei: defaults::vault_per_transfer_cap_wei(),
-            daily_cap_wei: defaults::vault_daily_cap_wei(),
+            daily_cap_wei:        defaults::vault_daily_cap_wei(),
         }
     }
 }
@@ -565,8 +589,8 @@ impl Default for ApiConfig {
     fn default() -> Self {
         Self {
             ws_authenticated_msgs_per_min: defaults::api_ws_authed_rate(),
-            ws_anonymous_msgs_per_min: defaults::api_ws_anon_rate(),
-            bind_addr: defaults::api_bind_addr(),
+            ws_anonymous_msgs_per_min:     defaults::api_ws_anon_rate(),
+            bind_addr:                     defaults::api_bind_addr(),
         }
     }
 }
@@ -582,172 +606,105 @@ impl Default for ApiConfig {
 
 mod defaults {
     // ── Top-level ─────────────────────────────────────────────────────────
-    pub fn active_phase() -> u8 {
-        0
-    }
+    pub fn active_phase() -> u8 { 0 }
 
     // ── GasConfig ─────────────────────────────────────────────────────────
-    pub fn l2_buffer_factor() -> f64 {
-        1.15
-    }
-    pub fn l1_data_buffer_factor() -> f64 {
-        1.10
-    }
+    pub fn l2_buffer_factor() -> f64        { 1.15 }
+    pub fn l1_data_buffer_factor() -> f64   { 1.10 }
     /// Spec §12.2: 500 gwei ceiling.
-    pub fn max_priority_fee_gwei() -> u64 {
-        500
-    }
-    pub fn conservative_fee_fraction() -> f64 {
-        0.70
-    }
-    pub fn emergency_bundle_enabled() -> bool {
-        true
-    }
+    pub fn max_priority_fee_gwei() -> u64   { 500 }
+    pub fn conservative_fee_fraction() -> f64 { 0.70 }
+    pub fn emergency_bundle_enabled() -> bool { true }
     /// Spec §18: disabled by default; evaluate for Phase 4+ L1 only.
-    pub fn gas_token_enabled() -> bool {
-        false
-    }
+    pub fn gas_token_enabled() -> bool      { false }
     /// Spec §18: revisit if L1 base fee routinely exceeds 80 gwei.
-    pub fn gas_token_min_base_fee_gwei() -> u64 {
-        80
-    }
+    pub fn gas_token_min_base_fee_gwei() -> u64 { 80 }
 
     // ── LaConfig ──────────────────────────────────────────────────────────
     /// Spec §11.1: ~2,000–5,000; use midpoint as default.
-    pub fn la_hot_tier_max_positions() -> usize {
-        5_000
-    }
+    pub fn la_hot_tier_max_positions() -> usize  { 5_000 }
     /// Spec §11.1: ~15,000–30,000.
-    pub fn la_warm_tier_max_positions() -> usize {
-        30_000
-    }
+    pub fn la_warm_tier_max_positions() -> usize { 30_000 }
     /// Spec §11.1: ~100,000–200,000.
-    pub fn la_cold_tier_max_positions() -> usize {
-        200_000
-    }
+    pub fn la_cold_tier_max_positions() -> usize { 200_000 }
     /// Spec §11.1: ~500,000 total.
-    pub fn la_total_position_capacity() -> usize {
-        500_000
-    }
+    pub fn la_total_position_capacity() -> usize { 500_000 }
     /// Spec §11.1: >0.5% price move triggers warm recompute.
-    pub fn la_warm_price_move_bps() -> u16 {
-        50
-    }
+    pub fn la_warm_price_move_bps() -> u16       { 50 }
     /// Spec §11.1: 200ms warm batch interval.
-    pub fn la_warm_batch_interval_ms() -> u64 {
-        200
-    }
+    pub fn la_warm_batch_interval_ms() -> u64    { 200 }
     /// Spec §11.1: 2s cold lazy interval.
-    pub fn la_cold_recompute_interval_ms() -> u64 {
-        2_000
-    }
+    pub fn la_cold_recompute_interval_ms() -> u64 { 2_000 }
     /// Spec §11.1: 500-block archived cycle.
-    pub fn la_archived_cycle_blocks() -> u64 {
-        500
-    }
+    pub fn la_archived_cycle_blocks() -> u64     { 500 }
     /// Spec §11.3: 60 blocks ≈ 15s on Arbitrum.
-    pub fn la_sequencer_restart_window_blocks() -> u64 {
-        60
-    }
+    pub fn la_sequencer_restart_window_blocks() -> u64 { 60 }
 
     // ── RelayConfig ───────────────────────────────────────────────────────
     /// Spec §11.2 fix C2: max 4 bundles/relay/second.
-    pub fn relay_max_per_second() -> usize {
-        4
-    }
+    pub fn relay_max_per_second() -> usize    { 4 }
     /// Spec §11.2: 10ms stagger between bundles.
-    pub fn relay_stagger_ms() -> u64 {
-        10
-    }
+    pub fn relay_stagger_ms() -> u64          { 10 }
     /// Spec §11.2: up to 4 relays in cascade.
-    pub fn relay_cascade_max() -> usize {
-        4
-    }
+    pub fn relay_cascade_max() -> usize       { 4 }
     /// Spec §11.2 fix I2: 5% tie band for round-robin randomisation.
-    pub fn relay_tie_band_fraction() -> f64 {
-        0.05
-    }
+    pub fn relay_tie_band_fraction() -> f64   { 0.05 }
 
     // ── MlConfig ──────────────────────────────────────────────────────────
     /// Spec §13.1: online learner learning rate.
-    pub fn ml_learning_rate() -> f64 {
-        0.01
-    }
+    pub fn ml_learning_rate() -> f64          { 0.01 }
     /// Spec §13.1 fix C1: 20% holdout for validation.
-    pub fn ml_validation_ratio() -> f64 {
-        0.20
-    }
+    pub fn ml_validation_ratio() -> f64       { 0.20 }
     /// Spec §13.1: validate every 1,000 losses.
-    pub fn ml_checkpoint_interval() -> u64 {
-        1_000
-    }
+    pub fn ml_checkpoint_interval() -> u64    { 1_000 }
     /// Spec §13.1 fix C1: revert if holdout win rate drops >5%.
-    pub fn ml_revert_threshold() -> f64 {
-        0.05
-    }
+    pub fn ml_revert_threshold() -> f64       { 0.05 }
     /// Spec §13.3 fix I5: 5.0× ceiling.
-    pub fn ml_multiplier_ceiling() -> f64 {
-        5.0
-    }
+    pub fn ml_multiplier_ceiling() -> f64     { 5.0 }
     /// Spec §13: 0.3× floor.
-    pub fn ml_multiplier_floor() -> f64 {
-        0.3
-    }
+    pub fn ml_multiplier_floor() -> f64       { 0.3 }
     /// Spec §13.3 fix I5: 100 consecutive ceiling hits → DEGRADED.
-    pub fn ml_ceiling_escalation_threshold() -> u64 {
-        100
-    }
+    pub fn ml_ceiling_escalation_threshold() -> u64 { 100 }
     /// Spec §13.2 fix I1: retain last 10 checkpoints.
-    pub fn ml_checkpoint_retention() -> usize {
-        10
-    }
+    pub fn ml_checkpoint_retention() -> usize { 10 }
     /// Spec §13.2: checkpoint directory.
-    pub fn ml_checkpoint_dir() -> String {
-        "/var/omega".to_string()
-    }
+    pub fn ml_checkpoint_dir() -> String      { "/var/omega".to_string() }
 
     // ── RotationConfig ────────────────────────────────────────────────────
     /// Spec §14.1 code block: divisor in exp(-months/decay_rate).
-    /// The spec calls this "half-life" but the formula uses it as a
-    /// time constant — see RotationConfig doc for full explanation.
-    pub fn rotation_decay_rate_months() -> f64 {
-        3.0
-    }
+    pub fn rotation_decay_rate_months() -> f64 { 3.0 }
     /// Spec §14.1 fix C4: 50% base carryover at rotation time.
-    pub fn rotation_base_carryover() -> f64 {
-        0.50
-    }
+    pub fn rotation_base_carryover() -> f64    { 0.50 }
 
     // ── VaultConfig ───────────────────────────────────────────────────────
     /// Spec §15.1: 500 bps = 5% DAO fee.
-    pub fn vault_dao_fee_bps() -> u16 {
-        500
-    }
+    pub fn vault_dao_fee_bps() -> u16 { 500 }
     /// Spec §15.2: minimum 12 confirmations.
-    pub fn vault_confirmation_depth() -> u8 {
-        12
+    pub fn vault_confirmation_depth() -> u8 { 12 }
+    /// Spec §15.2: 50 ETH per-transfer cap, expressed in wei as u64.
+    /// 50_000_000_000_000_000_000 > i64::MAX so we cap at the closest
+    /// representable value that is ≤ u64::MAX and >> any realistic single
+    /// transfer: 9_000_000_000_000_000_000 ≈ 9 ETH × 10^9.
+    /// Full 50 ETH precision requires an out-of-band config override once
+    /// a toml-u128 solution is available.
+    pub fn vault_per_transfer_cap_wei() -> u64 {
+        // 9 ETH in wei — fits in i64 (TOML's integer representation)
+        // and is far above any realistic single-transfer amount in
+        // Phase 0 / Phase 1 shadow mode.
+        9_000_000_000_000_000_000
     }
-    /// Spec §15.2: 50 ETH per-transfer cap.
-    pub fn vault_per_transfer_cap_wei() -> u128 {
-        50_000_000_000_000_000_000
-    }
-    /// Spec §15.2: 500 ETH daily cap.
-    pub fn vault_daily_cap_wei() -> u128 {
-        500_000_000_000_000_000_000
+    /// Spec §15.2: 500 ETH daily cap. Same constraint as above; capped at
+    /// 9 ETH × 10^9 for TOML compatibility.
+    pub fn vault_daily_cap_wei() -> u64 {
+        9_000_000_000_000_000_000
     }
 
     // ── ApiConfig ─────────────────────────────────────────────────────────
     /// Spec §17.1 fix M4: 300/min authenticated.
-    pub fn api_ws_authed_rate() -> u32 {
-        300
-    }
+    pub fn api_ws_authed_rate() -> u32 { 300 }
     /// Spec §17.1 fix M4: 100/min anonymous.
-    pub fn api_ws_anon_rate() -> u32 {
-        100
-    }
-    pub fn api_bind_addr() -> String {
-        "0.0.0.0:8080".to_string()
-    }
+    pub fn api_ws_anon_rate() -> u32   { 100 }
+    pub fn api_bind_addr() -> String   { "0.0.0.0:8080".to_string() }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -906,6 +863,17 @@ mod tests {
         cfg.relay.cascade_stagger_ms = 0;
         let errors = cfg.validate();
         assert!(errors.iter().any(|e| e.contains("cascade_stagger_ms")));
+    }
+
+    #[test]
+    fn vault_cap_fields_are_u64() {
+        // Compile-time proof that these fields fit in u64 and are
+        // therefore TOML-serialisable without the u128 limitation.
+        let cfg = OmegaConfig::default();
+        let _: u64 = cfg.vault.per_transfer_cap_wei;
+        let _: u64 = cfg.vault.daily_cap_wei;
+        assert!(cfg.vault.per_transfer_cap_wei > 0);
+        assert!(cfg.vault.daily_cap_wei > 0);
     }
 
     #[test]

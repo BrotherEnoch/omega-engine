@@ -10,27 +10,52 @@ name = "omega-control-plane"
 path = "src/main.rs"
 
 [dependencies]
-omega-core             = { path = "../../crates/omega-core" }
+omega-core              = { path = "../../crates/omega-core" }
 omega-control-contracts = { path = "../../crates/omega-control-contracts" }
-omega-health           = { path = "../../crates/omega-health" }
-omega-gas-war          = { path = "../../crates/omega-gas-war" }
-omega-loss-attribution = { path = "../../crates/omega-loss-attribution" }
+omega-health            = { path = "../../crates/omega-health" }
+omega-gas-war           = { path = "../../crates/omega-gas-war" }
+omega-loss-attribution  = { path = "../../crates/omega-loss-attribution" }
+omega-observability     = { path = "../../crates/omega-observability" }
 
-# HTTP API — ws feature required for WebSocket handler (§17.1)
+# HTTP API — ws feature required for WebSocket handler (§17.1).
+# cors added so the WASM dashboard (served by trunk on a different
+# origin/port, e.g. 127.0.0.1:8081) can call GET /api/v1/health and the
+# other REST endpoints via fetch() without the browser blocking the
+# response. WebSocket upgrades aren't subject to CORS, which is why
+# /ws/events worked before this was added but fetch()-based polling did
+# not.
 axum       = { workspace = true, features = ["ws", "macros"] }
 tower      = { workspace = true }
-tower-http = { workspace = true, features = ["trace"] }
+tower-http = { workspace = true, features = ["trace", "cors"] }
 
 # gRPC — tonic server for OmegaControl service (§17 proto)
 tonic  = { workspace = true }
-# prost is the protobuf runtime used by tonic's generated code
 prost  = "0.12"
 
 # Async runtime
 tokio        = { workspace = true }
-tokio-stream = { workspace = true }
+# "sync" feature required for tokio_stream::wrappers::BroadcastStream,
+# used by grpc.rs's WatchHealth server-streaming RPC to turn AppState's
+# broadcast::Receiver<WsEvent> into a futures::Stream.
+tokio-stream = { workspace = true, features = ["sync"] }
 
-# Concurrent data structures — relay win-rate map, metric channels
+# futures::Stream / StreamExt — used by grpc.rs's WatchHealth RPC
+# (Pin<Box<dyn futures::Stream<...>>> return type, .filter_map() on the
+# BroadcastStream above). Already pinned at the workspace level.
+futures = { workspace = true }
+
+# strum::IntoEnumIterator — used by grpc.rs to iterate every LayerId
+# variant (GetLatency's per-layer budget report, ClearHalt's layer-name
+# lookup). Version/feature flag matched to omega-core's own strum
+# dependency (crates/omega-core/Cargo.toml) to avoid Cargo building two
+# differently-featured copies of strum across the workspace. omega-core
+# already derives EnumIter/Display/EnumString on LayerId via this same
+# "derive" feature; this crate only consumes the resulting
+# IntoEnumIterator trait, not the derive macro itself, but matching the
+# feature flag keeps dependency resolution simple.
+strum = { version = "0.28.0", features = ["derive"] }
+
+# Concurrent data structures
 dashmap = { workspace = true }
 
 # Serialisation
@@ -58,5 +83,4 @@ clap = { workspace = true }
 tempfile = "3"
 
 [build-dependencies]
-# Compile the proto file at build time.
 tonic-build = "0.11"

@@ -9,6 +9,18 @@
 // Command RPCs (PauseStrategy/ResumeStrategy/ClearHalt/AdjustRollout): L2 —
 // the control-plane enforces the Bearer token; the API gateway enforces
 // the multisig signature off-band.
+//
+// ## Wiring note (reconciliation)
+//
+//   This file previously imported `AppState`, `WsEvent`, and
+//   `ALL_LAYER_IDS` from a separate, never-compiled `crate::state` module
+//   (no `mod state;` existed in `main.rs`). It now uses `main.rs`'s
+//   `AppState` directly (`crate::AppState`), the same
+//   `omega_control_contracts::ws::WsEvent` that `obs_bridge.rs`, `ws.rs`,
+//   and the frontend dashboard already agree on, and iterates
+//   `omega_core::LayerId` via `strum::IntoEnumIterator` in place of the
+//   old module-local `ALL_LAYER_IDS` constant (which only ever lived in
+//   the dead `state.rs`).
 
 use std::pin::Pin;
 use std::sync::Arc;
@@ -17,9 +29,12 @@ use futures::StreamExt as _;
 use tokio_stream::wrappers::BroadcastStream;
 use tonic::{Request, Response, Status};
 
-use omega_core::{HealthState, LayerHealth};
+use strum::IntoEnumIterator;
 
-use crate::state::{AppState, WsEvent, ALL_LAYER_IDS};
+use omega_control_contracts::ws::WsEvent;
+use omega_core::{HealthStatus, LayerHealth, LayerId};
+
+use crate::AppState;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Generated code
@@ -172,15 +187,15 @@ impl OmegaControl for OmegaControlService {
 
         // SLA budgets from §4.  p50/p95/p99 require live Prometheus scrape;
         // here we surface the budgets so callers can compare on their end.
-        let layers = ALL_LAYER_IDS.iter().map(|&id| LayerLatency {
+        let layers = LayerId::iter().map(|id| LayerLatency {
             layer_id:  id.to_string(),
             p50_us:    0.0,
             p95_us:    0.0,
             p99_us:    0.0,
             budget_us: match id {
-                omega_core::LayerId::HotPath => 1_000.0,   // 1ms Microtx (§4)
-                omega_core::LayerId::Relay   => 80_000.0,  // 80ms LA window (§11)
-                _                            => 5_000.0,   // 5ms default
+                LayerId::HotPath => 1_000.0,   // 1ms Microtx (§4)
+                LayerId::Relay   => 80_000.0,  // 80ms LA window (§11)
+                _                => 5_000.0,   // 5ms default
             },
         }).collect();
 
@@ -259,10 +274,8 @@ impl OmegaControl for OmegaControlService {
         check_metadata(&req, &self.state.api_token)?;
         let layer_str = req.into_inner().id;
 
-        let layer_id = ALL_LAYER_IDS
-            .iter()
-            .find(|&&id| id.to_string() == layer_str)
-            .copied();
+        let layer_id = LayerId::iter()
+            .find(|id| id.to_string() == layer_str);
 
         let Some(layer_id) = layer_id else {
             return Ok(Response::new(CommandResult {
@@ -272,7 +285,7 @@ impl OmegaControl for OmegaControlService {
         };
 
         if let Some(ctrl) = self.state.layer(layer_id) {
-            ctrl.set_state(HealthState::Healthy, "cleared via gRPC (L2 fast-approve)");
+            ctrl.set_state(HealthStatus::Healthy, "cleared via gRPC (L2 fast-approve)");
 
             self.state.publish(WsEvent::HealthTransition {
                 layer:     layer_str.clone(),
@@ -313,8 +326,9 @@ impl OmegaControl for OmegaControlService {
 
 /// Start the gRPC server on `:50051`.
 ///
-/// Spawned as a Tokio task alongside the HTTP server.
-/// Runs until the process exits.
+/// Spawned as a Tokio task alongside the HTTP server (see `main.rs`'s
+/// `main()`, which calls `tokio::spawn` around this function). Runs
+/// until the process exits.
 pub async fn serve(state: Arc<AppState>) -> anyhow::Result<()> {
     let addr = "0.0.0.0:50051"
         .parse()
@@ -331,4 +345,31 @@ pub async fn serve(state: Arc<AppState>) -> anyhow::Result<()> {
         .map_err(|e| anyhow::anyhow!("gRPC server error: {e}"))?;
 
     Ok(())
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Tests
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn layer_id_round_trips_through_display_and_iter() {
+        // ClearHalt looks up a LayerId by matching its Display string
+        // against the incoming proto LayerIdMsg.id. Every canonical
+        // variant must round-trip through this lookup.
+        for id in LayerId::iter() {
+            let s = id.to_string();
+            let found = LayerId::iter().find(|candidate| candidate.to_string() == s);
+            assert_eq!(found, Some(id), "LayerId {id:?} did not round-trip via Display");
+        }
+    }
+
+    #[test]
+    fn clear_halt_unknown_layer_string_has_no_match() {
+        let found = LayerId::iter().find(|id| id.to_string() == "NOT_A_REAL_LAYER");
+        assert!(found.is_none());
+    }
 }

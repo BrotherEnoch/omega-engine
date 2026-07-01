@@ -1,13 +1,15 @@
+# omega-frontend-arch/crates/omega-frontend/Cargo.toml
 [package]
-name        = "omega-frontend"
-version     = "0.12.0"
-edition     = "2021"
-description = "WASM-compatible frontend state, commands, sync, and render modules for OmegaEngine v12."
+name    = "omega-frontend"
+version = "12.0.0"
+edition = "2021"
+
+[lib]
+crate-type = ["rlib", "cdylib"]
 
 [dependencies]
+chrono                  = { workspace = true }
 omega-control-contracts = { path = "../omega-control-contracts" }
-serde      = { workspace = true }
-serde_json = { workspace = true }
-chrono     = { workspace = true }
-thiserror  = { workspace = true }
-strum      = { workspace = true }
+serde                   = { workspace = true }
+serde_json              = { workspace = true }
+strum                   = { workspace = true }

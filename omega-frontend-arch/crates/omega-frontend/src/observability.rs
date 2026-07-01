@@ -19,14 +19,14 @@ use omega_control_contracts::ws::{SimulationErrorSubCode, WsEvent};
 // ObservabilityEntry
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct ObservabilityEntry {
     pub recorded_at: DateTime<Utc>,
     pub kind:        ObservabilityEventKind,
 }
 
 /// All observable event kinds. `blueprint_hash` is `Arc<str>` — O(1) clone.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum ObservabilityEventKind {
     GasModelReverted    { checkpoint_version: u64, win_rate: f64 },
     CeilingEscalation   { feature_key: Arc<str>, hit_count: u64 },
@@ -42,7 +42,7 @@ pub enum ObservabilityEventKind {
 // Metrics
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct ObservabilityMetrics {
     pub gas_model_reverts:            u64,
     pub ceiling_escalations:          u64,
@@ -59,6 +59,7 @@ pub struct ObservabilityMetrics {
 // ObservabilityLog
 // ---------------------------------------------------------------------------
 
+#[derive(Debug, Clone, PartialEq)]
 pub struct ObservabilityLog {
     entries:  VecDeque<ObservabilityEntry>,
     capacity: usize,
@@ -126,10 +127,11 @@ impl ObservabilityLog {
                 }
                 Some(ObservabilityEventKind::SimulationError {
                     blueprint_hash: Arc::from(e.blueprint_hash.as_str()),
-                    sub_code:       e.sub_code.clone(),
+                    sub_code:       e.sub_code,
                 })
             }
-            _ => None,
+            // LayerEvent and Ping do not produce observability entries.
+            WsEvent::LayerEvent(_) | WsEvent::Ping(_) | WsEvent::BlueprintConfirmed(_) => None,
         };
 
         if let Some(k) = kind {
@@ -241,5 +243,17 @@ mod tests {
                 panic!("Wrong event kind");
             }
         }
+    }
+
+    #[test]
+    fn layer_event_and_ping_produce_no_entry() {
+        use omega_control_contracts::ws::{LayerEventPayload, PingPayload};
+        let mut log = ObservabilityLog::default();
+        log.record_ws_event(&WsEvent::LayerEvent(LayerEventPayload {
+            layer: "L08".into(), status: "HEALTHY".into(),
+            message: "tick=1".into(), version: 1, latency_ns: 100,
+        }));
+        log.record_ws_event(&WsEvent::Ping(PingPayload { nonce: 1 }));
+        assert_eq!(log.len(), 0, "LayerEvent and Ping must not produce observability entries");
     }
 }

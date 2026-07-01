@@ -32,6 +32,19 @@
 //   kept alive with periodic pings.  If the broadcast receiver lags and
 //   events are dropped, the client receives a `lag_detected` error frame
 //   and should reconnect.
+//
+//   The route itself (`GET /ws/events`) is mounted in `main.rs`'s
+//   `build_router()` — this module only provides the handler.
+//
+// ## Wire format
+//
+//   Every event frame has shape:
+//     { "type": "<snake_case_variant>", "payload": { … } }
+//
+//   This matches `state::WsEvent`'s
+//   `#[serde(tag = "type", content = "payload", rename_all = "snake_case")]`
+//   attribute and the frontend's `omega-control-contracts::ws::WsEvent`
+//   which uses the identical attribute.
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -41,7 +54,7 @@ use axum::extract::State;
 use axum::response::IntoResponse;
 use tokio::time::timeout;
 
-use crate::state::{AppState, WsEvent};
+use crate::AppState;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Constants
@@ -64,7 +77,7 @@ const PING_INTERVAL: Duration = Duration::from_secs(30);
 
 /// Axum route handler: upgrades an HTTP connection to WebSocket.
 ///
-/// Route: GET /ws/events
+/// Mounted at `GET /ws/events` in `main.rs`'s `build_router()`.
 pub async fn events_handler(
     ws:           WebSocketUpgrade,
     State(state): State<Arc<AppState>>,
@@ -244,8 +257,11 @@ async fn negotiate_auth(socket: &mut WebSocket, api_token: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::state::WS_CHANNEL_CAPACITY;
+    use crate::state::WsEvent;
     use tokio::sync::broadcast;
+
+    // WS_CHANNEL_CAPACITY lives in state.rs alongside WsEvent.
+    use crate::state::WS_CHANNEL_CAPACITY;
 
     #[test]
     fn rate_limits_match_spec() {
@@ -255,39 +271,47 @@ mod tests {
         assert_eq!(RATE_WINDOW,  Duration::from_secs(60));
     }
 
+    // ── Wire format correctness ───────────────────────────────────────────────
+    // These tests mirror the frontend's deserialisation expectations.
+    // state::WsEvent uses `#[serde(tag = "type", content = "payload")]`,
+    // so every serialised frame must contain both fields.
+
     #[test]
-    fn ws_event_serialises_correctly() {
-        let event = WsEvent::ConfigReloaded {
-            timestamp: chrono::Utc::now(),
-        };
-        let json = serde_json::to_string(&event).unwrap();
-        assert!(json.contains("\"kind\":\"config_reloaded\""));
+    fn config_reloaded_serialises_with_type_and_payload() {
+        let event = WsEvent::ConfigReloaded { timestamp: chrono::Utc::now() };
+        let json  = serde_json::to_string(&event).unwrap();
+        assert!(json.contains("\"type\":\"config_reloaded\""),
+            "wrong type tag: {json}");
+        assert!(json.contains("\"payload\":{"),
+            "missing payload wrapper: {json}");
     }
 
     #[test]
-    fn model_pause_event_serialises() {
-        let event = WsEvent::ModelPauseChanged {
-            paused:    true,
-            timestamp: chrono::Utc::now(),
-        };
-        let json = serde_json::to_string(&event).unwrap();
-        assert!(json.contains("\"kind\":\"model_pause_changed\""));
-        assert!(json.contains("\"paused\":true"));
+    fn model_pause_changed_serialises_with_type_and_payload() {
+        let event = WsEvent::ModelPauseChanged { paused: true, timestamp: chrono::Utc::now() };
+        let json  = serde_json::to_string(&event).unwrap();
+        assert!(json.contains("\"type\":\"model_pause_changed\""),
+            "wrong type tag: {json}");
+        assert!(json.contains("\"payload\":{"),
+            "missing payload wrapper: {json}");
+        assert!(json.contains("\"paused\":true"),
+            "paused field missing from payload: {json}");
     }
 
     #[test]
-    fn blacklist_event_serialises() {
-        let event = WsEvent::BlacklistReloaded {
-            entry_count: 42,
-            timestamp:   chrono::Utc::now(),
-        };
-        let json = serde_json::to_string(&event).unwrap();
-        assert!(json.contains("\"kind\":\"blacklist_reloaded\""));
-        assert!(json.contains("\"entry_count\":42"));
+    fn blacklist_reloaded_serialises_with_type_and_payload() {
+        let event = WsEvent::BlacklistReloaded { entry_count: 42, timestamp: chrono::Utc::now() };
+        let json  = serde_json::to_string(&event).unwrap();
+        assert!(json.contains("\"type\":\"blacklist_reloaded\""),
+            "wrong type tag: {json}");
+        assert!(json.contains("\"payload\":{"),
+            "missing payload wrapper: {json}");
+        assert!(json.contains("\"entry_count\":42"),
+            "entry_count missing from payload: {json}");
     }
 
     #[test]
-    fn health_transition_event_serialises() {
+    fn health_transition_serialises_with_type_and_payload() {
         let event = WsEvent::HealthTransition {
             layer:     "relay".into(),
             from:      "HEALTHY".into(),
@@ -296,8 +320,46 @@ mod tests {
             timestamp: chrono::Utc::now(),
         };
         let json = serde_json::to_string(&event).unwrap();
-        assert!(json.contains("\"kind\":\"health_transition\""));
-        assert!(json.contains("\"layer\":\"relay\""));
+        assert!(json.contains("\"type\":\"health_transition\""),
+            "wrong type tag: {json}");
+        assert!(json.contains("\"payload\":{"),
+            "missing payload wrapper: {json}");
+        assert!(json.contains("\"layer\":\"relay\""),
+            "layer field missing from payload: {json}");
+    }
+
+    #[test]
+    fn profit_split_serialises_with_type_and_payload() {
+        let event = WsEvent::ProfitSplit {
+            blueprint_hash: "0xabc".into(),
+            pil_share_wei:  "1000000000000000000".into(),
+            dao_fee_wei:    "50000000000000000".into(),
+            timestamp:      chrono::Utc::now(),
+        };
+        let json = serde_json::to_string(&event).unwrap();
+        assert!(json.contains("\"type\":\"profit_split\""),
+            "wrong type tag: {json}");
+        assert!(json.contains("\"payload\":{"),
+            "missing payload wrapper: {json}");
+        assert!(json.contains("\"blueprint_hash\":\"0xabc\""),
+            "blueprint_hash missing from payload: {json}");
+    }
+
+    #[test]
+    fn gas_model_reverted_serialises_with_type_and_payload() {
+        let event = WsEvent::GasModelReverted {
+            checkpoint_version: 7,
+            win_rate:           0.72,
+            sample_count:       7000,
+            timestamp:          chrono::Utc::now(),
+        };
+        let json = serde_json::to_string(&event).unwrap();
+        assert!(json.contains("\"type\":\"gas_model_reverted\""),
+            "wrong type tag: {json}");
+        assert!(json.contains("\"payload\":{"),
+            "missing payload wrapper: {json}");
+        assert!(json.contains("\"checkpoint_version\":7"),
+            "checkpoint_version missing: {json}");
     }
 
     #[tokio::test]
@@ -310,10 +372,28 @@ mod tests {
         let _ = tx.send(WsEvent::ConfigReloaded { timestamp: chrono::Utc::now() });
         // Receiver should get RecvError::Lagged if it was behind
         let result = rx.try_recv();
-        // Either we get the first event or a Lagged error — both are valid
         assert!(result.is_ok() || matches!(
             result.unwrap_err(),
             tokio::sync::broadcast::error::TryRecvError::Lagged(_)
         ));
+    }
+
+    #[tokio::test]
+    async fn broadcast_publish_reaches_subscriber() {
+        let (tx, mut rx) = broadcast::channel::<WsEvent>(16);
+        tx.send(WsEvent::ProfitSplit {
+            blueprint_hash: "0x1".into(),
+            pil_share_wei:  "1000".into(),
+            dao_fee_wei:    "50".into(),
+            timestamp:      chrono::Utc::now(),
+        }).unwrap();
+        let received = rx.try_recv();
+        assert!(received.is_ok(), "subscriber must receive published event");
+        match received.unwrap() {
+            WsEvent::ProfitSplit { blueprint_hash, .. } => {
+                assert_eq!(blueprint_hash, "0x1");
+            }
+            other => panic!("unexpected variant: {other:?}"),
+        }
     }
 }

@@ -1,8 +1,0 @@
-﻿# config/builder_blacklist.toml
-# MEV-Boost builder keys known to front-run bundles
-# Updated via L2 fast-approve: POST /api/v1/builders/blacklist/update
-# Review schedule: quarterly
-[[blacklisted_builders]]
-key     = "0x0000000000000000000000000000000000000000"
-reason  = "example — replace with real builder keys"
-added   = "2026-04-19"

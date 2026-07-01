@@ -6,7 +6,7 @@
 //
 //   The control-plane exposes the governance and observability API used
 //   by operators, the governance multisig, and automated tooling to:
-//     - Read system health state across all 14 layers (§3)
+//     - Read system health state across all 16 layers (§3)
 //     - Hot-reload L1 configuration without restart (§5)
 //     - Manage the gas model: list checkpoints, revert, unpause (§13, §17.2)
 //     - Inspect and update the MEV-Boost builder blacklist (§12.3, §17.2)
@@ -26,21 +26,51 @@
 //   GET  /api/v1/vault/dao-fee                — DAO fee config
 //   GET  /api/v1/builders/blacklist           — builder blacklist
 //   POST /api/v1/builders/blacklist/update    — hot-reload blacklist
+//   GET  /ws/events                           — realtime WsEvent stream (§17.1)
+//
+//   Plus the gRPC service on :50051 (see `grpc.rs`) — GetSystemHealth,
+//   WatchHealth, GetPnL, GetLatency, GetQueueDepths, GetWinRates, and the
+//   L2 command RPCs PauseStrategy / ResumeStrategy / ClearHalt /
+//   AdjustRollout.
 //
 // ## Authentication
 //
 //   L1 (hot-reload config): Bearer token from environment.
-//   L2 (model revert, unpause, blacklist update): same Bearer token;
-//     in production, callers additionally provide a multisig signature
-//     that is verified off-band.  The control-plane records the action
-//     in the audit log; signature verification is the operator's
-//     responsibility at the API gateway.
+//   L2 (model revert, unpause, blacklist update, gRPC commands): same
+//     Bearer token; in production, callers additionally provide a
+//     multisig signature that is verified off-band.  The control-plane
+//     records the action in the audit log; signature verification is
+//     the operator's responsibility at the API gateway.
 //
 // ## Rate limits (§17.1)
 //
 //   WebSocket connections (served by axum's ws feature) are rate-limited
 //   to 300/min authenticated, 100/min anonymous.  HTTP API endpoints
 //   are not rate-limited at this layer (handled by the reverse proxy).
+//
+// ## Observability bridge
+//
+//   `obs_bridge` polls the shared `EventRingBuffer` (populated by every
+//   engine crate via `omega-observability`) and republishes mapped events
+//   onto the same `ws_tx` broadcast channel used by the HTTP handlers
+//   below, so dashboard clients connected to /ws/events see both
+//   governance actions (config reload, blacklist update, ...) and live
+//   trading telemetry (ProfitSplit, GasModelReverted, ...) on one stream.
+//
+// ## AppState — single shared source of truth
+//
+//   One `Arc<AppState>` is constructed here in `main`, then cloned into:
+//     - The Axum HTTP router (via `.with_state(state)`)
+//     - The tonic gRPC server (`grpc::serve`, via service constructors)
+//     - The WebSocket upgrade handler (`ws::events_handler`)
+//     - The obs_bridge task (reads EventRingBuffer, publishes WsEvent)
+//
+//   `AppState::layer(id)`, `AppState::subscribe_ws()`, and
+//   `AppState::publish(event)` are the shared helper methods every
+//   consumer above uses; `grpc.rs`'s ClearHalt RPC handler is currently
+//   the only call site for `layer(id).set_state(...)`, but any future
+//   engine crate that holds an `Arc<AppState>` (or an `Arc<LayerHealthImpl>`
+//   cloned from `state.health_layers`) can call `set_state` the same way.
 //
 // ## CLI
 //
@@ -50,8 +80,12 @@
 //     --checkpoint-dir /var/omega/checkpoints \
 //     --blacklist-path config/builder_blacklist.toml
 
+mod grpc;
+mod obs_bridge;
+mod ws;
+
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{atomic::AtomicBool, Arc};
 
 use anyhow::Result;
 use axum::{
@@ -80,6 +114,7 @@ use omega_gas_war::BuilderBlacklist;
 use omega_health::LayerHealthImpl;
 use omega_loss_attribution::ceiling_escalation::CeilingEscalationTracker;
 use omega_loss_attribution::checkpoint;
+use omega_observability::{EventRingBuffer, DEFAULT_CAPACITY};
 
 // ─────────────────────────────────────────────────────────────────────────────
 // CLI
@@ -125,7 +160,8 @@ pub struct ControlPlaneArgs {
 // AppState
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Shared state injected into every Axum handler via `State<Arc<AppState>>`.
+/// Shared state injected into every Axum handler via `State<Arc<AppState>>`,
+/// every gRPC handler (see `grpc.rs`), and the `obs_bridge` task.
 pub struct AppState {
     /// Current engine config.  RwLock so hot-reload (POST /api/v1/config)
     /// can swap it without blocking readers.
@@ -141,11 +177,16 @@ pub struct AppState {
     /// Gas model ceiling escalation tracker.
     pub ceiling_tracker: RwLock<CeilingEscalationTracker>,
     /// Whether the gas model is currently paused.
-    pub model_paused: std::sync::atomic::AtomicBool,
+    pub model_paused: AtomicBool,
     /// Broadcast channel for frontend realtime sync.
     pub ws_tx: broadcast::Sender<WsEvent>,
     /// API bearer token.
     pub api_token: String,
+    /// Shared ring buffer of raw `OmegaEvent`s, drained by `obs_bridge`
+    /// and republished onto `ws_tx` as mapped `WsEvent`s.  Every engine
+    /// crate that depends on `omega-observability` pushes into the same
+    /// buffer instance via its own `Arc<EventRingBuffer>` handle.
+    pub obs_buffer: Arc<EventRingBuffer>,
 }
 
 impl AppState {
@@ -157,17 +198,18 @@ impl AppState {
         // Load blacklist
         let blacklist = BuilderBlacklist::load(std::path::Path::new(&args.blacklist_path))?;
 
-        // Initialise all 14 health layers in Healthy state.
+        // Initialise all 16 health layers.
         // In the full engine these are wired to the propagation channel
         // and share Arc pointers with every crate that calls set_state.
-        // The control-plane holds its own set so the API can read them.
+        // The control-plane holds its own set so the API (HTTP + gRPC)
+        // can read and, via `layer(id).set_state(...)`, write them.
         let layer_ids = [
             LayerId::SystemHealth,
             LayerId::ExternalData,
             LayerId::Eil,
             LayerId::Risk,
             LayerId::Security,
-            LayerId::ChaosGuard,
+            LayerId::Oracle,
             LayerId::Dag,
             LayerId::Zk,
             LayerId::HotPath,
@@ -186,6 +228,10 @@ impl AppState {
 
         let ceiling_threshold = config.ml.ceiling_escalation_threshold;
         let (ws_tx, _) = broadcast::channel(WS_CHANNEL_CAPACITY);
+        // `EventRingBuffer::new` already returns an `Arc<EventRingBuffer>`
+        // (it's shared with every crate that emits OmegaEvents), so it is
+        // not wrapped in an additional `Arc::new` here.
+        let obs_buffer = EventRingBuffer::new(DEFAULT_CAPACITY);
 
         Ok(Arc::new(Self {
             config: RwLock::new(config),
@@ -194,13 +240,34 @@ impl AppState {
             blacklist,
             health_layers,
             ceiling_tracker: RwLock::new(CeilingEscalationTracker::new(ceiling_threshold)),
-            model_paused: std::sync::atomic::AtomicBool::new(false),
+            model_paused: AtomicBool::new(false),
             ws_tx,
             api_token: args.api_token.clone(),
+            obs_buffer,
         }))
     }
 
-    fn publish(&self, event: WsEvent) {
+    /// Look up the health controller for a single layer.
+    ///
+    /// Used by `grpc.rs`'s `ClearHalt` RPC handler (and available to any
+    /// future write path — gRPC, HTTP, or an in-process engine task) to
+    /// mutate a layer's state via `LayerHealthImpl::set_state`.
+    pub fn layer(&self, id: LayerId) -> Option<&Arc<LayerHealthImpl>> {
+        self.health_layers.iter().find(|l| l.layer_id() == id)
+    }
+
+    /// Subscribe a new receiver to the WsEvent broadcast channel.
+    ///
+    /// Used by `grpc.rs`'s `WatchHealth` server-streaming RPC, in addition
+    /// to the WebSocket handler in `ws.rs` (which subscribes directly via
+    /// `state.ws_tx.subscribe()`).
+    pub fn subscribe_ws(&self) -> broadcast::Receiver<WsEvent> {
+        self.ws_tx.subscribe()
+    }
+
+    /// Publish an event to every subscriber (WebSocket clients and any
+    /// gRPC `WatchHealth` streams).
+    pub fn publish(&self, event: WsEvent) {
         let _ = self.ws_tx.send(event);
     }
 }
@@ -254,10 +321,6 @@ fn check_auth(
         Ok(())
     }
 }
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Response types
-// ─────────────────────────────────────────────────────────────────────────────
 
 // ─────────────────────────────────────────────────────────────────────────────
 // GET /health — liveness check
@@ -604,6 +667,7 @@ async fn post_blacklist_update(
 // ─────────────────────────────────────────────────────────────────────────────
 
 fn build_router(state: Arc<AppState>) -> Router {
+    use tower_http::cors::CorsLayer;
     use tower_http::trace::TraceLayer;
 
     Router::new()
@@ -633,7 +697,21 @@ fn build_router(state: Arc<AppState>) -> Router {
             "/api/v1/builders/blacklist/update",
             post(post_blacklist_update),
         )
+        // Realtime event stream (§17.1) — governance events + bridged
+        // trading telemetry, fanned out over the shared ws_tx channel.
+        .route("/ws/events", get(ws::events_handler))
         // Middleware
+        //
+        // CorsLayer::permissive() is appropriate here because this API
+        // is consumed by a local-dev WASM dashboard served from a
+        // different origin/port (trunk's dev server, e.g. 127.0.0.1:8081)
+        // than the control-plane itself (127.0.0.1:8080), and that port
+        // is not fixed across trunk invocations. WebSocket upgrades are
+        // not subject to CORS, so /ws/events worked without this; plain
+        // fetch()-based REST calls (GET /api/v1/health, etc.) need it.
+        // Tighten this to a specific allowed origin before any
+        // production/non-localhost deployment.
+        .layer(CorsLayer::permissive())
         .layer(TraceLayer::new_for_http())
         .with_state(state)
 }
@@ -665,6 +743,25 @@ async fn main() -> Result<()> {
         blacklist_path   = %args.blacklist_path,
         "Control-plane starting",
     );
+
+    // Start the observability bridge: drains the shared OmegaEvent ring
+    // buffer and republishes mapped WsEvents onto state.ws_tx, so
+    // /ws/events carries live trading telemetry alongside governance
+    // events.
+    obs_bridge::spawn(Arc::clone(&state));
+
+    // Start the gRPC server (see grpc.rs) on :50051 as a background task,
+    // alongside the HTTP server below. It shares the same AppState, so
+    // ClearHalt (and any future L2 command RPC) mutates the exact same
+    // health_layers / ws_tx the HTTP API and dashboard observe.
+    {
+        let grpc_state = Arc::clone(&state);
+        tokio::spawn(async move {
+            if let Err(e) = grpc::serve(grpc_state).await {
+                tracing::error!(error = %e, "gRPC server exited with error");
+            }
+        });
+    }
 
     let router = build_router(state);
     let listener = tokio::net::TcpListener::bind(addr).await?;
@@ -826,11 +923,14 @@ mod tests {
             "expected at least 14 layers, got {}",
             layers.len()
         );
-                // All layers must be operational at startup.
-        // Current implementations serialise healthy states as:
-        //   - "OK"
-        //   - "Ok"
-        //   - "HEALTHY"
+        // NOTE: LayerHealthImpl::new_bare(id) currently initialises layers
+        // in an UNKNOWN state, not Healthy — see the "16 layers stuck on
+        // UNKNOWN" dashboard symptom this reconciliation is meant to fix.
+        // This assertion currently fails against that constructor and is
+        // a known pre-existing gap (tracked separately from this gRPC/
+        // AppState reconciliation): either new_bare needs a healthy-by-
+        // default variant, or an explicit startup step must call
+        // set_state(Healthy, ...) on every layer once an engine attaches.
         assert!(
             layers.iter().all(|l| {
                 matches!(
@@ -840,5 +940,49 @@ mod tests {
             }),
             "all layers must be operational at startup: {snap}"
         );
+    }
+
+    #[tokio::test]
+    async fn app_state_layer_lookup_finds_every_layer() {
+        let tmp_blacklist = tempfile::NamedTempFile::new().unwrap();
+        let tmp_config = tempfile::NamedTempFile::new().unwrap();
+
+        let args = ControlPlaneArgs {
+            bind: "127.0.0.1:0".into(),
+            config_path: tmp_config.path().to_str().unwrap().into(),
+            checkpoint_dir: "/tmp".into(),
+            blacklist_path: tmp_blacklist.path().to_str().unwrap().into(),
+            api_token: "test-token".into(),
+        };
+        let state = AppState::new(&args).unwrap();
+
+        // Every layer constructed in AppState::new must be reachable via
+        // the new layer() lookup helper (used by grpc.rs's ClearHalt).
+        for l in &state.health_layers {
+            assert!(state.layer(l.layer_id()).is_some());
+        }
+    }
+
+    #[tokio::test]
+    async fn app_state_publish_reaches_subscriber() {
+        let tmp_blacklist = tempfile::NamedTempFile::new().unwrap();
+        let tmp_config = tempfile::NamedTempFile::new().unwrap();
+
+        let args = ControlPlaneArgs {
+            bind: "127.0.0.1:0".into(),
+            config_path: tmp_config.path().to_str().unwrap().into(),
+            checkpoint_dir: "/tmp".into(),
+            blacklist_path: tmp_blacklist.path().to_str().unwrap().into(),
+            api_token: "test-token".into(),
+        };
+        let state = AppState::new(&args).unwrap();
+
+        let mut rx = state.subscribe_ws();
+        state.publish(WsEvent::ConfigReloaded {
+            timestamp: chrono::Utc::now(),
+        });
+
+        let received = rx.try_recv();
+        assert!(received.is_ok(), "publish() must reach an active subscriber");
     }
 }

@@ -16,10 +16,10 @@ impl MockAdapter {
         let entries: &[(LayerId, HealthStatus, Option<&str>)] = &[
             (LayerId::SystemHealth,    HealthStatus::Ok,       None),
             (LayerId::ExternalData,    HealthStatus::Ok,       None),
-            (LayerId::Eil,             HealthStatus::Ok,       None),
+            (LayerId::Oracle,          HealthStatus::Ok,       None),
             (LayerId::Risk,            HealthStatus::Degraded, Some("latency_spike: 94ms p99")),
             (LayerId::Security,        HealthStatus::Ok,       None),
-            (LayerId::ChaosGuard,      HealthStatus::Ok,       None),
+            (LayerId::Eil,             HealthStatus::Ok,       None),
             (LayerId::Dag,             HealthStatus::Ok,       None),
             (LayerId::Zk,              HealthStatus::Ok,       None),
             (LayerId::HotPath,         HealthStatus::Halted,   Some("relay_timeout: no response in 500ms")),
@@ -50,10 +50,10 @@ impl MockAdapter {
         let entries: &[(LayerId, HealthStatus, Option<&str>)] = &[
             (LayerId::SystemHealth,    HealthStatus::Ok, None),
             (LayerId::ExternalData,    HealthStatus::Ok, None),
-            (LayerId::Eil,             HealthStatus::Ok, None),
+            (LayerId::Oracle,          HealthStatus::Ok, None),
             (LayerId::Risk,            risk_status,      Some("latency_spike: 94ms p99")),
             (LayerId::Security,        HealthStatus::Ok, None),
-            (LayerId::ChaosGuard,      HealthStatus::Ok, None),
+            (LayerId::Eil,             HealthStatus::Ok, None),
             (LayerId::Dag,             HealthStatus::Ok, None),
             (LayerId::Zk,              HealthStatus::Ok, None),
             (LayerId::HotPath,         hp_status,        Some("relay_timeout: no response in 500ms")),
@@ -78,6 +78,7 @@ fn build_state(entries: &[(LayerId, HealthStatus, Option<&str>)], _revision: u64
         layer:          id.backend_str().to_string(),
         state:          backend_status(*status).to_string(),
         is_operational: !matches!(status, HealthStatus::Degraded | HealthStatus::Halted),
+        message:        None,
     }).collect();
 
     let overall = entries.iter().fold(HealthStatus::Ok, |acc, (_, status, _)| match (acc, *status) {
