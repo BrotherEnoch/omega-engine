@@ -52,6 +52,12 @@ sha3         = "0.10"
 hex          = "0.4"
 alloy-primitives = { version = "0.7", features = ["serde"] }
 
+# ── Relay authentication (NEW) ────────────────────────────────────────────────
+# Real secp256k1 ECDSA signing for Flashbots-style X-Flashbots-Signature auth
+# (Flashbots/Titan). Nothing in the prior version signed submissions at all — see
+# signing.rs. Verified against known test vectors before use, not just written.
+k256         = { version = "0.13", features = ["ecdsa"] }
+
 # ── Randomness ────────────────────────────────────────────────────────────────
 rand         = "0.8"
 

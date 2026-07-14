@@ -4,6 +4,13 @@
 //! Every field maps 1-to-1 with the v12 spec. No fields are optional where the
 //! spec mandates a value; defaults are provided so `config/default.toml` can be
 //! partially overridden by chain-specific overlays.
+//!
+//! CHANGE: added `confirmation_rpc_url`, required by `confirmation::InclusionTracker` to
+//! check real on-chain inclusion instead of trusting a relay's HTTP-accept response.
+//! This is a breaking addition — existing `config/default.toml` files need this key
+//! added, since `RelayConfig` has no `#[serde(default)]` on individual fields (missing
+//! required keys fail deserialization loudly, which is the existing convention here, not
+//! something this change invented).
 
 use serde::{Deserialize, Serialize};
 
@@ -64,6 +71,10 @@ pub struct RelayConfig {
 
     /// Milliseconds to wait between successive bundle submissions — cascade stagger (§11.2).
     pub stagger_ms: u64,
+
+    /// Standard chain JSON-RPC endpoint used by `confirmation::InclusionTracker` to check
+    /// real on-chain inclusion. NOT a relay endpoint — a regular node.
+    pub confirmation_rpc_url: String,
 }
 
 impl Default for RelayConfig {
@@ -79,6 +90,7 @@ impl Default for RelayConfig {
             blind_fallback: true,
             max_bundles_per_relay_per_second: 4,
             stagger_ms: 10,
+            confirmation_rpc_url: String::new(),
         }
     }
 }

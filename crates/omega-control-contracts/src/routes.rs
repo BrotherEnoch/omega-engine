@@ -1,3 +1,4 @@
+// omega-engine\crates\omega-control-contracts\src\routes.rs
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -7,7 +8,16 @@ pub enum HttpMethod {
     Post,
 }
 
+/// CHANGE: added `#[serde(rename_all = "SCREAMING_SNAKE_CASE")]`, matching
+/// `HttpMethod` above. Before this, `ApiRoute` (which holds both an
+/// `HttpMethod` and an `AuthTier` field) would serialize as
+/// `{"method":"GET","auth":"Public"}` — two different casing conventions in
+/// the same object. Now both are `SCREAMING_SNAKE_CASE`
+/// (`"PUBLIC"`/`"L1"`/`"L2"`). Verified against a real serialize call, not
+/// just written. BREAKING for any JSON consumer expecting the old
+/// `"Public"`/`"L1"`/`"L2"` PascalCase casing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum AuthTier {
     Public,
     L1,
@@ -86,6 +96,12 @@ pub const BUILDER_BLACKLIST_RELOAD: ApiRoute = ApiRoute {
 pub const HEALTH_CLEAR_HALT_PREFIX: &str = "/api/v1/health/clear-halt/";
 pub const WS_EVENTS: &str = "/ws/events";
 
+/// Static routes only. `REVERT_CHECKPOINT_PREFIX` and
+/// `HEALTH_CLEAR_HALT_PREFIX` are deliberately not included here — both are
+/// dynamically-parameterized (`/revert/{version}`, `/clear-halt/{layer}`) and
+/// don't fit the static-`ApiRoute`-const pattern the rest of this list uses.
+/// If you're consuming this array to generate docs or mount routes, you need
+/// those two prefixes separately, not just this array.
 pub const REST_ROUTES: &[ApiRoute] = &[
     LIVENESS,
     HEALTH,
@@ -105,4 +121,22 @@ pub fn revert_checkpoint_path(version: u64) -> String {
 
 pub fn clear_halt_path(layer: &str) -> String {
     format!("{HEALTH_CLEAR_HALT_PREFIX}{layer}")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn method_and_auth_use_matching_casing() {
+        let json = serde_json::to_string(&LIVENESS).unwrap();
+        assert!(json.contains("\"method\":\"GET\""));
+        assert!(json.contains("\"auth\":\"PUBLIC\""));
+    }
+
+    #[test]
+    fn l2_route_casing() {
+        let json = serde_json::to_string(&UNPAUSE_MODEL).unwrap();
+        assert!(json.contains("\"auth\":\"L2\""));
+    }
 }

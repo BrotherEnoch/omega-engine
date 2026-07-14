@@ -33,17 +33,31 @@
 // in development.  Production deployments must provide all L3 fields
 // explicitly — missing L3 fields cause a `OmegaError::Config` halt.
 //
-// ## u128 → u64 for VaultConfig cap fields
+// `#[serde(deny_unknown_fields)]` is applied at every level, including
+// the top-level `OmegaConfig` itself (previously missing here — an
+// unrecognised top-level TOML key would have been silently ignored
+// rather than rejected, the one place in this file that didn't match
+// its own stated strictness policy).
 //
-// The `toml` crate (v0.5/v0.8) does not support u128 deserialisation —
-// it maps all TOML integers to i64 internally and rejects values that
-// do not fit or types it cannot represent.  `per_transfer_cap_wei` and
-// `daily_cap_wei` are therefore u64 here.
+// ## WeiAmount — u128 amounts that survive TOML round-trips
 //
-// u64::MAX = 18_446_744_073_709_551_615 wei ≈ 18.4 ETH × 10^9, which
-// is far larger than any realistic single-transfer or daily cap, so no
-// precision is lost in practice.  Any code that previously relied on
-// these fields being u128 must be updated to accept u64.
+// The `toml` crate (v0.5/v0.8) represents all TOML integers as `i64`
+// internally and rejects values that don't fit — `i64::MAX` ≈
+// 9.223 × 10^18, which is only ~9.223 ETH in wei. Neither a plain `u64`
+// nor a plain `u128` Rust field changes this: the TOML *parser* rejects
+// the literal before serde ever sees it, regardless of what Rust type
+// is on the receiving end. `WeiAmount` (defined below) sidesteps this
+// by serializing as a decimal STRING in TOML (TOML strings have no
+// magnitude limit) while storing the value as `u128` internally.
+//
+// This replaces a previous `u64`-typed workaround whose defaults were
+// both hardcoded to ~9 ETH — not merely an approximation of the spec's
+// 50 ETH / 500 ETH values, but numerically IDENTICAL to each other,
+// which collapsed the per-transfer and daily caps into one limit in
+// practice (a single transfer could already exhaust the entire "daily"
+// budget). `WeiAmount` restores the actual spec values and `validate()`
+// now enforces `per_transfer_cap_wei <= daily_cap_wei` explicitly rather
+// than relying on the defaults happening to make sense.
 //
 // Spec references:
 //   §1.1  — phase gates → active_phase
@@ -57,10 +71,94 @@
 //   §13   — ML online learner → MlConfig
 //   §14   — address rotation → RotationConfig
 //   §15   — Vault parameters → VaultConfig
+//   §15.2 — per-transfer / daily caps → VaultConfig::{per_transfer_cap_wei, daily_cap_wei}
 //   §17.1 — WebSocket rate limits → ApiConfig
 //   §18   — CHI/GST gas tokens (Phase 4+ L1 only) → GasConfig
 
 use serde::{Deserialize, Serialize};
+
+// ─────────────────────────────────────────────────────────────────────────────
+// WeiAmount
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Wei-denominated amount that can express values larger than
+/// `i64::MAX` in TOML config files. See the module doc comment above
+/// for why this exists.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct WeiAmount(u128);
+
+impl WeiAmount {
+    pub const ZERO: WeiAmount = WeiAmount(0);
+
+    #[inline]
+    pub const fn from_wei(wei: u128) -> Self {
+        WeiAmount(wei)
+    }
+
+    #[inline]
+    pub const fn as_wei(self) -> u128 {
+        self.0
+    }
+
+    /// Construct from a whole-ETH amount, converting to wei internally.
+    /// Panics on overflow — unreachable with any realistic config value;
+    /// even 1 million ETH fits comfortably under `u128::MAX`.
+    #[inline]
+    pub fn from_eth(eth: u64) -> Self {
+        WeiAmount(
+            (eth as u128)
+                .checked_mul(1_000_000_000_000_000_000)
+                .expect("from_eth overflow: value exceeds representable wei range"),
+        )
+    }
+}
+
+impl std::fmt::Display for WeiAmount {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+impl Serialize for WeiAmount {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        // Always serialize as a decimal string. This is what makes the
+        // type TOML-safe (see module doc comment) and is also
+        // unambiguous in JSON, which silently loses precision for
+        // integers beyond 2^53 in many JSON consumers (e.g.
+        // JavaScript's Number type) — a string sidesteps that too.
+        serializer.serialize_str(&self.0.to_string())
+    }
+}
+
+/// Accepts either a decimal string (the canonical wire format — see
+/// `Serialize` above) or a plain integer (so config constructed
+/// programmatically, or via a JSON source with a small-enough value,
+/// still deserializes without requiring the string form).
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum WeiAmountRepr {
+    String(String),
+    Number(u64),
+}
+
+impl<'de> Deserialize<'de> for WeiAmount {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        match WeiAmountRepr::deserialize(deserializer)? {
+            WeiAmountRepr::String(s) => s
+                .trim()
+                .parse::<u128>()
+                .map(WeiAmount)
+                .map_err(|e| serde::de::Error::custom(format!("invalid wei amount {s:?}: {e}"))),
+            WeiAmountRepr::Number(n) => Ok(WeiAmount(n as u128)),
+        }
+    }
+}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Top-level config
@@ -472,6 +570,12 @@ pub struct RotationConfig {
     /// The true half-life of the default configuration is 3 × ln(2) ≈ 2.08
     /// months, not 3 months.
     ///
+    /// This value is a DIVISOR in the formula above — `validate()` now
+    /// rejects a value ≤ 0.0, since zero would divide by zero (NaN) and
+    /// a negative value would invert decay into growth, both silently
+    /// corrupting every reputation-carryover calculation with no error
+    /// raised anywhere near the actual computation.
+    ///
     /// GOVERNANCE: L2 (fast-approve).
     #[serde(default = "defaults::rotation_decay_rate_months")]
     pub reputation_decay_rate_months: f64,
@@ -499,13 +603,13 @@ impl Default for RotationConfig {
 
 /// Vault and PIL treasury parameters (§15).
 ///
-/// ## Why u64 instead of u128 for cap fields
+/// ## WeiAmount instead of u64
 ///
-/// The `toml` crate does not support u128 deserialisation — it represents
-/// all integers as i64 internally.  `per_transfer_cap_wei` and
-/// `daily_cap_wei` are u64 to remain TOML-serialisable.
-/// u64::MAX ≈ 18.4 × 10^18 wei = 18.4 billion ETH, which is several
-/// orders of magnitude above any realistic cap.
+/// `per_transfer_cap_wei` and `daily_cap_wei` are `WeiAmount`, not a raw
+/// integer — see the module doc comment for why a plain integer field
+/// (of any width) can't survive a TOML round-trip at the magnitude the
+/// spec actually requires (50 ETH / 500 ETH), and why the previous `u64`
+/// workaround silently collapsed both caps to the same reduced value.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct VaultConfig {
@@ -526,23 +630,19 @@ pub struct VaultConfig {
     pub confirmation_depth: u8,
 
     /// Maximum profit released per single Vault transfer, in ETH wei.
-    /// Default 50 ETH = 50_000_000_000_000_000_000 wei.
-    ///
-    /// Stored as u64 (not u128) due to the `toml` crate's lack of u128
-    /// support.  u64::MAX ≈ 18.4 billion ETH — no practical constraint.
+    /// Default: 50 ETH (§15.2), expressed as the full spec value now
+    /// that `WeiAmount` removes the TOML-integer magnitude limitation.
     ///
     /// GOVERNANCE: L3 (48h timelock).
     #[serde(default = "defaults::vault_per_transfer_cap_wei")]
-    pub per_transfer_cap_wei: u64,
+    pub per_transfer_cap_wei: WeiAmount,
 
-    /// Maximum aggregate profit released per 24h rolling window, in ETH wei.
-    /// Default 500 ETH.
-    ///
-    /// Stored as u64 for the same reason as `per_transfer_cap_wei`.
+    /// Maximum aggregate profit released per 24h rolling window, in ETH
+    /// wei. Default: 500 ETH (§15.2).
     ///
     /// GOVERNANCE: L3 (48h timelock).
     #[serde(default = "defaults::vault_daily_cap_wei")]
-    pub daily_cap_wei: u64,
+    pub daily_cap_wei: WeiAmount,
 }
 
 impl Default for VaultConfig {
@@ -605,6 +705,8 @@ impl Default for ApiConfig {
 // ─────────────────────────────────────────────────────────────────────────────
 
 mod defaults {
+    use super::WeiAmount;
+
     // ── Top-level ─────────────────────────────────────────────────────────
     pub fn active_phase() -> u8 { 0 }
 
@@ -681,22 +783,15 @@ mod defaults {
     pub fn vault_dao_fee_bps() -> u16 { 500 }
     /// Spec §15.2: minimum 12 confirmations.
     pub fn vault_confirmation_depth() -> u8 { 12 }
-    /// Spec §15.2: 50 ETH per-transfer cap, expressed in wei as u64.
-    /// 50_000_000_000_000_000_000 > i64::MAX so we cap at the closest
-    /// representable value that is ≤ u64::MAX and >> any realistic single
-    /// transfer: 9_000_000_000_000_000_000 ≈ 9 ETH × 10^9.
-    /// Full 50 ETH precision requires an out-of-band config override once
-    /// a toml-u128 solution is available.
-    pub fn vault_per_transfer_cap_wei() -> u64 {
-        // 9 ETH in wei — fits in i64 (TOML's integer representation)
-        // and is far above any realistic single-transfer amount in
-        // Phase 0 / Phase 1 shadow mode.
-        9_000_000_000_000_000_000
+    /// Spec §15.2: 50 ETH per-transfer cap — the actual spec value, not
+    /// an i64-representable approximation, now that WeiAmount stores
+    /// this as a TOML string rather than a plain integer.
+    pub fn vault_per_transfer_cap_wei() -> WeiAmount {
+        WeiAmount::from_eth(50)
     }
-    /// Spec §15.2: 500 ETH daily cap. Same constraint as above; capped at
-    /// 9 ETH × 10^9 for TOML compatibility.
-    pub fn vault_daily_cap_wei() -> u64 {
-        9_000_000_000_000_000_000
+    /// Spec §15.2: 500 ETH daily cap — the actual spec value.
+    pub fn vault_daily_cap_wei() -> WeiAmount {
+        WeiAmount::from_eth(500)
     }
 
     // ── ApiConfig ─────────────────────────────────────────────────────────
@@ -736,6 +831,17 @@ impl OmegaConfig {
                 self.gas.l2_buffer_factor
             ));
         }
+        // Previously unvalidated: l1_data_buffer_factor feeds directly
+        // into the same dual-component gas cost estimate as
+        // l2_buffer_factor (§7) but had no range check at all — a
+        // misconfigured value here (e.g. 0.0, or negative) would
+        // silently under-cost every blueprint's L1 data component.
+        if !(1.0..=2.0).contains(&self.gas.l1_data_buffer_factor) {
+            errors.push(format!(
+                "gas.l1_data_buffer_factor {} out of range [1.0, 2.0]",
+                self.gas.l1_data_buffer_factor
+            ));
+        }
         if self.gas.max_priority_fee_gwei > 500 {
             errors.push(format!(
                 "gas.max_priority_fee_gwei {} exceeds 500 gwei ceiling (§12.2)",
@@ -746,6 +852,23 @@ impl OmegaConfig {
             errors.push(format!(
                 "gas.conservative_fee_fraction {} out of range [0.0, 1.0]",
                 self.gas.conservative_fee_fraction
+            ));
+        }
+
+        // LA tier capacity — previously unchecked: nothing stopped
+        // hot + warm + cold from exceeding total_position_capacity,
+        // which is the kind of misconfiguration that produces an
+        // inconsistent/unbounded index at runtime rather than a clear
+        // startup error.
+        let tier_sum = self.la.hot_tier_max_positions
+            .saturating_add(self.la.warm_tier_max_positions)
+            .saturating_add(self.la.cold_tier_max_positions);
+        if tier_sum > self.la.total_position_capacity {
+            errors.push(format!(
+                "la: hot_tier_max_positions + warm_tier_max_positions + cold_tier_max_positions \
+                 ({tier_sum}) exceeds total_position_capacity ({}) — the tier hierarchy assumes \
+                 the sum leaves room for the archived tier within the total (§11.1)",
+                self.la.total_position_capacity
             ));
         }
 
@@ -768,8 +891,55 @@ impl OmegaConfig {
                 self.ml.multiplier_floor
             ));
         }
+        // Previously unchecked: floor and ceiling were each validated
+        // independently, but nothing stopped floor > ceiling as a pair
+        // (e.g. ceiling overridden to 2.0 while floor stays at a
+        // default that's individually valid but now above it) — an
+        // inverted [floor, ceiling] range downstream (e.g. a
+        // `.clamp(floor, ceiling)` call) either panics or silently
+        // produces a nonsensical multiplier.
+        if self.ml.multiplier_floor > self.ml.multiplier_ceiling {
+            errors.push(format!(
+                "ml.multiplier_floor ({}) exceeds ml.multiplier_ceiling ({}) — \
+                 this range is inverted",
+                self.ml.multiplier_floor, self.ml.multiplier_ceiling
+            ));
+        }
         if self.ml.checkpoint_interval == 0 {
             errors.push("ml.checkpoint_interval must be > 0".to_string());
+        }
+        // Previously unvalidated.
+        if !(0.0..=1.0).contains(&self.ml.learning_rate) {
+            errors.push(format!(
+                "ml.learning_rate {} out of range [0.0, 1.0]",
+                self.ml.learning_rate
+            ));
+        }
+        if !(0.0..=1.0).contains(&self.ml.revert_threshold) {
+            errors.push(format!(
+                "ml.revert_threshold {} out of range [0.0, 1.0]",
+                self.ml.revert_threshold
+            ));
+        }
+
+        // Rotation — previously unvalidated. reputation_decay_rate_months
+        // is a DIVISOR in the carryover formula (see RotationConfig doc
+        // comment); zero or negative silently corrupts every carryover
+        // calculation (division by zero → NaN, or inverted decay into
+        // growth) with no error anywhere near the actual computation.
+        if self.rotation.reputation_decay_rate_months <= 0.0 {
+            errors.push(format!(
+                "rotation.reputation_decay_rate_months {} must be > 0.0 — it is a divisor \
+                 in the carryover formula (§14.1); zero or negative corrupts every \
+                 reputation calculation silently (NaN or inverted decay)",
+                self.rotation.reputation_decay_rate_months
+            ));
+        }
+        if !(0.0..=1.0).contains(&self.rotation.base_carryover_fraction) {
+            errors.push(format!(
+                "rotation.base_carryover_fraction {} out of range [0.0, 1.0]",
+                self.rotation.base_carryover_fraction
+            ));
         }
 
         // Vault
@@ -785,6 +955,24 @@ impl OmegaConfig {
                 self.vault.confirmation_depth
             ));
         }
+        // Previously unvalidated: nothing stopped either cap from being
+        // zero, and nothing stopped per_transfer_cap_wei from exceeding
+        // daily_cap_wei — a single transfer capped higher than the
+        // supposed daily aggregate limit defeats the purpose of having
+        // two separate limits (§15.2).
+        if self.vault.per_transfer_cap_wei == WeiAmount::ZERO {
+            errors.push("vault.per_transfer_cap_wei must be > 0".to_string());
+        }
+        if self.vault.daily_cap_wei == WeiAmount::ZERO {
+            errors.push("vault.daily_cap_wei must be > 0".to_string());
+        }
+        if self.vault.per_transfer_cap_wei > self.vault.daily_cap_wei {
+            errors.push(format!(
+                "vault.per_transfer_cap_wei ({} wei) exceeds vault.daily_cap_wei ({} wei) — \
+                 a single transfer could not legitimately exceed the daily aggregate cap (§15.2)",
+                self.vault.per_transfer_cap_wei, self.vault.daily_cap_wei
+            ));
+        }
 
         // Relay
         if self.relay.cascade_max_relays == 0 {
@@ -796,10 +984,22 @@ impl OmegaConfig {
                     .to_string(),
             );
         }
+        // Previously unvalidated.
+        if !(0.0..=1.0).contains(&self.relay.inclusion_rate_tie_band_fraction) {
+            errors.push(format!(
+                "relay.inclusion_rate_tie_band_fraction {} out of range [0.0, 1.0]",
+                self.relay.inclusion_rate_tie_band_fraction
+            ));
+        }
 
         // API
         if self.api.ws_authenticated_msgs_per_min == 0 {
             errors.push("api.ws_authenticated_msgs_per_min must be > 0".to_string());
+        }
+        // Previously only the authenticated rate was checked for zero;
+        // the anonymous rate had the identical failure mode unchecked.
+        if self.api.ws_anonymous_msgs_per_min == 0 {
+            errors.push("api.ws_anonymous_msgs_per_min must be > 0".to_string());
         }
 
         errors
@@ -866,14 +1066,157 @@ mod tests {
     }
 
     #[test]
-    fn vault_cap_fields_are_u64() {
-        // Compile-time proof that these fields fit in u64 and are
-        // therefore TOML-serialisable without the u128 limitation.
+    fn l1_data_buffer_factor_range_enforced() {
+        let mut cfg = OmegaConfig::default();
+        cfg.gas.l1_data_buffer_factor = 0.5;
+        let errors = cfg.validate();
+        assert!(errors.iter().any(|e| e.contains("l1_data_buffer_factor")));
+    }
+
+    #[test]
+    fn ml_floor_exceeding_ceiling_rejected() {
+        let mut cfg = OmegaConfig::default();
+        cfg.ml.multiplier_ceiling = 2.0;
+        cfg.ml.multiplier_floor = 3.0; // individually >= 0.1, but now > ceiling
+        let errors = cfg.validate();
+        assert!(errors.iter().any(|e| e.contains("multiplier_floor") && e.contains("exceeds")));
+    }
+
+    #[test]
+    fn ml_learning_rate_range_enforced() {
+        let mut cfg = OmegaConfig::default();
+        cfg.ml.learning_rate = 1.5;
+        let errors = cfg.validate();
+        assert!(errors.iter().any(|e| e.contains("learning_rate")));
+    }
+
+    #[test]
+    fn ml_revert_threshold_range_enforced() {
+        let mut cfg = OmegaConfig::default();
+        cfg.ml.revert_threshold = -0.1;
+        let errors = cfg.validate();
+        assert!(errors.iter().any(|e| e.contains("revert_threshold")));
+    }
+
+    #[test]
+    fn rotation_decay_rate_must_be_positive() {
+        let mut cfg = OmegaConfig::default();
+        cfg.rotation.reputation_decay_rate_months = 0.0;
+        let errors = cfg.validate();
+        assert!(errors.iter().any(|e| e.contains("reputation_decay_rate_months")));
+
+        let mut cfg2 = OmegaConfig::default();
+        cfg2.rotation.reputation_decay_rate_months = -1.0;
+        let errors2 = cfg2.validate();
+        assert!(errors2.iter().any(|e| e.contains("reputation_decay_rate_months")));
+    }
+
+    #[test]
+    fn rotation_carryover_fraction_range_enforced() {
+        let mut cfg = OmegaConfig::default();
+        cfg.rotation.base_carryover_fraction = 1.5;
+        let errors = cfg.validate();
+        assert!(errors.iter().any(|e| e.contains("base_carryover_fraction")));
+    }
+
+    #[test]
+    fn relay_tie_band_range_enforced() {
+        let mut cfg = OmegaConfig::default();
+        cfg.relay.inclusion_rate_tie_band_fraction = 1.2;
+        let errors = cfg.validate();
+        assert!(errors.iter().any(|e| e.contains("inclusion_rate_tie_band_fraction")));
+    }
+
+    #[test]
+    fn la_tier_capacity_ordering_enforced() {
+        let mut cfg = OmegaConfig::default();
+        cfg.la.total_position_capacity = 1_000; // far below hot+warm+cold defaults
+        let errors = cfg.validate();
+        assert!(errors.iter().any(|e| e.contains("total_position_capacity")));
+    }
+
+    #[test]
+    fn api_anonymous_rate_enforced() {
+        let mut cfg = OmegaConfig::default();
+        cfg.api.ws_anonymous_msgs_per_min = 0;
+        let errors = cfg.validate();
+        assert!(errors.iter().any(|e| e.contains("ws_anonymous_msgs_per_min")));
+    }
+
+    #[test]
+    fn vault_cap_zero_rejected() {
+        let mut cfg = OmegaConfig::default();
+        cfg.vault.per_transfer_cap_wei = WeiAmount::ZERO;
+        let errors = cfg.validate();
+        assert!(errors.iter().any(|e| e.contains("per_transfer_cap_wei")));
+    }
+
+    #[test]
+    fn vault_per_transfer_exceeding_daily_rejected() {
+        let mut cfg = OmegaConfig::default();
+        cfg.vault.per_transfer_cap_wei = WeiAmount::from_eth(600);
+        cfg.vault.daily_cap_wei = WeiAmount::from_eth(500);
+        let errors = cfg.validate();
+        assert!(errors.iter().any(|e| e.contains("exceeds vault.daily_cap_wei")));
+    }
+
+    #[test]
+    fn vault_cap_defaults_match_full_spec_values() {
+        // Regression test for the bug this fix addresses: the previous
+        // u64-typed defaults were both silently reduced to ~9 ETH (the
+        // largest TOML-representable magnitude) instead of the spec's
+        // 50 ETH / 500 ETH — and, worse, were numerically IDENTICAL to
+        // each other. WeiAmount removes that constraint entirely.
         let cfg = OmegaConfig::default();
-        let _: u64 = cfg.vault.per_transfer_cap_wei;
-        let _: u64 = cfg.vault.daily_cap_wei;
-        assert!(cfg.vault.per_transfer_cap_wei > 0);
-        assert!(cfg.vault.daily_cap_wei > 0);
+        assert_eq!(cfg.vault.per_transfer_cap_wei.as_wei(), 50_000_000_000_000_000_000);
+        assert_eq!(cfg.vault.daily_cap_wei.as_wei(), 500_000_000_000_000_000_000);
+        assert!(cfg.vault.per_transfer_cap_wei < cfg.vault.daily_cap_wei);
+    }
+
+    #[test]
+    fn wei_amount_round_trips_through_real_toml() {
+        // This is the test that actually proves the original bug is
+        // fixed: a plain u64/u128 field would fail this exact
+        // round-trip for any value beyond i64::MAX, since the TOML
+        // *parser* rejects the literal before serde even runs.
+        let cfg = OmegaConfig::default();
+        let toml_str = toml::to_string(&cfg).expect("serialize to TOML");
+        let parsed: OmegaConfig = toml::from_str(&toml_str).expect("deserialize from TOML");
+        assert_eq!(parsed.vault.per_transfer_cap_wei, cfg.vault.per_transfer_cap_wei);
+        assert_eq!(parsed.vault.daily_cap_wei, cfg.vault.daily_cap_wei);
+    }
+
+    #[test]
+    fn wei_amount_deserializes_from_plain_integer_too() {
+        #[derive(Deserialize)]
+        struct Wrapper {
+            amount: WeiAmount,
+        }
+        let parsed: Wrapper = serde_json::from_str(r#"{"amount": 12345}"#).unwrap();
+        assert_eq!(parsed.amount.as_wei(), 12345);
+    }
+
+    #[test]
+    fn wei_amount_rejects_garbage_string() {
+        #[derive(Deserialize)]
+        struct Wrapper {
+            amount: WeiAmount,
+        }
+        let result: Result<Wrapper, _> = serde_json::from_str(r#"{"amount": "not_a_number"}"#);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn unknown_top_level_field_rejected() {
+        // Regression test for the top-level deny_unknown_fields gap:
+        // every sub-config already rejected unknown fields, but
+        // OmegaConfig itself did not.
+        let bad_toml = r#"
+            active_phase = 1
+            bogus_top_level_field = true
+        "#;
+        let result: Result<OmegaConfig, _> = toml::from_str(bad_toml);
+        assert!(result.is_err(), "unknown top-level field must now be rejected");
     }
 
     #[test]

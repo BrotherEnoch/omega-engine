@@ -19,6 +19,21 @@
 // This makes the backend handler's `l.state().to_string()` produce "OK" which
 // matches both the serde wire format and the frontend contracts parser.
 //
+// ## Audit finding fixed in this pass: is_operational() and Unknown
+//
+// `is_operational()` previously treated `HealthStatus::Unknown` as
+// operational (it only excluded `Halted`). `Unknown` is documented as
+// "layer status is unknown (e.g. control plane just started)" — i.e.
+// exactly the startup window before a layer (Oracle, Risk, Relay, …)
+// has confirmed it's actually connected and healthy. Defaulting an
+// unconfirmed state to "safe to trade" is a fail-OPEN default on a
+// question where the safe default is fail-CLOSED: nothing should treat
+// a layer as fit to serve traffic until it has actively reported so.
+// `is_operational()` now excludes `Unknown` alongside `Halted`.
+// `Recovering` is left as operational, matching the original design —
+// a layer actively recovering (not halted) is a materially different,
+// less ambiguous case than one that has simply never reported in.
+//
 // ## LayerId — 16 canonical variants
 // Variant names follow the v12 architecture. Back-compat associated constants
 // map old pre-v12 names to their canonical equivalents so existing callers
@@ -60,8 +75,20 @@ impl HealthStatus {
     /// Returns true when the layer is fully healthy.
     pub fn is_healthy(self) -> bool { matches!(self, Self::Ok) }
 
-    /// Returns true when the layer can still serve traffic (not Halted).
-    pub fn is_operational(self) -> bool { !matches!(self, Self::Halted) }
+    /// Returns true when the layer can be trusted to serve traffic.
+    ///
+    /// Excludes both `Halted` (explicitly stopped) and `Unknown`
+    /// (never confirmed healthy — most commonly the startup window
+    /// before a layer has reported in at all). Treating `Unknown` as
+    /// operational would mean a layer nobody has yet confirmed is
+    /// connected defaults to "safe to trade," which is the wrong
+    /// default direction for a safety gate. `Recovering` remains
+    /// operational — it is actively recovering from a halt, a
+    /// materially different and less ambiguous state than "never
+    /// reported."
+    pub fn is_operational(self) -> bool {
+        !matches!(self, Self::Halted | Self::Unknown)
+    }
 }
 
 /// Back-compat type alias — pre-v12 code used HealthState everywhere.
@@ -229,5 +256,24 @@ mod tests {
         assert!(!HealthStatus::Halted.is_operational());
         assert!(HealthStatus::Ok.is_operational());
         assert!(HealthStatus::Degraded.is_operational());
+    }
+
+    #[test]
+    fn is_operational_unknown_is_false() {
+        // Regression test for the fail-open default this pass fixed:
+        // Unknown must NOT be treated as safe-to-trade.
+        assert!(
+            !HealthStatus::Unknown.is_operational(),
+            "Unknown must fail closed — a layer that has never reported \
+             in must not default to 'operational'"
+        );
+    }
+
+    #[test]
+    fn is_operational_recovering_is_true() {
+        // Recovering is distinct from Unknown: it means the layer IS
+        // reporting, and is actively recovering from a halt — kept
+        // operational, unchanged from the original design.
+        assert!(HealthStatus::Recovering.is_operational());
     }
 }

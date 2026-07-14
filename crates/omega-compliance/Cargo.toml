@@ -11,20 +11,18 @@ omega-core = { path = "../omega-core" }
 anyhow    = { workspace = true }
 thiserror = { workspace = true }
 
-# Serialisation — versioned rule sets, compliance reports
+# Serialisation
 serde      = { workspace = true }
 serde_json = { workspace = true }
 
 # Telemetry
 tracing = { workspace = true }
 
-# Timestamps — rule version activation timestamps, consent expiry
+# Timestamps
 chrono = { workspace = true }
 
-# NOTE: tokio is NOT listed here.
-# omega-compliance is a synchronous validation library.  All checks
-# are pure functions with no I/O — they run in the caller's async
-# context without requiring a Tokio runtime themselves.
+# Concurrency (better than std RwLock for this use)
+parking_lot = "0.12"
 
 [dev-dependencies]
 alloy-primitives = { workspace = true }

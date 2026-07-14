@@ -14,39 +14,45 @@ pub mod backpressure;
 pub mod blacklist;
 pub mod client;
 pub mod config;
+pub mod confirmation;
 pub mod dedup;
 pub mod error;
 pub mod metrics;
 pub mod reorg;
 pub mod reputation;
+pub mod signing;
 
-pub use backpressure::{CascadeResult, CascadeSubmitter, RelayRateLimiters};
+pub use backpressure::{CascadeResult, CascadeSubmitter, RelayOutcome, RelayRateLimiters};
 pub use blacklist::BuilderBlacklist;
 pub use client::{BundlePayload, RelayClient, SubmissionOutcome};
 pub use config::{RelayConfig, RelayName, WS_RATE_ANONYMOUS, WS_RATE_AUTHENTICATED};
+pub use confirmation::{ConfirmationResult, InclusionTracker, CONFIRMATION_GRACE_BLOCKS};
 pub use dedup::{PositionKey, SequencerRestartHandler, RESTART_WINDOW_BLOCKS};
 pub use error::{RelayError, RelayResult};
 pub use metrics::{ExecutionAddress, LaRelayMetrics, RelayRateSnapshot};
 pub use reorg::{BlueprintState, LaReorgGuard, LaReorgRiskEvent, TxHash, STABILITY_WINDOW_BLOCKS};
 pub use reputation::{carryover_pct, rotate_address, shuffled_submission_order, submission_order};
+pub use signing::{FlashbotsSigner, RelayAuth};
 
 use std::collections::HashMap;
 use std::sync::Arc;
 
 /// Top-level handle that owns all relay clients, metrics, dedup guard,
-/// reorg guard, and builder blacklist.
+/// reorg guard, builder blacklist, and inclusion confirmation tracker.
 pub struct MultiRelayClient {
-    submitter:     CascadeSubmitter,
-    dedup:         Arc<SequencerRestartHandler>,
-    reorg_guard:   Arc<LaReorgGuard>,
-    blacklist:     Arc<BuilderBlacklist>,
-    metrics:       Arc<LaRelayMetrics>,
-    relay_clients: Arc<HashMap<String, Arc<dyn RelayClient>>>,
-    rate_limiters: Arc<RelayRateLimiters>,
+    submitter:         CascadeSubmitter,
+    dedup:             Arc<SequencerRestartHandler>,
+    reorg_guard:       Arc<LaReorgGuard>,
+    blacklist:         Arc<BuilderBlacklist>,
+    metrics:           Arc<LaRelayMetrics>,
+    relay_clients:     Arc<HashMap<String, Arc<dyn RelayClient>>>,
+    rate_limiters:     Arc<RelayRateLimiters>,
+    inclusion_tracker: Arc<InclusionTracker>,
 }
 
 impl MultiRelayClient {
-    /// Construct the full relay layer.
+    /// Construct the full relay layer. `cfg.confirmation_rpc_url` must point at a real
+    /// chain JSON-RPC endpoint — see `confirmation::InclusionTracker`.
     pub fn new(
         relay_clients: HashMap<String, Arc<dyn RelayClient>>,
         metrics:       Arc<LaRelayMetrics>,
@@ -55,8 +61,13 @@ impl MultiRelayClient {
         startup_block: u64,
     ) -> Arc<Self> {
         let relay_clients = Arc::new(relay_clients);
-        let submitter =
-            CascadeSubmitter::new(Arc::clone(&relay_clients), Arc::clone(&metrics), cfg);
+        let inclusion_tracker = InclusionTracker::new(cfg.confirmation_rpc_url.clone());
+        let submitter = CascadeSubmitter::new(
+            Arc::clone(&relay_clients),
+            Arc::clone(&metrics),
+            cfg,
+            Arc::clone(&inclusion_tracker),
+        );
 
         let relay_names: Vec<String> = relay_clients.keys().cloned().collect();
         let rate_limiters = Arc::new(RelayRateLimiters::new(
@@ -74,6 +85,7 @@ impl MultiRelayClient {
             metrics,
             relay_clients,
             rate_limiters,
+            inclusion_tracker,
         })
     }
 
@@ -89,6 +101,7 @@ impl MultiRelayClient {
             &self.relay_clients,
             &self.metrics,
             &self.rate_limiters,
+            &self.inclusion_tracker,
         )
         .await
     }
@@ -98,10 +111,25 @@ impl MultiRelayClient {
         self.dedup.try_submit(position, current_block)
     }
 
-    /// Notify dedup and reorg guard of a new block header.
+    /// Notify dedup and reorg guard of a new block header. Fast and synchronous —
+    /// does NOT resolve pending inclusion confirmations; call `reconcile_inclusions`
+    /// separately (it needs real network I/O and shouldn't block this).
     pub fn on_new_block(&self, block: u64, block_hash: [u8; 32]) {
         self.dedup.on_new_block(block);
         self.reorg_guard.on_new_block(block, block_hash);
+    }
+
+    /// Call once per new canonical block, alongside `on_new_block` — resolves every
+    /// bundle that's been waiting on inclusion confirmation past its target block, and
+    /// feeds the REAL confirmed result into `LaRelayMetrics`. This is where the
+    /// reputation/ranking system actually gets fed accurate data, instead of the old
+    /// "relay said 200 OK" signal.
+    pub async fn reconcile_inclusions(&self, current_block: u64) -> Vec<ConfirmationResult> {
+        let results = self.inclusion_tracker.reconcile(current_block).await;
+        for r in &results {
+            self.metrics.record(&r.relay, r.included);
+        }
+        results
     }
 
     /// Register a submitted blueprint with the reorg guard.
@@ -137,6 +165,11 @@ impl MultiRelayClient {
     /// Access the reorg guard for blueprint status queries.
     pub fn reorg_guard(&self) -> &Arc<LaReorgGuard> {
         &self.reorg_guard
+    }
+
+    /// Number of bundles currently awaiting on-chain inclusion confirmation.
+    pub fn pending_confirmations(&self) -> usize {
+        self.inclusion_tracker.pending_count()
     }
 }
 
@@ -179,6 +212,7 @@ mod integration_tests {
         let cfg = RelayConfig {
             stagger_ms: 0,
             max_bundles_per_relay_per_second: 100,
+            confirmation_rpc_url: "http://localhost:1".into(),
             ..Default::default()
         };
 
@@ -195,6 +229,25 @@ mod integration_tests {
         ];
         let results = mr.cascade_submit(bundles).await;
         assert_eq!(results.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn accepted_bundle_tracked_then_reconciled() {
+        let mr = make_multi_relay(100);
+        let bundle = BundlePayload {
+            bundle_hash: "0xacc".into(),
+            txs: vec!["0xdeadbeef".into()],
+            block_number: "0x64".into(), // block 100
+            ..Default::default()
+        };
+        mr.cascade_submit(vec![bundle]).await;
+        assert_eq!(mr.pending_confirmations(), 1, "accepted bundle must be pending confirmation");
+
+        // Past target block + grace window, with an unreachable confirmation RPC —
+        // must resolve (as not-included) rather than staying pending forever.
+        let results = mr.reconcile_inclusions(100 + CONFIRMATION_GRACE_BLOCKS).await;
+        assert_eq!(results.len(), 1);
+        assert_eq!(mr.pending_confirmations(), 0);
     }
 
     #[tokio::test]

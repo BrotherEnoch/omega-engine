@@ -24,8 +24,6 @@ mod flashloan_tests {
         Address::from([b; 20])
     }
 
-    // ── Premium calculation ───────────────────────────────────────────────
-
     #[test]
     fn aave_premium_9bps() {
         let amount = eth(10);
@@ -59,8 +57,6 @@ mod flashloan_tests {
         assert_eq!(premium_wei(FlashloanProvider::AaveV3, U256::ZERO), U256::ZERO);
     }
 
-    // ── LiquidityRegistry ─────────────────────────────────────────────────
-
     #[test]
     fn update_and_snapshot_fresh() {
         let reg = test_registry();
@@ -89,8 +85,6 @@ mod flashloan_tests {
         assert_eq!(contracts[1].1.available_wei, eth(30));
         assert_eq!(contracts[2].1.available_wei, eth(10));
     }
-
-    // ── Provider selection ────────────────────────────────────────────────
 
     #[test]
     fn selects_balancer_over_aave_when_both_available() {
@@ -156,12 +150,10 @@ mod flashloan_tests {
         ));
     }
 
-    // ── Calldata encoding ─────────────────────────────────────────────────
-
     #[test]
     fn aave_calldata_has_correct_selector() {
         let calldata = encode_flashloan_call(
-            FlashloanProvider::AaveV3, addr(0xAA), addr(0xBB), addr(0xCC), eth(10), b"callback",
+            FlashloanProvider::AaveV3, addr(0xAA), addr(0xBB), addr(0xCC), eth(10), true, b"callback",
         );
         let expected_selector =
             &keccak256(b"flashLoanSimple(address,address,uint256,bytes,uint16)")[..4];
@@ -171,7 +163,7 @@ mod flashloan_tests {
     #[test]
     fn balancer_calldata_has_correct_selector() {
         let calldata = encode_flashloan_call(
-            FlashloanProvider::Balancer, addr(0xAA), addr(0xBB), addr(0xCC), eth(10), b"callback",
+            FlashloanProvider::Balancer, addr(0xAA), addr(0xBB), addr(0xCC), eth(10), true, b"callback",
         );
         let expected_selector =
             &keccak256(b"flashLoan(address,address[],uint256[],bytes)")[..4];
@@ -181,10 +173,38 @@ mod flashloan_tests {
     #[test]
     fn uniswap_calldata_has_correct_selector() {
         let calldata = encode_flashloan_call(
-            FlashloanProvider::UniswapV3, addr(0xAA), addr(0xBB), addr(0xCC), eth(10), b"callback",
+            FlashloanProvider::UniswapV3, addr(0xAA), addr(0xBB), addr(0xCC), eth(10), true, b"callback",
         );
         let expected_selector = &keccak256(b"flash(address,uint256,uint256,bytes)")[..4];
         assert_eq!(&calldata[..4], expected_selector);
+    }
+
+    /// Regression test for the token0/token1 bug: when the borrowed asset is the pool's
+    /// token1, amount_wei must land in the amount1 slot (bytes 68..100, right after the
+    /// 4-byte selector + 32-byte recipient + 32-byte amount0), and amount0 must be zero.
+    /// Before the fix, this would have silently put amount_wei in amount0 regardless.
+    #[test]
+    fn uniswap_asset_is_token1_places_amount_in_amount1_slot() {
+        let calldata = encode_flashloan_call(
+            FlashloanProvider::UniswapV3, addr(0xAA), addr(0xBB), addr(0xCC), eth(10), false, b"callback",
+        );
+        let amount0_bytes = &calldata[4 + 32..4 + 64];
+        let amount1_bytes = &calldata[4 + 64..4 + 96];
+        let zero = [0u8; 32];
+        assert_eq!(amount0_bytes, &zero[..], "amount0 must be zero when asset is token1");
+        assert_ne!(amount1_bytes, &zero[..], "amount1 must carry amount_wei when asset is token1");
+    }
+
+    #[test]
+    fn uniswap_asset_is_token0_places_amount_in_amount0_slot() {
+        let calldata = encode_flashloan_call(
+            FlashloanProvider::UniswapV3, addr(0xAA), addr(0xBB), addr(0xCC), eth(10), true, b"callback",
+        );
+        let amount0_bytes = &calldata[4 + 32..4 + 64];
+        let amount1_bytes = &calldata[4 + 64..4 + 96];
+        let zero = [0u8; 32];
+        assert_ne!(amount0_bytes, &zero[..], "amount0 must carry amount_wei when asset is token0");
+        assert_eq!(amount1_bytes, &zero[..], "amount1 must be zero when asset is token0");
     }
 
     #[test]
@@ -195,7 +215,7 @@ mod flashloan_tests {
             FlashloanProvider::UniswapV3,
         ] {
             let cd = encode_flashloan_call(
-                provider, addr(0x01), addr(0x02), addr(0x03), eth(1), b"test_data",
+                provider, addr(0x01), addr(0x02), addr(0x03), eth(1), true, b"test_data",
             );
             assert_eq!(
                 (cd.len() - 4) % 32, 0,
@@ -203,8 +223,6 @@ mod flashloan_tests {
             );
         }
     }
-
-    // ── Provider metadata ─────────────────────────────────────────────────
 
     #[test]
     fn balancer_has_lowest_priority_number() {

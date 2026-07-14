@@ -1,5 +1,8 @@
 // crates/omega-risk/src/gas_model.rs
-// (unchanged except lines 258 and 267: manual_range_contains fixes)
+// (unchanged except lines 258 and 267: manual_range_contains fixes;
+//  and dynamic_min_profit: cost components now round UP, not truncate,
+//  since this function computes a minimum-required-profit FLOOR — see
+//  inline comment.)
 
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
@@ -21,9 +24,19 @@ pub fn dynamic_min_profit(
     current_l1_gas_price: u64,
     l1_adaptive_buf:      f64,
 ) -> u64 {
-    let l2_cost  = (l2_exec_gas  as f64 * current_l2_base_fee  as f64 * L2_EXEC_BUFFER) as u64;
-    let l1_cost  = (l1_data_gas  as f64 * current_l1_gas_price as f64 * l1_adaptive_buf) as u64;
-    let ext_cost = (EXTRACTION_GAS as f64 * current_l2_base_fee as f64 * L2_EXEC_BUFFER) as u64;
+    // Each component uses `.ceil()` rather than a bare `as u64` truncation.
+    // This function computes a minimum-required-profit FLOOR: if the float
+    // multiplication produces a fractional wei/gwei amount and we truncate
+    // toward zero, the computed floor is slightly UNDER the true cost,
+    // which means a marginally unprofitable trade could pass check 5
+    // (MissProfit) by exactly the amount truncation discarded. Rounding
+    // the cost estimate up is the conservative direction for a safety
+    // floor — it can never let an unprofitable trade through due to
+    // float-to-int rounding, only (rarely, by <1 wei-equivalent) reject
+    // a trade that was truly break-even.
+    let l2_cost  = (l2_exec_gas  as f64 * current_l2_base_fee  as f64 * L2_EXEC_BUFFER).ceil() as u64;
+    let l1_cost  = (l1_data_gas  as f64 * current_l1_gas_price as f64 * l1_adaptive_buf).ceil() as u64;
+    let ext_cost = (EXTRACTION_GAS as f64 * current_l2_base_fee as f64 * L2_EXEC_BUFFER).ceil() as u64;
     base_min.max(l2_cost + l1_cost + ext_cost)
 }
 
@@ -142,7 +155,6 @@ mod gas_model_tests {
     fn high_volatility_clamps_at_max_buffer() {
         let prices: Vec<u64> = (0..20).map(|i| if i % 2 == 0 { 1 } else { 1000 }).collect();
         let buf = l1_adaptive_buffer(&prices);
-        // FIX: manual_range_contains → use RangeInclusive::contains
         assert!((1.30..=L1_BUFFER_MAX).contains(&buf),
             "buffer {} out of [1.30, 2.00]", buf);
         assert!((buf - L1_BUFFER_MAX).abs() < 0.01, "expected ~2.00, got {}", buf);
@@ -152,7 +164,6 @@ mod gas_model_tests {
     fn moderate_volatility_between_bounds() {
         let prices = vec![30u64, 35, 28, 40, 32, 38, 27, 42];
         let buf = l1_adaptive_buffer(&prices);
-        // FIX: manual_range_contains → use RangeInclusive::contains
         assert!((L1_BUFFER_MIN..=L1_BUFFER_MAX).contains(&buf));
     }
 
@@ -172,8 +183,17 @@ mod gas_model_tests {
     #[test]
     fn extraction_gas_included() {
         let profit       = dynamic_min_profit(0, 0, 0, 100, 0, 1.30);
-        let expected_ext = (EXTRACTION_GAS as f64 * 100.0 * L2_EXEC_BUFFER) as u64;
+        let expected_ext = (EXTRACTION_GAS as f64 * 100.0 * L2_EXEC_BUFFER).ceil() as u64;
         assert_eq!(profit, expected_ext);
+    }
+
+    #[test]
+    fn rounding_never_undercounts_fractional_cost() {
+        // l2_exec_gas=3, base_fee=1, buffer=1.10 -> raw = 3.3, truncation
+        // would give 3; the floor must be at least 4 (ceil) so a
+        // break-even-by-truncation trade can't slip through.
+        let profit = dynamic_min_profit(0, 3, 0, 1, 0, 1.10);
+        assert_eq!(profit, 4, "cost floor must round up, not truncate");
     }
 
     #[test]

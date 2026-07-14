@@ -9,6 +9,16 @@
 //! - Max 4 bundles / relay / second enforced via `governor` rate limiter (§11.2).
 //! - Normal (non-cascade) LA submission uses the same randomised round-robin
 //!   within the tie band (§14.2).
+//!
+//! ## CHANGE — metrics are no longer fed a fake inclusion signal
+//!
+//! This used to call `metrics.record(relay, outcome.included)` immediately after each
+//! HTTP response — recording an *accepted* submission as *included*, which conflates two
+//! different facts (see `client.rs`'s `SubmissionOutcome` docs and `confirmation.rs`).
+//! Now: a submission that outright failed or was rejected IS recorded immediately (that's
+//! a real, known negative — no need to wait). A submission the relay *accepted* is handed
+//! to `InclusionTracker` instead, and only feeds `LaRelayMetrics` once real on-chain
+//! confirmation resolves it — see `MultiRelayClient::reconcile_inclusions` in `lib.rs`.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -24,6 +34,7 @@ use tracing::{debug, warn};
 
 use crate::client::{BundlePayload, RelayClient, SubmissionOutcome};
 use crate::config::RelayConfig;
+use crate::confirmation::InclusionTracker;
 use crate::error::{RelayError, RelayResult};
 use crate::metrics::{LaRelayMetrics, RelayRateSnapshot};
 
@@ -73,25 +84,28 @@ type ClientsAndMetrics = (
 
 /// Executes cascade bundle submission with all v12 backpressure controls (§11.2).
 pub struct CascadeSubmitter {
-    relay_clients: Arc<HashMap<String, Arc<dyn RelayClient>>>,
-    metrics:       Arc<LaRelayMetrics>,
-    rate_limiters: Arc<RelayRateLimiters>,
-    stagger_ms:    u64,
+    relay_clients:     Arc<HashMap<String, Arc<dyn RelayClient>>>,
+    metrics:           Arc<LaRelayMetrics>,
+    rate_limiters:     Arc<RelayRateLimiters>,
+    inclusion_tracker: Arc<InclusionTracker>,
+    stagger_ms:        u64,
 }
 
 impl CascadeSubmitter {
-    /// Create a cascade submitter from relay clients, live relay metrics, and relay config.
+    /// Create a cascade submitter from relay clients, live relay metrics, relay config,
+    /// and an inclusion tracker (see `confirmation::InclusionTracker`).
     pub fn new(
-        relay_clients: Arc<HashMap<String, Arc<dyn RelayClient>>>,
-        metrics:       Arc<LaRelayMetrics>,
-        cfg:           &RelayConfig,
+        relay_clients:     Arc<HashMap<String, Arc<dyn RelayClient>>>,
+        metrics:           Arc<LaRelayMetrics>,
+        cfg:               &RelayConfig,
+        inclusion_tracker: Arc<InclusionTracker>,
     ) -> Self {
         let relay_names: Vec<String> = relay_clients.keys().cloned().collect();
         let rate_limiters = Arc::new(RelayRateLimiters::new(
             &relay_names,
             cfg.max_bundles_per_relay_per_second as u32,
         ));
-        Self { relay_clients, metrics, rate_limiters, stagger_ms: cfg.stagger_ms }
+        Self { relay_clients, metrics, rate_limiters, inclusion_tracker, stagger_ms: cfg.stagger_ms }
     }
 
     /// Submit `bundles` in cascade order with inter-bundle stagger (§11.2).
@@ -142,26 +156,17 @@ impl CascadeSubmitter {
 
         let outcomes: Vec<(String, RelayResult<SubmissionOutcome>)> = join_all(futs).await;
 
-        for (relay_name, outcome) in &outcomes {
-            let relay = self.metrics.active_address();
-            let _     = relay;
-            if let Ok(rn) = parse_relay_name(relay_name) {
-                self.metrics.record(
-                    &rn,
-                    outcome.as_ref().map(|o| o.included).unwrap_or(false),
-                );
-            }
-        }
+        record_or_track_outcomes(&outcomes, bundle, &self.metrics, &self.inclusion_tracker);
 
-        let any_included = outcomes
+        let any_accepted = outcomes
             .iter()
-            .any(|(_, o)| o.as_ref().map(|x| x.included).unwrap_or(false));
+            .any(|(_, o)| o.as_ref().map(|x| x.accepted).unwrap_or(false));
 
         debug!(
             bundle_hash  = %bundle.bundle_hash,
             relay_count  = outcomes.len(),
-            any_included,
-            "cascade: bundle submitted to all relays"
+            any_accepted,
+            "cascade: bundle submitted to all relays (acceptance, not yet confirmed inclusion)"
         );
 
         CascadeResult {
@@ -170,11 +175,11 @@ impl CascadeSubmitter {
                 .into_iter()
                 .map(|(r, o)| RelayOutcome {
                     relay:    r,
-                    included: o.as_ref().map(|x| x.included).unwrap_or(false),
+                    accepted: o.as_ref().map(|x| x.accepted).unwrap_or(false),
                     error:    o.err().map(|e| e.to_string()),
                 })
                 .collect(),
-            any_included,
+            any_accepted,
         }
     }
 
@@ -197,16 +202,43 @@ impl CascadeSubmitter {
     }
 }
 
+/// Shared by cascade and single-bundle submission: a relay that flat-out failed or
+/// rejected the submission is recorded as a real, known negative immediately. A relay
+/// that accepted it is handed to `InclusionTracker` for later, real confirmation —
+/// never recorded as included right away.
+fn record_or_track_outcomes(
+    outcomes:          &[(String, RelayResult<SubmissionOutcome>)],
+    bundle:            &BundlePayload,
+    metrics:           &Arc<LaRelayMetrics>,
+    inclusion_tracker: &Arc<InclusionTracker>,
+) {
+    for (relay_name, outcome) in outcomes {
+        let Ok(rn) = parse_relay_name(relay_name) else { continue };
+        match outcome {
+            Ok(o) if o.accepted => {
+                if let Err(e) = inclusion_tracker.track(rn, bundle) {
+                    warn!(relay = %relay_name, error = %e, "failed to track bundle for inclusion confirmation");
+                }
+            }
+            _ => {
+                // Outright failure or explicit rejection — a real, immediate negative.
+                metrics.record(&rn, false);
+            }
+        }
+    }
+}
+
 // ── Normal (non-cascade) LA submission ───────────────────────────────────────
 
 /// Submit a single bundle using the same anti-fingerprint round-robin as
 /// cascade, but without multi-bundle staggering. Used for non-cascade
 /// normal LA paths (§14.2).
 pub async fn submit_single_bundle(
-    bundle:        BundlePayload,
-    relay_clients: &HashMap<String, Arc<dyn RelayClient>>,
-    metrics:       &Arc<LaRelayMetrics>,
-    rate_limiters: &RelayRateLimiters,
+    bundle:            BundlePayload,
+    relay_clients:     &HashMap<String, Arc<dyn RelayClient>>,
+    metrics:           &Arc<LaRelayMetrics>,
+    rate_limiters:     &RelayRateLimiters,
+    inclusion_tracker: &Arc<InclusionTracker>,
 ) -> RelayResult<bool> {
     let mut ranked = metrics.la_ranked_relays();
     if ranked.is_empty() {
@@ -240,17 +272,13 @@ pub async fn submit_single_bundle(
         .collect();
 
     let outcomes: Vec<_> = join_all(futs).await;
-    let any_included = outcomes
+    let any_accepted = outcomes
         .iter()
-        .any(|(_, o)| o.as_ref().map(|x| x.included).unwrap_or(false));
+        .any(|(_, o)| o.as_ref().map(|x| x.accepted).unwrap_or(false));
 
-    for (relay_name, outcome) in &outcomes {
-        if let Ok(rn) = parse_relay_name(relay_name) {
-            metrics.record(&rn, outcome.as_ref().map(|o| o.included).unwrap_or(false));
-        }
-    }
+    record_or_track_outcomes(&outcomes, &bundle, metrics, inclusion_tracker);
 
-    Ok(any_included)
+    Ok(any_accepted)
 }
 
 // ── Result types ──────────────────────────────────────────────────────────────
@@ -260,8 +288,9 @@ pub async fn submit_single_bundle(
 pub struct RelayOutcome {
     /// Relay name that handled the submission attempt.
     pub relay:    String,
-    /// Whether the relay reported inclusion.
-    pub included: bool,
+    /// Whether the relay's HTTP endpoint accepted the submission — NOT confirmation of
+    /// on-chain inclusion. See `confirmation::InclusionTracker` for that.
+    pub accepted: bool,
     /// Stringified submission error, if the relay request failed.
     pub error:    Option<String>,
 }
@@ -273,8 +302,8 @@ pub struct CascadeResult {
     pub bundle_hash:    String,
     /// Per-relay submission outcomes in submission order.
     pub relay_outcomes: Vec<RelayOutcome>,
-    /// `true` when at least one relay reported inclusion.
-    pub any_included:   bool,
+    /// `true` when at least one relay accepted the submission (NOT confirmed inclusion).
+    pub any_accepted:   bool,
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
@@ -303,12 +332,12 @@ mod tests {
         let metrics = LaRelayMetrics::new(50, addr);
 
         let mut clients: HashMap<String, Arc<dyn RelayClient>> = HashMap::new();
-        for (name, includes) in relays {
+        for (name, accepts) in relays {
             let rn = parse_relay_name(name).unwrap();
             for i in 0..20u32 {
                 metrics.record(&rn, i < 18);
             }
-            clients.insert(name.to_string(), Arc::new(MockRelayClient::new(*includes)));
+            clients.insert(name.to_string(), Arc::new(MockRelayClient::new(*accepts)));
         }
         (Arc::new(clients), metrics)
     }
@@ -321,11 +350,15 @@ mod tests {
         }
     }
 
+    fn tracker() -> Arc<InclusionTracker> {
+        InclusionTracker::new("http://localhost:1") // unused by these tests directly
+    }
+
     #[tokio::test]
     async fn cascade_submits_to_all_relays() {
         let (clients, metrics) =
             make_clients_and_metrics(&[("flashbots", true), ("bloxroute", false)]);
-        let submitter = CascadeSubmitter::new(clients, metrics, &cfg());
+        let submitter = CascadeSubmitter::new(clients, metrics, &cfg(), tracker());
 
         let bundles = vec![
             BundlePayload { bundle_hash: "0xaaa".into(), ..Default::default() },
@@ -334,9 +367,39 @@ mod tests {
 
         let results = submitter.submit_cascade(bundles).await;
         assert_eq!(results.len(), 2);
-        assert!(results[0].any_included);
-        assert!(results[1].any_included);
+        assert!(results[0].any_accepted);
+        assert!(results[1].any_accepted);
         assert_eq!(results[0].relay_outcomes.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn rejected_relay_is_recorded_immediately_as_negative() {
+        let (clients, metrics) = make_clients_and_metrics(&[("bloxroute", false)]);
+        let submitter = CascadeSubmitter::new(clients, metrics.clone(), &cfg(), tracker());
+        submitter
+            .submit_cascade(vec![BundlePayload { bundle_hash: "0xrej".into(), ..Default::default() }])
+            .await;
+        // A rejection is a known negative and should be recorded right away, not deferred.
+        let rate = metrics.rate_for(&crate::config::RelayName::Bloxroute, &ExecutionAddress("0xTEST".into()));
+        assert!(rate.is_some(), "rejection must be recorded into metrics immediately");
+    }
+
+    #[tokio::test]
+    async fn accepted_relay_is_tracked_not_recorded_immediately() {
+        let (clients, metrics) = make_clients_and_metrics(&[("flashbots", true)]);
+        let track = tracker();
+        let submitter = CascadeSubmitter::new(clients, metrics.clone(), &cfg(), Arc::clone(&track));
+        submitter
+            .submit_cascade(vec![BundlePayload {
+                bundle_hash: "0xacc".into(),
+                txs: vec!["0xdeadbeef".into()],
+                block_number: "0x64".into(),
+                ..Default::default()
+            }])
+            .await;
+        // Accepted submissions must NOT be recorded into metrics yet — they must be
+        // handed to the inclusion tracker for real confirmation instead.
+        assert_eq!(track.pending_count(), 1, "accepted bundle must be tracked, not recorded");
     }
 
     #[tokio::test]
@@ -350,6 +413,7 @@ mod tests {
                 max_bundles_per_relay_per_second: 100,
                 ..Default::default()
             },
+            tracker(),
         );
 
         let start   = std::time::Instant::now();
@@ -369,7 +433,7 @@ mod tests {
     #[tokio::test]
     async fn empty_relay_list_returns_empty() {
         let metrics   = LaRelayMetrics::new(50, ExecutionAddress("0xX".into()));
-        let submitter = CascadeSubmitter::new(Arc::new(HashMap::new()), metrics, &cfg());
+        let submitter = CascadeSubmitter::new(Arc::new(HashMap::new()), metrics, &cfg(), tracker());
         let results   = submitter
             .submit_cascade(vec![BundlePayload { bundle_hash: "0x0".into(), ..Default::default() }])
             .await;

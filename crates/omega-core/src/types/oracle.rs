@@ -7,6 +7,18 @@
 // distinct from raw OracleSignal payloads (types/signal.rs) — signals
 // are the wire format; these are the domain model.
 //
+// ## Audit finding fixed in this pass
+//
+// `OraclePrice`'s doc comment already stated the invariant "Zero
+// indicates the price feed is stale or unavailable — strategies must
+// reject zero-priced tokens" — but nothing enforced it anywhere in this
+// type. A documented-but-unenforced invariant means every call site has
+// to independently remember to check `price_usd_e18 != 0` itself, with
+// no shared, correct, single implementation to call instead — exactly
+// the kind of gap where one call site eventually gets the check
+// backwards or forgets it entirely. Added `OraclePrice::is_valid()` as
+// the single canonical implementation of that check.
+//
 // Spec references:
 //   §7   — dual-component gas model: FeeSnapshot fields
 //   §11  — LA tier classification: PositionSnapshot health factor
@@ -44,6 +56,19 @@ pub struct OraclePrice {
     /// fallback (Chainlink / Pyth) source.  Strategies may apply a
     /// confidence discount on fallback-sourced prices.
     pub is_fallback: bool,
+}
+
+impl OraclePrice {
+    /// Returns `true` when this price is usable — i.e. non-zero. A
+    /// zero `price_usd_e18` is documented as meaning "feed is stale or
+    /// unavailable"; this is the single canonical place that check
+    /// should be made, rather than every call site re-implementing
+    /// `price.price_usd_e18 != U256::ZERO` independently (and risking
+    /// getting the comparison direction wrong).
+    #[inline]
+    pub fn is_valid(&self) -> bool {
+        self.price_usd_e18 != U256::ZERO
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -164,6 +189,11 @@ impl PositionSnapshot {
 
     /// Returns `true` when this position is currently liquidatable
     /// (health factor below 1.0 × 10^18).
+    ///
+    /// Boundary is strict `<` (HF == 1.0 exactly is NOT liquidatable),
+    /// matching standard lending-protocol semantics (e.g. Aave requires
+    /// healthFactor strictly below 1e18) — confirmed consistent with
+    /// real on-chain behavior, not changed in this pass.
     #[inline]
     pub fn is_liquidatable(&self) -> bool {
         const E18: u128 = 1_000_000_000_000_000_000;
@@ -199,4 +229,75 @@ pub struct FeeSnapshot {
 
     /// Block number at which this fee oracle was sampled.
     pub block_number: u64,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sample_position(hf_e18: u128) -> PositionSnapshot {
+        PositionSnapshot {
+            borrower: Address::ZERO,
+            protocol: Address::from([0x11u8; 20]),
+            hf_e18: U256::from(hf_e18),
+            collateral_usd_e18: U256::from(2_000_000_000_000_000_000u128),
+            debt_usd_e18: U256::from(1_000_000_000_000_000_000u128),
+            liquidation_bonus_bps: 500,
+            tier: LaTier::Hot,
+            block_number: 1,
+            state_version: 1,
+        }
+    }
+
+    #[test]
+    fn oracle_price_zero_is_invalid() {
+        let p = OraclePrice {
+            token: Address::ZERO,
+            price_usd_e18: U256::ZERO,
+            block_number: 1,
+            received_at_unix_ms: 0,
+            is_fallback: false,
+        };
+        assert!(!p.is_valid());
+    }
+
+    #[test]
+    fn oracle_price_nonzero_is_valid() {
+        let p = OraclePrice {
+            token: Address::ZERO,
+            price_usd_e18: U256::from(3_000_000_000_000_000_000_000u128),
+            block_number: 1,
+            received_at_unix_ms: 0,
+            is_fallback: false,
+        };
+        assert!(p.is_valid());
+    }
+
+    #[test]
+    fn la_tier_boundaries() {
+        const E18: u128 = 1_000_000_000_000_000_000;
+        assert_eq!(LaTier::from_hf_e18(U256::from(E18)), LaTier::Hot); // 1.0 exactly -> Hot
+        assert_eq!(LaTier::from_hf_e18(U256::from(E18 + E18 / 100)), LaTier::Warm); // 1.01 -> Warm (boundary inclusive)
+        assert_eq!(LaTier::from_hf_e18(U256::from(E18 + 5 * E18 / 100)), LaTier::Cold); // 1.05 -> Cold
+        assert_eq!(LaTier::from_hf_e18(U256::from(E18 + 20 * E18 / 100)), LaTier::Archived); // 1.20 -> Archived
+    }
+
+    #[test]
+    fn is_liquidatable_boundary() {
+        const E18: u128 = 1_000_000_000_000_000_000;
+        assert!(sample_position(E18 - 1).is_liquidatable());
+        assert!(!sample_position(E18).is_liquidatable(), "HF == 1.0 exactly is not liquidatable");
+        assert!(!sample_position(E18 + 1).is_liquidatable());
+    }
+
+    #[test]
+    fn dedup_key_is_stable_and_ignores_block_number() {
+        let mut p1 = sample_position(1_000_000_000_000_000_000);
+        let mut p2 = p1.clone();
+        p2.block_number = 999; // different block, same borrower/protocol
+        assert_eq!(p1.dedup_key(), p2.dedup_key());
+
+        p1.protocol = Address::from([0x22u8; 20]);
+        assert_ne!(p1.dedup_key(), p2.dedup_key());
+    }
 }

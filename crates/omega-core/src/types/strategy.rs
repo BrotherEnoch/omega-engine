@@ -2,6 +2,30 @@
 //
 // Core strategy abstraction — the trait every Omega strategy implements.
 //
+// ## Audit findings fixed in this pass
+//
+// `OpScore` and `SimResult` both had documented invariants the type
+// system didn't enforce:
+//   - OpScore: "score of exactly 0.0 is always skipped" is checked by
+//     `should_proceed`, but nothing confirmed `score`/`competition_prob`
+//     were even finite, non-NaN values in the first place. (NaN
+//     comparisons are always false in IEEE-754, so `should_proceed`
+//     already fails safe on a NaN score without any change — verified
+//     and pinned with a test rather than "fixed," since it was already
+//     correct — but Infinity passes `> 0.0` and was previously
+//     undetectable.) Added `is_well_formed()` as an explicit sanity
+//     check independent of the business-logic gate.
+//   - SimResult: "false [success] → the profit figures are invalid" was
+//     documented but nothing stopped a caller from reading `profit_net`
+//     directly without checking `success` first. Added
+//     `profit_net_if_successful()` as the safe accessor.
+//
+// Neither fix restructures the types (e.g. into tagged enums) or
+// changes any existing field — both are purely additive, since
+// `StrategyTrait` implementations (which construct/consume these types)
+// live in omega-strategies and aren't visible from here; a breaking
+// restructure would risk guessing at call sites this crate can't see.
+//
 // Spec references:
 //   §1.1  — strategy phases and StrategyId
 //   §4    — simulation backend selection (Lane / Simulator)
@@ -84,6 +108,14 @@ pub struct SignalState {
 ///
 /// A score of 0.0 means the opportunity does not meet the minimum
 /// threshold and MUST NOT proceed to `build_blueprint`.
+///
+/// NOTE: this doc comment describes a CONTRACT between whatever
+/// `StrategyTrait::score` implementation produces an `OpScore` and
+/// whatever consumes it — specifically, that `score` already
+/// incorporates `competition_prob`. Nothing in this generic type can
+/// verify that semantic coupling (it's strategy-specific business
+/// logic); `is_well_formed()` below only checks structural sanity
+/// (finite, non-NaN, in-range), not that coupling.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OpScore {
     /// Dimensionless score in [0.0, 1.0].  Zero → skip.
@@ -100,9 +132,33 @@ pub struct OpScore {
 impl OpScore {
     /// Returns `true` when this opportunity should proceed to blueprint
     /// construction.  A score of exactly 0.0 is always skipped.
+    ///
+    /// NaN handling: `self.score > 0.0` is `false` for a NaN score
+    /// under IEEE-754 comparison semantics, so a NaN score already
+    /// fails safe here without any special-case code — verified by
+    /// `nan_score_does_not_proceed` below. This was already correct;
+    /// it just wasn't documented or tested before.
     #[inline]
     pub fn should_proceed(&self) -> bool {
         self.score > 0.0 && self.expected_profit > U256::ZERO
+    }
+
+    /// Structural sanity check independent of `should_proceed`'s
+    /// business-logic gate: confirms `score` and `competition_prob` are
+    /// both finite, non-NaN, and within their documented [0.0, 1.0]
+    /// range. `should_proceed()` already fails safe on NaN (see its doc
+    /// comment) but silently PASSES an infinite score (`f64::INFINITY >
+    /// 0.0` is `true`) — this catches that case explicitly. Does NOT
+    /// verify the `score` ⊇ `competition_prob` semantic coupling
+    /// documented on the struct — that can only be checked by the
+    /// strategy implementation that constructed this value. Call this
+    /// before trusting an `OpScore` from an untrusted or external
+    /// source (e.g. deserialized from a wire payload).
+    pub fn is_well_formed(&self) -> bool {
+        self.score.is_finite()
+            && (0.0..=1.0).contains(&self.score)
+            && self.competition_prob.is_finite()
+            && (0.0..=1.0).contains(&self.competition_prob)
     }
 }
 
@@ -133,6 +189,20 @@ pub struct SimResult {
     /// `false` → the profit figures are invalid; this is a
     /// SIMULATION_EXECUTION_REVERT (§13.4).
     pub success: bool,
+}
+
+impl SimResult {
+    /// Returns `profit_net` only when the simulation actually
+    /// succeeded, `None` otherwise.
+    ///
+    /// `profit_net` is documented as invalid when `success` is `false`,
+    /// but nothing in the type system stops a caller from reading the
+    /// raw field directly and skipping that check. This is the safe
+    /// accessor that makes the invariant impossible to miss.
+    #[inline]
+    pub fn profit_net_if_successful(&self) -> Option<U256> {
+        self.success.then_some(self.profit_net)
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -235,4 +305,89 @@ pub trait StrategyTrait: Send + Sync {
     /// `blueprint.calldata`; some strategies re-encode with final
     /// slippage parameters computed from the simulation result.
     fn encode_calldata(&self, bp: &ExecutionBlueprint) -> Bytes;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn should_proceed_requires_positive_score_and_profit() {
+        let score = OpScore { score: 0.5, expected_profit: U256::from(1u64), competition_prob: 0.2 };
+        assert!(score.should_proceed());
+
+        let zero_score = OpScore { score: 0.0, expected_profit: U256::from(1u64), competition_prob: 0.2 };
+        assert!(!zero_score.should_proceed());
+
+        let zero_profit = OpScore { score: 0.5, expected_profit: U256::ZERO, competition_prob: 0.2 };
+        assert!(!zero_profit.should_proceed());
+    }
+
+    #[test]
+    fn nan_score_does_not_proceed() {
+        // Confirms should_proceed() already fails safe on NaN via
+        // IEEE-754 comparison semantics (NaN > 0.0 is false) — pinning
+        // this behavior with a test so it can't be "fixed" into a bug
+        // later by someone unaware NaN comparisons are intentionally
+        // false here.
+        let score = OpScore {
+            score: f64::NAN,
+            expected_profit: U256::from(1u64),
+            competition_prob: 0.2,
+        };
+        assert!(!score.should_proceed());
+    }
+
+    #[test]
+    fn is_well_formed_rejects_nan_and_infinite() {
+        let nan_score = OpScore { score: f64::NAN, expected_profit: U256::from(1u64), competition_prob: 0.2 };
+        assert!(!nan_score.is_well_formed());
+
+        let inf_score = OpScore { score: f64::INFINITY, expected_profit: U256::from(1u64), competition_prob: 0.2 };
+        assert!(!inf_score.is_well_formed(), "should_proceed() would wrongly accept this; is_well_formed() must reject it");
+
+        let inf_competition = OpScore { score: 0.5, expected_profit: U256::from(1u64), competition_prob: f64::INFINITY };
+        assert!(!inf_competition.is_well_formed());
+    }
+
+    #[test]
+    fn is_well_formed_rejects_out_of_range() {
+        let over = OpScore { score: 1.5, expected_profit: U256::from(1u64), competition_prob: 0.2 };
+        assert!(!over.is_well_formed());
+
+        let negative = OpScore { score: -0.1, expected_profit: U256::from(1u64), competition_prob: 0.2 };
+        assert!(!negative.is_well_formed());
+    }
+
+    #[test]
+    fn is_well_formed_accepts_valid_score() {
+        let ok = OpScore { score: 0.75, expected_profit: U256::from(1u64), competition_prob: 0.3 };
+        assert!(ok.is_well_formed());
+    }
+
+    #[test]
+    fn profit_net_if_successful_returns_none_on_failure() {
+        let result = SimResult {
+            profit_net: U256::from(1_000_000u64), // documented-invalid leftover value
+            gas_used: 50_000,
+            simulator: "revm".to_string(),
+            success: false,
+        };
+        assert_eq!(
+            result.profit_net_if_successful(),
+            None,
+            "profit_net must not be trusted when success is false"
+        );
+    }
+
+    #[test]
+    fn profit_net_if_successful_returns_value_on_success() {
+        let result = SimResult {
+            profit_net: U256::from(1_000_000u64),
+            gas_used: 50_000,
+            simulator: "revm".to_string(),
+            success: true,
+        };
+        assert_eq!(result.profit_net_if_successful(), Some(U256::from(1_000_000u64)));
+    }
 }

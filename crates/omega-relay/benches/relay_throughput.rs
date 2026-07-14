@@ -2,6 +2,11 @@
 //!
 //! Measures cascade submission throughput and single-bundle submission latency
 //! under mock relay clients with zero network overhead.
+//!
+//! CHANGE: `CascadeSubmitter::new` now takes an `InclusionTracker` (see
+//! `confirmation.rs`) — added here purely to keep this benchmark compiling; a
+//! dummy tracker pointed at a throwaway URL is fine since these benchmarks only
+//! measure submission throughput, not confirmation behavior.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -13,6 +18,7 @@ use omega_relay::{
     backpressure::CascadeSubmitter,
     client::{BundlePayload, MockRelayClient, RelayClient},
     config::{RelayConfig, RelayName},
+    confirmation::InclusionTracker,
     metrics::{ExecutionAddress, LaRelayMetrics},
     reputation::submission_order, PositionKey,
 };
@@ -80,8 +86,11 @@ fn bench_cascade_throughput(c: &mut Criterion) {
                 let clients = Arc::new(four_relay_clients());
                 let metrics = seeded_metrics("0xBENCH");
                 let cfg = no_stagger_cfg();
+                // Dummy tracker — these benchmarks measure submission throughput, not
+                // confirmation behavior, so a real RPC endpoint isn't needed here.
+                let tracker = InclusionTracker::new("http://localhost:1");
                 let submitter =
-                    CascadeSubmitter::new(Arc::clone(&clients), Arc::clone(&metrics), &cfg);
+                    CascadeSubmitter::new(Arc::clone(&clients), Arc::clone(&metrics), &cfg, tracker);
 
                 b.to_async(&rt).iter_batched(
                     || (0..count).map(bundle).collect::<Vec<_>>(),

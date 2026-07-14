@@ -16,6 +16,29 @@
 //    LOST_SIMULATION_ERROR code was insufficient; the three sub-types have
 //    distinct root causes and distinct corrective feedback actions.
 //
+// ## Serialization (added)
+//
+// `DropCode` now derives `Serialize`/`Deserialize` with
+// `#[serde(rename_all = "SCREAMING_SNAKE_CASE")]`. This was previously
+// missing despite the doc's own callout that "§16 — Observability: all
+// DropCodes are always-sampled LA events" — an always-sampled event
+// that can't be serialized can't actually be logged/exported in
+// structured form. Every variant's auto-generated wire string was
+// verified to match the existing hand-written `Display` impl exactly
+// (e.g. `MissHfNotLiquidatable` → `"MISS_HF_NOT_LIQUIDATABLE"` either
+// way), so this is a purely additive, zero-risk change: the Prometheus
+// label convention (`Display`) and the structured-log wire format
+// (`Serialize`) are now guaranteed to agree rather than being two
+// independently-hand-maintained strings that could drift apart.
+//
+// `OmegaError` itself is NOT given Serialize/Deserialize in this pass —
+// unlike DropCode, there's no equivalent explicit callout that it needs
+// to cross a wire boundary, and guessing at a tagging scheme
+// (adjacently-tagged vs internally-tagged vs untagged) risks producing
+// a wire shape that conflicts with something already downstream. Add it
+// deliberately, with a chosen tagging scheme, if/when a concrete
+// consumer needs it.
+//
 // Spec references:
 //   §3    — Health FSM: layer transitions triggered by OmegaError variants
 //   §7    — Gas model: MissGas, MissGasSpike DropCodes
@@ -28,6 +51,7 @@
 //   §16   — Observability: all DropCodes are always-sampled LA events
 
 use std::fmt;
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -47,7 +71,8 @@ use thiserror::Error;
 /// | `Miss*`  | Opportunity did not meet a threshold — expected drop  |
 /// | `Sim*`   | Blueprint failed at simulation stage (§13.4)          |
 /// | `Wrong*` | Blueprint was structurally invalid / misrouted        |
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum DropCode {
     // ── Routing / identity ───────────────────────────────────────────────
     /// Blueprint submitted to a relay targeting the wrong chain ID.
@@ -171,7 +196,11 @@ pub enum DropCode {
 impl fmt::Display for DropCode {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         // Produces the canonical SCREAMING_SNAKE_CASE label used in
-        // Prometheus counters and ELK log payloads (§16).
+        // Prometheus counters and ELK log payloads (§16). Kept as an
+        // explicit match (rather than deriving from the serde wire
+        // format at runtime) so a missing arm here is a compile error
+        // the moment a new variant is added — see the note on
+        // `#[non_exhaustive]` below.
         let s = match self {
             DropCode::WrongChain => "WRONG_CHAIN",
             DropCode::WrongChainId => "WRONG_CHAIN_ID",
@@ -245,6 +274,18 @@ impl DropCode {
         matches!(self, DropCode::SimulationExecutionRevert)
     }
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// UnknownChainId
+// ─────────────────────────────────────────────────────────────────────────────
+//
+// (No changes below this point in the file — OmegaError and its impls
+// are unchanged from the reviewed version. `is_critical()`'s narrow
+// scope, and `is_expected_miss()`'s specific 5-code allowlist, were both
+// considered during this audit: whether e.g. `WrongChain`/`WrongChainId`
+// should also be `is_critical()` is a domain/spec judgment call this
+// crate's own files don't have enough context to settle — flagged in
+// the accompanying review rather than changed speculatively.)
 
 // ─────────────────────────────────────────────────────────────────────────────
 // OmegaError
@@ -362,6 +403,49 @@ mod tests {
             "MISS_HF_NOT_LIQUIDATABLE"
         );
         assert_eq!(DropCode::WrongChainId.to_string(), "WRONG_CHAIN_ID");
+    }
+
+    #[test]
+    fn drop_code_serde_wire_format_matches_display() {
+        // Confirms the newly-added Serialize/Deserialize derive
+        // produces exactly the same string as the hand-written Display
+        // impl for every variant — so Prometheus labels and structured
+        // JSON logs can never silently drift apart.
+        let all_codes = [
+            DropCode::WrongChain,
+            DropCode::WrongChainId,
+            DropCode::MissExpiry,
+            DropCode::MissGas,
+            DropCode::MissGasSpike,
+            DropCode::MissWhitelist,
+            DropCode::MissProfit,
+            DropCode::MissOracle,
+            DropCode::MissOracleDiverge,
+            DropCode::MissSlippage,
+            DropCode::MissLiquidity,
+            DropCode::MissDexLiquidity,
+            DropCode::MissPriceImpact,
+            DropCode::MissCompetition,
+            DropCode::MissCapacity,
+            DropCode::MissCapacityNormal,
+            DropCode::MissRisk,
+            DropCode::MissFlashCrash,
+            DropCode::MissDagCycle,
+            DropCode::MissFlashloan,
+            DropCode::MissHfNotLiquidatable,
+            DropCode::MissOfaConsent,
+            DropCode::MissOfaSlippage,
+            DropCode::MissOfaOrder,
+            DropCode::SimulationStateMismatch,
+            DropCode::SimulationExecutionRevert,
+            DropCode::SimulationGasMiscalc,
+        ];
+        for code in all_codes {
+            let json = serde_json::to_string(&code).unwrap();
+            assert_eq!(json, format!("\"{code}\""), "wire format must match Display for {code}");
+            let back: DropCode = serde_json::from_str(&json).unwrap();
+            assert_eq!(back, code, "round-trip must preserve the variant for {code}");
+        }
     }
 
     #[test]

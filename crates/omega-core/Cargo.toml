@@ -38,3 +38,11 @@ tracing = { workspace = true }
 # the zero-transport-surface constraint.
 hex = "0.4"
 strum = { version = "0.28.0", features = ["derive"] }
+
+[dev-dependencies]
+# Test-only: proves WeiAmount (config.rs) actually round-trips through
+# real TOML, which is the entire point of that type's existence — a
+# plain-integer u128/u64 field would silently fail this exact test for
+# any value beyond i64::MAX, which is precisely the bug WeiAmount fixes.
+# Does not appear in the production dependency graph.
+toml = "0.8"

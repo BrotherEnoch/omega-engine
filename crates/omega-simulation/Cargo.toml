@@ -1,0 +1,51 @@
+# omega-engine\crates\omega-simulation\Cargo.toml
+[package]
+name = "omega-simulation"
+version = "0.1.0"
+edition = "2021"
+description = "Forked-mainnet simulation harness for omega-engine. Never links relay/signing crates."
+publish = false
+
+# ---------------------------------------------------------------------------
+# SAFETY INVARIANT (enforced by ops/check_no_live_deps.sh in CI, see repo root):
+#
+#   This crate MUST NOT depend, directly or transitively through a workspace
+#   path dependency, on any crate that knows how to talk to a real relay
+#   (Flashbots, bloXroute, Titan, Eden) or to a real signing backend (HSM,
+#   KMS, hardware wallet). Its only job is to execute against a local forked
+#   node. If you find yourself adding such a dependency here, stop — that
+#   code belongs in omega-execution, not omega-simulation.
+#
+#   omega-risk is exempt from this invariant: it is pure risk-tracking/
+#   metrics logic (circuit breakers, kill switch, heartbeat) with no relay
+#   client or signing code of its own, so depending on it here does not
+#   weaken the guarantee above. check_no_live_deps.sh's forbidden-pattern
+#   list only matches relay/signing crate names, so this dependency will
+#   not trip it — confirmed by reasoning about the crate's own contents,
+#   not by the script itself, since the script can't distinguish "safe
+#   dependency of omega-risk" from "omega-risk snuck in a live dependency
+#   transitively." If omega-risk ever gains a relay/signing dependency of
+#   its own, this exemption becomes false and the check script should be
+#   extended to scan transitively through omega-risk too.
+# ---------------------------------------------------------------------------
+
+[dependencies]
+ethers = { version = "2", features = ["ws", "rustls"] }
+tokio = { version = "1", features = ["full"] }
+async-trait = "0.1"
+anyhow = "1"
+thiserror = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+chrono = { version = "0.4", features = ["serde"] }
+clap = { version = "4", features = ["derive"] }
+omega-risk = { path = "../omega-risk" }
+
+[dev-dependencies]
+tempfile = "3"
+
+[[example]]
+name = "run_sim"
+path = "examples/run_sim.rs"

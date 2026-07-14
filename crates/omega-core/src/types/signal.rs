@@ -9,6 +9,35 @@
 // monotonic `state_version` and a `state_hash` so the EIL can detect
 // stale state before permitting simulation (§6, §13.4).
 //
+// ## Audit finding fixed in this pass
+//
+// Nothing here previously handled clock skew or out-of-order arrival:
+// a naive `now - signal.received_at_unix_ms` computed by a downstream
+// consumer is a real `u64` underflow risk if `received_at_unix_ms` is,
+// for any reason (clock skew between hosts, an out-of-order/replayed
+// signal), later than the caller's `now` — that PANICS in a debug build
+// and silently wraps to a huge, wrong value in release, either of which
+// is a worse outcome than reporting age zero. Added `age_ms()` with
+// saturating subtraction as the canonical way to compute this.
+//
+// ## Design note, not changed in this pass
+//
+// `payload: serde_json::Value` is untyped by design (documented
+// per-SignalKind schemas in a comment, not enforced by the type
+// system). This means ANY valid JSON deserializes successfully
+// regardless of whether its shape matches its `kind` — a malformed or
+// wrong-shaped payload is only caught later, wherever each strategy
+// crate parses its own payload, and if that parsing code isn't
+// defensive (e.g. `.unwrap()`s a missing field instead of returning an
+// error), a malformed signal could propagate further than ideal or
+// panic a strategy's scoring path. A stricter fix — replacing this
+// with a tagged enum (`SignalPayload::SpotPrice { .. }`, etc.) so serde
+// enforces the shape at deserialize time — would close that gap
+// structurally, but it's a bigger change than this pass should make
+// blind, since every consumer of `OracleSignal::payload` across the
+// workspace would need updating and none of that code is visible from
+// omega-core. Flagged here rather than silently reshaped.
+//
 // Spec references:
 //   §2   — L0/L1 channel map (oracle → EIL → strategy)
 //   §6   — EIL double-buffer; state_version staleness detection
@@ -100,4 +129,65 @@ pub struct OracleSignal {
     ///   OrderFlow    → `{ "tx_hash": "0x…", "decoded_swap": { … } }`
     ///   FeeOracle    → `{ "base_fee_gwei": N, "l1_data_fee_gwei": N, "priority_fee_gwei": N }`
     pub payload: serde_json::Value,
+}
+
+impl OracleSignal {
+    /// Age of this signal in milliseconds relative to `now_unix_ms`.
+    ///
+    /// Saturates to 0 rather than underflowing/panicking if
+    /// `received_at_unix_ms` is somehow in the future relative to
+    /// `now_unix_ms` (clock skew between the oracle-layer host and the
+    /// caller, or an out-of-order/replayed signal) — a naive `now -
+    /// self.received_at_unix_ms` would panic on underflow in a debug
+    /// build and silently wrap to a huge, wrong value in release,
+    /// either of which is worse than reporting age 0 for a signal that,
+    /// from its own timestamp's perspective, isn't stale at all.
+    ///
+    /// This crate deliberately does not hardcode a staleness threshold
+    /// here — that belongs to whichever config governs the consuming
+    /// layer (e.g. an `OmegaConfig`-owned max-age setting), not to the
+    /// signal type itself. This method supplies the safe age
+    /// computation; the threshold comparison is the caller's job.
+    #[inline]
+    pub fn age_ms(&self, now_unix_ms: u64) -> u64 {
+        now_unix_ms.saturating_sub(self.received_at_unix_ms)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sample_signal(received_at_unix_ms: u64) -> OracleSignal {
+        OracleSignal {
+            kind: SignalKind::SpotPrice,
+            chain_id: 42161,
+            block_number: 100,
+            received_at_unix_ms,
+            state_version: 1,
+            state_hash: B256::ZERO,
+            payload: serde_json::json!({ "token": "0x0", "price_usd_e18": "1" }),
+        }
+    }
+
+    #[test]
+    fn age_ms_normal_case() {
+        let s = sample_signal(1_000);
+        assert_eq!(s.age_ms(1_500), 500);
+    }
+
+    #[test]
+    fn age_ms_zero_when_now_equals_received() {
+        let s = sample_signal(1_000);
+        assert_eq!(s.age_ms(1_000), 0);
+    }
+
+    #[test]
+    fn age_ms_saturates_instead_of_underflowing() {
+        // received_at is AFTER "now" — clock skew / out-of-order arrival.
+        // A naive subtraction here would panic (debug) or wrap to a huge
+        // u64 (release); age_ms must instead report 0.
+        let s = sample_signal(2_000);
+        assert_eq!(s.age_ms(1_000), 0, "must saturate to 0, not underflow");
+    }
 }

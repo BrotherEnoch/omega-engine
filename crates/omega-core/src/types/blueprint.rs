@@ -8,6 +8,40 @@
 // and loss attribution.  No field is mutated after construction; any
 // re-pricing or re-scoring produces a *new* blueprint with a fresh hash.
 //
+// ## Audit findings fixed in this pass
+//
+// 1. BOUNDARY DISAGREEMENT WITH omega-risk (critical): `is_expired` and
+//    `is_profitable` previously used strict `>`, while the actually-
+//    enforced pre-trade gates in `omega_risk::checks` (`check_expiry`,
+//    `check_dynamic_profit`) use `>=`/`<` respectively — meaning a
+//    blueprint sitting exactly at its expiry block, or exactly at its
+//    minimum profit threshold, could get a different accept/reject
+//    answer depending which of the two independent implementations a
+//    caller happened to consult. Both methods here are now aligned to
+//    match omega-risk's boundary semantics exactly, since that's the
+//    check pipeline actually wired into submission.
+//
+// 2. GAS BUDGET TRUNCATION: `total_l2_gas_budget` computed
+//    `(gas_estimate as f64 * buffer_factor) as u64`, which truncates
+//    toward zero. Since this produces a BUDGET (a cap the downstream
+//    fee calculation must not underestimate), truncating silently
+//    under-budgets gas on every blueprint by up to the fractional
+//    remainder. Fixed to round up — same reasoning already applied to
+//    `omega_risk::gas_model::dynamic_min_profit` in this codebase.
+//
+// 3. HASH INTEGRITY GAP: every field is `pub` with no constructor, so
+//    nothing stops a caller from mutating a field after construction —
+//    silently desyncing `blueprint_hash` from the blueprint's actual
+//    contents without ever recomputing it, corrupting its role as the
+//    Loss Attribution join key (§13) and ZK vault proof input (§15).
+//    Added `compute_hash()`/`verify_hash()` as an additive integrity
+//    check callable at any trust boundary. This does NOT change field
+//    visibility (a breaking change across every crate that constructs
+//    an ExecutionBlueprint, which this crate can't see) — it gives
+//    downstream code a way to detect the problem, not a way to prevent
+//    the mutation at the type level. See `compute_hash`'s own doc
+//    comment for an important integration requirement this implies.
+//
 // Spec references:
 //   §1.1  — phases and StrategyId mapping
 //   §7    — Arbitrum dual-component gas model fields
@@ -124,6 +158,11 @@ pub struct ExecutionBlueprint {
     /// keccak256 of the canonical serialised blueprint fields (all fields
     /// except `blueprint_hash` itself).  Acts as the join key in Loss
     /// Attribution (§13) and the ZK vault proof input (§15).
+    ///
+    /// Nothing in the type system currently prevents this from
+    /// desyncing from the blueprint's actual field values if a field is
+    /// mutated after construction (every field here is `pub`). Call
+    /// `verify_hash()` at any trust boundary to catch that.
     pub blueprint_hash: B256,
 
     /// EIP-155 chain ID.  1 = Ethereum mainnet, 42161 = Arbitrum One.
@@ -245,13 +284,56 @@ pub struct ExecutionBlueprint {
     /// Ordered list of relay endpoint identifiers.  Populated by the
     /// Gas War Engine using LA-inclusion-rate ranking (§11.2).
     /// Must have at least one entry; may have up to 4 (cascade mode).
+    ///
+    /// NOTE: populated AFTER blueprint_hash is committed — deliberately
+    /// excluded from `compute_hash()`'s input set (see that method).
     pub relay_targets: Vec<String>,
 
     // ── ZK ───────────────────────────────────────────────────────────────
     /// Commitment to the StarkProof that gates Vault profit release (§15).
     /// None during blueprint construction; set by the ZK layer before
     /// relay submission when ZK is required for this strategy.
+    ///
+    /// NOTE: populated AFTER blueprint_hash is committed — deliberately
+    /// excluded from `compute_hash()`'s input set (see that method).
     pub zk_proof_commitment: Option<B256>,
+}
+
+/// Fields hashed by `ExecutionBlueprint::compute_hash`. Deliberately
+/// excludes `blueprint_hash` itself (a field can't authenticate its own
+/// value) and `relay_targets`/`zk_proof_commitment`, which are populated
+/// in LATER pipeline stages — including them would make `verify_hash()`
+/// fail for every legitimately-constructed blueprint the moment those
+/// later stages do their job.
+#[derive(Debug, Serialize)]
+struct HashedFields {
+    chain_id: u64,
+    strategy_id: StrategyId,
+    lane: Lane,
+    simulator: Simulator,
+    signal_state_hash: B256,
+    state_version: u64,
+    flashloan_provider: Address,
+    flashloan_amount: U256,
+    flashloan_available: U256,
+    calldata: Bytes,
+    strategy_bytecode_hash: B256,
+    l2_exec_gas_estimate: u64,
+    l1_data_gas_estimate: u64,
+    extraction_gas: u64,
+    expected_profit_net: U256,
+    dynamic_min_profit: U256,
+    l2_buffer_factor_bits: u64,
+    l1_data_buffer_factor_bits: u64,
+    slippage_bps: u16,
+    base_fee_at_creation: u64,
+    l1_data_fee_at_creation: u64,
+    priority_fee_gwei: u64,
+    price_impact_bps: Option<u16>,
+    ofa_compliant: bool,
+    expiry_block: u64,
+    nonce: u64,
+    confirmation_depth: u8,
 }
 
 impl ExecutionBlueprint {
@@ -261,7 +343,10 @@ impl ExecutionBlueprint {
     /// (strategy_id, chain_id) combination has an independent nonce
     /// sequence — preventing cross-strategy replay.
     pub fn nonce_key(strategy_id: StrategyId, chain_id: u64) -> B256 {
-        let mut buf = Vec::with_capacity(36);
+        // 32-byte hash + 8-byte chain_id = 40 bytes (previously
+        // under-allocated at 36; harmless — Vec reallocates
+        // automatically — but corrected since it's a one-line fix).
+        let mut buf = Vec::with_capacity(40);
         // Stable strategy discriminant — format!("{strategy_id}") is
         // used rather than the enum index to survive enum reordering.
         buf.extend_from_slice(keccak256(strategy_id.to_string().as_bytes()).as_slice());
@@ -295,34 +380,348 @@ impl ExecutionBlueprint {
 
     /// Returns the total L2 gas budget including extraction overhead.
     ///
-    /// total = (l2_exec_gas_estimate × l2_buffer_factor) + extraction_gas
+    /// total = ceil(l2_exec_gas_estimate × l2_buffer_factor) + extraction_gas
     ///
     /// Used by the Gas War Engine fee cap calculation (§12).
+    ///
+    /// Rounds UP (`.ceil()`), not truncates: this is a gas BUDGET (a cap
+    /// the downstream fee calculation must not underestimate), so any
+    /// fractional gas from the buffer multiplication must round up, not
+    /// down — same reasoning as
+    /// `omega_risk::gas_model::dynamic_min_profit`'s cost-floor rounding
+    /// elsewhere in this codebase. Truncating here would silently
+    /// under-budget gas by up to one unit's worth of fractional
+    /// remainder on every single blueprint.
     #[inline]
     pub fn total_l2_gas_budget(&self) -> u64 {
-        let buffered = (self.l2_exec_gas_estimate as f64 * self.l2_buffer_factor) as u64;
+        let buffered = (self.l2_exec_gas_estimate as f64 * self.l2_buffer_factor).ceil() as u64;
         buffered.saturating_add(self.extraction_gas)
     }
 
-    /// Returns `true` when `expected_profit_net` exceeds `dynamic_min_profit`.
+    /// Returns `true` when `expected_profit_net` meets or exceeds
+    /// `dynamic_min_profit`.
     ///
     /// This is the primary profitability gate checked before relay
     /// submission and before emergency bundle emission (§12.1).
+    ///
+    /// CONSISTENCY NOTE: uses `>=`, matching the authoritative pre-trade
+    /// gate `omega_risk::checks::check_dynamic_profit` (check 5 of 13),
+    /// which rejects only `expected_profit_net_wei 
+    /// dynamic_min_profit_wei` — i.e. treats an exact tie as profitable.
+    /// This method previously used strict `>`, which meant a blueprint
+    /// sitting exactly at its minimum profit threshold would read as
+    /// "not profitable" here while simultaneously PASSING the actual
+    /// enforced check in omega-risk. This is a convenience method, not a
+    /// substitute for the full 13-check omega-risk pipeline — it's
+    /// aligned to that pipeline's boundary semantics specifically so the
+    /// two can never silently disagree again.
     #[inline]
     pub fn is_profitable(&self) -> bool {
-        self.expected_profit_net > self.dynamic_min_profit
+        self.expected_profit_net >= self.dynamic_min_profit
     }
 
-    /// Returns `true` when this blueprint has exceeded its expiry block.
+    /// Returns `true` when this blueprint has reached or passed its
+    /// expiry block.
+    ///
+    /// CONSISTENCY NOTE: uses `>=`, matching the authoritative pre-trade
+    /// gate `omega_risk::checks::check_expiry` (check 2 of 13), which
+    /// rejects when `current_block >= bp.expiry_block`. This method
+    /// previously used strict `>`, meaning a blueprint sitting exactly
+    /// AT its expiry block would read as "not expired" here while the
+    /// actually-enforced check would already reject it — a blueprint
+    /// could pass this convenience check while the real gate silently
+    /// drops it, or vice versa if some path trusted only this method.
     #[inline]
     pub fn is_expired(&self, current_block: u64) -> bool {
-        current_block > self.expiry_block
+        current_block >= self.expiry_block
     }
 
     /// Returns `true` when `flashloan_amount` is within available
-    /// liquidity.  Checked during blueprint construction (§11).
+    /// liquidity, as of the flashloan snapshot recorded on this
+    /// blueprint.
+    ///
+    /// IMPORTANT: this is a raw feasibility check only — `amount <=
+    /// available`, no safety margin. It is NOT a substitute for the
+    /// full pre-trade `omega_risk::checks::check_flashloan_liquidity`,
+    /// which additionally requires `available >= amount × 1.20` (a 20%
+    /// safety margin, since a razor-thin margin can be consumed by a
+    /// competing transaction in the same block) and enforces the
+    /// no-self-flash rule (flashloan provider ≠ liquidation target
+    /// protocol). Do not treat `flashloan_feasible() == true` as
+    /// sufficient grounds to proceed with execution on its own.
     #[inline]
     pub fn flashloan_feasible(&self) -> bool {
         self.flashloan_amount <= self.flashloan_available
+    }
+
+    /// Deterministically recomputes what `blueprint_hash` should be
+    /// from every field fixed at construction time — everything except
+    /// `blueprint_hash` itself (self-referential) and the two fields
+    /// populated in later pipeline stages, `relay_targets` (Gas War
+    /// Engine, §12) and `zk_proof_commitment` (ZK layer, §15).
+    ///
+    /// This exists because every field on this struct is `pub`, so
+    /// nothing in the type system stops a caller from mutating a field
+    /// after construction — silently desyncing `blueprint_hash` from
+    /// the blueprint's actual contents. Call `verify_hash()` at any
+    /// trust boundary (before simulation, before relay submission) to
+    /// catch that.
+    ///
+    /// ## Encoding
+    ///
+    /// Fields are concatenated in a fixed, explicitly-specified byte
+    /// layout (big-endian integers, raw fixed-width bytes for
+    /// B256/Address/U256, IEEE-754 bit patterns for the two f64 buffer
+    /// factors) and hashed with keccak256 — deliberately NOT delegated
+    /// to `bincode` or another general-purpose serializer, since this
+    /// value is also used as a ZK vault proof input (§15) and a hash
+    /// commitment's byte layout needs to be self-specified and stable,
+    /// not dependent on a third-party crate's internal wire format
+    /// (which is not a byte-for-byte stability guarantee the way a
+    /// commitment scheme needs).
+    ///
+    /// ## Integration requirement
+    ///
+    /// Whatever code originally computes and sets `blueprint_hash` in
+    /// `StrategyTrait::build_blueprint` implementations (omega-strategies
+    /// — not visible from omega-core) MUST use this exact same field
+    /// set and encoding, or `verify_hash()` will report every
+    /// legitimately-constructed blueprint as tampered. This is the
+    /// reference encoding; align the real construction path to it (or
+    /// this method to the real one) as a follow-up — omega-core cannot
+    /// see that code to confirm which direction the alignment needs to
+    /// go.
+    pub fn compute_hash(&self) -> B256 {
+        let mut buf = Vec::with_capacity(512);
+        buf.extend_from_slice(&self.chain_id.to_be_bytes());
+        buf.extend_from_slice(self.strategy_id.to_string().as_bytes());
+        buf.push(match self.lane {
+            Lane::Microtx => 0u8,
+            Lane::Normal => 1u8,
+        });
+        buf.push(match self.simulator {
+            Simulator::Revm => 0u8,
+            Simulator::Anvil => 1u8,
+        });
+        buf.extend_from_slice(self.signal_state_hash.as_slice());
+        buf.extend_from_slice(&self.state_version.to_be_bytes());
+        buf.extend_from_slice(self.flashloan_provider.as_slice());
+        buf.extend_from_slice(&self.flashloan_amount.to_be_bytes::<32>());
+        buf.extend_from_slice(&self.flashloan_available.to_be_bytes::<32>());
+        buf.extend_from_slice(&self.calldata);
+        buf.extend_from_slice(self.strategy_bytecode_hash.as_slice());
+        buf.extend_from_slice(&self.l2_exec_gas_estimate.to_be_bytes());
+        buf.extend_from_slice(&self.l1_data_gas_estimate.to_be_bytes());
+        buf.extend_from_slice(&self.extraction_gas.to_be_bytes());
+        buf.extend_from_slice(&self.expected_profit_net.to_be_bytes::<32>());
+        buf.extend_from_slice(&self.dynamic_min_profit.to_be_bytes::<32>());
+        // f64 bit pattern, not the float value itself — deterministic,
+        // avoids any float-formatting ambiguity in a hash input.
+        buf.extend_from_slice(&self.l2_buffer_factor.to_bits().to_be_bytes());
+        buf.extend_from_slice(&self.l1_data_buffer_factor.to_bits().to_be_bytes());
+        buf.extend_from_slice(&self.slippage_bps.to_be_bytes());
+        buf.extend_from_slice(&self.base_fee_at_creation.to_be_bytes());
+        buf.extend_from_slice(&self.l1_data_fee_at_creation.to_be_bytes());
+        buf.extend_from_slice(&self.priority_fee_gwei.to_be_bytes());
+        // Option<u16>: explicit discriminant byte + value, so None and
+        // Some(0) remain distinguishable in the hash input.
+        match self.price_impact_bps {
+            Some(v) => {
+                buf.push(1);
+                buf.extend_from_slice(&v.to_be_bytes());
+            }
+            None => {
+                buf.push(0);
+                buf.extend_from_slice(&0u16.to_be_bytes());
+            }
+        }
+        buf.push(self.ofa_compliant as u8);
+        buf.extend_from_slice(&self.expiry_block.to_be_bytes());
+        buf.extend_from_slice(&self.nonce.to_be_bytes());
+        buf.push(self.confirmation_depth);
+        keccak256(&buf)
+    }
+
+    /// True if `blueprint_hash` matches what `compute_hash()` derives
+    /// from the blueprint's current field values, right now.
+    ///
+    /// Call this at any trust boundary — right before simulation, right
+    /// before relay submission — as a cheap integrity check that
+    /// nothing mutated a field after construction without recomputing
+    /// the hash. A blueprint that fails this check should be treated
+    /// the same as a SIMULATION_STATE_MISMATCH: discard it, never
+    /// submit it.
+    #[inline]
+    pub fn verify_hash(&self) -> bool {
+        self.blueprint_hash == self.compute_hash()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sample_blueprint() -> ExecutionBlueprint {
+        let mut bp = ExecutionBlueprint {
+            blueprint_hash: B256::ZERO, // placeholder; overwritten below
+            chain_id: 42161,
+            strategy_id: StrategyId::Sa,
+            lane: Lane::Microtx,
+            simulator: Simulator::Revm,
+            signal_state_hash: B256::from([0xABu8; 32]),
+            state_version: 7,
+            flashloan_provider: Address::ZERO,
+            flashloan_amount: U256::from(1_000_000u64),
+            flashloan_available: U256::from(2_000_000u64),
+            calldata: Bytes::from_static(&[0xde, 0xad, 0xbe, 0xef]),
+            strategy_bytecode_hash: B256::from([0xCDu8; 32]),
+            l2_exec_gas_estimate: 100_000,
+            l1_data_gas_estimate: 5_000,
+            extraction_gas: 45_000,
+            expected_profit_net: U256::from(1_000_000_000_000_000_000u128),
+            dynamic_min_profit: U256::from(100_000_000_000_000_000u128),
+            l2_buffer_factor: 1.15,
+            l1_data_buffer_factor: 1.10,
+            slippage_bps: 20,
+            base_fee_at_creation: 1,
+            l1_data_fee_at_creation: 40,
+            priority_fee_gwei: 10,
+            price_impact_bps: Some(15),
+            ofa_compliant: true,
+            expiry_block: 1_000,
+            nonce: 1,
+            confirmation_depth: 12,
+            relay_targets: vec!["flashbots".to_string()],
+            zk_proof_commitment: None,
+        };
+        bp.blueprint_hash = bp.compute_hash();
+        bp
+    }
+
+    #[test]
+    fn compute_hash_is_deterministic() {
+        let bp = sample_blueprint();
+        assert_eq!(bp.compute_hash(), bp.compute_hash());
+    }
+
+    #[test]
+    fn verify_hash_passes_for_freshly_constructed_blueprint() {
+        let bp = sample_blueprint();
+        assert!(bp.verify_hash());
+    }
+
+    #[test]
+    fn verify_hash_fails_after_mutating_a_hashed_field() {
+        let mut bp = sample_blueprint();
+        bp.expected_profit_net = U256::from(999u64);
+        assert!(!bp.verify_hash(), "mutating a hashed field must desync blueprint_hash");
+    }
+
+    #[test]
+    fn verify_hash_unaffected_by_post_construction_fields() {
+        // relay_targets and zk_proof_commitment are populated in LATER
+        // pipeline stages (Gas War Engine, ZK layer) — mutating them
+        // after construction must NOT break verify_hash(), since they
+        // were never part of the original commitment.
+        let mut bp = sample_blueprint();
+        assert!(bp.verify_hash());
+        bp.relay_targets = vec!["bloxroute".to_string(), "titan".to_string()];
+        bp.zk_proof_commitment = Some(B256::from([0xEFu8; 32]));
+        assert!(
+            bp.verify_hash(),
+            "relay_targets/zk_proof_commitment are intentionally excluded from the hash"
+        );
+    }
+
+    #[test]
+    fn is_expired_boundary_matches_omega_risk_check_expiry() {
+        let bp = sample_blueprint(); // expiry_block = 1_000
+        assert!(!bp.is_expired(999), "before expiry: not expired");
+        assert!(
+            bp.is_expired(1_000),
+            "AT expiry_block: must already be expired (matches check_expiry's >=)"
+        );
+        assert!(bp.is_expired(1_001), "past expiry: expired");
+    }
+
+    #[test]
+    fn is_profitable_boundary_matches_omega_risk_check_dynamic_profit() {
+        let mut bp = sample_blueprint();
+        bp.expected_profit_net = bp.dynamic_min_profit; // exact tie
+        assert!(
+            bp.is_profitable(),
+            "exact tie must be profitable, matching check_dynamic_profit's strict-< rejection"
+        );
+
+        bp.expected_profit_net = bp.dynamic_min_profit - U256::from(1u64);
+        assert!(!bp.is_profitable());
+    }
+
+    #[test]
+    fn total_l2_gas_budget_rounds_up_not_down() {
+        let mut bp = sample_blueprint();
+        // 3 gas * 1.10 buffer = 3.3 -> must ceil to 4, not truncate to 3.
+        bp.l2_exec_gas_estimate = 3;
+        bp.l2_buffer_factor = 1.10;
+        bp.extraction_gas = 0;
+        assert_eq!(bp.total_l2_gas_budget(), 4);
+    }
+
+    #[test]
+    fn total_l2_gas_budget_includes_extraction_gas() {
+        let mut bp = sample_blueprint();
+        bp.l2_exec_gas_estimate = 100_000;
+        bp.l2_buffer_factor = 1.0; // no rounding ambiguity
+        bp.extraction_gas = 45_000;
+        assert_eq!(bp.total_l2_gas_budget(), 145_000);
+    }
+
+    #[test]
+    fn flashloan_feasible_boundary() {
+        let mut bp = sample_blueprint();
+        bp.flashloan_amount = U256::from(500u64);
+        bp.flashloan_available = U256::from(500u64);
+        assert!(
+            bp.flashloan_feasible(),
+            "amount == available is feasible (raw check only, no safety margin)"
+        );
+        bp.flashloan_amount = U256::from(501u64);
+        assert!(!bp.flashloan_feasible());
+    }
+
+    #[test]
+    fn select_simulator_rule() {
+        assert_eq!(
+            ExecutionBlueprint::select_simulator(Lane::Microtx, 199_999),
+            Simulator::Revm
+        );
+        assert_eq!(
+            ExecutionBlueprint::select_simulator(Lane::Microtx, 200_000),
+            Simulator::Anvil
+        );
+        assert_eq!(
+            ExecutionBlueprint::select_simulator(Lane::Normal, 1_000),
+            Simulator::Anvil
+        );
+    }
+
+    #[test]
+    fn nonce_key_is_stable_and_distinguishes_chains() {
+        let k1 = ExecutionBlueprint::nonce_key(StrategyId::Sa, 42161);
+        let k2 = ExecutionBlueprint::nonce_key(StrategyId::Sa, 42161);
+        let k3 = ExecutionBlueprint::nonce_key(StrategyId::Sa, 1);
+        let k4 = ExecutionBlueprint::nonce_key(StrategyId::La, 42161);
+        assert_eq!(k1, k2, "same inputs must produce the same key");
+        assert_ne!(k1, k3, "different chain_id must produce a different key");
+        assert_ne!(k1, k4, "different strategy_id must produce a different key");
+    }
+
+    #[test]
+    fn is_canary_delegates_to_strategy_id() {
+        let mut bp = sample_blueprint();
+        bp.strategy_id = StrategyId::Cnry;
+        assert!(bp.is_canary());
+        bp.strategy_id = StrategyId::Sa;
+        assert!(!bp.is_canary());
     }
 }

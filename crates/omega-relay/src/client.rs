@@ -10,6 +10,7 @@ use serde::{Deserialize, Serialize};
 use tracing::{debug, warn};
 
 use crate::error::{RelayError, RelayResult};
+use crate::signing::RelayAuth;
 
 // ── Bundle payload ────────────────────────────────────────────────────────────
 
@@ -33,10 +34,18 @@ pub struct BundlePayload {
 }
 
 /// Outcome of a single relay submission.
+///
+/// CHANGE: this field used to be named `included` and was set to `true` on any
+/// successful HTTP response — which only means the relay's endpoint acknowledged the
+/// request, not that the bundle landed on-chain. Renamed to `accepted` to say exactly
+/// what it actually measures. Real inclusion is a separate fact, confirmed later via
+/// `confirmation::InclusionTracker` against real chain state — see that module.
 #[derive(Debug, Clone)]
 pub struct SubmissionOutcome {
-    /// Whether the relay reported the bundle as included.
-    pub included: bool,
+    /// Whether the relay's HTTP endpoint acknowledged the submission (HTTP success, no
+    /// JSON-RPC error). This is NOT confirmation of on-chain inclusion — see the
+    /// `confirmation` module for that.
+    pub accepted: bool,
     /// Relay-assigned bundle UUID (if returned).
     pub relay_bundle_id: Option<String>,
 }
@@ -46,7 +55,8 @@ pub struct SubmissionOutcome {
 /// Abstraction over a single relay endpoint.
 #[async_trait]
 pub trait RelayClient: Send + Sync + 'static {
-    /// Submit a bundle. Returns `Ok(SubmissionOutcome)` on HTTP 200.
+    /// Submit a bundle. Returns `Ok(SubmissionOutcome)` on HTTP 200 — see
+    /// `SubmissionOutcome::accepted`'s docs for what that does and doesn't mean.
     async fn submit_bundle(&self, bundle: BundlePayload) -> RelayResult<SubmissionOutcome>;
     /// Human-readable name for logging.
     fn name(&self) -> &str;
@@ -84,15 +94,26 @@ pub struct HttpRelayClient {
     name:     String,
     endpoint: String,
     client:   Client,
+    auth:     RelayAuth,
 }
 
 impl HttpRelayClient {
-    /// Construct with a shared `reqwest::Client` (allows connection pooling across multiple relays).
-    pub fn new(name: impl Into<String>, endpoint: impl Into<String>, client: Client) -> Arc<Self> {
+    /// Construct with a shared `reqwest::Client` (allows connection pooling across
+    /// multiple relays) and a `RelayAuth` — see `signing::RelayAuth` for the two real
+    /// auth styles (`FlashbotsStyle` for Flashbots/Titan, `BearerToken` for
+    /// bloXroute/Eden). CHANGE: `auth` is a new required parameter — the prior
+    /// constructor had no way to authenticate submissions at all.
+    pub fn new(
+        name: impl Into<String>,
+        endpoint: impl Into<String>,
+        client: Client,
+        auth: RelayAuth,
+    ) -> Arc<Self> {
         Arc::new(Self {
             name:     name.into(),
             endpoint: endpoint.into(),
             client,
+            auth,
         })
     }
 
@@ -123,16 +144,25 @@ impl RelayClient for HttpRelayClient {
             params:  std::slice::from_ref(&params),
         };
 
-        let resp = self
+        // Serialize to the EXACT bytes we're about to send, once — auth signing (for
+        // FlashbotsStyle) covers these bytes precisely, so signing anything other than
+        // the literal bytes on the wire would produce a signature the relay can't verify.
+        let body_bytes = serde_json::to_vec(&body).map_err(RelayError::Serde)?;
+        let auth_headers = self.auth.headers_for_body(&body_bytes)?;
+
+        let mut req = self
             .client
             .post(&self.endpoint)
-            .json(&body)
-            .send()
-            .await
-            .map_err(|e| RelayError::RequestFailed {
-                relay:  self.name.clone(),
-                source: e,
-            })?;
+            .header("Content-Type", "application/json")
+            .body(body_bytes);
+        for (name, value) in auth_headers {
+            req = req.header(name, value);
+        }
+
+        let resp = req.send().await.map_err(|e| RelayError::RequestFailed {
+            relay:  self.name.clone(),
+            source: e,
+        })?;
 
         let status = resp.status();
 
@@ -169,10 +199,10 @@ impl RelayClient for HttpRelayClient {
         debug!(
             relay       = %self.name,
             bundle_hash = %bundle.bundle_hash,
-            "bundle submitted successfully"
+            "bundle submission accepted by relay (not yet confirmed on-chain)"
         );
 
-        Ok(SubmissionOutcome { included: true, relay_bundle_id })
+        Ok(SubmissionOutcome { accepted: true, relay_bundle_id })
     }
 
     fn name(&self) -> &str { &self.name }
@@ -184,28 +214,28 @@ impl RelayClient for HttpRelayClient {
 #[cfg(any(test, feature = "test-utils"))]
 pub struct MockRelayClient {
     name: String,
-    /// Whether this mock will report inclusion.
-    pub includes: bool,
+    /// Whether this mock will report acceptance.
+    pub accepts: bool,
     /// Count of bundles received.
     pub received: std::sync::atomic::AtomicUsize,
 }
 
 #[cfg(any(test, feature = "test-utils"))]
 impl MockRelayClient {
-    /// Create a mock relay that either includes or rejects every bundle.
-    pub fn new(includes: bool) -> Self {
+    /// Create a mock relay that either accepts or rejects every bundle.
+    pub fn new(accepts: bool) -> Self {
         Self {
-            name: if includes { "mock-include" } else { "mock-reject" }.into(),
-            includes,
+            name: if accepts { "mock-accept" } else { "mock-reject" }.into(),
+            accepts,
             received: std::sync::atomic::AtomicUsize::new(0),
         }
     }
 
     /// Create a mock relay with a specific name.
-    pub fn with_name(name: impl Into<String>, includes: bool) -> Self {
+    pub fn with_name(name: impl Into<String>, accepts: bool) -> Self {
         Self {
             name:     name.into(),
-            includes,
+            accepts,
             received: std::sync::atomic::AtomicUsize::new(0),
         }
     }
@@ -222,7 +252,7 @@ impl RelayClient for MockRelayClient {
     async fn submit_bundle(&self, bundle: BundlePayload) -> RelayResult<SubmissionOutcome> {
         self.received.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         Ok(SubmissionOutcome {
-            included:        self.includes,
+            accepted:        self.accepts,
             relay_bundle_id: Some(format!("mock-{}", bundle.bundle_hash)),
         })
     }
@@ -238,24 +268,24 @@ mod tests {
     use super::*;
 
     #[tokio::test]
-    async fn mock_include_reports_included() {
+    async fn mock_accept_reports_accepted() {
         let client  = MockRelayClient::new(true);
         let outcome = client
             .submit_bundle(BundlePayload { bundle_hash: "0xtest".into(), ..Default::default() })
             .await
             .unwrap();
-        assert!(outcome.included);
+        assert!(outcome.accepted);
         assert_eq!(client.received_count(), 1);
     }
 
     #[tokio::test]
-    async fn mock_reject_reports_not_included() {
+    async fn mock_reject_reports_not_accepted() {
         let client  = MockRelayClient::new(false);
         let outcome = client
             .submit_bundle(BundlePayload { bundle_hash: "0xtest".into(), ..Default::default() })
             .await
             .unwrap();
-        assert!(!outcome.included);
+        assert!(!outcome.accepted);
     }
 
     #[tokio::test]

@@ -21,17 +21,31 @@
 //
 // ## Backpressure
 //
-//   `wait_until_allowed` sleeps 5ms per retry.  This is intentional:
-//   on a 500 rps budget the sleep duration is short enough to keep
-//   overall latency below 10ms while preventing a tight spin that
-//   would waste CPU.  The Tokio executor is not blocked — it is an
-//   async sleep.
+//   `wait_until_allowed` computes the exact time until a token becomes
+//   available and sleeps for that duration (minimum 1ms) rather than
+//   polling on a fixed interval — this keeps latency low without a
+//   tight spin.  The Tokio executor is not blocked — it is an async
+//   sleep.
 //
 // ## Thread safety
 //
 //   `RpcRateLimiter` is `Clone` and `Send + Sync`.  The inner state
 //   is wrapped in `Arc<Mutex<…>>`.  The Mutex is async (Tokio) — it
 //   never blocks an OS thread.
+//
+// ## Audit finding fixed in this pass
+//
+// `RateLimiterSnapshot::rpc_headroom()` previously hardcoded an assumed
+// read-bucket capacity of 400 in its calculation. `OmegaRpcClient::connect`
+// (client.rs) constructs CUSTOM bucket capacities from
+// `config.rps_limit` whenever it's nonzero — meaning any client
+// configured with an `rps_limit` other than the exact value that
+// produces a 400-capacity read bucket would silently get a WRONG
+// headroom fraction from this method: too generous (risking an
+// unexpected real rate-limit hit at the worst time) or too conservative
+// (risking throttling legitimate trading activity for no real reason),
+// depending on direction. Fixed by tracking and reporting the actual
+// configured capacity in every snapshot rather than assuming one.
 
 use std::time::{Duration, Instant};
 
@@ -133,6 +147,12 @@ impl TokenBucket {
     }
 
     /// Accumulate tokens for time elapsed since the last call.
+    ///
+    /// Uses `Instant`, which is monotonic — this cannot go backwards
+    /// even if the system wall clock is adjusted, so `elapsed` can
+    /// never be negative here in practice; the `<= 0.0` guard below
+    /// only handles the same-instant (zero-elapsed) case, not clock
+    /// skew.
     fn refill(&mut self) {
         let now = Instant::now();
         let elapsed = now.duration_since(self.last_refill).as_secs_f64();
@@ -143,6 +163,10 @@ impl TokenBucket {
         }
 
         let added = elapsed * self.refill_rate;
+        // Clamping to `capacity` on every refill call bounds any
+        // floating-point drift over a long process uptime — tokens can
+        // never accumulate past capacity regardless of how many refill
+        // calls have happened, so imprecision can't compound unbounded.
         self.tokens = (self.tokens + added).min(self.capacity as f64);
         self.last_refill = now;
     }
@@ -162,6 +186,11 @@ impl TokenBucket {
     fn available(&mut self) -> f64 {
         self.refill();
         self.tokens
+    }
+
+    /// This bucket's configured capacity.
+    fn capacity(&self) -> u32 {
+        self.capacity
     }
 
     /// Time until at least one token is available, in seconds.
@@ -252,10 +281,21 @@ impl RpcRateLimiter {
 
     /// Wait until a token of `kind` is available, then consume it.
     ///
-    /// Uses the computed time-until-available to sleep efficiently rather
-    /// than polling on a fixed 5ms interval — this reduces unnecessary
-    /// wakeups under load.  Falls back to a minimum 1ms sleep to avoid
-    /// zero-duration sleeps that waste CPU without yielding.
+    /// Computes the exact time-until-available and sleeps for that
+    /// duration rather than polling on a fixed interval — this reduces
+    /// unnecessary wakeups under load while keeping latency low.  Falls
+    /// back to a minimum 1ms sleep to avoid zero-duration sleeps that
+    /// waste CPU without yielding.
+    ///
+    /// The time-until-available value is read under one lock
+    /// acquisition and then re-checked via `allow()` under a SEPARATE
+    /// acquisition — there is a real time-of-check-to-time-of-use gap
+    /// between those two lock holds if multiple callers race for the
+    /// same bucket. This is handled correctly, not accidentally: if
+    /// another waiter consumes the token first, `allow()`'s own
+    /// `try_consume()` call (which re-checks state fresh, under its own
+    /// lock) simply returns `false`, and the loop retries rather than
+    /// assuming the earlier read is still valid.
     pub async fn wait_until_allowed(&self, kind: RpcRequestKind) {
         loop {
             let wait_secs = {
@@ -269,11 +309,15 @@ impl RpcRateLimiter {
             };
 
             if wait_secs <= 0.0 {
-                // Token is available — try to consume
+                // Token appeared available as of the read above — try
+                // to consume it now.
                 if self.allow(kind).await {
                     return;
                 }
-                // Race: another waiter consumed it first; retry immediately
+                // Race: another waiter consumed it first between our
+                // read and our consume attempt; retry immediately
+                // rather than sleeping, since a token may already be
+                // available again.
                 continue;
             }
 
@@ -283,13 +327,17 @@ impl RpcRateLimiter {
         }
     }
 
-    /// Telemetry snapshot of current bucket state and cumulative counts.
+    /// Telemetry snapshot of current bucket state, configured
+    /// capacities, and cumulative counts.
     pub async fn snapshot(&self) -> RateLimiterSnapshot {
         let mut g = self.inner.lock().await;
         RateLimiterSnapshot {
             read_tokens: g.read.available(),
+            read_capacity: g.read.capacity(),
             write_tokens: g.write.available(),
+            write_capacity: g.write.capacity(),
             subscribe_tokens: g.subscribe.available(),
+            subscribe_capacity: g.subscribe.capacity(),
             total_reads: g.total_reads,
             total_writes: g.total_writes,
             total_subscribes: g.total_subscribes,
@@ -313,10 +361,18 @@ impl Default for RpcRateLimiter {
 pub struct RateLimiterSnapshot {
     /// Available read tokens (after refill).
     pub read_tokens: f64,
+    /// The read bucket's CONFIGURED capacity — tracked explicitly
+    /// rather than assumed, since `OmegaRpcClient::connect` can
+    /// construct a non-default capacity from `config.rps_limit`.
+    pub read_capacity: u32,
     /// Available write tokens.
     pub write_tokens: f64,
+    /// The write bucket's configured capacity.
+    pub write_capacity: u32,
     /// Available subscribe tokens.
     pub subscribe_tokens: f64,
+    /// The subscribe bucket's configured capacity.
+    pub subscribe_capacity: u32,
     /// Cumulative read requests allowed.
     pub total_reads: u64,
     /// Cumulative write requests allowed.
@@ -329,19 +385,26 @@ pub struct RateLimiterSnapshot {
 
 impl RateLimiterSnapshot {
     /// Returns `true` when both read and write buckets have capacity.
-    ///
-    /// Used by the health monitor to detect RPC rate exhaustion.
     pub fn is_healthy(&self) -> bool {
         self.read_tokens > 1.0 && self.write_tokens > 1.0
     }
 
-    /// RPC headroom metric (shadow scorecard `rpc_headroom`).
+    /// RPC headroom metric (shadow scorecard `rpc_headroom`):
+    /// fraction of the READ bucket's ACTUAL configured capacity
+    /// currently available.
     ///
-    /// = read_tokens / read_capacity_estimate.
-    /// We use 400 as the capacity estimate (default config).
-    /// Returns 1.0 when the bucket is full; 0.0 when empty.
+    /// Uses `read_capacity` (the real configured value) rather than a
+    /// hardcoded assumption — see this file's module-level audit note
+    /// for why that distinction matters: a client configured with a
+    /// non-default `rps_limit` previously produced a silently wrong
+    /// headroom fraction, which is dangerous in either direction if
+    /// anything downstream makes throttling or alerting decisions from
+    /// it.
     pub fn rpc_headroom(&self) -> f64 {
-        (self.read_tokens / 400.0).clamp(0.0, 1.0)
+        if self.read_capacity == 0 {
+            return 0.0;
+        }
+        (self.read_tokens / self.read_capacity as f64).clamp(0.0, 1.0)
     }
 }
 
@@ -443,7 +506,7 @@ mod tests {
         // Drain the bucket
         rl.allow(RpcRequestKind::Read).await;
         rl.allow(RpcRequestKind::Read).await;
-        // wait_until_allowed must return within 5ms at 1000 rps
+        // wait_until_allowed must return within 50ms at 1000 rps
         tokio::time::timeout(
             Duration::from_millis(50),
             rl.wait_until_allowed(RpcRequestKind::Read),
@@ -453,9 +516,61 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn rpc_headroom_full_bucket() {
+    async fn rpc_headroom_full_bucket_default_capacity() {
         let rl = RpcRateLimiter::new();
         let snap = rl.snapshot().await;
+        assert_eq!(snap.read_capacity, 400);
         assert!((snap.rpc_headroom() - 1.0).abs() < 0.01);
+    }
+
+    #[tokio::test]
+    async fn rpc_headroom_reflects_custom_capacity_not_hardcoded_400() {
+        // Regression test for the bug this pass fixes: a limiter
+        // configured with a non-default capacity (as
+        // OmegaRpcClient::connect does whenever rps_limit != the exact
+        // value that happens to produce a 400-capacity read bucket)
+        // must report headroom relative to ITS OWN capacity, not a
+        // hardcoded 400.
+        let rl = RpcRateLimiter::with_config(
+            BucketConfig { capacity: 800, refill_per_second: 800 }, // custom, NOT 400
+            BucketConfig::write_default(),
+            BucketConfig::subscribe_default(),
+        );
+
+        // Full bucket: headroom must read as 1.0 (full), not 2.0
+        // (which the old hardcoded-400 formula would have produced
+        // before being clamped, silently masking that the bucket
+        // wasn't actually full relative to ITS capacity in other
+        // scenarios).
+        let snap_full = rl.snapshot().await;
+        assert_eq!(snap_full.read_capacity, 800);
+        assert!((snap_full.rpc_headroom() - 1.0).abs() < 0.01);
+
+        // Drain to exactly half of the 800 capacity (400 consumed).
+        for _ in 0..400 {
+            rl.allow(RpcRequestKind::Read).await;
+        }
+        let snap_half = rl.snapshot().await;
+        // Correct answer relative to real capacity: ~0.5.
+        // The old hardcoded-400 formula would have computed
+        // (400 remaining / 400 hardcoded) = 1.0 — falsely reporting
+        // "full headroom" when the bucket was actually half-drained
+        // relative to its real 800 capacity.
+        assert!(
+            (snap_half.rpc_headroom() - 0.5).abs() < 0.05,
+            "expected ~0.5 headroom relative to real capacity 800, got {}",
+            snap_half.rpc_headroom()
+        );
+    }
+
+    #[tokio::test]
+    async fn rpc_headroom_zero_capacity_does_not_divide_by_zero() {
+        let rl = RpcRateLimiter::with_config(
+            BucketConfig { capacity: 0, refill_per_second: 0 },
+            BucketConfig::write_default(),
+            BucketConfig::subscribe_default(),
+        );
+        let snap = rl.snapshot().await;
+        assert_eq!(snap.rpc_headroom(), 0.0);
     }
 }
