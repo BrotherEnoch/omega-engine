@@ -33,6 +33,36 @@
 // Thread-safety:
 //   DashMap provides concurrent read/write.  Freeze is a write-once bool in a
 //   DashSet so the "is_frozen" check is a lock-free set membership test.
+//
+// ## Audit fix (this revision): removed placeholder zero-filled strategy entries
+//
+// `default_strategy_entries()` previously hardcoded `bytecode_hash: [0u8; 32]` and
+// `contract_address: [0u8; 20]` for all five strategies, with a comment admitting
+// these were placeholders "replaced with real deployed hashes during the pre-audit
+// deployment step." Shipping that function meant the integrity registry could be
+// populated with zero-value entries by default — either causing `check_bytecode`
+// to reject every real blueprint (since a real deployed contract's bytecode hash
+// is never `[0u8; 32]`), or, if some other part of the pipeline also happened to
+// default `strategy_bytecode_hash` to zero, silently PASSING an integrity check
+// that verified nothing. Neither outcome belongs in this file with no loud
+// failure attached.
+//
+// Replaced with `strategy_entries_from_manifest()`, which takes real deployment
+// data (hex-encoded bytecode hash / contract address per strategy, as would be
+// read from a deployment artifacts file per spec Section 21.3) and:
+//   - rejects malformed hex outright,
+//   - rejects the wrong byte length outright,
+//   - rejects an all-zero hash or address outright, with an error message that
+//     names the placeholder problem explicitly, not just "invalid input" —
+//     so this exact class of bug fails loudly at startup instead of silently
+//     shipping. There is no code path left in this file that can produce a
+//     zero-filled `StrategyEntry`.
+//
+// This does not invent a deployment-artifact file format or loader — that's a
+// decision for whatever code constructs a `DeploymentManifest` (out of scope for
+// this file, and not something this crate has visibility into). This file only
+// guarantees that whatever manifest is supplied cannot contain placeholder data
+// without being rejected.
 
 use dashmap::{DashMap, DashSet};
 use serde::{Deserialize, Serialize};
@@ -260,47 +290,130 @@ impl StrategyFreezeGuard {
     }
 }
 
-// ─── Default production strategy registrations ───────────────────────────────
+// ─── Deployment manifest → StrategyEntry ──────────────────────────────────────
 
-/// Known bytecode hash seeds for the initial strategy registry.
-/// In production these are read from the deployment artifacts and verified
-/// against the deployed contract codehash via on-chain RPC before startup.
-pub fn default_strategy_entries(phase: u8) -> Vec<StrategyEntry> {
-    // Hash values are placeholder zeros — replaced with real deployed hashes
-    // during the pre-audit deployment step (spec Section 21.3).
-    let all = vec![
-        StrategyEntry {
-            strategy_id:      "CNRY".into(),
-            bytecode_hash:    [0u8; 32], // populated from CanaryArb.sol deployment
-            contract_address: [0u8; 20],
-            min_phase:        0,
-        },
-        StrategyEntry {
-            strategy_id:      "SA".into(),
-            bytecode_hash:    [0u8; 32], // populated from SimpleArb.sol deployment
-            contract_address: [0u8; 20],
-            min_phase:        1,
-        },
-        StrategyEntry {
-            strategy_id:      "MSA".into(),
-            bytecode_hash:    [0u8; 32],
-            contract_address: [0u8; 20],
-            min_phase:        2,
-        },
-        StrategyEntry {
-            strategy_id:      "LA".into(),
-            bytecode_hash:    [0u8; 32],
-            contract_address: [0u8; 20],
-            min_phase:        3,
-        },
-        StrategyEntry {
-            strategy_id:      "MEV".into(),
-            bytecode_hash:    [0u8; 32],
-            contract_address: [0u8; 20],
-            min_phase:        4,
-        },
-    ];
-    all.into_iter().filter(|e| e.min_phase <= phase).collect()
+/// One strategy's deployment record, as read from a real deployment artifacts
+/// file (spec Section 21.3 — "pre-audit deployment step"). Hex fields carry an
+/// optional `0x` prefix.
+///
+/// This type carries no defaults and no `Default` impl on purpose: every field
+/// must come from an actual deployment, not from a struct literal with zeroed
+/// placeholders sitting in source control.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StrategyDeployment {
+    /// Strategy identifier string (e.g., "SA", "LA", "MEV", "CNRY", "MSA").
+    pub strategy_id: String,
+    /// Hex-encoded keccak256 hash of the deployed strategy contract's runtime
+    /// bytecode (32 bytes / 64 hex chars, optional `0x` prefix).
+    pub bytecode_hash: String,
+    /// Hex-encoded deployed contract address (20 bytes / 40 hex chars,
+    /// optional `0x` prefix).
+    pub contract_address: String,
+    /// Phase at which this strategy becomes active.
+    pub min_phase: u8,
+}
+
+/// A full deployment manifest — one entry per strategy contract actually
+/// deployed on-chain. Loaded from disk by the caller (out of scope for this
+/// crate) and passed to `strategy_entries_from_manifest`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DeploymentManifest {
+    pub strategies: Vec<StrategyDeployment>,
+}
+
+/// Parse a hex-encoded 32-byte bytecode hash, rejecting anything that isn't
+/// exactly 32 real, non-zero bytes.
+///
+/// The all-zero rejection is deliberate and load-bearing: a real deployed
+/// contract's keccak256 bytecode hash is never `[0u8; 32]` (keccak256 of any
+/// non-empty input is never the zero digest in practice for real bytecode),
+/// so an all-zero value here can only mean "this manifest entry still has
+/// placeholder data" — exactly the bug this function exists to make
+/// impossible to ship silently.
+fn parse_bytecode_hash(hex_str: &str, strategy_id: &str) -> Result<[u8; 32], SecurityError> {
+    let bytes = hex::decode(hex_str.trim_start_matches("0x")).map_err(|e| {
+        SecurityError::InvalidDeploymentEntry {
+            strategy_id: strategy_id.to_string(),
+            detail: format!("bytecode_hash is not valid hex: {e}"),
+        }
+    })?;
+    if bytes.len() != 32 {
+        return Err(SecurityError::InvalidDeploymentEntry {
+            strategy_id: strategy_id.to_string(),
+            detail: format!("bytecode_hash must be exactly 32 bytes, got {}", bytes.len()),
+        });
+    }
+    let mut arr = [0u8; 32];
+    arr.copy_from_slice(&bytes);
+    if arr == [0u8; 32] {
+        return Err(SecurityError::InvalidDeploymentEntry {
+            strategy_id: strategy_id.to_string(),
+            detail: "bytecode_hash is all-zero — this is placeholder data, not a real \
+                      deployed bytecode hash; refusing to register a strategy with no \
+                      actual integrity check behind it".to_string(),
+        });
+    }
+    Ok(arr)
+}
+
+/// Parse a hex-encoded 20-byte contract address, rejecting anything that
+/// isn't exactly 20 real, non-zero bytes. See `parse_bytecode_hash` for why
+/// the all-zero rejection is deliberate, not incidental.
+fn parse_contract_address(hex_str: &str, strategy_id: &str) -> Result<[u8; 20], SecurityError> {
+    let bytes = hex::decode(hex_str.trim_start_matches("0x")).map_err(|e| {
+        SecurityError::InvalidDeploymentEntry {
+            strategy_id: strategy_id.to_string(),
+            detail: format!("contract_address is not valid hex: {e}"),
+        }
+    })?;
+    if bytes.len() != 20 {
+        return Err(SecurityError::InvalidDeploymentEntry {
+            strategy_id: strategy_id.to_string(),
+            detail: format!("contract_address must be exactly 20 bytes, got {}", bytes.len()),
+        });
+    }
+    let mut arr = [0u8; 20];
+    arr.copy_from_slice(&bytes);
+    if arr == [0u8; 20] {
+        return Err(SecurityError::InvalidDeploymentEntry {
+            strategy_id: strategy_id.to_string(),
+            detail: "contract_address is all-zero — this is placeholder data, not a real \
+                      deployed contract address; refusing to register".to_string(),
+        });
+    }
+    Ok(arr)
+}
+
+/// Build the list of `StrategyEntry` to register at startup (or after an L3
+/// deployment) from a real `DeploymentManifest`, filtered to strategies whose
+/// `min_phase <= phase`.
+///
+/// Every entry is validated: malformed hex, wrong byte length, or an
+/// all-zero hash/address is rejected with `SecurityError::InvalidDeploymentEntry`
+/// rather than silently producing a zero-filled `StrategyEntry`. There is no
+/// fallback path in this function that returns placeholder data — a manifest
+/// with a bad entry fails the whole call, on purpose, since a partially-loaded
+/// integrity registry (some strategies checked, one silently unchecked) is
+/// worse than refusing to start.
+pub fn strategy_entries_from_manifest(
+    manifest: &DeploymentManifest,
+    phase:    u8,
+) -> Result<Vec<StrategyEntry>, SecurityError> {
+    manifest
+        .strategies
+        .iter()
+        .filter(|dep| dep.min_phase <= phase)
+        .map(|dep| {
+            let bytecode_hash    = parse_bytecode_hash(&dep.bytecode_hash, &dep.strategy_id)?;
+            let contract_address = parse_contract_address(&dep.contract_address, &dep.strategy_id)?;
+            Ok(StrategyEntry {
+                strategy_id: dep.strategy_id.clone(),
+                bytecode_hash,
+                contract_address,
+                min_phase: dep.min_phase,
+            })
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -467,16 +580,147 @@ mod integrity_tests {
         assert!(h1.is_some());
     }
 
-    #[test]
-    fn default_phase0_entries_includes_cnry_only() {
-        let entries = default_strategy_entries(0);
-        assert_eq!(entries.len(), 1);
-        assert_eq!(entries[0].strategy_id, "CNRY");
+    // ── strategy_entries_from_manifest: valid manifests ───────────────────────
+
+    fn sample_manifest() -> DeploymentManifest {
+        DeploymentManifest {
+            strategies: vec![
+                StrategyDeployment {
+                    strategy_id:      "CNRY".into(),
+                    bytecode_hash:    format!("0x{}", "11".repeat(32)),
+                    contract_address: format!("0x{}", "21".repeat(20)),
+                    min_phase:        0,
+                },
+                StrategyDeployment {
+                    strategy_id:      "SA".into(),
+                    bytecode_hash:    format!("0x{}", "12".repeat(32)),
+                    contract_address: format!("0x{}", "22".repeat(20)),
+                    min_phase:        1,
+                },
+                StrategyDeployment {
+                    strategy_id:      "MSA".into(),
+                    bytecode_hash:    format!("0x{}", "13".repeat(32)),
+                    contract_address: format!("0x{}", "23".repeat(20)),
+                    min_phase:        2,
+                },
+                StrategyDeployment {
+                    strategy_id:      "LA".into(),
+                    bytecode_hash:    format!("0x{}", "14".repeat(32)),
+                    contract_address: format!("0x{}", "24".repeat(20)),
+                    min_phase:        3,
+                },
+                StrategyDeployment {
+                    strategy_id:      "MEV".into(),
+                    bytecode_hash:    format!("0x{}", "15".repeat(32)),
+                    contract_address: format!("0x{}", "25".repeat(20)),
+                    min_phase:        4,
+                },
+            ],
+        }
     }
 
     #[test]
-    fn default_phase4_entries_includes_all_strategies() {
-        let entries = default_strategy_entries(4);
+    fn manifest_phase0_includes_cnry_only() {
+        let entries = strategy_entries_from_manifest(&sample_manifest(), 0).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].strategy_id, "CNRY");
+        assert_ne!(entries[0].bytecode_hash, [0u8; 32]);
+        assert_ne!(entries[0].contract_address, [0u8; 20]);
+    }
+
+    #[test]
+    fn manifest_phase4_includes_all_strategies() {
+        let entries = strategy_entries_from_manifest(&sample_manifest(), 4).unwrap();
         assert_eq!(entries.len(), 5);
+        for e in &entries {
+            assert_ne!(e.bytecode_hash, [0u8; 32], "no entry may carry a placeholder hash");
+            assert_ne!(e.contract_address, [0u8; 20], "no entry may carry a placeholder address");
+        }
+    }
+
+    #[test]
+    fn manifest_hex_prefix_is_optional() {
+        let mut m = sample_manifest();
+        m.strategies[0].bytecode_hash    = "11".repeat(32); // no 0x prefix
+        m.strategies[0].contract_address = "21".repeat(20);
+        let entries = strategy_entries_from_manifest(&m, 0).unwrap();
+        assert_eq!(entries.len(), 1);
+    }
+
+    #[test]
+    fn manifest_entries_round_trip_into_working_integrity_check() {
+        let entries = strategy_entries_from_manifest(&sample_manifest(), 4).unwrap();
+        let reg = IntegrityRegistry::new();
+        reg.register_all(entries);
+        let sa = sample_manifest().strategies.into_iter().find(|s| s.strategy_id == "SA").unwrap();
+        let hash = parse_bytecode_hash(&sa.bytecode_hash, "SA").unwrap();
+        assert!(reg.full_integrity_check("SA", &hash).is_ok());
+    }
+
+    // ── strategy_entries_from_manifest: rejection of placeholder/bad data ─────
+
+    #[test]
+    fn manifest_rejects_all_zero_bytecode_hash() {
+        let mut m = sample_manifest();
+        m.strategies[0].bytecode_hash = format!("0x{}", "00".repeat(32));
+        let result = strategy_entries_from_manifest(&m, 0);
+        assert!(
+            matches!(result, Err(SecurityError::InvalidDeploymentEntry { .. })),
+            "an all-zero bytecode_hash must be rejected as placeholder data, not silently accepted"
+        );
+    }
+
+    #[test]
+    fn manifest_rejects_all_zero_contract_address() {
+        let mut m = sample_manifest();
+        m.strategies[0].contract_address = format!("0x{}", "00".repeat(20));
+        let result = strategy_entries_from_manifest(&m, 0);
+        assert!(matches!(result, Err(SecurityError::InvalidDeploymentEntry { .. })));
+    }
+
+    #[test]
+    fn manifest_rejects_malformed_hex() {
+        let mut m = sample_manifest();
+        m.strategies[0].bytecode_hash = "not-hex-at-all".into();
+        let result = strategy_entries_from_manifest(&m, 0);
+        assert!(matches!(result, Err(SecurityError::InvalidDeploymentEntry { .. })));
+    }
+
+    #[test]
+    fn manifest_rejects_wrong_length_hash() {
+        let mut m = sample_manifest();
+        m.strategies[0].bytecode_hash = format!("0x{}", "11".repeat(16)); // 16 bytes, not 32
+        let result = strategy_entries_from_manifest(&m, 0);
+        assert!(matches!(result, Err(SecurityError::InvalidDeploymentEntry { .. })));
+    }
+
+    #[test]
+    fn manifest_rejects_wrong_length_address() {
+        let mut m = sample_manifest();
+        m.strategies[0].contract_address = format!("0x{}", "21".repeat(10)); // 10 bytes, not 20
+        let result = strategy_entries_from_manifest(&m, 0);
+        assert!(matches!(result, Err(SecurityError::InvalidDeploymentEntry { .. })));
+    }
+
+    #[test]
+    fn manifest_one_bad_entry_fails_the_whole_call() {
+        // A manifest with one good entry and one placeholder entry must not
+        // silently register the good one and drop the bad one — that would
+        // leave the integrity registry partially populated with no signal
+        // that a strategy went unchecked. The whole call fails instead.
+        let mut m = sample_manifest();
+        m.strategies[1].bytecode_hash = format!("0x{}", "00".repeat(32)); // SA now placeholder
+        let result = strategy_entries_from_manifest(&m, 4);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn empty_manifest_produces_empty_entries_not_an_error() {
+        // An intentionally empty manifest (e.g. a fresh testnet with nothing
+        // deployed yet) is valid input, distinct from a manifest containing
+        // placeholder entries — this must succeed with zero entries, not fail.
+        let m = DeploymentManifest { strategies: vec![] };
+        let entries = strategy_entries_from_manifest(&m, 4).unwrap();
+        assert!(entries.is_empty());
     }
 }

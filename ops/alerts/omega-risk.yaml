@@ -1,0 +1,227 @@
+# omega-engine/ops/alerts/omega-risk.yaml
+groups:
+  - name: omega_risk_critical
+    rules:
+      # ── Kill switch: absolute funds-at-risk halt ──────────────────────
+      # This is the highest-severity alert in the system by design — if
+      # this fires, real capital stopped moving because something broke
+      # badly enough to trip an absolute (not relative) threshold.
+      - alert: KillSwitchTripped
+        expr: omega_risk_kill_switch_tripped > 0
+        for: 0s   # page immediately, no debounce — this already required
+                  # sustained bad behavior to trip in the first place
+        labels:
+          severity: page
+          team: mev-engineering
+        annotations:
+          summary: "Kill switch TRIPPED for scope {{ $labels.scope }}"
+          description: >
+            Absolute funds-at-risk kill switch has halted submissions for
+            scope {{ $labels.scope }}. This does not auto-resolve. See
+            runbook: docs/runbooks/kill-switch-tripped.md
+          runbook_url: "https://internal-docs/runbooks/kill-switch-tripped"
+
+      - alert: KillSwitchCumulativeLossApproachingThreshold
+        # Fires at 80% of the configured threshold — gives a human a
+        # chance to intervene manually before the hard trip. Depends on
+        # omega_risk_kill_switch_max_cumulative_loss_wei, which
+        # KillSwitchRegistry publishes at first observation of each scope
+        # (crates/omega-risk/src/kill_switch.rs, get_or_create).
+        expr: |
+          omega_risk_kill_switch_cumulative_loss_wei
+            > 0.8 * on(scope) omega_risk_kill_switch_max_cumulative_loss_wei
+        for: 1m
+        labels:
+          severity: warning
+          team: mev-engineering
+        annotations:
+          summary: "Kill switch for {{ $labels.scope }} at 80%+ of loss threshold"
+          description: >
+            Cumulative realized loss is approaching the kill-switch
+            threshold. Consider manual trip_manual() before the automatic
+            halt fires.
+
+      - alert: KillSwitchResetOccurred
+        # Audit-trail visibility, not an incident by itself — someone
+        # decided it was safe to resume trading for this scope and that
+        # decision should be visible to the whole team automatically, not
+        # depend on the resetting operator remembering to post in a
+        # channel. Backed by KillSwitchRegistry::reset
+        # (crates/omega-risk/src/kill_switch.rs).
+        expr: increase(omega_risk_kill_switch_reset_total[5m]) > 0
+        for: 0s
+        labels:
+          severity: info
+          team: mev-engineering
+        annotations:
+          summary: "Kill switch reset for scope {{ $labels.scope }}"
+          description: >
+            A kill switch reset occurred for {{ $labels.scope }}. Check
+            omega_risk_kill_switch_reset_last_operator_info{scope="{{ $labels.scope }}"}
+            for the operator and reason. See runbook:
+            docs/runbooks/kill-switch-tripped.md
+
+      # ── Circuit breaker: relative EV degradation ──────────────────────
+      - alert: CircuitBreakerHalted
+        expr: omega_risk_circuit_breaker_state == 3
+        for: 0s
+        labels:
+          severity: page
+          team: mev-engineering
+        annotations:
+          summary: "Strategy {{ $labels.strategy }} HALTED (EV ratio < 0.50)"
+          description: >
+            L3 governance required to resume per spec S19. See
+            runbook: docs/runbooks/circuit-breaker-halted.md
+
+      - alert: CircuitBreakerAutoPaused
+        expr: omega_risk_circuit_breaker_state == 2
+        for: 0s
+        labels:
+          severity: warning
+          team: mev-engineering
+        annotations:
+          summary: "Strategy {{ $labels.strategy }} AUTO_PAUSED (EV ratio < 0.70)"
+          description: "L2 fast-approve required to resume per spec S19."
+
+      - alert: CircuitBreakerInvestigate
+        expr: omega_risk_circuit_breaker_state == 1
+        for: 15m   # debounced — Investigate is still operational, so this
+                   # is a heads-up, not an emergency; avoid alert fatigue
+                   # from a strategy hovering right at the 0.85 boundary
+        labels:
+          severity: info
+          team: mev-engineering
+        annotations:
+          summary: "Strategy {{ $labels.strategy }} in INVESTIGATE state for 15m+"
+
+      - alert: CircuitBreakerL2ResumeOccurred
+        # Audit-trail visibility for the L2 recovery path, mirroring
+        # CircuitBreakerL3ClearOccurred below and KillSwitchResetOccurred
+        # above. Backed by StrategyCircuitBreaker::resume_l2
+        # (crates/omega-risk/src/circuit_breakers.rs).
+        expr: increase(omega_risk_circuit_breaker_l2_resume_total[5m]) > 0
+        for: 0s
+        labels:
+          severity: info
+          team: mev-engineering
+        annotations:
+          summary: "Circuit breaker L2-resumed for strategy {{ $labels.strategy }}"
+          description: >
+            An L2 fast-approve resume occurred for {{ $labels.strategy }}.
+            Check
+            omega_risk_circuit_breaker_l2_resume_last_operator_info{strategy="{{ $labels.strategy }}"}
+            for the operator and reason. Unlike an L3 clear, the EV
+            window was NOT reset — recent history still counts toward the
+            strategy's ratio. See runbook:
+            docs/runbooks/circuit-breaker-halted.md
+
+      - alert: CircuitBreakerL3ClearOccurred
+        # Audit-trail visibility for the L3 recovery path. Backed by
+        # StrategyCircuitBreaker::clear_halt_l3
+        # (crates/omega-risk/src/circuit_breakers.rs).
+        expr: increase(omega_risk_circuit_breaker_l3_clear_total[5m]) > 0
+        for: 0s
+        labels:
+          severity: info
+          team: mev-engineering
+        annotations:
+          summary: "Circuit breaker L3-cleared for strategy {{ $labels.strategy }}"
+          description: >
+            An L3 governance clear occurred for {{ $labels.strategy }}.
+            Check
+            omega_risk_circuit_breaker_l3_clear_last_operator_info{strategy="{{ $labels.strategy }}"}
+            for the operator and reason. Note the EV window was reset to
+            empty as part of this action — the strategy has no
+            performance history until new outcomes accumulate. See
+            runbook: docs/runbooks/circuit-breaker-halted.md
+
+      # ── Flash crash guard ──────────────────────────────────────────────
+      - alert: FlashCrashResponseActive
+        expr: omega_risk_flash_crash_active > 0
+        for: 0s
+        labels:
+          severity: warning
+          team: mev-engineering
+        annotations:
+          summary: "Graduated flash-crash response active for {{ $labels.asset }}"
+          description: >
+            Size reduced to 50%, min-profit multiplier raised to 2.5x,
+            oracle agreement tightened to 0.1%. Not an outage — a
+            defensive posture change worth being aware of.
+
+      # ── Pre-trade check drop-rate anomalies ────────────────────────────
+      - alert: DropRateSpike
+        # Sudden spike in any single drop_code suggests something upstream
+        # broke (oracle feed down, whitelist misconfigured, gas spike from
+        # a real market event) rather than normal opportunity scarcity.
+        expr: |
+          rate(omega_risk_checks_failed_total[5m])
+            > 3 * rate(omega_risk_checks_failed_total[1h] offset 5m)
+        for: 5m
+        labels:
+          severity: warning
+          team: mev-engineering
+        annotations:
+          summary: "Drop rate for {{ $labels.drop_code }} on {{ $labels.strategy }} spiked 3x"
+
+      - alert: NoBlueprintsPassingChecks
+        # If a strategy that's normally active suddenly passes zero
+        # checks for an extended period, that's as suspicious as too many
+        # failures — could mean the detector died upstream, not just that
+        # the market went quiet. Overlaps in symptom with
+        # ComponentHeartbeatStale below, but is not redundant with it: a
+        # detector can be alive (still beating) yet stuck failing to
+        # produce anything checkable, which is exactly this alert's case.
+        expr: |
+          rate(omega_risk_checks_passed_total[30m]) == 0
+          and
+          rate(omega_risk_checks_failed_total[30m]) == 0
+        for: 30m
+        labels:
+          severity: warning
+          team: mev-engineering
+        annotations:
+          summary: "Strategy {{ $labels.strategy }} has produced zero blueprints in 30m"
+          description: >
+            Could be genuine market quiet, or the detector/fork/RPC
+            connection died silently. Worth a manual check either way.
+
+      # ── Gas regime ──────────────────────────────────────────────────────
+      - alert: L1BufferAtMaximum
+        expr: omega_risk_l1_adaptive_buffer >= 1.99
+        for: 10m
+        labels:
+          severity: info
+          team: mev-engineering
+        annotations:
+          summary: "L1 gas buffer for chain {{ $labels.chain_id }} pinned at max (2.00x)"
+          description: "Sustained high gas volatility — expect reduced profitable-opportunity volume."
+
+      # ── Liveness ─────────────────────────────────────────────────────────
+      # Distinct from every alert above: those all describe activity
+      # OUTCOMES (checks, breaker state, kill switch, gas regime), which
+      # read as "quiet" — not "dead" — when a process crashes or hangs.
+      # This is the one alert that answers "is the component that would
+      # even notice a quiet market still running at all."
+      - alert: ComponentHeartbeatStale
+        # Threshold (120s) matches HeartbeatConfig::default() in
+        # crates/omega-risk/src/heartbeat.rs. Any component registered
+        # with a longer max_silence (e.g. an hourly reconciliation job)
+        # needs its own alert with a matching threshold below — Prometheus
+        # has no way to read the per-component tolerance back out of the
+        # gauge itself, since only the timestamp is exported, not the
+        # configured tolerance.
+        expr: time() - omega_risk_heartbeat_last_beat_timestamp > 120
+        for: 30s
+        labels:
+          severity: page
+          team: mev-engineering
+        annotations:
+          summary: "Component {{ $labels.component }} has not sent a heartbeat in 2m+"
+          description: >
+            Either the process crashed, hung, or lost its upstream
+            connection (RPC/relay/oracle). Distinct from
+            NoBlueprintsPassingChecks — that alert can mean the market is
+            genuinely quiet; this one means the component that would even
+            notice a quiet market has stopped reporting in at all.

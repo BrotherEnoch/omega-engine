@@ -15,6 +15,37 @@
 //   S11 — LA: price impact threshold 50 bps, flashloan exclusion list.
 //   S12 — gas spike guard: 30 % L1 delta threshold.
 //   S19 — EV ratio monitoring for rollout.
+//
+// ## Audit fix (this revision): account exposure fields for check 14
+//
+// `current_account_exposure_wei` / `max_account_exposure_wei` back
+// `checks::check_account_exposure` (spec-unnumbered addition:
+// MissExposureLimit). See checks.rs's module doc comment for why the
+// check sums `bp.flashloan_amount` (capital principal) against these
+// fields rather than `bp.expected_profit_net_wei` — this file only
+// carries the context data, the reasoning lives with the check itself.
+//
+// ## Audit fix (this revision): integer-ratio constants for checks 6 and 10
+//
+// `GAS_SPIKE_THRESHOLD` (f64, 0.30) and `FLASHLOAN_SAFETY_FACTOR` (f64, 1.20)
+// are replaced by exact integer numerator/denominator pairs
+// (`GAS_SPIKE_THRESHOLD_NUM/DEN`, `FLASHLOAN_SAFETY_NUM/DEN`). See
+// `checks.rs`'s `check_gas_spike` and `check_flashloan_liquidity` for why:
+// float division in a pre-trade safety gate risks non-bit-identical
+// evaluation across platforms/builds, and a naive integer replacement using
+// floor division would silently round the flashloan safety margin DOWN,
+// the wrong direction for a check whose entire purpose is staying
+// conservative.
+//
+// The old f64 constants are removed rather than kept alongside the new
+// ones — leaving both in place invites exactly the drift this fix is
+// meant to eliminate (someone tunes one and not the other, and the two
+// checks that are supposed to enforce the same threshold silently
+// disagree). If anything else in this crate still references
+// `GAS_SPIKE_THRESHOLD` or `FLASHLOAN_SAFETY_FACTOR` by name, that call
+// site needs to be updated to the integer form too — grep the crate for
+// both identifiers before merging this change. Nothing in `checks.rs` or
+// this file references them anymore as of this revision.
 
 use serde::{Deserialize, Serialize};
 
@@ -23,8 +54,18 @@ pub const CHAINLINK_STALENESS_SECS: u64 = 45;
 pub const PYTH_STALENESS_SECS:      u64 = 45;
 pub const TWAP_STALENESS_SECS:      u64 = 120;
 
-/// Maximum acceptable L1 gas price delta before rejecting blueprint (spec S12: 30 %).
-pub const GAS_SPIKE_THRESHOLD: f64 = 0.30;
+/// Maximum acceptable L1 gas price delta before rejecting blueprint (spec
+/// S12: 30 %), expressed as an exact integer ratio `NUM / DEN` rather than
+/// an `f64`. `checks::check_gas_spike` evaluates this as
+/// `diff * DEN > at_creation * NUM` — algebraically equivalent to
+/// `diff / at_creation > NUM / DEN`, but with no division and no float
+/// rounding anywhere in the comparison.
+///
+/// To change the threshold, edit these two constants together (e.g. 25%
+/// would be NUM=25, DEN=100) — there is no other copy of this ratio
+/// anywhere in the crate.
+pub const GAS_SPIKE_THRESHOLD_NUM: u64 = 30;
+pub const GAS_SPIKE_THRESHOLD_DEN: u64 = 100;
 
 /// Maximum price impact in basis points for LA blueprints (spec S11: 50 bps).
 pub const MAX_PRICE_IMPACT_BPS: u16 = 50;
@@ -35,10 +76,28 @@ pub const MAX_SLIPPAGE_BPS_MSA: u16 = 50;
 pub const MAX_SLIPPAGE_BPS_LA:  u16 = 100;
 pub const MAX_SLIPPAGE_BPS_MEV: u16 = 30;
 
-/// Flashloan safety margin: available liquidity must cover amount × this factor (spec S11).
-pub const FLASHLOAN_SAFETY_FACTOR: f64 = 1.20;
+/// Flashloan safety margin (spec S11): available liquidity must cover
+/// `amount × (NUM / DEN)` (default 1.20, i.e. a 20% margin), expressed as
+/// an exact integer ratio rather than an `f64`.
+/// `checks::check_flashloan_liquidity` evaluates the required threshold as
+/// `amount.saturating_mul(NUM).div_ceil(DEN)` — ceiling division, so any
+/// fractional remainder makes the requirement stricter (rounds up), never
+/// looser. A floor-dividing replacement of the old float cast would have
+/// silently accepted slightly less liquidity than the configured margin.
+///
+/// To change the margin, edit these two constants together (e.g. 1.25x
+/// would be NUM=125, DEN=100).
+pub const FLASHLOAN_SAFETY_NUM: u128 = 120;
+pub const FLASHLOAN_SAFETY_DEN: u128 = 100;
 
 /// Maximum oracle divergence between Chainlink and Pyth (spec S5: 0.4 %).
+///
+/// Retained as `f64`: `OracleSnapshot::chainlink_pyth_divergence()` (below)
+/// is itself computed from `f64` oracle prices, so converting only the
+/// threshold constant to an integer ratio wouldn't remove the float
+/// dependency — it would just relocate where the precision question lives.
+/// Revisit this alongside `chainlink_pyth_divergence()` together if/when
+/// oracle prices become fixed-point at the source.
 pub const ORACLE_DIVERGE_THRESHOLD: f64 = 0.004;
 
 /// Live oracle price snapshot used in checks 7–8.
@@ -142,4 +201,14 @@ pub struct CheckContext {
     pub risk_score: f64,
     /// Maximum acceptable risk score.
     pub max_risk_score: f64,
+
+    // ── Account exposure ────────────────────────────────────────────────────
+    /// Account's already-outstanding exposure in wei, prior to this
+    /// blueprint — check 14. This blueprint's `flashloan_amount` (capital
+    /// principal, NOT expected profit — see checks.rs's module doc
+    /// comment) is added to this and compared against
+    /// `max_account_exposure_wei`.
+    pub current_account_exposure_wei: u128,
+    /// Configured cap on total account exposure, in wei — check 14.
+    pub max_account_exposure_wei: u128,
 }

@@ -1,6 +1,12 @@
 // crates/omega-relay/src/reputation.rs
 //! Address rotation with reputation carryover (§14.1, C4, I4) and
 //! anti-fingerprint randomised round-robin (§14.2, I2).
+//!
+//! ## Audit fix (this revision)
+//!
+//! `submission_order` hardcoded the 5% tie-band cutoff as a bare `0.95` literal — the
+//! third independent copy of this same constant, alongside two in `backpressure.rs`.
+//! Replaced with `crate::config::LA_TIE_BAND_FRACTION` — see `config.rs`'s audit note.
 
 use std::sync::Arc;
 
@@ -8,7 +14,7 @@ use rand::seq::SliceRandom;
 use rand::thread_rng;
 use tracing::info;
 
-use crate::config::RelayName;
+use crate::config::{RelayName, LA_TIE_BAND_FRACTION};
 use crate::error::{RelayError, RelayResult};
 use crate::metrics::{ExecutionAddress, LaRelayMetrics, RelayRateSnapshot};
 
@@ -68,7 +74,7 @@ pub fn submission_order(metrics: &Arc<LaRelayMetrics>) -> Vec<RelayRateSnapshot>
     let Some(best) = ranked.first().map(|snapshot| snapshot.la_rate) else {
         return ranked;
     };
-    let threshold = best * 0.95;
+    let threshold = best * (1.0 - LA_TIE_BAND_FRACTION);
 
     let (in_band, below_band): (Vec<_>, Vec<_>) =
         ranked.into_iter().partition(|r| r.la_rate >= threshold);
@@ -182,5 +188,27 @@ mod tests {
         let order = submission_order(&m);
         assert_eq!(order.len(), 3);
         assert_eq!(order.last().unwrap().relay, RelayName::Titan);
+    }
+
+    // ── Audit fix regression test (this revision) ─────────────────────────────
+
+    #[test]
+    fn submission_order_threshold_derives_from_shared_constant() {
+        let m = LaRelayMetrics::new(100, ExecutionAddress("0xB".into()));
+        // flashbots at exactly the tie-band boundary relative to bloxroute
+        // (best=0.90; threshold = 0.90 * (1 - LA_TIE_BAND_FRACTION) = 0.855),
+        // titan clearly below.
+        for i in 0..100 {
+            m.record(&RelayName::Flashbots, i < 90); // 0.90
+            m.record(&RelayName::Bloxroute, i < 86); // 0.86 -> in band (>= 0.855)
+            m.record(&RelayName::Titan, i < 50);     // 0.50 -> below band
+        }
+        let order = submission_order(&m);
+        // Titan must be last (below band); flashbots and bloxroute both in band
+        // (order between them is randomised, only their presence before Titan matters).
+        assert_eq!(order.last().unwrap().relay, RelayName::Titan);
+        let in_band_names: Vec<_> = order[..2].iter().map(|r| r.relay.clone()).collect();
+        assert!(in_band_names.contains(&RelayName::Flashbots));
+        assert!(in_band_names.contains(&RelayName::Bloxroute));
     }
 }

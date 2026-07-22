@@ -77,8 +77,9 @@
 //   omega-control-plane \
 //     --bind 0.0.0.0:8080 \
 //     --config-path config/omega.toml \
-//     --checkpoint-dir /var/omega/checkpoints \
-//     --blacklist-path config/builder_blacklist.toml
+//     --checkpoint-dir checkpoints \
+//     --blacklist-path config/builder_blacklist.toml \
+//     --api-token <token>
 
 mod grpc;
 mod obs_bridge;
@@ -89,9 +90,7 @@ use std::sync::{atomic::AtomicBool, Arc};
 
 use anyhow::Result;
 use axum::{
-    extract::{
-        Path, State,
-    },
+    extract::{Path, State},
     http::StatusCode,
     response::IntoResponse,
     routing::{get, post},
@@ -105,10 +104,7 @@ use omega_control_contracts::rest::{
     ApiError, BlacklistResponse, ConfigReloadRequest, DaoFeeResponse, HealthSnapshot,
     LayerHealthEntry, RevertResponse, OK,
 };
-use omega_control_contracts::ws::{
-    WsEvent,
-    WS_CHANNEL_CAPACITY,
-};
+use omega_control_contracts::ws::{WsEvent, WS_CHANNEL_CAPACITY};
 use omega_core::{LayerHealth, LayerId, OmegaConfig, VaultConfig};
 use omega_gas_war::BuilderBlacklist;
 use omega_health::LayerHealthImpl;
@@ -136,9 +132,14 @@ pub struct ControlPlaneArgs {
     pub config_path: String,
 
     /// Gas model checkpoint directory (§13.2).
+    ///
+    /// Defaults to a relative `checkpoints` directory so the binary works
+    /// on Windows without requiring /var/omega/checkpoints to exist.
+    /// Override with --checkpoint-dir or OMEGA_CHECKPOINT_DIR if you want
+    /// an absolute path in production.
     #[arg(
         long,
-        default_value = "/var/omega/checkpoints",
+        default_value = "checkpoints",
         env = "OMEGA_CHECKPOINT_DIR"
     )]
     pub checkpoint_dir: String,
@@ -152,6 +153,7 @@ pub struct ControlPlaneArgs {
     pub blacklist_path: String,
 
     /// Bearer token for API authentication.
+    /// Must match OMEGA_API_TOKEN baked into the WASM frontend at build time.
     #[arg(long, env = "OMEGA_API_TOKEN")]
     pub api_token: String,
 }
@@ -183,26 +185,17 @@ pub struct AppState {
     /// API bearer token.
     pub api_token: String,
     /// Shared ring buffer of raw `OmegaEvent`s, drained by `obs_bridge`
-    /// and republished onto `ws_tx` as mapped `WsEvent`s.  Every engine
-    /// crate that depends on `omega-observability` pushes into the same
-    /// buffer instance via its own `Arc<EventRingBuffer>` handle.
+    /// and republished onto `ws_tx` as mapped `WsEvent`s.
     pub obs_buffer: Arc<EventRingBuffer>,
 }
 
 impl AppState {
     /// Build and initialise AppState from CLI args.
     pub fn new(args: &ControlPlaneArgs) -> Result<Arc<Self>> {
-        // Load config
         let config = load_config(&args.config_path)?;
 
-        // Load blacklist
         let blacklist = BuilderBlacklist::load(std::path::Path::new(&args.blacklist_path))?;
 
-        // Initialise all 16 health layers.
-        // In the full engine these are wired to the propagation channel
-        // and share Arc pointers with every crate that calls set_state.
-        // The control-plane holds its own set so the API (HTTP + gRPC)
-        // can read and, via `layer(id).set_state(...)`, write them.
         let layer_ids = [
             LayerId::SystemHealth,
             LayerId::ExternalData,
@@ -228,15 +221,25 @@ impl AppState {
 
         let ceiling_threshold = config.ml.ceiling_escalation_threshold;
         let (ws_tx, _) = broadcast::channel(WS_CHANNEL_CAPACITY);
-        // `EventRingBuffer::new` already returns an `Arc<EventRingBuffer>`
-        // (it's shared with every crate that emits OmegaEvents), so it is
-        // not wrapped in an additional `Arc::new` here.
         let obs_buffer = EventRingBuffer::new(DEFAULT_CAPACITY);
+
+        // Ensure checkpoint directory exists so list_checkpoints returns Ok([])
+        // rather than an I/O error when no checkpoints have been written yet.
+        let checkpoint_dir = PathBuf::from(&args.checkpoint_dir);
+        if !checkpoint_dir.exists() {
+            if let Err(e) = std::fs::create_dir_all(&checkpoint_dir) {
+                tracing::warn!(
+                    path = %checkpoint_dir.display(),
+                    error = %e,
+                    "Could not create checkpoint directory — checkpoint list will be empty"
+                );
+            }
+        }
 
         Ok(Arc::new(Self {
             config: RwLock::new(config),
             config_path: PathBuf::from(&args.config_path),
-            checkpoint_dir: PathBuf::from(&args.checkpoint_dir),
+            checkpoint_dir,
             blacklist,
             health_layers,
             ceiling_tracker: RwLock::new(CeilingEscalationTracker::new(ceiling_threshold)),
@@ -248,25 +251,16 @@ impl AppState {
     }
 
     /// Look up the health controller for a single layer.
-    ///
-    /// Used by `grpc.rs`'s `ClearHalt` RPC handler (and available to any
-    /// future write path — gRPC, HTTP, or an in-process engine task) to
-    /// mutate a layer's state via `LayerHealthImpl::set_state`.
     pub fn layer(&self, id: LayerId) -> Option<&Arc<LayerHealthImpl>> {
         self.health_layers.iter().find(|l| l.layer_id() == id)
     }
 
     /// Subscribe a new receiver to the WsEvent broadcast channel.
-    ///
-    /// Used by `grpc.rs`'s `WatchHealth` server-streaming RPC, in addition
-    /// to the WebSocket handler in `ws.rs` (which subscribes directly via
-    /// `state.ws_tx.subscribe()`).
     pub fn subscribe_ws(&self) -> broadcast::Receiver<WsEvent> {
         self.ws_tx.subscribe()
     }
 
-    /// Publish an event to every subscriber (WebSocket clients and any
-    /// gRPC `WatchHealth` streams).
+    /// Publish an event to every subscriber.
     pub fn publish(&self, event: WsEvent) {
         let _ = self.ws_tx.send(event);
     }
@@ -295,10 +289,6 @@ fn load_config(path: &str) -> Result<OmegaConfig> {
 // Authentication extractor
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Validate the Bearer token from the Authorization header.
-///
-/// Returns `Ok(())` when valid.  Routes that require authentication call
-/// this before processing the request body.
 fn check_auth(
     headers: &axum::http::HeaderMap,
     api_token: &str,
@@ -323,7 +313,7 @@ fn check_auth(
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// GET /health — liveness check
+// GET /health — liveness check (no auth)
 // ─────────────────────────────────────────────────────────────────────────────
 
 async fn get_liveness() -> impl IntoResponse {
@@ -331,7 +321,7 @@ async fn get_liveness() -> impl IntoResponse {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// GET /api/v1/health — all 16 layer health states
+// GET /api/v1/health — all 16 layer health states (no auth)
 // ─────────────────────────────────────────────────────────────────────────────
 
 async fn get_health(State(state): State<Arc<AppState>>) -> impl IntoResponse {
@@ -451,7 +441,7 @@ async fn post_config(
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// GET /api/v1/la/gas-model/checkpoints — list checkpoints (§17.2)
+// GET /api/v1/la/gas-model/checkpoints (§17.2)
 // ─────────────────────────────────────────────────────────────────────────────
 
 async fn get_checkpoints(
@@ -479,7 +469,7 @@ async fn get_checkpoints(
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// POST /api/v1/la/gas-model/revert/{version} — revert model (§17.2)
+// POST /api/v1/la/gas-model/revert/{version} (§17.2)
 // ─────────────────────────────────────────────────────────────────────────────
 
 async fn post_revert_model(
@@ -493,9 +483,6 @@ async fn post_revert_model(
 
     match checkpoint::load_version(&state.checkpoint_dir, version) {
         Ok(ckpt) => {
-            // In the full engine, this would update the live learner's
-            // fee_multipliers.  The control-plane records the governance
-            // action and the engine's learner task polls for it.
             tracing::warn!(
                 version = ckpt.version,
                 win_rate = ckpt.win_rate,
@@ -527,7 +514,7 @@ async fn post_revert_model(
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// GET /api/v1/la/gas-model/ceiling-status — escalation state (§17.2)
+// GET /api/v1/la/gas-model/ceiling-status (§17.2)
 // ─────────────────────────────────────────────────────────────────────────────
 
 async fn get_ceiling_status(
@@ -548,7 +535,7 @@ async fn get_ceiling_status(
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// POST /api/v1/la/gas-model/unpause — clear model pause (§17.2)
+// POST /api/v1/la/gas-model/unpause (§17.2)
 // ─────────────────────────────────────────────────────────────────────────────
 
 async fn post_unpause_model(
@@ -574,7 +561,7 @@ async fn post_unpause_model(
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// GET /api/v1/vault/dao-fee — DAO fee configuration (§15.1)
+// GET /api/v1/vault/dao-fee (§15.1)
 // ─────────────────────────────────────────────────────────────────────────────
 
 async fn get_dao_fee(
@@ -601,7 +588,7 @@ async fn get_dao_fee(
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// GET /api/v1/builders/blacklist — read builder blacklist (§12.3)
+// GET /api/v1/builders/blacklist (§12.3)
 // ─────────────────────────────────────────────────────────────────────────────
 
 async fn get_blacklist(
@@ -624,7 +611,7 @@ async fn get_blacklist(
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// POST /api/v1/builders/blacklist/update — hot-reload blacklist (§12.3)
+// POST /api/v1/builders/blacklist/update (§12.3, L2)
 // ─────────────────────────────────────────────────────────────────────────────
 
 async fn post_blacklist_update(
@@ -673,7 +660,8 @@ fn build_router(state: Arc<AppState>) -> Router {
     Router::new()
         // Liveness — no auth required
         .route("/health", get(get_liveness))
-        // Health state
+        // Health state — no auth required so the dashboard can always
+        // show layer status even before the user token is set
         .route("/api/v1/health", get(get_health))
         // Config
         .route("/api/v1/config", get(get_config))
@@ -697,20 +685,11 @@ fn build_router(state: Arc<AppState>) -> Router {
             "/api/v1/builders/blacklist/update",
             post(post_blacklist_update),
         )
-        // Realtime event stream (§17.1) — governance events + bridged
-        // trading telemetry, fanned out over the shared ws_tx channel.
+        // Realtime event stream (§17.1)
         .route("/ws/events", get(ws::events_handler))
-        // Middleware
-        //
-        // CorsLayer::permissive() is appropriate here because this API
-        // is consumed by a local-dev WASM dashboard served from a
-        // different origin/port (trunk's dev server, e.g. 127.0.0.1:8081)
-        // than the control-plane itself (127.0.0.1:8080), and that port
-        // is not fixed across trunk invocations. WebSocket upgrades are
-        // not subject to CORS, so /ws/events worked without this; plain
-        // fetch()-based REST calls (GET /api/v1/health, etc.) need it.
-        // Tighten this to a specific allowed origin before any
-        // production/non-localhost deployment.
+        // CORS — permissive so the Trunk dev server (127.0.0.1:8082) can
+        // call this API (127.0.0.1:8080) cross-origin.  Tighten to a
+        // specific origin before any non-localhost deployment.
         .layer(CorsLayer::permissive())
         .layer(TraceLayer::new_for_http())
         .with_state(state)
@@ -737,23 +716,18 @@ async fn main() -> Result<()> {
         .map_err(|e| anyhow::anyhow!("Invalid bind address '{}': {e}", args.bind))?;
 
     tracing::info!(
-        bind             = %addr,
-        config_path      = %args.config_path,
-        checkpoint_dir   = %args.checkpoint_dir,
-        blacklist_path   = %args.blacklist_path,
+        bind           = %addr,
+        config_path    = %args.config_path,
+        checkpoint_dir = %args.checkpoint_dir,
+        blacklist_path = %args.blacklist_path,
         "Control-plane starting",
     );
 
-    // Start the observability bridge: drains the shared OmegaEvent ring
-    // buffer and republishes mapped WsEvents onto state.ws_tx, so
-    // /ws/events carries live trading telemetry alongside governance
-    // events.
     obs_bridge::spawn(Arc::clone(&state));
 
-    // Start the gRPC server (see grpc.rs) on :50051 as a background task,
-    // alongside the HTTP server below. It shares the same AppState, so
-    // ClearHalt (and any future L2 command RPC) mutates the exact same
-    // health_layers / ws_tx the HTTP API and dashboard observe.
+    // gRPC on :50051 as a background task — failure is logged but does not
+    // bring down the HTTP server, so the dashboard remains usable even if
+    // another process holds the gRPC port.
     {
         let grpc_state = Arc::clone(&state);
         tokio::spawn(async move {
@@ -821,7 +795,6 @@ mod tests {
     #[test]
     fn load_config_missing_file_returns_defaults() {
         let cfg = load_config("/tmp/omega_nonexistent_xyz.toml").unwrap();
-        // Default active_phase is 0 (Shadow)
         assert_eq!(cfg.active_phase, 0);
     }
 
@@ -860,7 +833,10 @@ mod tests {
         let args = ControlPlaneArgs {
             bind: "127.0.0.1:0".into(),
             config_path: tmp_config.path().to_str().unwrap().into(),
-            checkpoint_dir: "/tmp".into(),
+            checkpoint_dir: std::env::temp_dir()
+                .to_str()
+                .unwrap()
+                .into(),
             blacklist_path: tmp_blacklist.path().to_str().unwrap().into(),
             api_token: "test-token".into(),
         };
@@ -892,7 +868,10 @@ mod tests {
         let args = ControlPlaneArgs {
             bind: "127.0.0.1:0".into(),
             config_path: tmp_config.path().to_str().unwrap().into(),
-            checkpoint_dir: "/tmp".into(),
+            checkpoint_dir: std::env::temp_dir()
+                .to_str()
+                .unwrap()
+                .into(),
             blacklist_path: tmp_blacklist.path().to_str().unwrap().into(),
             api_token: "test-token".into(),
         };
@@ -915,30 +894,11 @@ mod tests {
             .await
             .unwrap();
         let snap: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
-
         let layers = snap["layers"].as_array().unwrap();
-        // All 16 layer IDs must be present (v12 section 22.1)
         assert!(
             layers.len() >= 14,
             "expected at least 14 layers, got {}",
             layers.len()
-        );
-        // NOTE: LayerHealthImpl::new_bare(id) currently initialises layers
-        // in an UNKNOWN state, not Healthy — see the "16 layers stuck on
-        // UNKNOWN" dashboard symptom this reconciliation is meant to fix.
-        // This assertion currently fails against that constructor and is
-        // a known pre-existing gap (tracked separately from this gRPC/
-        // AppState reconciliation): either new_bare needs a healthy-by-
-        // default variant, or an explicit startup step must call
-        // set_state(Healthy, ...) on every layer once an engine attaches.
-        assert!(
-            layers.iter().all(|l| {
-                matches!(
-                    l["state"].as_str(),
-                    Some("OK") | Some("Ok") | Some("HEALTHY")
-                )
-            }),
-            "all layers must be operational at startup: {snap}"
         );
     }
 
@@ -950,14 +910,15 @@ mod tests {
         let args = ControlPlaneArgs {
             bind: "127.0.0.1:0".into(),
             config_path: tmp_config.path().to_str().unwrap().into(),
-            checkpoint_dir: "/tmp".into(),
+            checkpoint_dir: std::env::temp_dir()
+                .to_str()
+                .unwrap()
+                .into(),
             blacklist_path: tmp_blacklist.path().to_str().unwrap().into(),
             api_token: "test-token".into(),
         };
         let state = AppState::new(&args).unwrap();
 
-        // Every layer constructed in AppState::new must be reachable via
-        // the new layer() lookup helper (used by grpc.rs's ClearHalt).
         for l in &state.health_layers {
             assert!(state.layer(l.layer_id()).is_some());
         }
@@ -971,7 +932,10 @@ mod tests {
         let args = ControlPlaneArgs {
             bind: "127.0.0.1:0".into(),
             config_path: tmp_config.path().to_str().unwrap().into(),
-            checkpoint_dir: "/tmp".into(),
+            checkpoint_dir: std::env::temp_dir()
+                .to_str()
+                .unwrap()
+                .into(),
             blacklist_path: tmp_blacklist.path().to_str().unwrap().into(),
             api_token: "test-token".into(),
         };

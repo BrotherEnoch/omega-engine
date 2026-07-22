@@ -47,6 +47,20 @@
 // ## Nonce
 //
 //   Per-chain AtomicU64, same scheme as SA and LA.
+//
+// ## Audit fix (this revision)
+//
+// This file previously had its own private `compute_blueprint_hash`
+// associated function, hashing only (chain_id, signal_state_hash,
+// state_version, nonce, l2_exec_gas_estimate, expected_profit_net) —
+// structurally different from (and a strict subset of)
+// `ExecutionBlueprint::compute_hash()`'s canonical encoding, and
+// different again from every other strategy's own ad hoc hash (sa.rs,
+// la.rs, msa.rs each had yet another bespoke variant, now all fixed the
+// same way). `verify_hash()` would have failed for every MEV blueprint.
+// Removed `compute_blueprint_hash` entirely and switched to the
+// canonical `bp.compute_hash()`. Also adds `signal_id`,
+// `client_order_id`, `idempotency_key`.
 
 use std::sync::{
     atomic::{AtomicU64, Ordering},
@@ -56,6 +70,7 @@ use std::sync::{
 use alloy_primitives::{keccak256, Address, Bytes, B256, U256};
 use anyhow::Result;
 use async_trait::async_trait;
+use uuid::Uuid;
 
 use omega_core::types::blueprint::{ExecutionBlueprint, StrategyId};
 use omega_core::types::lane::{Lane, Simulator};
@@ -182,19 +197,6 @@ impl MevStrategy {
         buf.extend_from_slice(contract.as_slice());
         Bytes::from(buf)
     }
-
-    /// Compute blueprint_hash = keccak256 of all blueprint fields except
-    /// blueprint_hash itself.
-    fn compute_blueprint_hash(bp: &ExecutionBlueprint) -> B256 {
-        let mut buf = Vec::with_capacity(128);
-        buf.extend_from_slice(&bp.chain_id.to_be_bytes());
-        buf.extend_from_slice(bp.signal_state_hash.as_slice());
-        buf.extend_from_slice(&bp.state_version.to_be_bytes());
-        buf.extend_from_slice(&bp.nonce.to_be_bytes());
-        buf.extend_from_slice(&bp.l2_exec_gas_estimate.to_be_bytes());
-        buf.extend_from_slice(bp.expected_profit_net.as_le_slice());
-        keccak256(&buf)
-    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -309,15 +311,20 @@ impl StrategyTrait for MevStrategy {
         let l2_buf = self.gas.l2_buffer_factor;
         let l1_buf = self.gas.l1_data_buffer_factor;
 
+        let signal_id = Uuid::new_v4();
+        let client_order_id =
+            ExecutionBlueprint::derive_client_order_id(StrategyId::Mev, self.chain_id, nonce, signal_id);
+
         // Partially-built blueprint for hash computation
         let mut bp = ExecutionBlueprint {
-            blueprint_hash: B256::ZERO, // filled below
+            blueprint_hash: B256::ZERO, // filled below via canonical compute_hash()
             chain_id: self.chain_id,
             strategy_id: StrategyId::Mev,
             lane: Lane::Normal,
             simulator: Simulator::Anvil,
             signal_state_hash: signal.state_hash,
             state_version: signal.state_version,
+            signal_id,
             flashloan_provider: Address::ZERO, // MEV does not use flashloans
             flashloan_amount: U256::ZERO,
             flashloan_available: U256::ZERO,
@@ -339,11 +346,14 @@ impl StrategyTrait for MevStrategy {
             expiry_block: signal.block_number + MEV_EXPIRY_BLOCKS,
             nonce,
             confirmation_depth: MEV_CONFIRMATION,
+            client_order_id,
+            idempotency_key: B256::ZERO, // filled below
             relay_targets: vec!["mev_share_primary".to_string()],
             zk_proof_commitment: None,
         };
 
-        bp.blueprint_hash = Self::compute_blueprint_hash(&bp);
+        bp.idempotency_key = bp.compute_idempotency_key();
+        bp.blueprint_hash = bp.compute_hash();
 
         if !bp.is_profitable() {
             anyhow::bail!(
@@ -553,5 +563,31 @@ mod tests {
         let bp1 = strategy.build_blueprint(&signal).await.unwrap();
         let bp2 = strategy.build_blueprint(&signal).await.unwrap();
         assert!(bp2.nonce > bp1.nonce, "nonces must be strictly increasing");
+    }
+
+    // ── Blueprint integrity (this revision) ──────────────────────────────────
+
+    #[tokio::test]
+    async fn build_blueprint_passes_verify_hash() {
+        let strategy = make_strategy();
+        let signal = test_signal(9, 50);
+        let score = strategy.score(&signal).await.unwrap();
+        if !score.should_proceed() {
+            return;
+        }
+        let bp = strategy.build_blueprint(&signal).await.unwrap();
+        assert!(bp.verify_hash(), "MEV blueprint must pass the canonical integrity check");
+    }
+
+    #[tokio::test]
+    async fn build_blueprint_passes_verify_idempotency_key() {
+        let strategy = make_strategy();
+        let signal = test_signal(9, 50);
+        let score = strategy.score(&signal).await.unwrap();
+        if !score.should_proceed() {
+            return;
+        }
+        let bp = strategy.build_blueprint(&signal).await.unwrap();
+        assert!(bp.verify_idempotency_key());
     }
 }

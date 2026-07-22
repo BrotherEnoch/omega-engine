@@ -1,0 +1,7 @@
+# omega-engine/tools/module-check/Cargo.toml
+[package]
+name = "module-check"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]

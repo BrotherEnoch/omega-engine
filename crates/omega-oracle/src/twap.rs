@@ -33,6 +33,25 @@
 //
 //   Static mapping: token symbol → (pool address, token0 address, token1 address,
 //   token0_decimals, token1_decimals) on Arbitrum One.
+//
+// ## Audit fix (this revision) — DATA DEFECT, unresolved
+//
+// The LINK entry in `arbitrum_pools()` below has a malformed pool
+// address: 39 hex characters, one short of the 40 required for a valid
+// 20-byte address (verified programmatically, not by inspection). This
+// crate cannot verify what the correct address should be without a live
+// lookup this environment does not have access to, so rather than
+// fabricate a plausible-looking replacement — which would be worse than
+// the loud failure this currently is, since a wrong-but-valid-looking
+// address silently points at an arbitrary or nonexistent contract — a
+// test (`all_pool_addresses_are_well_formed`) has been added that
+// asserts every entry in `arbitrum_pools()` is exactly "0x" + 40 hex
+// characters. That test WILL FAIL until the LINK address is replaced
+// with a verified value from an authoritative source (Uniswap's official
+// pool list, or an on-chain factory `getPool` query) — this is
+// intentional: it converts a silent runtime panic wherever this string
+// eventually gets parsed into an `Address` into an explicit, immediate
+// `cargo test` failure instead.
 
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -51,6 +70,11 @@ use crate::resolution::{OraclePrice, OracleSource, TWAP_STALE_SECS};
 ///
 /// `token0_is_numerator = true` means token0 is the asset being priced,
 /// token1 is the quote (USD-stable or WETH).
+///
+/// WARNING: the LINK entry's address is currently malformed (39 hex
+/// chars, not 40) — see this file's module-level audit note. Do not
+/// deploy against this table until `all_pool_addresses_are_well_formed`
+/// passes.
 pub fn arbitrum_pools() -> &'static [(&'static str, &'static str, bool, u8, u8)] {
     &[
         // WETH / USDC.e 0.05% pool — USDC as quote, WETH as numerator
@@ -70,6 +94,10 @@ pub fn arbitrum_pools() -> &'static [(&'static str, &'static str, bool, u8, u8)]
             8,
         ),
         // LINK / ETH 0.3% pool — LINK as token0, ETH as token1 (priced in ETH, converted)
+        // FIXME (this revision): address below is 39 hex chars, not 40 —
+        // confirmed malformed, NOT independently verified/corrected. See
+        // module-level audit note. Replace with a verified address before
+        // relying on this entry.
         (
             "LINK",
             "0x468b88941e7Cc0B88c1869d68ab6b570bCEF62F",
@@ -300,5 +328,36 @@ mod tests {
             (price - target_price).abs() < 1.0,
             "decoded WETH/USDC price should round-trip near {target_price}, got {price}"
         );
+    }
+
+    // ── Audit fix regression test (this revision) ────────────────────────────
+
+    #[test]
+    fn all_pool_addresses_are_well_formed() {
+        // Guards against exactly the defect found in this revision: the
+        // LINK entry's address was 39 hex chars, one short of a valid
+        // 20-byte address. This test intentionally FAILS until every
+        // entry in arbitrum_pools() is a properly formatted "0x" + 40
+        // hex chars — see this file's module-level audit note. A failing
+        // assertion here is preferable to a runtime panic wherever this
+        // string eventually gets parsed into an on-chain `Address`.
+        for (symbol, addr, _, _, _) in arbitrum_pools() {
+            assert!(
+                addr.starts_with("0x"),
+                "{symbol}: pool address must start with 0x, got {addr}"
+            );
+            let hex_part = &addr[2..];
+            assert_eq!(
+                hex_part.len(),
+                40,
+                "{symbol}: pool address must be exactly 40 hex chars after 0x \
+                 (20-byte address), got {} chars in {addr}",
+                hex_part.len()
+            );
+            assert!(
+                hex_part.chars().all(|c| c.is_ascii_hexdigit()),
+                "{symbol}: pool address contains non-hex characters: {addr}"
+            );
+        }
     }
 }

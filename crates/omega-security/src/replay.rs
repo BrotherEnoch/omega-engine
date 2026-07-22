@@ -29,6 +29,30 @@
 // Thread-safety:
 //   DashMap/DashSet provide lock-free reads and fine-grained shard locks for writes.
 //   All public methods take &self.
+//
+// ## Audit fix (this revision): nonce_map_key did not actually mirror nonce_key()
+//
+// This file's own doc comment (above, and previously on `nonce_map_key` itself)
+// asserted that the local key derivation "mirrors `ExecutionBlueprint::nonce_key()`
+// in omega-core." It did not. `ExecutionBlueprint::nonce_key()` is a two-stage
+// hash — `keccak256(keccak256(strategy_id_string) || chain_id_be_bytes)` — chosen
+// specifically (per that function's own comment) so the strategy discriminant is
+// hashed on its own before being combined with `chain_id`. `nonce_map_key` was
+// instead hashing `strategy_id_bytes || chain_id_bytes` in a single pass — a
+// different key for the same logical `(strategy_id, chain_id)` pair.
+//
+// This was not a live functional bug: `NonceRegistry` only ever compares its own
+// derivation against itself (`validate`/`advance`/`on_chain_nonce_sync` all route
+// through the same `nonce_map_key`), so internal self-consistency held. But the
+// doc-asserted equivalence with `omega-core`'s hash was false, and any future code
+// that trusted the comment to cross-reference a nonce key between the two crates
+// (e.g. to look up a `NonceState` using a key derived from
+// `ExecutionBlueprint::nonce_key()` directly) would have silently gotten a
+// different key and missed the entry. Fixed to use the same two-stage
+// keccak256(keccak256(..) || ..) structure, and a regression test now calls
+// `omega_core::types::blueprint::ExecutionBlueprint::nonce_key()` directly and
+// asserts byte-for-byte equality, so this can't drift silently again — `Cargo.toml`
+// already depends on `omega-core`, so this cross-check costs nothing new.
 
 use dashmap::{DashMap, DashSet};
 use serde::{Deserialize, Serialize};
@@ -143,12 +167,19 @@ impl Default for ReplayGuard {
 
 // ─── Nonce registry ───────────────────────────────────────────────────────────
 
-/// Chain-scoped nonce key: keccak256(strategy_id || chain_id).
-/// Mirrors `ExecutionBlueprint::nonce_key()` in omega-core.
+/// Chain-scoped nonce key: keccak256(keccak256(strategy_id) || chain_id).
+///
+/// Must exactly mirror `ExecutionBlueprint::nonce_key()` in omega-core — see this
+/// file's audit note above. The strategy discriminant is hashed on its own first
+/// (`inner`), then combined with `chain_id` in a second hash, rather than hashing
+/// both inputs together in one pass; the two-stage structure is what
+/// `ExecutionBlueprint::nonce_key()` actually does, so this must match it exactly,
+/// not just produce "a" deterministic key.
 fn nonce_map_key(strategy_id: &str, chain_id: u64) -> [u8; 32] {
     use sha3::{Digest, Keccak256};
+    let inner: [u8; 32] = Keccak256::digest(strategy_id.as_bytes()).into();
     let mut h = Keccak256::new();
-    h.update(strategy_id.as_bytes());
+    h.update(inner);
     h.update(chain_id.to_be_bytes());
     h.finalize().into()
 }
@@ -382,5 +413,66 @@ mod replay_tests {
         assert_eq!(k1, k2);
         let k3 = nonce_map_key("LA", 42161);
         assert_ne!(k1, k3);
+    }
+
+    // ── Regression: nonce_map_key must match omega-core's nonce_key() exactly ──
+
+    #[test]
+    fn nonce_map_key_matches_execution_blueprint_nonce_key() {
+        // Direct cross-crate check against the reference implementation —
+        // omega-security already depends on omega-core, so this costs
+        // nothing new and makes the doc-asserted equivalence enforceable
+        // instead of just claimed in a comment. Covers every StrategyId
+        // variant, not just one, since the string discriminant differs
+        // per variant (SA/CNRY/MSA/LA/MEV) and each is a separate input
+        // to the inner hash.
+        use omega_core::types::blueprint::{ExecutionBlueprint, StrategyId};
+
+        let cases = [
+            (StrategyId::Sa,   "SA"),
+            (StrategyId::Cnry, "CNRY"),
+            (StrategyId::Msa,  "MSA"),
+            (StrategyId::La,   "LA"),
+            (StrategyId::Mev,  "MEV"),
+        ];
+
+        for (strategy_id, label) in cases {
+            for chain_id in [1u64, 42161u64] {
+                let expected: [u8; 32] =
+                    ExecutionBlueprint::nonce_key(strategy_id, chain_id).0;
+                let actual = nonce_map_key(label, chain_id);
+                assert_eq!(
+                    actual, expected,
+                    "nonce_map_key({label:?}, {chain_id}) must exactly match \
+                     ExecutionBlueprint::nonce_key({strategy_id:?}, {chain_id})"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn nonce_map_key_is_not_a_single_pass_hash() {
+        // Regression guard for the specific bug fixed in this revision:
+        // a naive single-pass keccak256(strategy_id_bytes || chain_id_bytes)
+        // must NOT equal the real two-stage key. If this test starts
+        // failing, nonce_map_key has regressed back to the single-pass
+        // form that silently diverged from ExecutionBlueprint::nonce_key().
+        use sha3::{Digest, Keccak256};
+
+        let strategy_id = "SA";
+        let chain_id     = 42161u64;
+
+        let mut naive = Keccak256::new();
+        naive.update(strategy_id.as_bytes());
+        naive.update(chain_id.to_be_bytes());
+        let naive_key: [u8; 32] = naive.finalize().into();
+
+        let correct_key = nonce_map_key(strategy_id, chain_id);
+
+        assert_ne!(
+            naive_key, correct_key,
+            "nonce_map_key must NOT match the naive single-pass hash — \
+             the two-stage inner/outer hash must produce a different key"
+        );
     }
 }

@@ -1,6 +1,15 @@
 // crates/omega-strategies/src/la.rs
 //
 // Liquidation Arbitrage (LA) — Phase 3 strategy (spec §1.1, §11).
+//
+// ## Audit fix (this revision)
+//
+// Same fix as sa.rs: `blueprint_hash` was previously computed from an ad
+// hoc, strategy-local `keccak256(signal_state_hash || nonce ||
+// debt_wei)` — different from, and much smaller than,
+// `ExecutionBlueprint::compute_hash()`'s canonical encoding. Fixed to
+// build with a placeholder and call the canonical `bp.compute_hash()`.
+// Also adds `signal_id`, `client_order_id`, `idempotency_key`.
 
 use std::sync::{
     atomic::{AtomicU64, Ordering},
@@ -10,6 +19,7 @@ use std::sync::{
 use alloy_primitives::{keccak256, Address, Bytes, B256, U256};
 use anyhow::Result;
 use async_trait::async_trait;
+use uuid::Uuid;
 
 use omega_core::types::blueprint::{ExecutionBlueprint, StrategyId};
 use omega_core::types::lane::{Lane, Simulator};
@@ -187,24 +197,23 @@ impl StrategyTrait for LaStrategy {
             net_profit,
         );
 
-        let mut hash_input = Vec::new();
-        hash_input.extend_from_slice(signal.state_hash.as_slice());
-        hash_input.extend_from_slice(&nonce.to_be_bytes());
-        hash_input.extend_from_slice(debt_wei.as_le_slice());
-        let blueprint_hash = keccak256(&hash_input);
+        let signal_id = Uuid::new_v4();
+        let client_order_id =
+            ExecutionBlueprint::derive_client_order_id(StrategyId::La, self.chain_id, nonce, signal_id);
 
         let dynamic_min = U256::from(signal.base_fee_gwei)
             .saturating_mul(U256::from(LA_GAS_BUDGET))
             .saturating_mul(U256::from(1_000_000_000_u64));
 
-        Ok(ExecutionBlueprint {
-            blueprint_hash,
+        let mut bp = ExecutionBlueprint {
+            blueprint_hash:          B256::ZERO, // filled below via canonical compute_hash()
             chain_id:                self.chain_id,
             strategy_id:             StrategyId::La,
             lane:                    Lane::Normal,
             simulator:               Simulator::Anvil,
             signal_state_hash:       signal.state_hash,
             state_version:           signal.state_version,
+            signal_id,
             flashloan_provider:      self.flashloan_provider,
             flashloan_amount:        debt_wei,
             flashloan_available:     debt_wei.saturating_mul(U256::from(2)),
@@ -226,9 +235,14 @@ impl StrategyTrait for LaStrategy {
             expiry_block:            signal.block_number + LA_EXPIRY_BLOCKS,
             nonce,
             confirmation_depth:      LA_CONFIRMATION,
+            client_order_id,
+            idempotency_key:         B256::ZERO, // filled below
             relay_targets:           vec!["relay_1".into(), "relay_2".into()],
             zk_proof_commitment:     None,
-        })
+        };
+        bp.idempotency_key = bp.compute_idempotency_key();
+        bp.blueprint_hash = bp.compute_hash();
+        Ok(bp)
     }
 
     async fn simulate(&self, bp: &ExecutionBlueprint) -> Result<SimResult> {
@@ -319,5 +333,30 @@ mod tests {
         let hf_warm = U256::from(e18 + 5 * e18 / 100); // 1.05 — above threshold
         assert!( LaStrategy::is_hot_tier(hf_hot),  "1.001 should be hot tier");
         assert!(!LaStrategy::is_hot_tier(hf_warm), "1.05 should not be hot tier");
+    }
+
+    // ── Blueprint integrity (this revision) ──────────────────────────────────
+
+    #[tokio::test]
+    async fn build_blueprint_passes_verify_hash() {
+        // Regression guard: LA previously hashed only
+        // (signal_state_hash, nonce, debt_wei) — never matching
+        // ExecutionBlueprint::compute_hash()'s canonical encoding.
+        let bp = make().build_blueprint(&sig(5)).await.unwrap();
+        assert!(bp.verify_hash(), "LA blueprint must pass the canonical integrity check");
+    }
+
+    #[tokio::test]
+    async fn build_blueprint_passes_verify_idempotency_key() {
+        let bp = make().build_blueprint(&sig(5)).await.unwrap();
+        assert!(bp.verify_idempotency_key());
+    }
+
+    #[tokio::test]
+    async fn build_blueprint_has_distinct_signal_ids_across_calls() {
+        let s   = make();
+        let bp1 = s.build_blueprint(&sig(5)).await.unwrap();
+        let bp2 = s.build_blueprint(&sig(5)).await.unwrap();
+        assert_ne!(bp1.signal_id, bp2.signal_id);
     }
 }

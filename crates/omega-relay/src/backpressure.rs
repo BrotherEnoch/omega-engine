@@ -19,6 +19,14 @@
 //! a real, known negative — no need to wait). A submission the relay *accepted* is handed
 //! to `InclusionTracker` instead, and only feeds `LaRelayMetrics` once real on-chain
 //! confirmation resolves it — see `MultiRelayClient::reconcile_inclusions` in `lib.rs`.
+//!
+//! ## Audit fix (this revision)
+//!
+//! `build_submission_order` and `submit_single_bundle` each hardcoded the 5% tie-band
+//! cutoff as a bare `0.95` literal — a third, independent copy of the same constant also
+//! duplicated in `reputation.rs::submission_order`. Replaced with
+//! `crate::config::LA_TIE_BAND_FRACTION`, the single source of truth added in this
+//! revision — see `config.rs`'s audit note.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -33,7 +41,7 @@ use tokio::time::sleep;
 use tracing::{debug, warn};
 
 use crate::client::{BundlePayload, RelayClient, SubmissionOutcome};
-use crate::config::RelayConfig;
+use crate::config::{RelayConfig, LA_TIE_BAND_FRACTION};
 use crate::confirmation::InclusionTracker;
 use crate::error::{RelayError, RelayResult};
 use crate::metrics::{LaRelayMetrics, RelayRateSnapshot};
@@ -189,7 +197,7 @@ impl CascadeSubmitter {
         if ranked.is_empty() { return ranked; }
 
         let Some(best) = ranked.first().map(|s| s.la_rate) else { return ranked; };
-        let threshold = best * 0.95;
+        let threshold = best * (1.0 - LA_TIE_BAND_FRACTION);
 
         let (mut in_band, below_band): (Vec<_>, Vec<_>) =
             ranked.into_iter().partition(|r| r.la_rate >= threshold);
@@ -248,7 +256,7 @@ pub async fn submit_single_bundle(
     let Some(best) = ranked.first().map(|s| s.la_rate) else {
         return Err(RelayError::AllRelaysFailed { bundle_hash: bundle.bundle_hash.clone() });
     };
-    let threshold = best * 0.95;
+    let threshold = best * (1.0 - LA_TIE_BAND_FRACTION);
     let (mut band, rest): (Vec<_>, Vec<_>) =
         ranked.drain(..).partition(|r| r.la_rate >= threshold);
     band.shuffle(&mut thread_rng());
@@ -438,5 +446,17 @@ mod tests {
             .submit_cascade(vec![BundlePayload { bundle_hash: "0x0".into(), ..Default::default() }])
             .await;
         assert!(results.is_empty());
+    }
+
+    // ── Audit fix regression test (this revision) ─────────────────────────────
+
+    #[test]
+    fn tie_band_threshold_derives_from_shared_constant() {
+        // Regression guard: both build_submission_order and submit_single_bundle
+        // must compute their threshold from LA_TIE_BAND_FRACTION, not a
+        // hardcoded 0.95 literal that could silently drift from it.
+        let best = 0.90_f64;
+        let expected_threshold = best * (1.0 - LA_TIE_BAND_FRACTION);
+        assert!((expected_threshold - 0.855).abs() < 1e-9);
     }
 }

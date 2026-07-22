@@ -17,6 +17,22 @@ edition = "2021"
 # require ZK proofs before relay submission (the ZK gate is at the Vault
 # level, not the submission level).  omega-hot-path is intentionally
 # dependency-minimal to keep compile times low.
+#
+# ## Audit fix (this revision): lint enforcement + uuid
+#
+# `[lints]` added below. `unwrap_used`/`expect_used` are set to "warn",
+# not "deny", pending an actual sweep of this crate's existing code for
+# unwrap/expect call sites — flipping straight to "deny" without first
+# auditing what's there risks silently failing `cargo clippy` on code
+# nobody has reviewed for it yet. Escalate to "deny" once that sweep is
+# done and any remaining unwrap/expect calls are either removed or have
+# a justified `#[allow(...)]` with a comment explaining why the
+# invariant holds. `unsafe_code`, `float_cmp`, and `panic` are set to
+# "deny" directly since a hot-path execution lane has no legitimate use
+# for any of the three.
+#
+# `uuid` added for client-order-ID / idempotency-key generation in the
+# hot-path submission logic — this crate did not previously depend on it.
 
 [dependencies]
 omega-core = { path = "../omega-core" }
@@ -44,3 +60,18 @@ chrono = { workspace = true }
 
 # Lock-free metrics counters — read from observability without locking
 arc-swap = { workspace = true }
+
+# Idempotency / client order IDs for hot-path submission dedup
+uuid = { workspace = true }
+
+[lints.rust]
+unsafe_code = "deny"
+
+[lints.clippy]
+# See this file's audit note above: "warn" until an explicit sweep of
+# existing unwrap/expect call sites in this crate is done and the deny
+# can be turned on without breaking an unreviewed baseline.
+unwrap_used = "warn"
+expect_used = "warn"
+float_cmp   = "deny"
+panic       = "deny"

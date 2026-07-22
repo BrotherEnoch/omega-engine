@@ -1,4 +1,4 @@
-crates/omega-risk/src/heartbeat.rs
+// crates/omega-risk/src/heartbeat.rs
 //
 // Liveness / heartbeat tracking.
 //

@@ -4,6 +4,7 @@ use alloy_primitives::{Address, B256, U256};
 use omega_core::errors::DropCode;
 use omega_core::types::blueprint::{ExecutionBlueprint, StrategyId};
 use omega_core::types::lane::{Lane, Simulator};
+use uuid::Uuid;
 
 use crate::scheduler::ExecutionDag;
 use crate::types::{DagConfig, DagError};
@@ -23,6 +24,16 @@ fn test_config() -> DagConfig {
 fn make_bp(hash_byte: u8, strategy: StrategyId, lane: Lane) -> ExecutionBlueprint {
     let mut hash = B256::ZERO;
     hash.0[0] = hash_byte;
+    // signal_id/client_order_id/idempotency_key: these DAG scheduling
+    // tests exercise admission/dependency/eviction logic only, never
+    // verify_hash()/verify_idempotency_key(), so — same as
+    // blueprint_hash above — these are deterministic placeholders keyed
+    // off hash_byte for uniqueness across test cases, not integrity-
+    // checked values. Do not copy this pattern into code that DOES rely
+    // on hash/idempotency integrity.
+    let signal_id = Uuid::from_bytes([hash_byte; 16]);
+    let client_order_id =
+        ExecutionBlueprint::derive_client_order_id(strategy, 42161, 0, signal_id);
     ExecutionBlueprint {
         blueprint_hash:          hash,
         chain_id:                42161,
@@ -31,6 +42,7 @@ fn make_bp(hash_byte: u8, strategy: StrategyId, lane: Lane) -> ExecutionBlueprin
         simulator:               Simulator::Revm,
         signal_state_hash:       B256::ZERO,
         state_version:           1,
+        signal_id,
         flashloan_provider:      Address::ZERO,
         flashloan_amount:        U256::ZERO,
         flashloan_available:     U256::ZERO,
@@ -52,6 +64,8 @@ fn make_bp(hash_byte: u8, strategy: StrategyId, lane: Lane) -> ExecutionBlueprin
         expiry_block:            1_001,
         nonce:                   0,
         confirmation_depth:      12,
+        client_order_id,
+        idempotency_key:         B256::ZERO,
         relay_targets:           vec!["relay_a".into()],
         zk_proof_commitment:     None,
     }

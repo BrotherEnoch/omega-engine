@@ -37,16 +37,47 @@
 //   if `our_fee_gwei × multiplier <= our_fee_gwei` (i.e. multiplier ≤
 //   1.0, no overbid).  All other loss codes count as "wins" for the
 //   holdout check (non-gas losses are not multiplier-attributable).
+//
+// ## Audit fix (this revision): CeilingEscalationTracker was never wired in
+//
+// `ceiling_escalation.rs`'s own doc comment states this learner "owns
+// this tracker and updates it on every LostGasLow at the ceiling" — but
+// no `CeilingEscalationTracker` field or usage existed anywhere in this
+// struct. The ceiling-hit counting and pause decision were implemented
+// entirely with a separate, independent `ceiling_hit_count: AtomicU64`,
+// so `CeilingEscalationTracker` was dead code: nothing ever called
+// `record_ceiling_hit`/`record_pause`/`record_unpause`, meaning the
+// observability API this tracker exists specifically to back
+// (`GET /api/v1/la/gas-model/ceiling-status`, §17.2) would report
+// `consecutive_ceiling_hits: 0`, `trigger_key: None`, `paused_at: None`
+// forever, regardless of what actually happened to the model.
+//
+// Fixed by adding `ceiling_tracker: Mutex<CeilingEscalationTracker>` and
+// calling its recording methods at the exact points the existing atomic
+// is already touched (ceiling hit, non-ceiling reset, overbid reset,
+// pause, unpause) — additive only. The atomic-based pause/resume
+// decision logic is UNCHANGED and remains the authoritative source for
+// whether the model is actually paused (it's already correct and
+// already tested); the tracker now just faithfully mirrors it for the
+// observability snapshot, via `ceiling_snapshot()`. `Mutex` (not
+// `RwLock` or a second atomic) because updates only ever happen from
+// within `update_multiplier`/`unpause`, both low-frequency relative to
+// the hot scoring path, and `CeilingEscalationTracker`'s own API
+// requires `&mut self` for recording — a plain field would have needed
+// `&mut self` on this learner too, breaking the "governance API can
+// read/clear without a mutable reference" contract this file already
+// documents for `paused`/`ceiling_hit_count`.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{
-    Arc,
+    Arc, Mutex,
     atomic::{AtomicBool, AtomicU64, Ordering},
 };
 
 use omega_core::{HealthState, LayerHealth, MlConfig};
 
+use super::ceiling_escalation::{CeilingEscalationState, CeilingEscalationTracker};
 use super::checkpoint::{self, ModelCheckpoint};
 use super::classifier::{FeatureKey, LossCode, LossEvent};
 
@@ -88,8 +119,16 @@ pub struct GasModelOnlineLearner {
 
     /// Consecutive LostGasLow events at the ceiling, per-FeatureKey
     /// aggregated into a single counter.  Reset to zero on any non-ceiling
-    /// update.
+    /// update. This remains the authoritative source for the pause
+    /// decision — see this file's module-level audit note for why
+    /// `ceiling_tracker` below does not replace it.
     ceiling_hit_count: Arc<AtomicU64>,
+
+    /// Observability mirror of the ceiling-escalation state, backing
+    /// `GET /api/v1/la/gas-model/ceiling-status` (§13.3, §17.2) via
+    /// `ceiling_snapshot()`. Updated in lockstep with `ceiling_hit_count`
+    /// at every call site that touches it — see this file's audit note.
+    ceiling_tracker: Mutex<CeilingEscalationTracker>,
 
     // ── Health layer reference (for DEGRADED transition on escalation) ────
     health: Option<Arc<dyn LayerHealth>>,
@@ -117,6 +156,9 @@ impl GasModelOnlineLearner {
             held_out: Vec::new(),
             paused: Arc::new(AtomicBool::new(false)),
             ceiling_hit_count: Arc::new(AtomicU64::new(0)),
+            ceiling_tracker: Mutex::new(CeilingEscalationTracker::new(
+                config.ceiling_escalation_threshold,
+            )),
             health: None,
         }
     }
@@ -197,11 +239,26 @@ impl GasModelOnlineLearner {
         self.paused.load(Ordering::Acquire)
     }
 
+    /// Full ceiling-escalation observability snapshot, backing
+    /// `GET /api/v1/la/gas-model/ceiling-status` (§13.3, §17.2). See
+    /// this file's module-level audit note — this is the fix that
+    /// makes that endpoint report real data instead of permanent zeros.
+    pub fn ceiling_snapshot(&self) -> CeilingEscalationState {
+        self.ceiling_tracker
+            .lock()
+            .expect("ceiling_tracker mutex poisoned")
+            .snapshot(self.is_paused())
+    }
+
     /// Unpause the model after governance clearance
     /// (POST /api/v1/la/gas-model/unpause, §17.2).
     pub fn unpause(&self) {
         self.paused.store(false, Ordering::Release);
         self.ceiling_hit_count.store(0, Ordering::Release);
+        self.ceiling_tracker
+            .lock()
+            .expect("ceiling_tracker mutex poisoned")
+            .record_unpause();
         tracing::info!("Gas model unpaused by governance");
     }
 
@@ -223,6 +280,17 @@ impl GasModelOnlineLearner {
                 if *m >= self.multiplier_ceiling - 1e-6 {
                     let hits = self.ceiling_hit_count.fetch_add(1, Ordering::Relaxed) + 1;
 
+                    // Mirror into the observability tracker — see this
+                    // file's audit note. Recorded regardless of whether
+                    // this specific hit crosses the pause threshold; the
+                    // tracker's own internal count stays in lockstep
+                    // with `ceiling_hit_count` since both are only ever
+                    // touched together, right here.
+                    self.ceiling_tracker
+                        .lock()
+                        .expect("ceiling_tracker mutex poisoned")
+                        .record_ceiling_hit(&key);
+
                     if hits > self.ceiling_escalation_threshold {
                         tracing::error!(
                             feature_key  = %key.label(),
@@ -230,6 +298,10 @@ impl GasModelOnlineLearner {
                             "GAS_MODEL_CEILING_ESCALATION — pausing model, L2 governance required",
                         );
                         self.paused.store(true, Ordering::SeqCst);
+                        self.ceiling_tracker
+                            .lock()
+                            .expect("ceiling_tracker mutex poisoned")
+                            .record_pause();
 
                         if let Some(ref health) = self.health {
                             health.set_state(
@@ -246,6 +318,10 @@ impl GasModelOnlineLearner {
                 } else {
                     // Any non-ceiling update resets the consecutive counter
                     self.ceiling_hit_count.store(0, Ordering::Relaxed);
+                    self.ceiling_tracker
+                        .lock()
+                        .expect("ceiling_tracker mutex poisoned")
+                        .reset_hits();
                 }
             }
 
@@ -253,6 +329,10 @@ impl GasModelOnlineLearner {
                 *m -= self.learning_rate;
                 // Overbid resets ceiling hit streak
                 self.ceiling_hit_count.store(0, Ordering::Relaxed);
+                self.ceiling_tracker
+                    .lock()
+                    .expect("ceiling_tracker mutex poisoned")
+                    .reset_hits();
             }
 
             _ => {}
@@ -520,5 +600,82 @@ mod tests {
         *l.fee_multipliers.entry(key).or_insert(1.0) = 1.05;
         l.held_out.push(event);
         assert!((l.compute_holdout_win_rate() - 0.0).abs() < 1e-9);
+    }
+
+    // ── Ceiling tracker wiring (this revision) ────────────────────────────
+
+    #[test]
+    fn ceiling_snapshot_reflects_hits_before_escalation() {
+        let mut l = make_learner();
+        // Push a multiplier to the ceiling so every further LostGasLow
+        // counts as a ceiling hit.
+        let key = train(LossCode::LostGasLow).feature_key();
+        *l.fee_multipliers.entry(key.clone()).or_insert(1.0) = l.multiplier_ceiling - 1e-9;
+
+        l.on_loss(train(LossCode::LostGasLow));
+
+        let snap = l.ceiling_snapshot();
+        assert_eq!(snap.consecutive_ceiling_hits, 1);
+        assert!(snap.trigger_key.is_some());
+        assert!(snap.last_hit_at.is_some());
+        assert!(!snap.paused, "not paused yet — below threshold");
+    }
+
+    #[test]
+    fn ceiling_snapshot_reflects_pause_after_escalation() {
+        let mut l = make_learner();
+        let key = train(LossCode::LostGasLow).feature_key();
+        *l.fee_multipliers.entry(key.clone()).or_insert(1.0) = l.multiplier_ceiling - 1e-9;
+
+        // Drive past the escalation threshold.
+        for _ in 0..=l.ceiling_escalation_threshold {
+            *l.fee_multipliers.get_mut(&key).unwrap() = l.multiplier_ceiling - 1e-9;
+            l.on_loss(train(LossCode::LostGasLow));
+        }
+
+        assert!(l.is_paused(), "model must be paused after crossing threshold");
+        let snap = l.ceiling_snapshot();
+        assert!(snap.paused, "snapshot must reflect paused state");
+        assert!(snap.paused_at.is_some(), "record_pause must have been called");
+    }
+
+    #[test]
+    fn ceiling_snapshot_resets_after_unpause() {
+        let mut l = make_learner();
+        let key = train(LossCode::LostGasLow).feature_key();
+        for _ in 0..=l.ceiling_escalation_threshold {
+            *l.fee_multipliers.entry(key.clone()).or_insert(1.0) = l.multiplier_ceiling - 1e-9;
+            l.on_loss(train(LossCode::LostGasLow));
+        }
+        assert!(l.is_paused());
+
+        l.unpause();
+
+        let snap = l.ceiling_snapshot();
+        assert!(!snap.paused);
+        assert_eq!(snap.consecutive_ceiling_hits, 0);
+        assert!(snap.trigger_key.is_none());
+        assert!(snap.paused_at.is_none());
+    }
+
+    #[test]
+    fn ceiling_tracker_resets_on_non_ceiling_update() {
+        let mut l = make_learner();
+        let key = train(LossCode::LostGasLow).feature_key();
+        // First hit at the ceiling.
+        *l.fee_multipliers.entry(key.clone()).or_insert(1.0) = l.multiplier_ceiling - 1e-9;
+        l.on_loss(train(LossCode::LostGasLow));
+        assert_eq!(l.ceiling_snapshot().consecutive_ceiling_hits, 1);
+
+        // Now push the SAME key's multiplier well below ceiling and take
+        // another LostGasLow — this is a non-ceiling update and must
+        // reset the tracker's count, mirroring ceiling_hit_count.
+        *l.fee_multipliers.get_mut(&key).unwrap() = 1.0;
+        l.on_loss(train(LossCode::LostGasLow));
+        assert_eq!(
+            l.ceiling_snapshot().consecutive_ceiling_hits,
+            0,
+            "a non-ceiling update must reset the observability tracker too"
+        );
     }
 }

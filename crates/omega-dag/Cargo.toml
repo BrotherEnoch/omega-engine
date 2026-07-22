@@ -4,6 +4,12 @@ name    = "omega-dag"
 version = "12.0.0"
 edition = "2021"
 
+# ## Audit fix (this revision)
+#
+# Added `uuid` — src/tests.rs's `make_bp()` helper now constructs
+# `signal_id: Uuid` as part of `ExecutionBlueprint`'s new field set
+# (omega-core). Not previously a dependency of this crate.
+
 [dependencies]
 omega-core = { path = "../omega-core" }
 
@@ -29,5 +35,8 @@ chrono = { workspace = true }
 
 # Telemetry
 tracing = { workspace = true }
+
+# ExecutionBlueprint::signal_id construction in test helpers (src/tests.rs)
+uuid = { workspace = true }
 
 [dev-dependencies]

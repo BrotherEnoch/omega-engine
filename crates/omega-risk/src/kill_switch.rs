@@ -65,6 +65,7 @@
 // them.
 
 use chrono::{DateTime, Utc};
+use dashmap::mapref::entry::Entry;
 use dashmap::DashMap;
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
@@ -523,33 +524,46 @@ impl KillSwitchRegistry {
         Ok(Self { switches: Arc::new(DashMap::new()), default_config })
     }
 
+    /// Bug fix: this previously read `!self.switches.contains_key(scope)`
+    /// into an `is_new` bool, then made a *separate* `entry(..).
+    /// or_insert_with(..)` call and acted on that stale bool afterward.
+    /// Two threads racing on the same never-seen `scope` could both
+    /// observe `is_new == true` before either had inserted — the losing
+    /// thread's `or_insert_with` becomes a no-op (it gets the winner's
+    /// switch back), but it would still fall into the "publish initial
+    /// metrics" branch and re-zero `KILL_SWITCH_TRIPPED` /
+    /// `KILL_SWITCH_CUMULATIVE_LOSS_WEI` for a switch that, by the time
+    /// the loser ran, might already have been tripped or accumulated
+    /// real loss by the winner.
+    ///
+    /// Matching on `dashmap::Entry` directly removes the separate read:
+    /// "did I just create this entry" is now inherent to a single atomic
+    /// map operation, so the initial-metrics branch can only ever execute
+    /// for the one thread that actually inserted it.
     fn get_or_create(&self, scope: &str) -> Arc<KillSwitch> {
-        let is_new = !self.switches.contains_key(scope);
-        let switch = self
-            .switches
-            .entry(scope.to_string())
-            .or_insert_with(|| {
-                Arc::new(
+        match self.switches.entry(scope.to_string()) {
+            Entry::Occupied(e) => e.get().clone(),
+            Entry::Vacant(e) => {
+                let switch = Arc::new(
                     KillSwitch::new(self.default_config.clone())
                         .expect("default_config already validated in KillSwitchRegistry::new"),
-                )
-            })
-            .clone();
+                );
+                e.insert(switch.clone());
 
-        if is_new {
-            // Publish the configured threshold once, at first observation
-            // of this scope, so alert rules comparing observed loss
-            // against the threshold (e.g. "80% of cap reached") have
-            // something to compare against from the start rather than
-            // only after the first recorded outcome.
-            metrics::KILL_SWITCH_MAX_CUMULATIVE_LOSS_WEI
-                .with_label_values(&[scope])
-                .set(switch.config().max_cumulative_loss_wei as f64);
-            metrics::KILL_SWITCH_TRIPPED.with_label_values(&[scope]).set(0.0);
-            metrics::KILL_SWITCH_CUMULATIVE_LOSS_WEI.with_label_values(&[scope]).set(0.0);
+                // Publish the configured threshold once, at first observation
+                // of this scope, so alert rules comparing observed loss
+                // against the threshold (e.g. "80% of cap reached") have
+                // something to compare against from the start rather than
+                // only after the first recorded outcome.
+                metrics::KILL_SWITCH_MAX_CUMULATIVE_LOSS_WEI
+                    .with_label_values(&[scope])
+                    .set(switch.config().max_cumulative_loss_wei as f64);
+                metrics::KILL_SWITCH_TRIPPED.with_label_values(&[scope]).set(0.0);
+                metrics::KILL_SWITCH_CUMULATIVE_LOSS_WEI.with_label_values(&[scope]).set(0.0);
+
+                switch
+            }
         }
-
-        switch
     }
 
     /// True if `scope` may currently submit. Unknown scopes default to

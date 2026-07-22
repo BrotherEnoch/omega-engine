@@ -4,6 +4,33 @@ name    = "omega-risk"
 version = "12.0.0"
 edition = "2021"
 
+# ## Audit fix (this revision): lint enforcement + uuid
+#
+# `[lints]` added below. `unwrap_used`/`expect_used` are set to "warn",
+# not "deny" — this is not a hypothetical caution here the way it is in
+# omega-hot-path's Cargo.toml: this crate's own test modules already
+# reviewed in this conversation (checks.rs, circuit_breakers.rs,
+# kill_switch.rs, flash_crash.rs, whitelist.rs, competition.rs) use
+# `.unwrap()` extensively inside `#[cfg(test)]` blocks. Cargo's `[lints]`
+# table applies crate-wide, INCLUDING test modules, and clippy's
+# unwrap_used/expect_used lints do not auto-exempt `#[cfg(test)]` code.
+# Setting these to "deny" as originally proposed would fail
+# `cargo clippy` on this crate immediately, against code already in this
+# thread — not a future risk, a guaranteed break. Escalate to "deny" only
+# after either rewriting every test's `.unwrap()` to use a justified
+# `.expect("...")`/`#[allow(...)]`, or scoping the deny to non-test code
+# via a `#![cfg_attr(not(test), deny(clippy::unwrap_used))]`-style
+# attribute in `lib.rs` (which Cargo's manifest-level `[lints]` table
+# cannot itself express — that split needs a source-level attribute).
+# `unsafe_code`, `float_cmp`, and `panic` are set to "deny" directly: no
+# unsafe blocks, direct float equality comparisons, or bare `panic!()`
+# calls were found in this crate's reviewed source.
+#
+# `uuid` added for the same idempotency-key purpose as in
+# omega-hot-path's Cargo.toml — this crate did not previously depend on
+# it, and any exposure/idempotency-adjacent tracking added to
+# checks.rs/context.rs going forward may need it.
+
 [dependencies]
 omega-core   = { path = "../omega-core" }
 omega-oracle = { path = "../omega-oracle" }
@@ -33,5 +60,20 @@ once_cell   = "1"
 # Time
 chrono      = { version = "0.4", features = ["serde"] }
 
+# Idempotency / client order IDs
+uuid        = { version = "1", features = ["v4", "serde"] }
+
 [dev-dependencies]
 tokio = { version = "1", features = ["rt", "macros"] }
+
+[lints.rust]
+unsafe_code = "deny"
+
+[lints.clippy]
+# See this file's audit note above: "warn" pending either a rewrite of
+# every existing test's .unwrap() call or a source-level cfg(test) split
+# — Cargo.toml's [lints] table cannot express that split on its own.
+unwrap_used = "warn"
+expect_used = "warn"
+float_cmp   = "deny"
+panic       = "deny"

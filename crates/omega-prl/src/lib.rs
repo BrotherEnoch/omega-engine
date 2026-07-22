@@ -21,6 +21,25 @@
 //! `FeatureExtractor`.  Pattern scoring uses a shared `Arc<PatternMatcher>`
 //! whose `DashMap` internals provide shard-level locking — no global mutex
 //! on the hot path.  The Rayon thread pool is used for parallel replay.
+//!
+//! ## Audit note (this revision)
+//!
+//! `drain_shard_tick` previously kept scoring events even while
+//! `PrlHealth` was `Halted` — only the `get_*` read accessors checked
+//! `is_halted()`. Fixed below: the ingestion path now discards (rather
+//! than scores) events while halted. See that method's comment.
+//!
+//! `PrlEngine` (below) is flagged `#[deprecated]` — it references
+//! `crate::pattern::PatternMatcher` (singular module) and
+//! `omega_core::types::signal::Signal`, neither of which match the
+//! production pipeline (`PatternRecognitionLayer`,
+//! `crate::patterns::matcher::PatternMatcher`) or this crate's actual
+//! `omega_core` dependency (which exports `OracleSignal`, not `Signal`).
+//! It calls `self.matcher.match_pattern(signal)`, a method that does not
+//! exist on the real `PatternMatcher`. This looks like orphaned scaffold
+//! code that bypasses `PrlHealth`, the WAL, confidence decay, and
+//! threshold governance entirely via a separate, unaudited
+//! `PrlSafetyGate`. See the warning on the struct itself.
 
 #![deny(unsafe_op_in_unsafe_fn)]
 
@@ -82,6 +101,56 @@ pub mod health {
 pub mod metrics {
     pub mod events;
     pub mod prometheus;
+}
+
+pub mod pattern;
+pub mod inference;
+pub mod safety;
+
+use omega_core::types::signal::Signal;
+use tracing;
+
+/// AUDIT WARNING (see module doc comment above): this struct uses
+/// `crate::pattern::PatternMatcher` (singular module) and
+/// `omega_core::types::signal::Signal` — NEITHER of which match the
+/// production pipeline (`crate::patterns::matcher::PatternMatcher`,
+/// `PatternRecognitionLayer`) or the `omega_core::types::signal::OracleSignal`
+/// type this crate's own dependency actually exports.
+/// `process_signal` calls `self.matcher.match_pattern(signal)`, a method
+/// that does not exist on the real `PatternMatcher` reviewed in this
+/// audit. This looks like orphaned scaffold code that either fails to
+/// compile against the rest of this crate, or — if `pattern.rs` /
+/// `inference.rs` / `safety.rs` define a fully separate type universe —
+/// completely bypasses `PrlHealth`, the WAL, confidence decay, and
+/// threshold governance via a separate, unaudited `PrlSafetyGate`.
+/// DO NOT treat this as a safe alternative entry point until it is
+/// reconciled with — or removed in favor of — `PatternRecognitionLayer`.
+#[deprecated(
+    note = "unreconciled with PatternRecognitionLayer's health/WAL/confidence \
+            pipeline — see the audit warning on this struct's doc comment"
+)]
+pub struct PrlEngine {
+    matcher: pattern::PatternMatcher,
+    safety: safety::PrlSafetyGate,
+}
+
+#[allow(deprecated)]
+impl PrlEngine {
+    pub fn new() -> Self {
+        Self {
+            matcher: pattern::PatternMatcher::new(),
+            safety: safety::PrlSafetyGate::new(),
+        }
+    }
+
+    pub fn process_signal(&self, signal: Signal) -> Option<Signal> {
+        if !self.safety.is_safe_to_process() {
+            tracing::warn!("PRL blocked by safety gate (kill switch or budget exceeded)");
+            return None;
+        }
+
+        self.matcher.match_pattern(signal)
+    }
 }
 
 pub mod integration;
@@ -351,6 +420,17 @@ impl PatternRecognitionLayer {
         let mut buf = Vec::with_capacity(256);
         // drain_shard is now defined on EventBus — correct call.
         self.bus.drain_shard(shard_idx, &mut buf, 256);
+
+        // Previously ungated: pattern matching kept running even while
+        // PrlHealth was Halted — only the read accessors (get_pattern_score,
+        // etc.) checked is_halted(). Draining still happens (so the shard's
+        // queue doesn't grow unboundedly while halted) but events are
+        // discarded rather than scored, matching the crate's own stated
+        // invariant that a HALTED PRL disables all advisory outputs.
+        if self.health.is_halted() {
+            self.metrics.set_queue_depth(0);
+            return;
+        }
 
         for event in buf {
             if let Some(fv) = extractor.extract(&event) {

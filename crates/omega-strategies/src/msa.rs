@@ -28,6 +28,16 @@
 //   from the signal hash and fee conditions. That keeps the code production-
 //   ready at the crate boundary while preserving deterministic, low-allocation
 //   behavior and a real MSA execution path distinct from Canary/SA.
+//
+// ## Audit fix (this revision)
+//
+// Same fix as sa.rs/la.rs: `blueprint_hash` was previously computed from
+// an ad hoc, strategy-local hash — different from, and structurally
+// incompatible with, `ExecutionBlueprint::compute_hash()`'s canonical
+// encoding, meaning `verify_hash()` would have failed for every MSA
+// blueprint. Fixed to build with a placeholder and call the canonical
+// `bp.compute_hash()`. Also adds `signal_id`, `client_order_id`,
+// `idempotency_key`.
 
 use std::sync::{
     atomic::{AtomicU64, Ordering},
@@ -37,6 +47,7 @@ use std::sync::{
 use alloy_primitives::{keccak256, Address, Bytes, B256, U256};
 use anyhow::Result;
 use async_trait::async_trait;
+use uuid::Uuid;
 
 use omega_core::types::blueprint::{ExecutionBlueprint, StrategyId};
 use omega_core::types::lane::{Lane, Simulator};
@@ -255,26 +266,23 @@ impl StrategyTrait for MsaStrategy {
             &route.route_tag,
         );
 
-        let mut hash_input = Vec::with_capacity(96);
-        hash_input.extend_from_slice(signal.state_hash.as_slice());
-        hash_input.extend_from_slice(&nonce.to_be_bytes());
-        hash_input.extend_from_slice(&signal.block_number.to_be_bytes());
-        hash_input.extend_from_slice(&route.route_tag);
-        hash_input.push(route.hops);
-        let blueprint_hash = keccak256(&hash_input);
+        let signal_id = Uuid::new_v4();
+        let client_order_id =
+            ExecutionBlueprint::derive_client_order_id(StrategyId::Msa, self.chain_id, nonce, signal_id);
 
         let dynamic_min = U256::from(signal.base_fee_gwei)
             .saturating_mul(U256::from(MSA_GAS_BUDGET))
             .saturating_mul(U256::from(1_000_000_000_u64));
 
-        Ok(ExecutionBlueprint {
-            blueprint_hash,
+        let mut bp = ExecutionBlueprint {
+            blueprint_hash: B256::ZERO, // filled below via canonical compute_hash()
             chain_id: self.chain_id,
             strategy_id: StrategyId::Msa,
             lane: Lane::Normal,
             simulator: Simulator::Anvil,
             signal_state_hash: signal.state_hash,
             state_version: signal.state_version,
+            signal_id,
             flashloan_provider: Address::ZERO,
             flashloan_amount: U256::ZERO,
             flashloan_available: U256::MAX,
@@ -296,9 +304,14 @@ impl StrategyTrait for MsaStrategy {
             expiry_block,
             nonce,
             confirmation_depth: MSA_CONFIRMATION,
+            client_order_id,
+            idempotency_key: B256::ZERO, // filled below
             relay_targets: vec!["relay_1".into(), "relay_2".into()],
             zk_proof_commitment: None,
-        })
+        };
+        bp.idempotency_key = bp.compute_idempotency_key();
+        bp.blueprint_hash = bp.compute_hash();
+        Ok(bp)
     }
 
     async fn simulate(&self, bp: &ExecutionBlueprint) -> Result<SimResult> {
@@ -380,5 +393,19 @@ mod tests {
         assert!(sim.success);
         assert_eq!(sim.simulator, "anvil");
         assert!(sim.gas_used < bp.l2_exec_gas_estimate);
+    }
+
+    // ── Blueprint integrity (this revision) ──────────────────────────────────
+
+    #[tokio::test]
+    async fn build_blueprint_passes_verify_hash() {
+        let bp = make().build_blueprint(&sig(0x21, 5)).await.unwrap();
+        assert!(bp.verify_hash(), "MSA blueprint must pass the canonical integrity check");
+    }
+
+    #[tokio::test]
+    async fn build_blueprint_passes_verify_idempotency_key() {
+        let bp = make().build_blueprint(&sig(0x21, 5)).await.unwrap();
+        assert!(bp.verify_idempotency_key());
     }
 }

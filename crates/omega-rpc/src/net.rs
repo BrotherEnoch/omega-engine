@@ -1,16 +1,4 @@
-crates/omega-rpc/src/net.rs
-//
-// Shared boundary-safety helpers used by both client.rs and
-// subscriptions.rs — every place in this crate that establishes a
-// connection or converts a raw numeric value from an RPC response goes
-// through these, so the checks can't accidentally be applied
-// inconsistently or forgotten at one call site while present at another.
-//
-// This module exists because of specific audit findings:
-//   - RpcClientError / is_fatal(): connect_with_retry previously retried
-//     forever regardless of cause. A permanently wrong URL scheme or a
-//     chain-ID mismatch is a CONFIGURATION error, not a transient
-//     network condition — retrying it forever wastes resources and
+// crates/omega-rpc/src/net.rs
 //     gives an operator no signal that the problem needs their
 //     attention, not more patience.
 //   - verify_chain_id: nothing anywhere in this crate previously checked

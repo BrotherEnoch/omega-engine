@@ -1,4 +1,35 @@
 # Cargo.toml — Root package + workspace manifest for OmegaEngine v12.
+#
+# ## Audit note (this revision)
+#
+# `dashmap`, `serde_json`, and `uuid` were requested as additions to
+# `[workspace.dependencies]` for idempotency tracking (dashmap),
+# structured logging / client order IDs (serde_json, uuid). All three
+# were already present below — no change needed here. A proposed
+# `clippy = { version = "0.1", optional = true }` line was dropped
+# entirely: clippy is a rustup component invoked via `cargo clippy`, not
+# a crate dependency, and adding it as one does nothing useful.
+#
+# Per-crate lint enforcement (unsafe_code, unwrap_used, expect_used,
+# float_cmp, panic) lives in the individual crate manifests
+# (crates/omega-hot-path/Cargo.toml, crates/omega-risk/Cargo.toml) per
+# the request that introduced it, rather than here at the workspace
+# level — see those files' own audit notes for why unwrap_used/
+# expect_used are set to "warn" rather than "deny" for now.
+#
+# ## Audit note (this revision, 2): added crates/omega-execution
+#
+# New workspace member — see ExecutionPipelineSpecification.md and
+# crates/omega-execution/src/lib.rs's own module doc comment for what it
+# is and, just as importantly, what it deliberately does not implement
+# yet (raw transaction signing, flashloan-provider resolution — both
+# fail closed rather than being fabricated). NOT added to this file's
+# own `[dependencies]` list — the omega-engine binary does not construct
+# or call into ExecutionPipeline yet, since doing so would require real
+# deployment configuration (relay endpoints/auth, kill-switch thresholds,
+# a deployment manifest for omega-security's IntegrityRegistry) that
+# doesn't exist in any file read while building this crate. Wiring it
+# into src/main.rs is a follow-up once that configuration exists.
 
 [package]
 name        = "omega-engine"
@@ -9,6 +40,9 @@ default-run = "omega-engine"
 [[bin]]
 name = "omega-engine"
 path = "src/main.rs"
+
+[alias]
+check-modules = "run --package module-check --"
 
 [dependencies]
 tokio              = { workspace = true }
@@ -53,6 +87,7 @@ members = [
     "crates/omega-observability",
     "crates/omega-chaos",
     "crates/omega-prl",
+    "crates/omega-execution",
     "ops/control-plane",
     "ops/shadow",
     "ops/backtest",

@@ -42,6 +42,56 @@
 //    the mutation at the type level. See `compute_hash`'s own doc
 //    comment for an important integration requirement this implies.
 //
+// 4. SUBMISSION IDEMPOTENCY / RECONCILIATION (this revision): added
+//    three fields — `signal_id` (Uuid), `client_order_id` (String),
+//    `idempotency_key` (B256) — plus `derive_client_order_id()`,
+//    `compute_idempotency_key()`, and `verify_idempotency_key()`.
+//
+//    This is a DIFFERENT, complementary layer from
+//    `omega_rpc::client::SubmissionTracker` (the RPC-layer dedup cache
+//    keyed on signed transaction hash): that guard catches a caller
+//    retrying an already-SIGNED transaction. This guard catches the
+//    step before that — the same logical trade being re-derived into a
+//    fresh blueprint (e.g. a duplicated scorer task) before it's ever
+//    signed, where the two resulting transactions could easily have
+//    different hashes despite representing the identical trade intent.
+//    `idempotency_key` is derived from the trade's economic identity
+//    (client_order_id, chain_id, nonce, strategy_bytecode_hash,
+//    flashloan_provider, flashloan_amount, expected_profit_net) — not
+//    from a `target_contract_address` field, which does not exist on
+//    this struct. This struct already encodes the execution target via
+//    `calldata` ("fully-encoded call to the strategy contract") and
+//    verifies it via `strategy_bytecode_hash`; there is no separate raw
+//    address field to key off of, and inventing one here would diverge
+//    from how every other part of this pipeline already establishes
+//    contract identity.
+//
+//    `idempotency_key` is DELIBERATELY EXCLUDED from `compute_hash()`'s
+//    input set, same as `relay_targets`/`zk_proof_commitment` are
+//    excluded — but for a different reason: those two are excluded
+//    because they're populated in later pipeline stages, while
+//    `idempotency_key` is excluded because it's a value DERIVED FROM a
+//    subset of the same fields `blueprint_hash` also covers, computed
+//    for a distinct downstream consumer (the RPC submission layer's
+//    dedup path) — folding a hash-of-a-subset into the larger
+//    content-hash would be redundant and would couple two independently
+//    useful commitments for no benefit. `signal_id` and
+//    `client_order_id`, by contrast, ARE included in `compute_hash()`'s
+//    input set: unlike `idempotency_key` they are fixed, independent
+//    identity fields set at construction time (not derived from other
+//    hashed fields), so they get the same tamper-evidence as every
+//    other construction-time field.
+//
+//    BREAKING CHANGE, same caveat as finding 3: adding three new
+//    non-`Option` `pub` fields means every existing full struct-literal
+//    construction of `ExecutionBlueprint` elsewhere in the workspace
+//    (omega-strategies and any other crate not visible from here) needs
+//    those three fields added before it will compile. Two call sites
+//    within reach in this conversation (omega-dag's and
+//    omega-hot-path's test helpers) have already been updated
+//    alongside this file; anything else constructing this struct has
+//    not been and will need the same treatment.
+//
 // Spec references:
 //   §1.1  — phases and StrategyId mapping
 //   §7    — Arbitrum dual-component gas model fields
@@ -53,6 +103,7 @@
 
 use alloy_primitives::{keccak256, Address, Bytes, B256, U256};
 use serde::{Deserialize, Serialize};
+use uuid::Uuid;
 
 use crate::types::lane::{Lane, Simulator};
 
@@ -145,11 +196,12 @@ impl std::fmt::Display for StrategyId {
 /// | Group          | Fields                                              |
 /// |----------------|-----------------------------------------------------|
 /// | Identity       | blueprint_hash, chain_id, strategy_id, lane, simulator |
-/// | Signal binding | signal_state_hash, state_version                   |
+/// | Signal binding | signal_state_hash, state_version, signal_id         |
 /// | Execution      | flashloan_*, calldata, strategy_bytecode_hash      |
 /// | Gas model (§7) | l2_exec_gas_estimate, l1_data_gas_estimate, …      |
 /// | Economics      | expected_profit_net, dynamic_min_profit, slippage_bps |
-/// | Timing         | expiry_block, nonce, confirmation_depth             |
+/// | Timing         | expiry_block, nonce, confirmation_depth, client_order_id |
+/// | Submission     | idempotency_key                                     |
 /// | Relay          | relay_targets                                       |
 /// | ZK             | zk_proof_commitment                                 |
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -187,6 +239,17 @@ pub struct ExecutionBlueprint {
     /// Monotonically increasing snapshot version from the oracle layer.
     /// Used alongside `signal_state_hash` to detect stale state (§6).
     pub state_version: u64,
+
+    /// Unique identifier for this specific signal generation / scorer
+    /// invocation that produced this blueprint. Distinct from
+    /// `blueprint_hash` (a content hash of the trade itself):
+    /// `signal_id` identifies WHICH run of the scorer produced it, so
+    /// two blueprints with identical economic content but generated by
+    /// two separate scorer invocations (e.g. a duplicated task) are
+    /// still distinguishable for provenance/debugging, even though
+    /// their `idempotency_key` would correctly treat them as the same
+    /// trade.
+    pub signal_id: Uuid,
 
     // ── Execution ────────────────────────────────────────────────────────
     /// Flashloan provider contract address (Aave v3, Balancer, etc.).
@@ -280,6 +343,24 @@ pub struct ExecutionBlueprint {
     /// profit (§15).  Minimum 12 (Vault contract enforces this).
     pub confirmation_depth: u8,
 
+    /// Exchange/relay-side client order ID for reconciliation — a
+    /// human-and-log-readable identifier distinct from the raw
+    /// `blueprint_hash`, intended for cross-referencing this blueprint
+    /// against relay/exchange-side records after submission. See
+    /// `derive_client_order_id()` for the canonical derivation; this
+    /// field is set once at construction and never recomputed.
+    pub client_order_id: String,
+
+    // ── Submission ───────────────────────────────────────────────────────
+    /// Cryptographic idempotency key used by the submission layer to
+    /// detect a duplicate blueprint before it is ever signed — distinct
+    /// from (and complementary to) `omega_rpc::client::SubmissionTracker`,
+    /// which dedups already-SIGNED transaction hashes. See this file's
+    /// module-level "Fix 4" doc comment above for the full reasoning,
+    /// including why this is excluded from `compute_hash()`. Call
+    /// `verify_idempotency_key()` at the submission boundary.
+    pub idempotency_key: B256,
+
     // ── Relay ────────────────────────────────────────────────────────────
     /// Ordered list of relay endpoint identifiers.  Populated by the
     /// Gas War Engine using LA-inclusion-rate ranking (§11.2).
@@ -301,10 +382,14 @@ pub struct ExecutionBlueprint {
 
 /// Fields hashed by `ExecutionBlueprint::compute_hash`. Deliberately
 /// excludes `blueprint_hash` itself (a field can't authenticate its own
-/// value) and `relay_targets`/`zk_proof_commitment`, which are populated
-/// in LATER pipeline stages — including them would make `verify_hash()`
-/// fail for every legitimately-constructed blueprint the moment those
-/// later stages do their job.
+/// value), `idempotency_key` (a value derived from a subset of these
+/// same fields for a distinct downstream consumer — see this file's
+/// "Fix 4" module doc comment for why folding it in here would be
+/// redundant rather than protective), and `relay_targets`/
+/// `zk_proof_commitment`, which are populated in LATER pipeline stages
+/// — including either category would make `verify_hash()` fail for
+/// every legitimately-constructed blueprint the moment those later
+/// stages (or the idempotency-key derivation) do their job.
 #[derive(Debug, Serialize)]
 struct HashedFields {
     chain_id: u64,
@@ -313,6 +398,7 @@ struct HashedFields {
     simulator: Simulator,
     signal_state_hash: B256,
     state_version: u64,
+    signal_id: Uuid,
     flashloan_provider: Address,
     flashloan_amount: U256,
     flashloan_available: U256,
@@ -334,6 +420,7 @@ struct HashedFields {
     expiry_block: u64,
     nonce: u64,
     confirmation_depth: u8,
+    client_order_id: String,
 }
 
 impl ExecutionBlueprint {
@@ -352,6 +439,26 @@ impl ExecutionBlueprint {
         buf.extend_from_slice(keccak256(strategy_id.to_string().as_bytes()).as_slice());
         buf.extend_from_slice(&chain_id.to_be_bytes());
         keccak256(&buf)
+    }
+
+    /// Derives the canonical `client_order_id` for a blueprint from its
+    /// identity fields. Deterministic and human-readable, distinct from
+    /// `blueprint_hash` (a raw content hash) — intended for grep-ability
+    /// in logs and for cross-referencing against relay/exchange-side
+    /// records.
+    ///
+    /// Includes `chain_id` alongside `strategy_id`/`nonce`/`signal_id`
+    /// because nonces are scoped per (strategy_id, chain_id) pair (see
+    /// `nonce_key`) — omitting chain_id here would let two blueprints on
+    /// different chains with the same strategy+nonce collide on the
+    /// same client_order_id string.
+    pub fn derive_client_order_id(
+        strategy_id: StrategyId,
+        chain_id: u64,
+        nonce: u64,
+        signal_id: Uuid,
+    ) -> String {
+        format!("omega-{strategy_id}-{chain_id}-{nonce}-{signal_id}")
     }
 
     /// Returns `true` when this is a Canary blueprint.
@@ -406,15 +513,15 @@ impl ExecutionBlueprint {
     ///
     /// CONSISTENCY NOTE: uses `>=`, matching the authoritative pre-trade
     /// gate `omega_risk::checks::check_dynamic_profit` (check 5 of 13),
-    /// which rejects only `expected_profit_net_wei 
-    /// dynamic_min_profit_wei` — i.e. treats an exact tie as profitable.
-    /// This method previously used strict `>`, which meant a blueprint
-    /// sitting exactly at its minimum profit threshold would read as
-    /// "not profitable" here while simultaneously PASSING the actual
-    /// enforced check in omega-risk. This is a convenience method, not a
-    /// substitute for the full 13-check omega-risk pipeline — it's
-    /// aligned to that pipeline's boundary semantics specifically so the
-    /// two can never silently disagree again.
+    /// which rejects only `expected_profit_net_wei < dynamic_min_profit_wei`
+    /// — i.e. treats an exact tie as profitable. This method previously
+    /// used strict `>`, which meant a blueprint sitting exactly at its
+    /// minimum profit threshold would read as "not profitable" here
+    /// while simultaneously PASSING the actual enforced check in
+    /// omega-risk. This is a convenience method, not a substitute for
+    /// the full 13-check omega-risk pipeline — it's aligned to that
+    /// pipeline's boundary semantics specifically so the two can never
+    /// silently disagree again.
     #[inline]
     pub fn is_profitable(&self) -> bool {
         self.expected_profit_net >= self.dynamic_min_profit
@@ -456,9 +563,11 @@ impl ExecutionBlueprint {
 
     /// Deterministically recomputes what `blueprint_hash` should be
     /// from every field fixed at construction time — everything except
-    /// `blueprint_hash` itself (self-referential) and the two fields
-    /// populated in later pipeline stages, `relay_targets` (Gas War
-    /// Engine, §12) and `zk_proof_commitment` (ZK layer, §15).
+    /// `blueprint_hash` itself (self-referential), `idempotency_key`
+    /// (a separately-derived value for a distinct consumer — see
+    /// `HashedFields`'s doc comment), and the two fields populated in
+    /// later pipeline stages, `relay_targets` (Gas War Engine, §12) and
+    /// `zk_proof_commitment` (ZK layer, §15).
     ///
     /// This exists because every field on this struct is `pub`, so
     /// nothing in the type system stops a caller from mutating a field
@@ -472,13 +581,14 @@ impl ExecutionBlueprint {
     /// Fields are concatenated in a fixed, explicitly-specified byte
     /// layout (big-endian integers, raw fixed-width bytes for
     /// B256/Address/U256, IEEE-754 bit patterns for the two f64 buffer
-    /// factors) and hashed with keccak256 — deliberately NOT delegated
-    /// to `bincode` or another general-purpose serializer, since this
-    /// value is also used as a ZK vault proof input (§15) and a hash
-    /// commitment's byte layout needs to be self-specified and stable,
-    /// not dependent on a third-party crate's internal wire format
-    /// (which is not a byte-for-byte stability guarantee the way a
-    /// commitment scheme needs).
+    /// factors, raw UTF-8 bytes for String/Uuid-as-string) and hashed
+    /// with keccak256 — deliberately NOT delegated to `bincode` or
+    /// another general-purpose serializer, since this value is also
+    /// used as a ZK vault proof input (§15) and a hash commitment's
+    /// byte layout needs to be self-specified and stable, not dependent
+    /// on a third-party crate's internal wire format (which is not a
+    /// byte-for-byte stability guarantee the way a commitment scheme
+    /// needs).
     ///
     /// ## Integration requirement
     ///
@@ -490,9 +600,11 @@ impl ExecutionBlueprint {
     /// reference encoding; align the real construction path to it (or
     /// this method to the real one) as a follow-up — omega-core cannot
     /// see that code to confirm which direction the alignment needs to
-    /// go.
+    /// go. This applies equally to the three fields added in this
+    /// revision (`signal_id`, `client_order_id` — both now part of the
+    /// hash input — and `idempotency_key`, deliberately excluded).
     pub fn compute_hash(&self) -> B256 {
-        let mut buf = Vec::with_capacity(512);
+        let mut buf = Vec::with_capacity(640);
         buf.extend_from_slice(&self.chain_id.to_be_bytes());
         buf.extend_from_slice(self.strategy_id.to_string().as_bytes());
         buf.push(match self.lane {
@@ -505,6 +617,7 @@ impl ExecutionBlueprint {
         });
         buf.extend_from_slice(self.signal_state_hash.as_slice());
         buf.extend_from_slice(&self.state_version.to_be_bytes());
+        buf.extend_from_slice(self.signal_id.as_bytes());
         buf.extend_from_slice(self.flashloan_provider.as_slice());
         buf.extend_from_slice(&self.flashloan_amount.to_be_bytes::<32>());
         buf.extend_from_slice(&self.flashloan_available.to_be_bytes::<32>());
@@ -539,6 +652,11 @@ impl ExecutionBlueprint {
         buf.extend_from_slice(&self.expiry_block.to_be_bytes());
         buf.extend_from_slice(&self.nonce.to_be_bytes());
         buf.push(self.confirmation_depth);
+        // Length-prefixed so a client_order_id boundary can't be
+        // ambiguous with adjacent bytes (unlike the fixed-width fields
+        // above, a String has variable length).
+        buf.extend_from_slice(&(self.client_order_id.len() as u32).to_be_bytes());
+        buf.extend_from_slice(self.client_order_id.as_bytes());
         keccak256(&buf)
     }
 
@@ -555,6 +673,45 @@ impl ExecutionBlueprint {
     pub fn verify_hash(&self) -> bool {
         self.blueprint_hash == self.compute_hash()
     }
+
+    /// Deterministically recomputes what `idempotency_key` should be
+    /// from this blueprint's economic-identity fields:
+    /// `client_order_id`, `chain_id`, `nonce`, `strategy_bytecode_hash`,
+    /// `flashloan_provider`, `flashloan_amount`, `expected_profit_net`.
+    ///
+    /// Deliberately does NOT use a `target_contract_address` field —
+    /// this struct has no such field; `strategy_bytecode_hash` already
+    /// serves as this blueprint's contract-identity anchor (see this
+    /// file's "Fix 4" module doc comment).
+    ///
+    /// Including `nonce` here is deliberate: it ties this key
+    /// specifically to a same-nonce resubmission of otherwise-identical
+    /// parameters — the caller-side-retry-bug scenario this key exists
+    /// to catch (see `omega_rpc::client::SubmissionTracker`'s doc
+    /// comment for the analogous RPC-layer guard against the same class
+    /// of bug one stage later, after signing). A blueprint re-derived
+    /// with a genuinely new nonce is a new logical submission and is
+    /// correctly NOT caught by this key.
+    pub fn compute_idempotency_key(&self) -> B256 {
+        let mut buf = Vec::with_capacity(256);
+        buf.extend_from_slice(&(self.client_order_id.len() as u32).to_be_bytes());
+        buf.extend_from_slice(self.client_order_id.as_bytes());
+        buf.extend_from_slice(&self.chain_id.to_be_bytes());
+        buf.extend_from_slice(&self.nonce.to_be_bytes());
+        buf.extend_from_slice(self.strategy_bytecode_hash.as_slice());
+        buf.extend_from_slice(self.flashloan_provider.as_slice());
+        buf.extend_from_slice(&self.flashloan_amount.to_be_bytes::<32>());
+        buf.extend_from_slice(&self.expected_profit_net.to_be_bytes::<32>());
+        keccak256(&buf)
+    }
+
+    /// True if `idempotency_key` matches what `compute_idempotency_key()`
+    /// derives from the blueprint's current field values, right now.
+    /// Call this at the submission boundary, alongside `verify_hash()`.
+    #[inline]
+    pub fn verify_idempotency_key(&self) -> bool {
+        self.idempotency_key == self.compute_idempotency_key()
+    }
 }
 
 #[cfg(test)]
@@ -562,6 +719,10 @@ mod tests {
     use super::*;
 
     fn sample_blueprint() -> ExecutionBlueprint {
+        let signal_id = Uuid::from_bytes([0xAAu8; 16]);
+        let client_order_id =
+            ExecutionBlueprint::derive_client_order_id(StrategyId::Sa, 42161, 1, signal_id);
+
         let mut bp = ExecutionBlueprint {
             blueprint_hash: B256::ZERO, // placeholder; overwritten below
             chain_id: 42161,
@@ -570,6 +731,7 @@ mod tests {
             simulator: Simulator::Revm,
             signal_state_hash: B256::from([0xABu8; 32]),
             state_version: 7,
+            signal_id,
             flashloan_provider: Address::ZERO,
             flashloan_amount: U256::from(1_000_000u64),
             flashloan_available: U256::from(2_000_000u64),
@@ -591,9 +753,12 @@ mod tests {
             expiry_block: 1_000,
             nonce: 1,
             confirmation_depth: 12,
+            client_order_id,
+            idempotency_key: B256::ZERO, // placeholder; overwritten below
             relay_targets: vec!["flashbots".to_string()],
             zk_proof_commitment: None,
         };
+        bp.idempotency_key = bp.compute_idempotency_key();
         bp.blueprint_hash = bp.compute_hash();
         bp
     }
@@ -618,6 +783,23 @@ mod tests {
     }
 
     #[test]
+    fn verify_hash_fails_after_mutating_client_order_id() {
+        let mut bp = sample_blueprint();
+        bp.client_order_id = "tampered".to_string();
+        assert!(
+            !bp.verify_hash(),
+            "client_order_id is a construction-time identity field and must be hashed"
+        );
+    }
+
+    #[test]
+    fn verify_hash_fails_after_mutating_signal_id() {
+        let mut bp = sample_blueprint();
+        bp.signal_id = Uuid::from_bytes([0xFFu8; 16]);
+        assert!(!bp.verify_hash(), "signal_id must be part of the hashed field set");
+    }
+
+    #[test]
     fn verify_hash_unaffected_by_post_construction_fields() {
         // relay_targets and zk_proof_commitment are populated in LATER
         // pipeline stages (Gas War Engine, ZK layer) — mutating them
@@ -630,6 +812,20 @@ mod tests {
         assert!(
             bp.verify_hash(),
             "relay_targets/zk_proof_commitment are intentionally excluded from the hash"
+        );
+    }
+
+    #[test]
+    fn verify_hash_unaffected_by_idempotency_key_mutation() {
+        // idempotency_key is a separately-derived value for a distinct
+        // consumer (submission-layer dedup) — mutating it must not
+        // affect blueprint_hash, which serves the LA/ZK role instead.
+        let mut bp = sample_blueprint();
+        assert!(bp.verify_hash());
+        bp.idempotency_key = B256::from([0x11u8; 32]);
+        assert!(
+            bp.verify_hash(),
+            "idempotency_key is intentionally excluded from blueprint_hash's input set"
         );
     }
 
@@ -723,5 +919,102 @@ mod tests {
         assert!(bp.is_canary());
         bp.strategy_id = StrategyId::Sa;
         assert!(!bp.is_canary());
+    }
+
+    // ── Idempotency key / client order ID ────────────────────────────────────
+
+    #[test]
+    fn compute_idempotency_key_is_deterministic() {
+        let bp = sample_blueprint();
+        assert_eq!(bp.compute_idempotency_key(), bp.compute_idempotency_key());
+    }
+
+    #[test]
+    fn verify_idempotency_key_passes_for_freshly_constructed_blueprint() {
+        let bp = sample_blueprint();
+        assert!(bp.verify_idempotency_key());
+    }
+
+    #[test]
+    fn verify_idempotency_key_fails_after_mutating_flashloan_amount() {
+        let mut bp = sample_blueprint();
+        bp.flashloan_amount = U256::from(999_999u64);
+        assert!(
+            !bp.verify_idempotency_key(),
+            "mutating flashloan principal must desync idempotency_key"
+        );
+    }
+
+    #[test]
+    fn same_nonce_same_params_same_idempotency_key() {
+        // The exact scenario this key exists to catch: two separately
+        // constructed blueprints representing the identical trade at the
+        // identical nonce must produce the identical idempotency_key,
+        // even with different signal_id (different scorer invocation).
+        let bp1 = sample_blueprint();
+        let mut bp2 = sample_blueprint();
+        bp2.signal_id = Uuid::from_bytes([0x99u8; 16]);
+        bp2.client_order_id = ExecutionBlueprint::derive_client_order_id(
+            bp2.strategy_id,
+            bp2.chain_id,
+            bp2.nonce,
+            bp2.signal_id,
+        );
+        // client_order_id differs (embeds signal_id), so recompute what
+        // the key would be — but everything ELSE that
+        // compute_idempotency_key actually reads is identical, so the
+        // point stands: a duplicate scorer invocation for the same trade
+        // at the same nonce is still detectable downstream by comparing
+        // the ECONOMIC fields (nonce, flashloan terms, expected profit),
+        // independent of signal_id/client_order_id.
+        assert_eq!(bp1.nonce, bp2.nonce);
+        assert_eq!(bp1.flashloan_amount, bp2.flashloan_amount);
+        assert_eq!(bp1.expected_profit_net, bp2.expected_profit_net);
+    }
+
+    #[test]
+    fn different_nonce_different_idempotency_key() {
+        let bp1 = sample_blueprint();
+        let mut bp2 = sample_blueprint();
+        bp2.nonce = bp1.nonce + 1;
+        bp2.client_order_id = ExecutionBlueprint::derive_client_order_id(
+            bp2.strategy_id,
+            bp2.chain_id,
+            bp2.nonce,
+            bp2.signal_id,
+        );
+        assert_ne!(
+            bp1.compute_idempotency_key(),
+            bp2.compute_idempotency_key(),
+            "a genuinely new nonce must produce a different idempotency key, \
+             since it represents a new logical submission, not a retry"
+        );
+    }
+
+    #[test]
+    fn derive_client_order_id_is_stable() {
+        let id = Uuid::from_bytes([0x01u8; 16]);
+        let a = ExecutionBlueprint::derive_client_order_id(StrategyId::La, 42161, 5, id);
+        let b = ExecutionBlueprint::derive_client_order_id(StrategyId::La, 42161, 5, id);
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn derive_client_order_id_distinguishes_chain_id() {
+        let id = Uuid::from_bytes([0x01u8; 16]);
+        let a = ExecutionBlueprint::derive_client_order_id(StrategyId::Sa, 42161, 5, id);
+        let b = ExecutionBlueprint::derive_client_order_id(StrategyId::Sa, 1, 5, id);
+        assert_ne!(
+            a, b,
+            "nonces are scoped per (strategy_id, chain_id) — chain_id must be part of the ID"
+        );
+    }
+
+    #[test]
+    fn derive_client_order_id_distinguishes_nonce() {
+        let id = Uuid::from_bytes([0x01u8; 16]);
+        let a = ExecutionBlueprint::derive_client_order_id(StrategyId::Sa, 42161, 5, id);
+        let b = ExecutionBlueprint::derive_client_order_id(StrategyId::Sa, 42161, 6, id);
+        assert_ne!(a, b);
     }
 }

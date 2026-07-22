@@ -1,6 +1,24 @@
 // crates/omega-strategies/src/sa.rs
 //
 // Simple Arbitrage (SA) — Phase 1 strategy (spec §1.1).
+//
+// ## Audit fix (this revision)
+//
+// `blueprint_hash` was previously computed from an ad hoc, strategy-local
+// `keccak256(signal_state_hash || nonce || block_number)` — a much
+// smaller field set than, and structurally different from,
+// `ExecutionBlueprint::compute_hash()` (the canonical encoding defined in
+// omega-core specifically so `verify_hash()` can catch post-construction
+// mutation). Since the two never matched, `verify_hash()` would have
+// reported every SA blueprint as tampered despite nothing being wrong.
+// Fixed to build the blueprint with a placeholder hash, then call the
+// canonical `bp.compute_hash()` — same pattern already used in
+// `omega_core::types::blueprint`'s own tests.
+//
+// Also adds `signal_id`, `client_order_id`, `idempotency_key` — see
+// `ExecutionBlueprint`'s own doc comments (omega-core) for what each is
+// for. `idempotency_key` is filled in the same way, via
+// `bp.compute_idempotency_key()`, after construction.
 
 use std::sync::{
     atomic::{AtomicU64, Ordering},
@@ -10,6 +28,7 @@ use std::sync::{
 use alloy_primitives::{keccak256, Address, Bytes, B256, U256};
 use anyhow::Result;
 use async_trait::async_trait;
+use uuid::Uuid;
 
 use omega_core::types::blueprint::{ExecutionBlueprint, StrategyId};
 use omega_core::types::lane::{Lane, Simulator};
@@ -184,24 +203,23 @@ impl omega_core::types::strategy::StrategyTrait for SaStrategy {
             signal.block_number + SA_EXPIRY_BLOCKS,
         );
 
-        let mut hash_input = Vec::new();
-        hash_input.extend_from_slice(signal.state_hash.as_slice());
-        hash_input.extend_from_slice(&nonce.to_be_bytes());
-        hash_input.extend_from_slice(&signal.block_number.to_be_bytes());
-        let blueprint_hash = keccak256(&hash_input);
+        let signal_id = Uuid::new_v4();
+        let client_order_id =
+            ExecutionBlueprint::derive_client_order_id(StrategyId::Sa, self.chain_id, nonce, signal_id);
 
         let dynamic_min = U256::from(signal.base_fee_gwei)
             .saturating_mul(U256::from(SA_GAS_BUDGET))
             .saturating_mul(U256::from(1_000_000_000_u64));
 
-        Ok(ExecutionBlueprint {
-            blueprint_hash,
+        let mut bp = ExecutionBlueprint {
+            blueprint_hash:          B256::ZERO, // filled below via canonical compute_hash()
             chain_id:                self.chain_id,
             strategy_id:             StrategyId::Sa,
             lane:                    Lane::Microtx,
             simulator:               Simulator::Revm,
             signal_state_hash:       signal.state_hash,
             state_version:           signal.state_version,
+            signal_id,
             flashloan_provider:      Address::ZERO,
             flashloan_amount:        U256::ZERO,
             flashloan_available:     U256::MAX,
@@ -223,9 +241,14 @@ impl omega_core::types::strategy::StrategyTrait for SaStrategy {
             expiry_block:            signal.block_number + SA_EXPIRY_BLOCKS,
             nonce,
             confirmation_depth:      SA_CONFIRMATION,
+            client_order_id,
+            idempotency_key:         B256::ZERO, // filled below
             relay_targets:           vec!["relay_1".into()],
             zk_proof_commitment:     None,
-        })
+        };
+        bp.idempotency_key = bp.compute_idempotency_key();
+        bp.blueprint_hash = bp.compute_hash();
+        Ok(bp)
     }
 
     async fn simulate(&self, bp: &ExecutionBlueprint) -> Result<SimResult> {
@@ -335,5 +358,34 @@ mod tests {
         );
         // selector(4) + amount_in(32) + min_out(32) + deadline(32) + addr(32) = 132 bytes
         assert_eq!(data.len(), 132);
+    }
+
+    // ── Blueprint integrity (this revision) ──────────────────────────────────
+
+    #[tokio::test]
+    async fn build_blueprint_passes_verify_hash() {
+        // Regression guard: previously blueprint_hash was computed via a
+        // strategy-local ad hoc hash that never matched
+        // ExecutionBlueprint::compute_hash(), so verify_hash() would have
+        // failed for every SA blueprint. Now that build_blueprint calls
+        // the canonical compute_hash(), this must pass.
+        let s  = make_strategy();
+        let bp = s.build_blueprint(&make_signal(5)).await.unwrap();
+        assert!(bp.verify_hash(), "SA blueprint must pass the canonical integrity check");
+    }
+
+    #[tokio::test]
+    async fn build_blueprint_passes_verify_idempotency_key() {
+        let s  = make_strategy();
+        let bp = s.build_blueprint(&make_signal(5)).await.unwrap();
+        assert!(bp.verify_idempotency_key());
+    }
+
+    #[tokio::test]
+    async fn build_blueprint_has_distinct_signal_ids_across_calls() {
+        let s   = make_strategy();
+        let bp1 = s.build_blueprint(&make_signal(5)).await.unwrap();
+        let bp2 = s.build_blueprint(&make_signal(5)).await.unwrap();
+        assert_ne!(bp1.signal_id, bp2.signal_id, "each build is a distinct signal generation");
     }
 }

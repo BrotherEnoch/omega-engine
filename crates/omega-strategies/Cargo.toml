@@ -4,6 +4,13 @@ name    = "omega-strategies"
 version = "12.0.0"
 edition = "2021"
 
+# ## Audit fix (this revision)
+#
+# Added `uuid` — sa.rs/la.rs/msa.rs/mev.rs each generate a `signal_id`
+# via `Uuid::new_v4()` in `build_blueprint` now that
+# `ExecutionBlueprint` (omega-core) has that field; cnry.rs's test
+# module also constructs one. Not previously a dependency of this crate.
+
 [dependencies]
 omega-core             = { path = "../omega-core" }
 omega-gas-war          = { path = "../omega-gas-war" }
@@ -47,6 +54,9 @@ arc-swap = { workspace = true }
 
 # PRNG (cascade relay order randomisation, §11.2)
 rand = { workspace = true }
+
+# ExecutionBlueprint::signal_id generation in build_blueprint (sa/la/msa/mev)
+uuid = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true }

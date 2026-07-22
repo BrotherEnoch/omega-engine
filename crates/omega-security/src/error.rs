@@ -2,6 +2,15 @@
 //
 // Unified error type for omega-security.
 // Every public function that can fail returns Result<T, SecurityError>.
+//
+// ## Audit fix (this revision)
+//
+// Added `InvalidDeploymentEntry`, used by `integrity::strategy_entries_from_manifest`
+// to reject a deployment manifest entry that is malformed hex, the wrong byte
+// length, or an all-zero hash/address — i.e. placeholder data masquerading as a
+// real deployment record. See `integrity.rs`'s own audit note for the full
+// reasoning: this variant exists specifically so that class of bug fails loudly
+// at load time instead of silently producing a zero-filled `StrategyEntry`.
 
 use thiserror::Error;
 
@@ -71,6 +80,9 @@ pub enum SecurityError {
 
     #[error("Chain ID mismatch: blueprint targets chain {bp_chain}, orchestrator expects {expected_chain}")]
     ChainIdMismatch { bp_chain: u64, expected_chain: u64 },
+
+    #[error("Invalid deployment manifest entry for strategy {strategy_id}: {detail}")]
+    InvalidDeploymentEntry { strategy_id: String, detail: String },
 
     // ── Internal ──────────────────────────────────────────────────────────────
     #[error("Internal security error: {0}")]

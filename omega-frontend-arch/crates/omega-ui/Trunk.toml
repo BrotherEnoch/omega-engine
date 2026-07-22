@@ -1,4 +1,3 @@
-# omega-frontend-arch/crates/omega-ui/index.html
 [build]
 target = "index.html"
 dist = "dist"
@@ -6,5 +5,13 @@ public_url = "/"
 
 [serve]
 addresses = ["127.0.0.1"]
-port = 8080
+port = 8082
 open = true
+
+[[proxy]]
+backend = "http://127.0.0.1:8080/api"
+rewrite = "/api"
+
+[[proxy]]
+backend = "ws://127.0.0.1:8080/ws"
+rewrite = "/ws"

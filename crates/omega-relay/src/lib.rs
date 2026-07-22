@@ -25,7 +25,9 @@ pub mod signing;
 pub use backpressure::{CascadeResult, CascadeSubmitter, RelayOutcome, RelayRateLimiters};
 pub use blacklist::BuilderBlacklist;
 pub use client::{BundlePayload, RelayClient, SubmissionOutcome};
-pub use config::{RelayConfig, RelayName, WS_RATE_ANONYMOUS, WS_RATE_AUTHENTICATED};
+pub use config::{
+    RelayConfig, RelayName, LA_TIE_BAND_FRACTION, WS_RATE_ANONYMOUS, WS_RATE_AUTHENTICATED,
+};
 pub use confirmation::{ConfirmationResult, InclusionTracker, CONFIRMATION_GRACE_BLOCKS};
 pub use dedup::{PositionKey, SequencerRestartHandler, RESTART_WINDOW_BLOCKS};
 pub use error::{RelayError, RelayResult};
@@ -37,8 +39,29 @@ pub use signing::{FlashbotsSigner, RelayAuth};
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use tokio::sync::mpsc;
+
 /// Top-level handle that owns all relay clients, metrics, dedup guard,
 /// reorg guard, builder blacklist, and inclusion confirmation tracker.
+///
+/// ## Audit fix (this revision): reorg-risk events were silently discarded
+///
+/// `LaReorgGuard::new()` returns `(Arc<LaReorgGuard>, mpsc::UnboundedReceiver<
+/// LaReorgRiskEvent>)`. `MultiRelayClient::new` previously did
+/// `let (reorg_guard, _event_rx) = LaReorgGuard::new();` — dropping the
+/// receiver immediately. Once dropped, every subsequent `event_tx.send(...)`
+/// inside `LaReorgGuard::on_reorg` fails silently (logged only at `warn!`
+/// level as "event channel closed"), meaning no caller of this public
+/// constructor could ever observe a `LaReorgRiskEvent` — the blueprint state
+/// transition to `ReorgRisk` still happened internally (queryable via
+/// `reorg_guard().state()`/`reorg_risk_blueprints()`), but the event stream
+/// this type exists to also provide was dead on arrival. Fixed by returning
+/// the receiver from `new()` instead of discarding it, so the actual caller
+/// — who has visibility into whatever rescoring logic consumes
+/// `LaReorgRiskEvent` (not visible from this crate) — can wire it up. This
+/// is a breaking signature change to `new()`, the same category as other
+/// breaking-but-correct fixes elsewhere in this codebase: the alternative
+/// (silently eating the channel) is strictly worse.
 pub struct MultiRelayClient {
     submitter:         CascadeSubmitter,
     dedup:             Arc<SequencerRestartHandler>,
@@ -53,13 +76,19 @@ pub struct MultiRelayClient {
 impl MultiRelayClient {
     /// Construct the full relay layer. `cfg.confirmation_rpc_url` must point at a real
     /// chain JSON-RPC endpoint — see `confirmation::InclusionTracker`.
+    ///
+    /// Returns the client alongside the reorg-risk event receiver — see this
+    /// struct's audit note above for why this is no longer discarded
+    /// internally. Callers that don't need reorg-risk notifications can
+    /// simply drop the receiver themselves; the difference is that the
+    /// choice is now theirs to make, not made silently for them.
     pub fn new(
         relay_clients: HashMap<String, Arc<dyn RelayClient>>,
         metrics:       Arc<LaRelayMetrics>,
         blacklist:     Arc<BuilderBlacklist>,
         cfg:           &RelayConfig,
         startup_block: u64,
-    ) -> Arc<Self> {
+    ) -> (Arc<Self>, mpsc::UnboundedReceiver<LaReorgRiskEvent>) {
         let relay_clients = Arc::new(relay_clients);
         let inclusion_tracker = InclusionTracker::new(cfg.confirmation_rpc_url.clone());
         let submitter = CascadeSubmitter::new(
@@ -75,9 +104,9 @@ impl MultiRelayClient {
             cfg.max_bundles_per_relay_per_second as u32,
         ));
 
-        let (reorg_guard, _event_rx) = LaReorgGuard::new();
+        let (reorg_guard, event_rx) = LaReorgGuard::new();
 
-        Arc::new(Self {
+        let client = Arc::new(Self {
             submitter,
             dedup: SequencerRestartHandler::new(startup_block),
             reorg_guard,
@@ -86,7 +115,9 @@ impl MultiRelayClient {
             relay_clients,
             rate_limiters,
             inclusion_tracker,
-        })
+        });
+
+        (client, event_rx)
     }
 
     /// Submit a bundle in cascade mode.
@@ -193,6 +224,12 @@ mod integration_tests {
         f
     }
 
+    /// Test helper — discards the reorg-risk event receiver, since none of
+    /// these tests exercise reorg notifications. Production callers should
+    /// NOT copy this pattern; see `MultiRelayClient::new`'s audit note on
+    /// why silently discarding this receiver was the bug fixed in this
+    /// revision. Tests are an intentional exception: nothing here sends a
+    /// reorg event, so there's nothing to lose by not consuming it.
     fn make_multi_relay(startup_block: u64) -> Arc<MultiRelayClient> {
         let f        = make_blacklist_file();
         let blacklist = BuilderBlacklist::load(f.path()).unwrap();
@@ -217,7 +254,8 @@ mod integration_tests {
         };
 
         let _ = f;
-        MultiRelayClient::new(clients, metrics, blacklist, &cfg, startup_block)
+        let (mr, _event_rx) = MultiRelayClient::new(clients, metrics, blacklist, &cfg, startup_block);
+        mr
     }
 
     #[tokio::test]
@@ -292,5 +330,31 @@ mod integration_tests {
         let ranked = mr.ranked_relays();
         assert_eq!(ranked.len(), 2);
         assert_eq!(ranked[0].relay, RelayName::Flashbots);
+    }
+
+    // ── Audit fix regression test (this revision) ─────────────────────────────
+
+    #[tokio::test]
+    async fn new_returns_a_live_reorg_event_receiver() {
+        let f        = make_blacklist_file();
+        let blacklist = BuilderBlacklist::load(f.path()).unwrap();
+        let metrics  = LaRelayMetrics::new(10, ExecutionAddress("0xEVT".into()));
+        let mut clients: HashMap<String, Arc<dyn RelayClient>> = HashMap::new();
+        clients.insert("flashbots".into(), Arc::new(MockRelayClient::new(true)));
+        let cfg = RelayConfig { confirmation_rpc_url: "http://localhost:1".into(), ..Default::default() };
+
+        let (mr, mut event_rx) = MultiRelayClient::new(clients, metrics, blacklist, &cfg, 0);
+
+        // Trigger a real reorg and confirm the event actually arrives through
+        // the receiver this constructor now returns, instead of vanishing.
+        mr.on_bundle_submitted(TxHash("0xreorgtest".into()), 500);
+        mr.on_new_block(500, [1u8; 32]);
+        mr.on_new_block(500, [2u8; 32]); // different hash at same height -> reorg
+
+        let event = tokio::time::timeout(std::time::Duration::from_millis(200), event_rx.recv())
+            .await
+            .expect("must not time out")
+            .expect("channel must not be closed");
+        assert_eq!(event.orphaned_block, 500);
     }
 }

@@ -35,10 +35,23 @@
 //   limits submissions to 4 per relay per second (config
 //   relay.max_bundles_per_relay_per_second).  The 12-submission bound
 //   is the anti-fingerprint ceiling — see §11.2 fix I2.
+//
+// ## Audit fix (this revision)
+//
+// `emergency_fee`'s ceiling was hardcoded as a `500` literal instead of
+// referencing `adaptive_cap::MAX_PRIORITY_FEE_GWEI` — the actual named
+// constant defining this same fee ceiling elsewhere in this crate (and
+// already re-exported from `lib.rs`). Two independent encodings of the
+// same domain constant can silently drift apart if one is ever tuned
+// without the other; fixed to reference the constant directly, same
+// reasoning as the `GAS_SPIKE_THRESHOLD` duplication fix elsewhere in
+// this codebase (omega-risk).
 
 use alloy_primitives::U256;
 
 use omega_core::GasConfig;
+
+use crate::adaptive_cap::MAX_PRIORITY_FEE_GWEI;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // BundleVariants
@@ -137,7 +150,7 @@ pub fn compute_variants(
     // ── Conservative and aggressive fees ──────────────────────────────────
     let conservative_fee = apply_fraction(cap_gwei, config.conservative_fee_fraction);
     let aggressive_fee = cap_gwei;
-    let emergency_fee = cap_gwei.saturating_mul(2).min(500);
+    let emergency_fee = cap_gwei.saturating_mul(2).min(MAX_PRIORITY_FEE_GWEI);
 
     // ── Emergency bundle profit check (fix M2) ────────────────────────────
     let (emergency_fee_opt, skip_reason) = if !config.emergency_bundle_enabled {
@@ -254,7 +267,12 @@ mod tests {
     }
 
     #[test]
-    fn emergency_is_2x_cap_clamped_to_500() {
+    fn emergency_is_2x_cap_clamped_to_ceiling_constant() {
+        // Regression guard for the fix in this revision: the clamp must
+        // derive from adaptive_cap::MAX_PRIORITY_FEE_GWEI, not a
+        // hardcoded literal that could silently drift from it. Uses the
+        // constant directly rather than the literal 500, so this test
+        // fails loudly if the two are ever allowed to diverge again.
         let (v, skip) = compute_variants(
             300,
             profitable_profit(),
@@ -263,7 +281,7 @@ mod tests {
             &default_config(),
         );
         assert!(skip.is_none());
-        assert_eq!(v.emergency_fee_gwei, Some(500)); // 600 clamped to 500
+        assert_eq!(v.emergency_fee_gwei, Some(MAX_PRIORITY_FEE_GWEI)); // 600 clamped
     }
 
     #[test]

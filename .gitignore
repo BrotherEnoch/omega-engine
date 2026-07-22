@@ -1,114 +1,12 @@
-# =========================
-# OmegaEngine Global Ignore
-# =========================
-
-# ─────────────────────────
-# Rust / Cargo (WORKSPACE SAFE)
-# ─────────────────────────
-target/
-**/target/
-
-Cargo.lock
-
-**/*.rs.bk
-**/*.pdb
-
-# ─────────────────────────
-# WASM / Frontend / Leptos / Trunk
-# ─────────────────────────
-dist/
-build/
-out/
-pkg/
-
-.leptos/
-.trunk/
-*.wasm
-
-# ─────────────────────────
-# Node / JS tooling (if present)
-# ─────────────────────────
-node_modules/
-npm-debug.log*
-yarn-debug.log*
-yarn-error.log*
-pnpm-debug.log*
-
-# ─────────────────────────
-# Foundry / Solidity / Blockchain artifacts
-# ─────────────────────────
-contracts/cache/
-contracts/out/
-contracts/broadcast/
-contracts/artifacts/
-contracts/lib/
-
-# Foundry internal state
-contracts/foundry.lock
-contracts/.cache/
-contracts/.env
-
-# ─────────────────────────
-# Secrets / environment
-# ─────────────────────────
+# .gitignore
+# Never commit real credentials
 .env
 .env.*
-!.env.example
 
-# ─────────────────────────
-# IDE / OS noise
-# ─────────────────────────
+# Build artifacts
+target/
+dist/
+
+# Editor
 .vscode/
-.idea/
-*.iml
-
-.DS_Store
-Thumbs.db
-
-# ─────────────────────────
-# Logs / runtime dumps
-# ─────────────────────────
-*.log
-logs/
-debug.log
-
-# ─────────────────────────
-# Backups / archives (CRITICAL for your repo size issue)
-# ─────────────────────────
-omega_backup_*/
-omega_backup_*
-backup_*/
 *.bak
-*.tmp
-*.old
-
-# ─────────────────────────
-# CI / coverage / test outputs
-# ─────────────────────────
-coverage/
-*.lcov
-*.profraw
-
-# ─────────────────────────
-# Python tooling (optional scripts)
-# ─────────────────────────
-__pycache__/
-*.pyc
-.venv/
-venv/
-
-# ─────────────────────────
-# Build artifacts from accidental commits
-# ─────────────────────────
-*.o
-*.so
-*.dll
-*.dylib
-*.exe
-
-# ─────────────────────────
-# Docs / generated binaries accidentally included
-# ─────────────────────────
-*.docx
-*.pdf
-*.zip

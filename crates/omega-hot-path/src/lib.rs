@@ -37,6 +37,26 @@
 //   metrics.rs:
 //     record_success(latency_us: u64, profit_net: U256) — 2 args (no strategy_id)
 //     record_miss() — used for all failure/rejection cases (no record_failure/record_rejection)
+//
+// ## Audit fix (this revision): lint escalation split
+//
+// Added `#![cfg_attr(not(test), deny(clippy::unwrap_used, clippy::expect_used))]`,
+// mirroring the same fix in omega-risk/src/lib.rs. Cargo.toml's
+// `[lints.clippy]` table sets unwrap_used/expect_used to "warn"
+// crate-wide (see that file's own audit note); a manifest-level table
+// can't express "deny outside tests, warn inside them" on its own, so
+// that split is expressed here instead. Verified before adding: this
+// crate's non-test code (`HotPathRunner::run` and everything it calls)
+// contains no `.unwrap()`/`.expect()` calls — every `.unwrap()`/
+// `.expect()` in this file lives inside `#[cfg(test)] mod tests` — so
+// the deny should apply cleanly with nothing to fix first. The
+// `unreachable!()` inside the `other` match arm below is unaffected by
+// either `clippy::panic` (which targets `panic!()` specifically, not
+// `unreachable!()`) or this new attribute (which only covers
+// unwrap_used/expect_used) — it's a distinct, deliberate invariant, not
+// an oversight covered by this fix.
+
+#![cfg_attr(not(test), deny(clippy::unwrap_used, clippy::expect_used))]
 
 pub mod gate;
 pub mod metrics;
@@ -229,10 +249,18 @@ mod tests {
     use alloy_primitives::{Address, Bytes, B256, U256};
     use omega_core::types::blueprint::{ExecutionBlueprint, StrategyId};
     use omega_core::types::lane::{Lane, Simulator};
+    use uuid::Uuid;
 
     fn make_bp(strategy: StrategyId, gas: u64, hash_byte: u8) -> ExecutionBlueprint {
         let mut hash = B256::ZERO;
         hash.0[0] = hash_byte;
+        // signal_id/client_order_id/idempotency_key: these hot-path gate
+        // tests exercise admission/simulation logic only, never
+        // verify_hash()/verify_idempotency_key() — same placeholder
+        // caveat as omega-dag's test helper.
+        let signal_id = Uuid::from_bytes([hash_byte; 16]);
+        let client_order_id =
+            ExecutionBlueprint::derive_client_order_id(strategy, 42161, 0, signal_id);
         ExecutionBlueprint {
             blueprint_hash: hash,
             chain_id: 42161,
@@ -241,6 +269,7 @@ mod tests {
             simulator: Simulator::Revm,
             signal_state_hash: B256::ZERO,
             state_version: 1,
+            signal_id,
             flashloan_provider: Address::ZERO,
             flashloan_amount: U256::ZERO,
             flashloan_available: U256::ZERO,
@@ -262,6 +291,8 @@ mod tests {
             expiry_block: 1_001,
             nonce: 0,
             confirmation_depth: 12,
+            client_order_id,
+            idempotency_key: B256::ZERO,
             relay_targets: vec!["relay_a".into()],
             zk_proof_commitment: None,
         }

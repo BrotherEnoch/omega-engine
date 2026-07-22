@@ -30,6 +30,16 @@
 //   In production this registry is populated from the Chainlink feed registry
 //   contract or a config TOML.  Here we provide Arbitrum mainnet addresses
 //   for the tokens used by LA (§11).
+//
+// ## Audit fix (this revision)
+//
+// `update()` previously constructed a `CacheEntry` twice: once to move
+// into the cache, and a second, separate one purely to call
+// `.age_secs()` for the debug log line. `age_secs()` only reads
+// `updated_at`, so the second construction was redundant — cleaned up to
+// compute the age once, before the cache insert, and reuse it in the log
+// line. Behavior is unchanged; this is a minor clarity/efficiency
+// cleanup, not a correctness fix.
 
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -110,25 +120,20 @@ impl ChainlinkOracle {
     /// `updated_at`:  Unix timestamp from the aggregator's `updatedAt` field.
     /// `block_number`: block at which the read was performed.
     pub fn update(&self, token: &str, price_usd: f64, updated_at: u64, block_number: u64) {
-        self.cache.insert(
-            token.to_owned(),
-            CacheEntry {
-                price_usd,
-                updated_at,
-                block_number,
-            },
-        );
+        let entry = CacheEntry {
+            price_usd,
+            updated_at,
+            block_number,
+        };
+        let age_secs = entry.age_secs();
+
+        self.cache.insert(token.to_owned(), entry);
 
         tracing::debug!(
             chain_id = self.chain_id,
             token,
             price_usd,
-            age_secs = CacheEntry {
-                price_usd,
-                updated_at,
-                block_number
-            }
-            .age_secs(),
+            age_secs,
             "Chainlink price updated",
         );
     }

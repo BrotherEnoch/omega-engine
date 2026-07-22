@@ -1,0 +1,46 @@
+# crates/omega-execution/Cargo.toml
+[package]
+name    = "omega-execution"
+version = "12.0.0"
+edition = "2021"
+
+# omega-execution — implements the "THIS DOCUMENT: the missing stage" box
+# from ExecutionPipelineSpecification.md §2. Bridges ExecutionBlueprint
+# (produced by omega-strategies, scheduled by omega-dag, simulated by
+# omega-hot-path/omega-zk) to omega-relay::MultiRelayClient, gated by
+# omega-risk's kill switch and 15 pre-trade checks.
+#
+# This is the only crate in the workspace that depends on BOTH omega-risk
+# and omega-relay at once — see the spec's §4 for why that gap existed:
+# omega-dag/omega-hot-path are deliberately dependency-minimal, and
+# omega-relay's BundlePayload has no visibility into ExecutionBlueprint's
+# fields at all.
+
+[dependencies]
+omega-core     = { path = "../omega-core" }
+omega-risk     = { path = "../omega-risk" }
+omega-relay    = { path = "../omega-relay" }
+omega-security = { path = "../omega-security" }
+omega-dag      = { path = "../omega-dag" }
+
+alloy-primitives = { workspace = true }
+tokio            = { workspace = true }
+async-trait      = { workspace = true }
+dashmap          = { workspace = true }
+chrono           = { workspace = true }
+tracing          = { workspace = true }
+thiserror        = { workspace = true }
+anyhow           = { workspace = true }
+serde            = { workspace = true }
+
+# Hex encode/decode for the signed-transaction <-> bundle_hash transform
+# (transform.rs) — not a workspace-level dependency elsewhere, pinned
+# directly, same as omega-security's Cargo.toml does for the same crate.
+hex = "0.4"
+
+[dev-dependencies]
+uuid     = { workspace = true }
+# Used by pipeline.rs's tests to write a real temp blacklist file for
+# BuilderBlacklist::load — the same pattern omega-relay's own
+# integration_tests module already uses for the same constructor.
+tempfile = "3"

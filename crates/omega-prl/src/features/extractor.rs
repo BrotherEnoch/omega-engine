@@ -10,6 +10,22 @@
 //! Feature categories (§6.2):
 //!   Temporal | Economic | Behavioral | Structural | Adversarial
 //!   Execution | Market | Oracle
+//!
+//! ## Audit fix (this revision)
+//!
+//! `extract_loss`'s `protocol_id` and `extract_reorg`'s `depth` were the
+//! only two feature computations in this file that skipped the `norm_*`
+//! clamping helpers everything else uses — an out-of-range input byte
+//! could produce a feature value far outside the documented `[-1, 1]`
+//! range, which `count_above_threshold` (used by every Statistical-type
+//! pattern signature) would then count as a spurious anomaly unrelated
+//! to real market behavior. Both are now clamped to `[0.0, 1.0]`.
+//!
+//! `extract_loss`'s `F_REVERT_RATE` is set to a hardcoded constant
+//! (`norm_prob(0.5)`), not derived from payload data — flagged but not
+//! fixed, since the real revert-rate payload schema wasn't available to
+//! this audit; every `LossRecorded` event currently produces the
+//! identical value here regardless of what actually happened.
 
 use std::sync::LazyLock;
 
@@ -290,13 +306,24 @@ impl FeatureExtractor {
         }
         let gas_paid = u64::from_le_bytes(p[1..9].try_into().unwrap_or([0; 8]));
         let gas_used = u64::from_le_bytes(p[9..17].try_into().unwrap_or([0; 8]));
-        let protocol_id = p[17] as f32 / 4.0; // normalise 0..4 → [0,1]
+        // Clamped — previously unclamped (byte/4.0 up to 63.75), the one
+        // feature computation in this file that skipped the norm_*
+        // helpers everything else uses. An out-of-range protocol_id byte
+        // could otherwise produce a feature far outside the documented
+        // [-1, 1] range, which count_above_threshold (used by every
+        // Statistical-type signature) would count as a spurious anomaly
+        // unrelated to real market behavior.
+        let protocol_id = (p[17] as f32 / 4.0).clamp(0.0, 1.0);
 
         fv.set(
             F_GAS_MISCALC_RATE,
             if gas_used > gas_paid { 1.0 } else { 0.0 },
         );
         fv.set(F_PROTOCOL_ID, protocol_id);
+        // NOTE: hardcoded constant, not derived from payload data — every
+        // LossRecorded event produces the identical value here regardless
+        // of what actually happened. Flagged in this audit; not fixed,
+        // since the real revert-rate payload schema wasn't available.
         fv.set(F_REVERT_RATE, norm_prob(0.5));
     }
 
@@ -334,7 +361,9 @@ impl FeatureExtractor {
         if ev.payload_len < 3 {
             return;
         }
-        let depth = p[0] as f32 / 10.0;
+        // Clamped — same class of gap as protocol_id above (byte/10.0
+        // up to 25.5, unbounded).
+        let depth = (p[0] as f32 / 10.0).clamp(0.0, 1.0);
         fv.set(F_INCLUSION_JITTER, depth);
         fv.set(F_BLOCK_INTERVAL_NORM, depth);
     }
@@ -353,5 +382,60 @@ impl FeatureExtractor {
 impl Default for FeatureExtractor {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn event_with_payload(et: EventType, bytes: &[u8]) -> PatternEvent {
+        let mut ev = PatternEvent::zeroed();
+        ev.event_type = et;
+        ev.payload[..bytes.len()].copy_from_slice(bytes);
+        ev.payload_len = bytes.len();
+        ev
+    }
+
+    #[test]
+    fn protocol_id_clamped_for_out_of_range_byte() {
+        let extractor = FeatureExtractor::new();
+        // gas_paid=0, gas_used=0 (bytes 1..17 zero), protocol_id byte = 250
+        let mut payload = [0u8; 18];
+        payload[17] = 250;
+        let ev = event_with_payload(EventType::LossRecorded, &payload);
+        let fv = extractor.extract(&ev).unwrap();
+        assert!(
+            fv.values[F_PROTOCOL_ID] <= 1.0,
+            "must clamp, got {}",
+            fv.values[F_PROTOCOL_ID]
+        );
+    }
+
+    #[test]
+    fn reorg_depth_clamped_for_out_of_range_byte() {
+        let extractor = FeatureExtractor::new();
+        let payload = [255u8, 0, 0];
+        let ev = event_with_payload(EventType::ReorgDetected, &payload);
+        let fv = extractor.extract(&ev).unwrap();
+        assert!(fv.values[F_INCLUSION_JITTER] <= 1.0);
+        assert!(fv.values[F_BLOCK_INTERVAL_NORM] <= 1.0);
+    }
+
+    #[test]
+    fn unknown_event_type_returns_none() {
+        let extractor = FeatureExtractor::new();
+        let ev = PatternEvent::zeroed(); // event_type: Unknown
+        assert!(extractor.extract(&ev).is_none());
+    }
+
+    #[test]
+    fn short_payload_leaves_features_unset() {
+        let extractor = FeatureExtractor::new();
+        // GasEscalation requires payload_len >= 18; give it less.
+        let ev = event_with_payload(EventType::GasEscalation, &[1, 2, 3]);
+        let fv = extractor.extract(&ev).unwrap();
+        assert_eq!(fv.values[F_GAS_ESCALATION_VEL], 0.0);
+        assert_eq!(fv.present & (1u64 << F_GAS_ESCALATION_VEL), 0);
     }
 }

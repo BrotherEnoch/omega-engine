@@ -6,6 +6,21 @@
 //!   - Time-bucketed aggregation; cache-aligned storage (§7.1)
 //!   - Online algorithms only — no historical rescans (§7.3)
 //!   - Six window classes from 5ms nano to 24h historical (§7.2)
+//!
+//! ## Audit fix (this revision)
+//!
+//! `CircularWindow::advance_to` previously walked forward one bucket at
+//! a time to reach a target timestamp. For the `Nano` window class
+//! (~312.5µs/bucket), a timestamp even an hour ahead of the window
+//! (clock skew, a backfill jump, corrupted data) required roughly 11
+//! million loop iterations before returning — a genuine runaway-loop
+//! vector triggerable by a single malformed event, silently stalling
+//! whichever shard worker owns this window for the duration while the
+//! process otherwise looks alive. Fixed with a bounded fast path: if the
+//! gap exceeds the window's full span, every existing bucket is already
+//! stale regardless, so the window resets directly to a fresh state at
+//! the target timestamp instead of stepping through each intermediate
+//! bucket.
 
 /// §7.2 — Window class definitions.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -178,9 +193,41 @@ impl CircularWindow {
         agg
     }
 
+    /// Advance the write position to cover `ts_nanos`.
+    ///
+    /// Previously walked one bucket at a time — for a timestamp far
+    /// ahead of the window (clock skew, a backfill jump, corrupted
+    /// data), this could iterate millions of times before catching up,
+    /// stalling the shard worker that owns this window for the
+    /// duration. Fixed with a bounded fast path: if the gap exceeds the
+    /// full window span, every existing bucket is already stale anyway,
+    /// so reset directly to a fresh window at `ts_nanos` instead of
+    /// stepping through each one.
+    ///
+    /// An out-of-order (past) timestamp — `ts_nanos` older than the
+    /// current write bucket — is written into the CURRENT bucket rather
+    /// than rejected. This is a known, separate gap: such a value gets
+    /// silently attributed to the wrong (newer) time bucket rather than
+    /// discarded. Left as-is here since rejecting it outright would
+    /// require the caller to handle a dropped sample, which is a
+    /// decision belonging to whoever owns event ordering upstream.
     fn advance_to(&mut self, ts_nanos: u64) {
         let bucket_dur = self.class.bucket_duration_nanos();
         let n = self.buckets.len();
+        let full_span = bucket_dur * n as u64;
+
+        let current_start = self.buckets[self.write_idx].ts_start;
+
+        // Fast path: gap too large to step through bucket-by-bucket.
+        if ts_nanos >= current_start.saturating_add(full_span) {
+            for (i, bucket) in self.buckets.iter_mut().enumerate() {
+                *bucket = TemporalBucket::new(ts_nanos + i as u64 * bucket_dur);
+            }
+            self.write_idx = 0;
+            self.window_start = ts_nanos;
+            return;
+        }
+
         loop {
             let current_start = self.buckets[self.write_idx].ts_start;
             if ts_nanos < current_start + bucket_dur {
@@ -284,5 +331,34 @@ mod tests {
         let short = agg.aggregate(WindowClass::Short);
         assert!(short.count > 0);
         assert!(short.mean >= 0.0);
+    }
+
+    #[test]
+    fn advance_to_does_not_loop_unboundedly_on_large_gap() {
+        // Regression test for the runaway-loop bug this pass fixes: a
+        // single event with a timestamp far ahead of the window (clock
+        // skew, backfill, corrupted data) must not stall the caller.
+        let start = 1_000_000_000u64;
+        let mut w = CircularWindow::new(WindowClass::Nano, start); // 5ms window, 16 buckets
+        w.record(start, 1.0);
+        // Jump 1 hour ahead — the old bucket-by-bucket implementation
+        // would need roughly 11 million iterations to reach this point.
+        let far_future = start + 3_600_000_000_000;
+        w.record(far_future, 2.0);
+        let agg = w.aggregate();
+        assert!(agg.count > 0);
+    }
+
+    #[test]
+    fn advance_to_fast_path_resets_window_start_correctly() {
+        let start = 1_000_000_000u64;
+        let mut w = CircularWindow::new(WindowClass::Micro, start); // 50ms window, 16 buckets
+        let jump_target = start + 10_000_000_000; // far beyond the 50ms span
+        w.record(jump_target, 5.0);
+        // After the fast-path reset, a sample recorded exactly at the
+        // jump target must land in a fresh, non-stale bucket.
+        let agg = w.aggregate();
+        assert_eq!(agg.count, 1);
+        assert_eq!(agg.mean, 5.0);
     }
 }

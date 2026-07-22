@@ -1,4 +1,946 @@
-﻿# config/arbitrum.toml
+﻿PS C:\Users\silve\Documents\omega-engine> Get-ChildItem . -Recurse -Filter *.rs |
+>>     Select-String -Pattern "struct\s+ExecutionBlueprint|enum\s+ExecutionBlueprint|type\s+ExecutionBlueprint"
+
+crates\omega-core\src\types\blueprint.rs:208:pub struct ExecutionBlueprint {
+omega_backup_20260514_071110\crates\omega-core\src\types\blueprint.rs:122:pub struct ExecutionBlueprint {
+
+
+PS C:\Users\silve\Documents\omega-engine> Get-ChildItem . -Recurse -Filter *.rs |
+>>     Select-String -Pattern "\bExecutionBlueprint\b"
+
+crates\omega-compliance\src\ofa.rs:39:use omega_core::types::blueprint::ExecutionBlueprint;
+crates\omega-compliance\src\ofa.rs:252:        bp: &ExecutionBlueprint,
+crates\omega-compliance\src\ofa.rs:304:        bp: &ExecutionBlueprint,
+crates\omega-compliance\src\ofa.rs:326:    use omega_core::types::blueprint::{ExecutionBlueprint, StrategyId};
+crates\omega-compliance\src\ofa.rs:353:    fn dummy_bp(price_impact_bps: Option<u16>) -> ExecutionBlueprint {
+crates\omega-compliance\src\ofa.rs:354:        ExecutionBlueprint {
+crates\omega-compliance\src\policy.rs:7:use omega_core::types::blueprint::ExecutionBlueprint;  // Adjust import as
+needed in your core
+crates\omega-compliance\src\policy.rs:60:        bp: &ExecutionBlueprint,
+crates\omega-core\src\errors.rs:120:    /// via `ExecutionBlueprint::verify_hash()`).
+crates\omega-core\src\errors.rs:213:    /// (see `ExecutionBlueprint::compute_idempotency_key` /
+crates\omega-core\src\lib.rs:21://                        this crate (ExecutionBlueprint::compute_hash
+crates\omega-core\src\lib.rs:35://   types/blueprint.rs  — ExecutionBlueprint, StrategyId
+crates\omega-core\src\lib.rs:65:// Downstream crates can write `use omega_core::ExecutionBlueprint` rather
+crates\omega-core\src\lib.rs:74:    ExecutionBlueprint, FeeSnapshot, HealthState, HealthStatus, LaTier, Lane,
+LayerHealth,
+crates\omega-core\src\types\blueprint.rs:3:// ExecutionBlueprint — the central data structure of the Omega Engine.
+crates\omega-core\src\types\blueprint.rs:40://    an ExecutionBlueprint, which this crate can't see) — it gives
+crates\omega-core\src\types\blueprint.rs:87://    construction of `ExecutionBlueprint` elsewhere in the workspace
+crates\omega-core\src\types\blueprint.rs:185:// ExecutionBlueprint
+crates\omega-core\src\types\blueprint.rs:208:pub struct ExecutionBlueprint {
+crates\omega-core\src\types\blueprint.rs:383:/// Fields hashed by `ExecutionBlueprint::compute_hash`. Deliberately
+crates\omega-core\src\types\blueprint.rs:426:impl ExecutionBlueprint {
+crates\omega-core\src\types\blueprint.rs:721:    fn sample_blueprint() -> ExecutionBlueprint {
+crates\omega-core\src\types\blueprint.rs:724:            ExecutionBlueprint::derive_client_order_id(StrategyId::Sa,
+42161, 1, signal_id);
+crates\omega-core\src\types\blueprint.rs:726:        let mut bp = ExecutionBlueprint {
+crates\omega-core\src\types\blueprint.rs:891:            ExecutionBlueprint::select_simulator(Lane::Microtx, 199_999),
+crates\omega-core\src\types\blueprint.rs:895:            ExecutionBlueprint::select_simulator(Lane::Microtx, 200_000),
+crates\omega-core\src\types\blueprint.rs:899:            ExecutionBlueprint::select_simulator(Lane::Normal, 1_000),
+crates\omega-core\src\types\blueprint.rs:906:        let k1 = ExecutionBlueprint::nonce_key(StrategyId::Sa, 42161);
+crates\omega-core\src\types\blueprint.rs:907:        let k2 = ExecutionBlueprint::nonce_key(StrategyId::Sa, 42161);
+crates\omega-core\src\types\blueprint.rs:908:        let k3 = ExecutionBlueprint::nonce_key(StrategyId::Sa, 1);
+crates\omega-core\src\types\blueprint.rs:909:        let k4 = ExecutionBlueprint::nonce_key(StrategyId::La, 42161);
+crates\omega-core\src\types\blueprint.rs:957:        bp2.client_order_id = ExecutionBlueprint::derive_client_order_id(
+crates\omega-core\src\types\blueprint.rs:980:        bp2.client_order_id = ExecutionBlueprint::derive_client_order_id(
+crates\omega-core\src\types\blueprint.rs:997:        let a =
+ExecutionBlueprint::derive_client_order_id(StrategyId::La, 42161, 5, id);
+crates\omega-core\src\types\blueprint.rs:998:        let b =
+ExecutionBlueprint::derive_client_order_id(StrategyId::La, 42161, 5, id);
+crates\omega-core\src\types\blueprint.rs:1005:        let a =
+ExecutionBlueprint::derive_client_order_id(StrategyId::Sa, 42161, 5, id);
+crates\omega-core\src\types\blueprint.rs:1006:        let b =
+ExecutionBlueprint::derive_client_order_id(StrategyId::Sa, 1, 5, id);
+crates\omega-core\src\types\blueprint.rs:1016:        let a =
+ExecutionBlueprint::derive_client_order_id(StrategyId::Sa, 42161, 5, id);
+crates\omega-core\src\types\blueprint.rs:1017:        let b =
+ExecutionBlueprint::derive_client_order_id(StrategyId::Sa, 42161, 6, id);
+crates\omega-core\src\types\lane.rs:10:// Simulator is recorded on ExecutionBlueprint so downstream crates
+crates\omega-core\src\types\lane.rs:32:/// Recorded on [`ExecutionBlueprint`] at construction time.  Downstream
+crates\omega-core\src\types\mod.rs:23:// crates can write `use omega_core::types::ExecutionBlueprint` rather
+crates\omega-core\src\types\mod.rs:25:pub use blueprint::{ExecutionBlueprint, StrategyId};
+crates\omega-core\src\types\strategy.rs:47:use crate::types::blueprint::{ExecutionBlueprint, StrategyId};
+crates\omega-core\src\types\strategy.rs:169:/// Result of simulating an [`ExecutionBlueprint`].
+crates\omega-core\src\types\strategy.rs:282:    /// Build a fully-specified [`ExecutionBlueprint`] for the given
+crates\omega-core\src\types\strategy.rs:290:    ///   4. Set `simulator` via `ExecutionBlueprint::select_simulator`.
+crates\omega-core\src\types\strategy.rs:291:    async fn build_blueprint(&self, signal: &SignalState) ->
+Result<ExecutionBlueprint>;
+crates\omega-core\src\types\strategy.rs:299:    async fn simulate(&self, bp: &ExecutionBlueprint) -> Result<SimResult>;
+crates\omega-core\src\types\strategy.rs:307:    fn encode_calldata(&self, bp: &ExecutionBlueprint) -> Bytes;
+crates\omega-dag\src\scheduler.rs:31://   Nodes: each admits one `ExecutionBlueprint` identified by `blueprint_hash`.
+crates\omega-dag\src\scheduler.rs:70:use omega_core::types::blueprint::ExecutionBlueprint;
+crates\omega-dag\src\scheduler.rs:81:    blueprint: ExecutionBlueprint,
+crates\omega-dag\src\scheduler.rs:149:        blueprint: ExecutionBlueprint,
+crates\omega-dag\src\tests.rs:5:use omega_core::types::blueprint::{ExecutionBlueprint, StrategyId};
+crates\omega-dag\src\tests.rs:24:fn make_bp(hash_byte: u8, strategy: StrategyId, lane: Lane) -> ExecutionBlueprint {
+crates\omega-dag\src\tests.rs:36:        ExecutionBlueprint::derive_client_order_id(strategy, 42161, 0, signal_id);
+crates\omega-dag\src\tests.rs:37:    ExecutionBlueprint {
+crates\omega-hot-path\src\gate.rs:29:use omega_core::types::blueprint::{ExecutionBlueprint, StrategyId};
+crates\omega-hot-path\src\gate.rs:94:    pub fn admit(&self, bp: &ExecutionBlueprint) -> AdmissionResult {
+crates\omega-hot-path\src\gate.rs:216:    use omega_core::types::blueprint::{ExecutionBlueprint, StrategyId};
+crates\omega-hot-path\src\gate.rs:219:    fn make_bp(strategy: StrategyId, lane: Lane, gas: u64, profit: u128) ->
+ExecutionBlueprint {
+crates\omega-hot-path\src\gate.rs:220:        ExecutionBlueprint {
+crates\omega-hot-path\src\gate.rs:254:    fn valid_bp() -> ExecutionBlueprint {
+crates\omega-hot-path\src\lib.rs:71:use omega_core::types::blueprint::ExecutionBlueprint;
+crates\omega-hot-path\src\lib.rs:86:    pub blueprint: ExecutionBlueprint,
+crates\omega-hot-path\src\lib.rs:250:    use omega_core::types::blueprint::{ExecutionBlueprint, StrategyId};
+crates\omega-hot-path\src\lib.rs:254:    fn make_bp(strategy: StrategyId, gas: u64, hash_byte: u8) ->
+ExecutionBlueprint {
+crates\omega-hot-path\src\lib.rs:263:            ExecutionBlueprint::derive_client_order_id(strategy, 42161, 0,
+signal_id);
+crates\omega-hot-path\src\lib.rs:264:        ExecutionBlueprint {
+crates\omega-hot-path\src\simulator.rs:39:use omega_core::types::blueprint::ExecutionBlueprint;
+crates\omega-hot-path\src\simulator.rs:117:        bp: &ExecutionBlueprint,
+crates\omega-hot-path\src\simulator.rs:198:    fn estimate_reads(&self, bp: &ExecutionBlueprint) -> u8 {
+crates\omega-hot-path\src\simulator.rs:212:    use omega_core::types::blueprint::{ExecutionBlueprint, StrategyId};
+crates\omega-hot-path\src\simulator.rs:217:    fn make_bp(gas: u64, profit: u128, expiry: u64, sim: Simulator) ->
+ExecutionBlueprint {
+crates\omega-hot-path\src\simulator.rs:218:        ExecutionBlueprint {
+crates\omega-loss-attribution\src\classifier.rs:35:// on `ExecutionBlueprint`.  The original `[u8; 32]` was an
+arbitrary
+crates\omega-loss-attribution\src\classifier.rs:259:/// `blueprint_hash` is `B256` — the same type used on
+`ExecutionBlueprint`
+crates\omega-loss-attribution\src\classifier.rs:266:    /// Matches `ExecutionBlueprint::blueprint_hash`.
+crates\omega-risk\src\checks.rs:95:// `ExecutionBlueprint` + `alloy::primitives::U256` directly, bypassing the
+crates\omega-risk\src\checks.rs:148:// We accept a `BlueprintFields` struct (not the full ExecutionBlueprint) to keep
+crates\omega-risk\src\checks.rs:153:/// Extracted from ExecutionBlueprint by the caller.
+crates\omega-risk\src\whitelist.rs:8://      Checked against ExecutionBlueprint.strategy_bytecode_hash.
+crates\omega-security\src\replay.rs:10://   ExecutionBlueprint.nonce_key():
+crates\omega-security\src\replay.rs:147:/// Mirrors `ExecutionBlueprint::nonce_key()` in omega-core.
+crates\omega-security\src\signer.rs:6://   1. Sign the keccak256 of every ExecutionBlueprint before relay submission.
+crates\omega-strategies\src\cnry.rs:7:// `build_blueprint` here never actually constructs an `ExecutionBlueprint`
+crates\omega-strategies\src\cnry.rs:12:// adding the three new `ExecutionBlueprint` fields (`signal_id`,
+crates\omega-strategies\src\cnry.rs:14:// literals below, since `ExecutionBlueprint` now requires them at every
+crates\omega-strategies\src\cnry.rs:27:use omega_core::types::blueprint::{ExecutionBlueprint, StrategyId};
+crates\omega-strategies\src\cnry.rs:125:    async fn build_blueprint(&self, _signal: &SignalState) ->
+Result<ExecutionBlueprint> {
+crates\omega-strategies\src\cnry.rs:129:    async fn simulate(&self, _bp: &ExecutionBlueprint) -> Result<SimResult> {
+crates\omega-strategies\src\cnry.rs:133:    fn encode_calldata(&self, _bp: &ExecutionBlueprint) -> Bytes {
+Bytes::new() }
+crates\omega-strategies\src\cnry.rs:169:    fn test_blueprint() -> ExecutionBlueprint {
+crates\omega-strategies\src\cnry.rs:172:            ExecutionBlueprint::derive_client_order_id(StrategyId::Cnry,
+42161, 0, signal_id);
+crates\omega-strategies\src\cnry.rs:173:        ExecutionBlueprint {
+crates\omega-strategies\src\la.rs:10:// `ExecutionBlueprint::compute_hash()`'s canonical encoding. Fixed to
+crates\omega-strategies\src\la.rs:24:use omega_core::types::blueprint::{ExecutionBlueprint, StrategyId};
+crates\omega-strategies\src\la.rs:182:    async fn build_blueprint(&self, signal: &SignalState) ->
+Result<ExecutionBlueprint> {
+crates\omega-strategies\src\la.rs:202:            ExecutionBlueprint::derive_client_order_id(StrategyId::La,
+self.chain_id, nonce, signal_id);
+crates\omega-strategies\src\la.rs:208:        let mut bp = ExecutionBlueprint {
+crates\omega-strategies\src\la.rs:248:    async fn simulate(&self, bp: &ExecutionBlueprint) -> Result<SimResult> {
+crates\omega-strategies\src\la.rs:259:    fn encode_calldata(&self, bp: &ExecutionBlueprint) -> Bytes {
+bp.calldata.clone() }
+crates\omega-strategies\src\la.rs:344:        // ExecutionBlueprint::compute_hash()'s canonical encoding.
+crates\omega-strategies\src\mev.rs:57:// `ExecutionBlueprint::compute_hash()`'s canonical encoding, and
+crates\omega-strategies\src\mev.rs:75:use omega_core::types::blueprint::{ExecutionBlueprint, StrategyId};
+crates\omega-strategies\src\mev.rs:304:    async fn build_blueprint(&self, signal: &SignalState) ->
+Result<ExecutionBlueprint> {
+crates\omega-strategies\src\mev.rs:316:            ExecutionBlueprint::derive_client_order_id(StrategyId::Mev,
+self.chain_id, nonce, signal_id);
+crates\omega-strategies\src\mev.rs:319:        let mut bp = ExecutionBlueprint {
+crates\omega-strategies\src\mev.rs:385:    async fn simulate(&self, bp: &ExecutionBlueprint) -> Result<SimResult> {
+crates\omega-strategies\src\mev.rs:415:    fn encode_calldata(&self, bp: &ExecutionBlueprint) -> Bytes {
+crates\omega-strategies\src\msa.rs:36:// incompatible with, `ExecutionBlueprint::compute_hash()`'s canonical
+crates\omega-strategies\src\msa.rs:52:use omega_core::types::blueprint::{ExecutionBlueprint, StrategyId};
+crates\omega-strategies\src\msa.rs:248:    async fn build_blueprint(&self, signal: &SignalState) ->
+Result<ExecutionBlueprint> {
+crates\omega-strategies\src\msa.rs:271:            ExecutionBlueprint::derive_client_order_id(StrategyId::Msa,
+self.chain_id, nonce, signal_id);
+crates\omega-strategies\src\msa.rs:277:        let mut bp = ExecutionBlueprint {
+crates\omega-strategies\src\msa.rs:317:    async fn simulate(&self, bp: &ExecutionBlueprint) -> Result<SimResult> {
+crates\omega-strategies\src\msa.rs:335:    fn encode_calldata(&self, bp: &ExecutionBlueprint) -> Bytes {
+crates\omega-strategies\src\registry.rs:195:    use omega_core::types::blueprint::{ExecutionBlueprint, StrategyId};
+crates\omega-strategies\src\registry.rs:234:        async fn build_blueprint(&self, _: &SignalState) ->
+Result<ExecutionBlueprint> {
+crates\omega-strategies\src\registry.rs:237:        async fn simulate(&self, _: &ExecutionBlueprint) ->
+Result<SimResult> {
+crates\omega-strategies\src\registry.rs:240:        fn encode_calldata(&self, _: &ExecutionBlueprint) -> Bytes {
+crates\omega-strategies\src\sa.rs:10:// `ExecutionBlueprint::compute_hash()` (the canonical encoding defined in
+crates\omega-strategies\src\sa.rs:19:// `ExecutionBlueprint`'s own doc comments (omega-core) for what each is
+crates\omega-strategies\src\sa.rs:33:use omega_core::types::blueprint::{ExecutionBlueprint, StrategyId};
+crates\omega-strategies\src\sa.rs:192:    async fn build_blueprint(&self, signal: &SignalState) ->
+Result<ExecutionBlueprint> {
+crates\omega-strategies\src\sa.rs:208:            ExecutionBlueprint::derive_client_order_id(StrategyId::Sa,
+self.chain_id, nonce, signal_id);
+crates\omega-strategies\src\sa.rs:214:        let mut bp = ExecutionBlueprint {
+crates\omega-strategies\src\sa.rs:254:    async fn simulate(&self, bp: &ExecutionBlueprint) -> Result<SimResult> {
+crates\omega-strategies\src\sa.rs:265:    fn encode_calldata(&self, bp: &ExecutionBlueprint) -> Bytes {
+bp.calldata.clone() }
+crates\omega-strategies\src\sa.rs:369:        // ExecutionBlueprint::compute_hash(), so verify_hash() would have
+crates\omega-zk\src\commitment.rs:3:// Proof commitment derivation (spec: ExecutionBlueprint.zk_proof_commitment:
+Option<B256>).
+crates\omega-zk\src\commitment.rs:11:// This commitment is embedded in the ExecutionBlueprint before relay submission
+crates\omega-zk\src\commitment.rs:24:/// A 32-byte proof commitment embedded in ExecutionBlueprint.zk_proof_commitment.
+crates\omega-zk\src\commitment.rs:49:/// * `blueprint_hash`   — keccak256 of the encoded ExecutionBlueprint (32 bytes).
+omega_backup_20260514_071110\crates\omega-compliance\src\ofa.rs:39:use
+omega_core::types::blueprint::ExecutionBlueprint;
+omega_backup_20260514_071110\crates\omega-compliance\src\ofa.rs:252:        bp:      &ExecutionBlueprint,
+omega_backup_20260514_071110\crates\omega-compliance\src\ofa.rs:307:        bp:            &ExecutionBlueprint,
+omega_backup_20260514_071110\crates\omega-compliance\src\ofa.rs:329:    use
+omega_core::types::blueprint::{ExecutionBlueprint, Simulator, StrategyId};
+omega_backup_20260514_071110\crates\omega-compliance\src\ofa.rs:356:    fn dummy_bp(price_impact_bps: Option<u16>) ->
+ExecutionBlueprint {
+omega_backup_20260514_071110\crates\omega-compliance\src\ofa.rs:357:        ExecutionBlueprint {
+omega_backup_20260514_071110\crates\omega-core\src\lib.rs:29://   types/blueprint.rs  â€” ExecutionBlueprint,
+StrategyId
+omega_backup_20260514_071110\crates\omega-core\src\lib.rs:42:// Downstream crates can write `use
+omega_core::ExecutionBlueprint` rather
+omega_backup_20260514_071110\crates\omega-core\src\lib.rs:61:    ExecutionBlueprint,
+omega_backup_20260514_071110\crates\omega-core\src\types\blueprint.rs:3:// ExecutionBlueprint â€” the central data
+structure of the Omega Engine.
+omega_backup_20260514_071110\crates\omega-core\src\types\blueprint.rs:100:// ExecutionBlueprint
+omega_backup_20260514_071110\crates\omega-core\src\types\blueprint.rs:122:pub struct ExecutionBlueprint {
+omega_backup_20260514_071110\crates\omega-core\src\types\blueprint.rs:257:impl ExecutionBlueprint {
+omega_backup_20260514_071110\crates\omega-core\src\types\lane.rs:10:// Simulator is recorded on ExecutionBlueprint so
+downstream crates
+omega_backup_20260514_071110\crates\omega-core\src\types\lane.rs:32:/// Recorded on [`ExecutionBlueprint`] at
+construction time.  Downstream
+omega_backup_20260514_071110\crates\omega-core\src\types\mod.rs:23:// crates can write `use
+omega_core::types::ExecutionBlueprint` rather
+omega_backup_20260514_071110\crates\omega-core\src\types\mod.rs:25:pub use blueprint::{ExecutionBlueprint, StrategyId};
+omega_backup_20260514_071110\crates\omega-core\src\types\strategy.rs:23:use
+crate::types::blueprint::{ExecutionBlueprint, StrategyId};
+omega_backup_20260514_071110\crates\omega-core\src\types\strategy.rs:113:/// Result of simulating an
+[`ExecutionBlueprint`].
+omega_backup_20260514_071110\crates\omega-core\src\types\strategy.rs:212:    /// Build a fully-specified
+[`ExecutionBlueprint`] for the given
+omega_backup_20260514_071110\crates\omega-core\src\types\strategy.rs:220:    ///   4. Set `simulator` via
+`ExecutionBlueprint::select_simulator`.
+omega_backup_20260514_071110\crates\omega-core\src\types\strategy.rs:221:    async fn build_blueprint(&self, signal:
+&SignalState) -> Result<ExecutionBlueprint>;
+omega_backup_20260514_071110\crates\omega-core\src\types\strategy.rs:229:    async fn simulate(&self, bp:
+&ExecutionBlueprint) -> Result<SimResult>;
+omega_backup_20260514_071110\crates\omega-core\src\types\strategy.rs:237:    fn encode_calldata(&self, bp:
+&ExecutionBlueprint) -> Bytes;
+omega_backup_20260514_071110\crates\omega-dag\src\scheduler.rs:31://   Nodes: each admits one `ExecutionBlueprint`
+identified by `blueprint_hash`.
+omega_backup_20260514_071110\crates\omega-dag\src\scheduler.rs:70:use omega_core::types::blueprint::ExecutionBlueprint;
+omega_backup_20260514_071110\crates\omega-dag\src\scheduler.rs:81:    blueprint: ExecutionBlueprint,
+omega_backup_20260514_071110\crates\omega-dag\src\scheduler.rs:149:        blueprint:    ExecutionBlueprint,
+omega_backup_20260514_071110\crates\omega-dag\src\tests.rs:11:use omega_core::types::blueprint::{ExecutionBlueprint,
+Simulator, StrategyId};
+omega_backup_20260514_071110\crates\omega-dag\src\tests.rs:27:fn make_bp(hash_byte: u8, strategy: StrategyId, lane:
+Lane) -> ExecutionBlueprint {
+omega_backup_20260514_071110\crates\omega-dag\src\tests.rs:30:    ExecutionBlueprint {
+omega_backup_20260514_071110\crates\omega-hot-path\src\gate.rs:29:use omega_core::types::blueprint::ExecutionBlueprint;
+omega_backup_20260514_071110\crates\omega-hot-path\src\gate.rs:94:    pub fn admit(&self, bp: &ExecutionBlueprint) ->
+AdmissionResult {
+omega_backup_20260514_071110\crates\omega-hot-path\src\gate.rs:216:    use
+omega_core::types::blueprint::{ExecutionBlueprint, Simulator, StrategyId};
+omega_backup_20260514_071110\crates\omega-hot-path\src\gate.rs:224:    ) -> ExecutionBlueprint {
+omega_backup_20260514_071110\crates\omega-hot-path\src\gate.rs:225:        ExecutionBlueprint {
+omega_backup_20260514_071110\crates\omega-hot-path\src\gate.rs:259:    fn valid_bp() -> ExecutionBlueprint {
+omega_backup_20260514_071110\crates\omega-hot-path\src\lib.rs:51:use omega_core::types::blueprint::ExecutionBlueprint;
+omega_backup_20260514_071110\crates\omega-hot-path\src\lib.rs:64:    pub blueprint: ExecutionBlueprint,
+omega_backup_20260514_071110\crates\omega-hot-path\src\lib.rs:225:    use
+omega_core::types::blueprint::{ExecutionBlueprint, StrategyId};
+omega_backup_20260514_071110\crates\omega-hot-path\src\lib.rs:228:    fn make_bp(strategy: StrategyId, gas: u64,
+hash_byte: u8) -> ExecutionBlueprint {
+omega_backup_20260514_071110\crates\omega-hot-path\src\lib.rs:231:        ExecutionBlueprint {
+omega_backup_20260514_071110\crates\omega-hot-path\src\simulator.rs:39:use
+omega_core::types::blueprint::ExecutionBlueprint;
+omega_backup_20260514_071110\crates\omega-hot-path\src\simulator.rs:118:        bp:          &ExecutionBlueprint,
+omega_backup_20260514_071110\crates\omega-hot-path\src\simulator.rs:197:    fn estimate_reads(&self, bp:
+&ExecutionBlueprint) -> u8 {
+omega_backup_20260514_071110\crates\omega-hot-path\src\simulator.rs:211:    use
+omega_core::types::blueprint::{ExecutionBlueprint, StrategyId};
+omega_backup_20260514_071110\crates\omega-hot-path\src\simulator.rs:216:    fn make_bp(gas: u64, profit: u128, expiry:
+u64, sim: Simulator) -> ExecutionBlueprint {
+omega_backup_20260514_071110\crates\omega-hot-path\src\simulator.rs:217:        ExecutionBlueprint {
+omega_backup_20260514_071110\crates\omega-loss-attribution\src\classifier.rs:35:// on `ExecutionBlueprint`.  The
+original `[u8; 32]` was an arbitrary
+omega_backup_20260514_071110\crates\omega-loss-attribution\src\classifier.rs:251:/// `blueprint_hash` is `B256` â€”
+the same type used on `ExecutionBlueprint`
+omega_backup_20260514_071110\crates\omega-loss-attribution\src\classifier.rs:258:    /// Matches
+`ExecutionBlueprint::blueprint_hash`.
+omega_backup_20260514_071110\crates\omega-risk\src\checks.rs:54:// We accept a `BlueprintFields` struct (not the full
+ExecutionBlueprint) to keep
+omega_backup_20260514_071110\crates\omega-risk\src\checks.rs:59:/// Extracted from ExecutionBlueprint by the caller.
+omega_backup_20260514_071110\crates\omega-risk\src\lib.rs:5:// Responsibility: pre-trade risk gate for every
+ExecutionBlueprint.
+omega_backup_20260514_071110\crates\omega-risk\src\whitelist.rs:8://      Checked against
+ExecutionBlueprint.strategy_bytecode_hash.
+omega_backup_20260514_071110\crates\omega-security\src\replay.rs:10://   ExecutionBlueprint.nonce_key():
+omega_backup_20260514_071110\crates\omega-security\src\replay.rs:147:/// Mirrors `ExecutionBlueprint::nonce_key()` in
+omega-core.
+omega_backup_20260514_071110\crates\omega-security\src\signer.rs:6://   1. Sign the keccak256 of every
+ExecutionBlueprint before relay submission.
+omega_backup_20260514_071110\crates\omega-strategies\src\cnry.rs:44:use
+omega_core::types::blueprint::{ExecutionBlueprint, StrategyId};
+omega_backup_20260514_071110\crates\omega-strategies\src\cnry.rs:166:    async fn build_blueprint(&self, _signal:
+&SignalState) -> Result<ExecutionBlueprint> {
+omega_backup_20260514_071110\crates\omega-strategies\src\cnry.rs:173:    async fn simulate(&self, _bp:
+&ExecutionBlueprint) -> Result<SimResult> {
+omega_backup_20260514_071110\crates\omega-strategies\src\cnry.rs:180:    fn encode_calldata(&self, _bp:
+&ExecutionBlueprint) -> Bytes {
+omega_backup_20260514_071110\crates\omega-strategies\src\cnry.rs:243:        let bp = ExecutionBlueprint {
+omega_backup_20260514_071110\crates\omega-strategies\src\cnry.rs:281:        let bp = ExecutionBlueprint {
+omega_backup_20260514_071110\crates\omega-strategies\src\la.rs:44:use
+omega_core::types::blueprint::{ExecutionBlueprint, Simulator, StrategyId};
+omega_backup_20260514_071110\crates\omega-strategies\src\la.rs:217:    async fn build_blueprint(&self, signal:
+&SignalState) -> Result<ExecutionBlueprint> {
+omega_backup_20260514_071110\crates\omega-strategies\src\la.rs:241:        Ok(ExecutionBlueprint {
+omega_backup_20260514_071110\crates\omega-strategies\src\la.rs:275:    async fn simulate(&self, bp:
+&ExecutionBlueprint) -> Result<SimResult> {
+omega_backup_20260514_071110\crates\omega-strategies\src\la.rs:286:    fn encode_calldata(&self, bp:
+&ExecutionBlueprint) -> Bytes {
+omega_backup_20260514_071110\crates\omega-strategies\src\mev.rs:60:use
+omega_core::types::blueprint::{ExecutionBlueprint, Simulator, StrategyId};
+omega_backup_20260514_071110\crates\omega-strategies\src\mev.rs:187:    fn compute_blueprint_hash(bp:
+&ExecutionBlueprint) -> B256 {
+omega_backup_20260514_071110\crates\omega-strategies\src\mev.rs:291:    async fn build_blueprint(&self, signal:
+&SignalState) -> Result<ExecutionBlueprint> {
+omega_backup_20260514_071110\crates\omega-strategies\src\mev.rs:302:        let mut bp = ExecutionBlueprint {
+omega_backup_20260514_071110\crates\omega-strategies\src\mev.rs:364:    async fn simulate(&self, bp:
+&ExecutionBlueprint) -> Result<SimResult> {
+omega_backup_20260514_071110\crates\omega-strategies\src\mev.rs:394:    fn encode_calldata(&self, bp:
+&ExecutionBlueprint) -> Bytes {
+omega_backup_20260514_071110\crates\omega-strategies\src\msa.rs:44:use
+omega_core::types::blueprint::{ExecutionBlueprint, StrategyId};
+omega_backup_20260514_071110\crates\omega-strategies\src\msa.rs:166:    async fn build_blueprint(&self, _signal:
+&SignalState) -> Result<ExecutionBlueprint> {
+omega_backup_20260514_071110\crates\omega-strategies\src\msa.rs:173:    async fn simulate(&self, _bp:
+&ExecutionBlueprint) -> Result<SimResult> {
+omega_backup_20260514_071110\crates\omega-strategies\src\msa.rs:180:    fn encode_calldata(&self, _bp:
+&ExecutionBlueprint) -> Bytes {
+omega_backup_20260514_071110\crates\omega-strategies\src\msa.rs:243:        let bp = ExecutionBlueprint {
+omega_backup_20260514_071110\crates\omega-strategies\src\msa.rs:281:        let bp = ExecutionBlueprint {
+omega_backup_20260514_071110\crates\omega-strategies\src\registry.rs:198:    use
+omega_core::types::blueprint::{ExecutionBlueprint, StrategyId};
+omega_backup_20260514_071110\crates\omega-strategies\src\registry.rs:220:        async fn build_blueprint(&self, _:
+&SignalState)  -> Result<ExecutionBlueprint> {
+omega_backup_20260514_071110\crates\omega-strategies\src\registry.rs:223:        async fn simulate(&self, _:
+&ExecutionBlueprint)  -> Result<SimResult> {
+omega_backup_20260514_071110\crates\omega-strategies\src\registry.rs:226:        fn encode_calldata(&self, _:
+&ExecutionBlueprint) -> Bytes { Bytes::new() }
+omega_backup_20260514_071110\crates\omega-strategies\src\sa.rs:33://   an `AtomicU64`.  The nonce key is
+`ExecutionBlueprint::nonce_key`.
+omega_backup_20260514_071110\crates\omega-strategies\src\sa.rs:44:use
+omega_core::types::blueprint::{ExecutionBlueprint, Simulator, StrategyId};
+omega_backup_20260514_071110\crates\omega-strategies\src\sa.rs:227:    async fn build_blueprint(&self, signal:
+&SignalState) -> Result<ExecutionBlueprint> {
+omega_backup_20260514_071110\crates\omega-strategies\src\sa.rs:255:        Ok(ExecutionBlueprint {
+omega_backup_20260514_071110\crates\omega-strategies\src\sa.rs:289:    async fn simulate(&self, bp:
+&ExecutionBlueprint) -> Result<SimResult> {
+omega_backup_20260514_071110\crates\omega-strategies\src\sa.rs:308:    fn encode_calldata(&self, bp:
+&ExecutionBlueprint) -> Bytes {
+omega_backup_20260514_071110\crates\omega-zk\src\commitment.rs:3:// Proof commitment derivation (spec:
+ExecutionBlueprint.zk_proof_commitment: Option<B256>).
+omega_backup_20260514_071110\crates\omega-zk\src\commitment.rs:11:// This commitment is embedded in the
+ExecutionBlueprint before relay submission
+omega_backup_20260514_071110\crates\omega-zk\src\commitment.rs:24:/// A 32-byte proof commitment embedded in
+ExecutionBlueprint.zk_proof_commitment.
+omega_backup_20260514_071110\crates\omega-zk\src\commitment.rs:49:/// * `blueprint_hash`   â€” keccak256 of the
+encoded ExecutionBlueprint (32 bytes).
+omega_backup_20260514_071110\crates\omega-zk\src\lib.rs:14://   ExecutionBlueprint â€” zk_proof_commitment:
+Option<B256>.
+omega_backup_20260514_071110\crates\omega-zk\src\prover.rs:13://   that a valid ExecutionBlueprint with that hash
+exists and produces at least
+omega_backup_20260514_071110\crates\omega-zk\src\prover.rs:121:    /// * `blueprint_hash`  â€” keccak256 of the
+encoded ExecutionBlueprint.
+
+
+PS C:\Users\silve\Documents\omega-engine> Get-ChildItem . -Recurse -Filter *.rs |
+>>     Select-String -Pattern "idempotency_key|client_order_id"
+
+crates\omega-core\src\errors.rs:213:    /// (see `ExecutionBlueprint::compute_idempotency_key` /
+crates\omega-core\src\errors.rs:214:    /// `verify_idempotency_key`, omega-core, and the RPC-layer
+crates\omega-core\src\errors.rs:279:            DropCode::DuplicateIdempotencyKey => "DUPLICATE_IDEMPOTENCY_KEY",
+crates\omega-core\src\errors.rs:468:            "DUPLICATE_IDEMPOTENCY_KEY"
+crates\omega-core\src\types\blueprint.rs:46://    three fields — `signal_id` (Uuid), `client_order_id` (String),
+crates\omega-core\src\types\blueprint.rs:47://    `idempotency_key` (B256) — plus `derive_client_order_id()`,
+crates\omega-core\src\types\blueprint.rs:48://    `compute_idempotency_key()`, and `verify_idempotency_key()`.
+crates\omega-core\src\types\blueprint.rs:58://    `idempotency_key` is derived from the trade's economic identity
+crates\omega-core\src\types\blueprint.rs:59://    (client_order_id, chain_id, nonce, strategy_bytecode_hash,
+crates\omega-core\src\types\blueprint.rs:69://    `idempotency_key` is DELIBERATELY EXCLUDED from `compute_hash()`'s
+crates\omega-core\src\types\blueprint.rs:73://    `idempotency_key` is excluded because it's a value DERIVED FROM a
+crates\omega-core\src\types\blueprint.rs:79://    `client_order_id`, by contrast, ARE included in `compute_hash()`'s
+crates\omega-core\src\types\blueprint.rs:80://    input set: unlike `idempotency_key` they are fixed, independent
+crates\omega-core\src\types\blueprint.rs:203:/// | Timing         | expiry_block, nonce, confirmation_depth,
+client_order_id |
+crates\omega-core\src\types\blueprint.rs:204:/// | Submission     | idempotency_key
+ |
+crates\omega-core\src\types\blueprint.rs:250:    /// their `idempotency_key` would correctly treat them as the same
+crates\omega-core\src\types\blueprint.rs:350:    /// `derive_client_order_id()` for the canonical derivation; this
+crates\omega-core\src\types\blueprint.rs:352:    pub client_order_id: String,
+crates\omega-core\src\types\blueprint.rs:361:    /// `verify_idempotency_key()` at the submission boundary.
+crates\omega-core\src\types\blueprint.rs:362:    pub idempotency_key: B256,
+crates\omega-core\src\types\blueprint.rs:385:/// value), `idempotency_key` (a value derived from a subset of these
+crates\omega-core\src\types\blueprint.rs:423:    client_order_id: String,
+crates\omega-core\src\types\blueprint.rs:444:    /// Derives the canonical `client_order_id` for a blueprint from its
+crates\omega-core\src\types\blueprint.rs:454:    /// same client_order_id string.
+crates\omega-core\src\types\blueprint.rs:455:    pub fn derive_client_order_id(
+crates\omega-core\src\types\blueprint.rs:566:    /// `blueprint_hash` itself (self-referential), `idempotency_key`
+crates\omega-core\src\types\blueprint.rs:604:    /// revision (`signal_id`, `client_order_id` — both now part of the
+crates\omega-core\src\types\blueprint.rs:605:    /// hash input — and `idempotency_key`, deliberately excluded).
+crates\omega-core\src\types\blueprint.rs:655:        // Length-prefixed so a client_order_id boundary can't be
+crates\omega-core\src\types\blueprint.rs:658:        buf.extend_from_slice(&(self.client_order_id.len() as
+u32).to_be_bytes());
+crates\omega-core\src\types\blueprint.rs:659:        buf.extend_from_slice(self.client_order_id.as_bytes());
+crates\omega-core\src\types\blueprint.rs:677:    /// Deterministically recomputes what `idempotency_key` should be
+crates\omega-core\src\types\blueprint.rs:679:    /// `client_order_id`, `chain_id`, `nonce`, `strategy_bytecode_hash`,
+crates\omega-core\src\types\blueprint.rs:695:    pub fn compute_idempotency_key(&self) -> B256 {
+crates\omega-core\src\types\blueprint.rs:697:        buf.extend_from_slice(&(self.client_order_id.len() as
+u32).to_be_bytes());
+crates\omega-core\src\types\blueprint.rs:698:        buf.extend_from_slice(self.client_order_id.as_bytes());
+crates\omega-core\src\types\blueprint.rs:708:    /// True if `idempotency_key` matches what `compute_idempotency_key()`
+crates\omega-core\src\types\blueprint.rs:712:    pub fn verify_idempotency_key(&self) -> bool {
+crates\omega-core\src\types\blueprint.rs:713:        self.idempotency_key == self.compute_idempotency_key()
+crates\omega-core\src\types\blueprint.rs:723:        let client_order_id =
+crates\omega-core\src\types\blueprint.rs:724:            ExecutionBlueprint::derive_client_order_id(StrategyId::Sa,
+42161, 1, signal_id);
+crates\omega-core\src\types\blueprint.rs:756:            client_order_id,
+crates\omega-core\src\types\blueprint.rs:757:            idempotency_key: B256::ZERO, // placeholder; overwritten below
+crates\omega-core\src\types\blueprint.rs:761:        bp.idempotency_key = bp.compute_idempotency_key();
+crates\omega-core\src\types\blueprint.rs:786:    fn verify_hash_fails_after_mutating_client_order_id() {
+crates\omega-core\src\types\blueprint.rs:788:        bp.client_order_id = "tampered".to_string();
+crates\omega-core\src\types\blueprint.rs:791:            "client_order_id is a construction-time identity field and
+must be hashed"
+crates\omega-core\src\types\blueprint.rs:819:    fn verify_hash_unaffected_by_idempotency_key_mutation() {
+crates\omega-core\src\types\blueprint.rs:820:        // idempotency_key is a separately-derived value for a distinct
+crates\omega-core\src\types\blueprint.rs:825:        bp.idempotency_key = B256::from([0x11u8; 32]);
+crates\omega-core\src\types\blueprint.rs:828:            "idempotency_key is intentionally excluded from
+blueprint_hash's input set"
+crates\omega-core\src\types\blueprint.rs:927:    fn compute_idempotency_key_is_deterministic() {
+crates\omega-core\src\types\blueprint.rs:929:        assert_eq!(bp.compute_idempotency_key(),
+bp.compute_idempotency_key());
+crates\omega-core\src\types\blueprint.rs:933:    fn verify_idempotency_key_passes_for_freshly_constructed_blueprint() {
+crates\omega-core\src\types\blueprint.rs:935:        assert!(bp.verify_idempotency_key());
+crates\omega-core\src\types\blueprint.rs:939:    fn verify_idempotency_key_fails_after_mutating_flashloan_amount() {
+crates\omega-core\src\types\blueprint.rs:943:            !bp.verify_idempotency_key(),
+crates\omega-core\src\types\blueprint.rs:944:            "mutating flashloan principal must desync idempotency_key"
+crates\omega-core\src\types\blueprint.rs:949:    fn same_nonce_same_params_same_idempotency_key() {
+crates\omega-core\src\types\blueprint.rs:952:        // identical nonce must produce the identical idempotency_key,
+crates\omega-core\src\types\blueprint.rs:957:        bp2.client_order_id = ExecutionBlueprint::derive_client_order_id(
+crates\omega-core\src\types\blueprint.rs:963:        // client_order_id differs (embeds signal_id), so recompute what
+crates\omega-core\src\types\blueprint.rs:965:        // compute_idempotency_key actually reads is identical, so the
+crates\omega-core\src\types\blueprint.rs:969:        // independent of signal_id/client_order_id.
+crates\omega-core\src\types\blueprint.rs:976:    fn different_nonce_different_idempotency_key() {
+crates\omega-core\src\types\blueprint.rs:980:        bp2.client_order_id = ExecutionBlueprint::derive_client_order_id(
+crates\omega-core\src\types\blueprint.rs:987:            bp1.compute_idempotency_key(),
+crates\omega-core\src\types\blueprint.rs:988:            bp2.compute_idempotency_key(),
+crates\omega-core\src\types\blueprint.rs:995:    fn derive_client_order_id_is_stable() {
+crates\omega-core\src\types\blueprint.rs:997:        let a =
+ExecutionBlueprint::derive_client_order_id(StrategyId::La, 42161, 5, id);
+crates\omega-core\src\types\blueprint.rs:998:        let b =
+ExecutionBlueprint::derive_client_order_id(StrategyId::La, 42161, 5, id);
+crates\omega-core\src\types\blueprint.rs:1003:    fn derive_client_order_id_distinguishes_chain_id() {
+crates\omega-core\src\types\blueprint.rs:1005:        let a =
+ExecutionBlueprint::derive_client_order_id(StrategyId::Sa, 42161, 5, id);
+crates\omega-core\src\types\blueprint.rs:1006:        let b =
+ExecutionBlueprint::derive_client_order_id(StrategyId::Sa, 1, 5, id);
+crates\omega-core\src\types\blueprint.rs:1014:    fn derive_client_order_id_distinguishes_nonce() {
+crates\omega-core\src\types\blueprint.rs:1016:        let a =
+ExecutionBlueprint::derive_client_order_id(StrategyId::Sa, 42161, 5, id);
+crates\omega-core\src\types\blueprint.rs:1017:        let b =
+ExecutionBlueprint::derive_client_order_id(StrategyId::Sa, 42161, 6, id);
+crates\omega-dag\src\tests.rs:27:    // signal_id/client_order_id/idempotency_key: these DAG scheduling
+crates\omega-dag\src\tests.rs:29:    // verify_hash()/verify_idempotency_key(), so — same as
+crates\omega-dag\src\tests.rs:35:    let client_order_id =
+crates\omega-dag\src\tests.rs:36:        ExecutionBlueprint::derive_client_order_id(strategy, 42161, 0, signal_id);
+crates\omega-dag\src\tests.rs:67:        client_order_id,
+crates\omega-dag\src\tests.rs:68:        idempotency_key:         B256::ZERO,
+crates\omega-hot-path\src\lib.rs:257:        // signal_id/client_order_id/idempotency_key: these hot-path gate
+crates\omega-hot-path\src\lib.rs:259:        // verify_hash()/verify_idempotency_key() — same placeholder
+crates\omega-hot-path\src\lib.rs:262:        let client_order_id =
+crates\omega-hot-path\src\lib.rs:263:            ExecutionBlueprint::derive_client_order_id(strategy, 42161, 0,
+signal_id);
+crates\omega-hot-path\src\lib.rs:294:            client_order_id,
+crates\omega-hot-path\src\lib.rs:295:            idempotency_key: B256::ZERO,
+crates\omega-strategies\src\cnry.rs:13:// `client_order_id`, `idempotency_key`) to the two test-only blueprint
+crates\omega-strategies\src\cnry.rs:165:    /// client_order_id/idempotency_key here are just placeholders to
+crates\omega-strategies\src\cnry.rs:168:    /// verify_hash()/verify_idempotency_key().
+crates\omega-strategies\src\cnry.rs:171:        let client_order_id =
+crates\omega-strategies\src\cnry.rs:172:            ExecutionBlueprint::derive_client_order_id(StrategyId::Cnry,
+42161, 0, signal_id);
+crates\omega-strategies\src\cnry.rs:203:            client_order_id,
+crates\omega-strategies\src\cnry.rs:204:            idempotency_key:         B256::ZERO,
+crates\omega-strategies\src\la.rs:12:// Also adds `signal_id`, `client_order_id`, `idempotency_key`.
+crates\omega-strategies\src\la.rs:201:        let client_order_id =
+crates\omega-strategies\src\la.rs:202:            ExecutionBlueprint::derive_client_order_id(StrategyId::La,
+self.chain_id, nonce, signal_id);
+crates\omega-strategies\src\la.rs:238:            client_order_id,
+crates\omega-strategies\src\la.rs:239:            idempotency_key:         B256::ZERO, // filled below
+crates\omega-strategies\src\la.rs:243:        bp.idempotency_key = bp.compute_idempotency_key();
+crates\omega-strategies\src\la.rs:350:    async fn build_blueprint_passes_verify_idempotency_key() {
+crates\omega-strategies\src\la.rs:352:        assert!(bp.verify_idempotency_key());
+crates\omega-strategies\src\mev.rs:63:// `client_order_id`, `idempotency_key`.
+crates\omega-strategies\src\mev.rs:315:        let client_order_id =
+crates\omega-strategies\src\mev.rs:316:            ExecutionBlueprint::derive_client_order_id(StrategyId::Mev,
+self.chain_id, nonce, signal_id);
+crates\omega-strategies\src\mev.rs:349:            client_order_id,
+crates\omega-strategies\src\mev.rs:350:            idempotency_key: B256::ZERO, // filled below
+crates\omega-strategies\src\mev.rs:355:        bp.idempotency_key = bp.compute_idempotency_key();
+crates\omega-strategies\src\mev.rs:583:    async fn build_blueprint_passes_verify_idempotency_key() {
+crates\omega-strategies\src\mev.rs:591:        assert!(bp.verify_idempotency_key());
+crates\omega-strategies\src\msa.rs:39:// `bp.compute_hash()`. Also adds `signal_id`, `client_order_id`,
+crates\omega-strategies\src\msa.rs:40:// `idempotency_key`.
+crates\omega-strategies\src\msa.rs:270:        let client_order_id =
+crates\omega-strategies\src\msa.rs:271:            ExecutionBlueprint::derive_client_order_id(StrategyId::Msa,
+self.chain_id, nonce, signal_id);
+crates\omega-strategies\src\msa.rs:307:            client_order_id,
+crates\omega-strategies\src\msa.rs:308:            idempotency_key: B256::ZERO, // filled below
+crates\omega-strategies\src\msa.rs:312:        bp.idempotency_key = bp.compute_idempotency_key();
+crates\omega-strategies\src\msa.rs:407:    async fn build_blueprint_passes_verify_idempotency_key() {
+crates\omega-strategies\src\msa.rs:409:        assert!(bp.verify_idempotency_key());
+crates\omega-strategies\src\sa.rs:18:// Also adds `signal_id`, `client_order_id`, `idempotency_key` — see
+crates\omega-strategies\src\sa.rs:20:// for. `idempotency_key` is filled in the same way, via
+crates\omega-strategies\src\sa.rs:21:// `bp.compute_idempotency_key()`, after construction.
+crates\omega-strategies\src\sa.rs:207:        let client_order_id =
+crates\omega-strategies\src\sa.rs:208:            ExecutionBlueprint::derive_client_order_id(StrategyId::Sa,
+self.chain_id, nonce, signal_id);
+crates\omega-strategies\src\sa.rs:244:            client_order_id,
+crates\omega-strategies\src\sa.rs:245:            idempotency_key:         B256::ZERO, // filled below
+crates\omega-strategies\src\sa.rs:249:        bp.idempotency_key = bp.compute_idempotency_key();
+crates\omega-strategies\src\sa.rs:378:    async fn build_blueprint_passes_verify_idempotency_key() {
+crates\omega-strategies\src\sa.rs:381:        assert!(bp.verify_idempotency_key());
+
+
+PS C:\Users\silve\Documents\omega-engine> Get-ChildItem . -Recurse -Filter *.rs |
+>>     Select-String -Pattern "BundlePayload|ExecutionBlueprint|submit_bundle|submit_bundle_to_all_relays|BundleBuilder|build_bundle|into\(\s*BundlePayload|From<ExecutionBlueprint>|impl From<ExecutionBlueprint>"
+
+crates\omega-compliance\src\ofa.rs:39:use omega_core::types::blueprint::ExecutionBlueprint;
+crates\omega-compliance\src\ofa.rs:252:        bp: &ExecutionBlueprint,
+crates\omega-compliance\src\ofa.rs:304:        bp: &ExecutionBlueprint,
+crates\omega-compliance\src\ofa.rs:326:    use omega_core::types::blueprint::{ExecutionBlueprint, StrategyId};
+crates\omega-compliance\src\ofa.rs:353:    fn dummy_bp(price_impact_bps: Option<u16>) -> ExecutionBlueprint {
+crates\omega-compliance\src\ofa.rs:354:        ExecutionBlueprint {
+crates\omega-compliance\src\policy.rs:7:use omega_core::types::blueprint::ExecutionBlueprint;  // Adjust import as
+needed in your core
+crates\omega-compliance\src\policy.rs:60:        bp: &ExecutionBlueprint,
+crates\omega-core\src\errors.rs:120:    /// via `ExecutionBlueprint::verify_hash()`).
+crates\omega-core\src\errors.rs:213:    /// (see `ExecutionBlueprint::compute_idempotency_key` /
+crates\omega-core\src\lib.rs:21://                        this crate (ExecutionBlueprint::compute_hash
+crates\omega-core\src\lib.rs:35://   types/blueprint.rs  — ExecutionBlueprint, StrategyId
+crates\omega-core\src\lib.rs:65:// Downstream crates can write `use omega_core::ExecutionBlueprint` rather
+crates\omega-core\src\lib.rs:74:    ExecutionBlueprint, FeeSnapshot, HealthState, HealthStatus, LaTier, Lane,
+LayerHealth,
+crates\omega-core\src\types\blueprint.rs:3:// ExecutionBlueprint — the central data structure of the Omega Engine.
+crates\omega-core\src\types\blueprint.rs:40://    an ExecutionBlueprint, which this crate can't see) — it gives
+crates\omega-core\src\types\blueprint.rs:87://    construction of `ExecutionBlueprint` elsewhere in the workspace
+crates\omega-core\src\types\blueprint.rs:185:// ExecutionBlueprint
+crates\omega-core\src\types\blueprint.rs:208:pub struct ExecutionBlueprint {
+crates\omega-core\src\types\blueprint.rs:383:/// Fields hashed by `ExecutionBlueprint::compute_hash`. Deliberately
+crates\omega-core\src\types\blueprint.rs:426:impl ExecutionBlueprint {
+crates\omega-core\src\types\blueprint.rs:721:    fn sample_blueprint() -> ExecutionBlueprint {
+crates\omega-core\src\types\blueprint.rs:724:            ExecutionBlueprint::derive_client_order_id(StrategyId::Sa,
+42161, 1, signal_id);
+crates\omega-core\src\types\blueprint.rs:726:        let mut bp = ExecutionBlueprint {
+crates\omega-core\src\types\blueprint.rs:891:            ExecutionBlueprint::select_simulator(Lane::Microtx, 199_999),
+crates\omega-core\src\types\blueprint.rs:895:            ExecutionBlueprint::select_simulator(Lane::Microtx, 200_000),
+crates\omega-core\src\types\blueprint.rs:899:            ExecutionBlueprint::select_simulator(Lane::Normal, 1_000),
+crates\omega-core\src\types\blueprint.rs:906:        let k1 = ExecutionBlueprint::nonce_key(StrategyId::Sa, 42161);
+crates\omega-core\src\types\blueprint.rs:907:        let k2 = ExecutionBlueprint::nonce_key(StrategyId::Sa, 42161);
+crates\omega-core\src\types\blueprint.rs:908:        let k3 = ExecutionBlueprint::nonce_key(StrategyId::Sa, 1);
+crates\omega-core\src\types\blueprint.rs:909:        let k4 = ExecutionBlueprint::nonce_key(StrategyId::La, 42161);
+crates\omega-core\src\types\blueprint.rs:957:        bp2.client_order_id = ExecutionBlueprint::derive_client_order_id(
+crates\omega-core\src\types\blueprint.rs:980:        bp2.client_order_id = ExecutionBlueprint::derive_client_order_id(
+crates\omega-core\src\types\blueprint.rs:997:        let a =
+ExecutionBlueprint::derive_client_order_id(StrategyId::La, 42161, 5, id);
+crates\omega-core\src\types\blueprint.rs:998:        let b =
+ExecutionBlueprint::derive_client_order_id(StrategyId::La, 42161, 5, id);
+crates\omega-core\src\types\blueprint.rs:1005:        let a =
+ExecutionBlueprint::derive_client_order_id(StrategyId::Sa, 42161, 5, id);
+crates\omega-core\src\types\blueprint.rs:1006:        let b =
+ExecutionBlueprint::derive_client_order_id(StrategyId::Sa, 1, 5, id);
+crates\omega-core\src\types\blueprint.rs:1016:        let a =
+ExecutionBlueprint::derive_client_order_id(StrategyId::Sa, 42161, 5, id);
+crates\omega-core\src\types\blueprint.rs:1017:        let b =
+ExecutionBlueprint::derive_client_order_id(StrategyId::Sa, 42161, 6, id);
+crates\omega-core\src\types\lane.rs:10:// Simulator is recorded on ExecutionBlueprint so downstream crates
+crates\omega-core\src\types\lane.rs:32:/// Recorded on [`ExecutionBlueprint`] at construction time.  Downstream
+crates\omega-core\src\types\mod.rs:23:// crates can write `use omega_core::types::ExecutionBlueprint` rather
+crates\omega-core\src\types\mod.rs:25:pub use blueprint::{ExecutionBlueprint, StrategyId};
+crates\omega-core\src\types\strategy.rs:47:use crate::types::blueprint::{ExecutionBlueprint, StrategyId};
+crates\omega-core\src\types\strategy.rs:169:/// Result of simulating an [`ExecutionBlueprint`].
+crates\omega-core\src\types\strategy.rs:282:    /// Build a fully-specified [`ExecutionBlueprint`] for the given
+crates\omega-core\src\types\strategy.rs:290:    ///   4. Set `simulator` via `ExecutionBlueprint::select_simulator`.
+crates\omega-core\src\types\strategy.rs:291:    async fn build_blueprint(&self, signal: &SignalState) ->
+Result<ExecutionBlueprint>;
+crates\omega-core\src\types\strategy.rs:299:    async fn simulate(&self, bp: &ExecutionBlueprint) -> Result<SimResult>;
+crates\omega-core\src\types\strategy.rs:307:    fn encode_calldata(&self, bp: &ExecutionBlueprint) -> Bytes;
+crates\omega-dag\src\scheduler.rs:31://   Nodes: each admits one `ExecutionBlueprint` identified by `blueprint_hash`.
+crates\omega-dag\src\scheduler.rs:70:use omega_core::types::blueprint::ExecutionBlueprint;
+crates\omega-dag\src\scheduler.rs:81:    blueprint: ExecutionBlueprint,
+crates\omega-dag\src\scheduler.rs:149:        blueprint: ExecutionBlueprint,
+crates\omega-dag\src\tests.rs:5:use omega_core::types::blueprint::{ExecutionBlueprint, StrategyId};
+crates\omega-dag\src\tests.rs:24:fn make_bp(hash_byte: u8, strategy: StrategyId, lane: Lane) -> ExecutionBlueprint {
+crates\omega-dag\src\tests.rs:36:        ExecutionBlueprint::derive_client_order_id(strategy, 42161, 0, signal_id);
+crates\omega-dag\src\tests.rs:37:    ExecutionBlueprint {
+crates\omega-hot-path\src\gate.rs:29:use omega_core::types::blueprint::{ExecutionBlueprint, StrategyId};
+crates\omega-hot-path\src\gate.rs:94:    pub fn admit(&self, bp: &ExecutionBlueprint) -> AdmissionResult {
+crates\omega-hot-path\src\gate.rs:216:    use omega_core::types::blueprint::{ExecutionBlueprint, StrategyId};
+crates\omega-hot-path\src\gate.rs:219:    fn make_bp(strategy: StrategyId, lane: Lane, gas: u64, profit: u128) ->
+ExecutionBlueprint {
+crates\omega-hot-path\src\gate.rs:220:        ExecutionBlueprint {
+crates\omega-hot-path\src\gate.rs:254:    fn valid_bp() -> ExecutionBlueprint {
+crates\omega-hot-path\src\lib.rs:71:use omega_core::types::blueprint::ExecutionBlueprint;
+crates\omega-hot-path\src\lib.rs:86:    pub blueprint: ExecutionBlueprint,
+crates\omega-hot-path\src\lib.rs:250:    use omega_core::types::blueprint::{ExecutionBlueprint, StrategyId};
+crates\omega-hot-path\src\lib.rs:254:    fn make_bp(strategy: StrategyId, gas: u64, hash_byte: u8) ->
+ExecutionBlueprint {
+crates\omega-hot-path\src\lib.rs:263:            ExecutionBlueprint::derive_client_order_id(strategy, 42161, 0,
+signal_id);
+crates\omega-hot-path\src\lib.rs:264:        ExecutionBlueprint {
+crates\omega-hot-path\src\simulator.rs:39:use omega_core::types::blueprint::ExecutionBlueprint;
+crates\omega-hot-path\src\simulator.rs:117:        bp: &ExecutionBlueprint,
+crates\omega-hot-path\src\simulator.rs:198:    fn estimate_reads(&self, bp: &ExecutionBlueprint) -> u8 {
+crates\omega-hot-path\src\simulator.rs:212:    use omega_core::types::blueprint::{ExecutionBlueprint, StrategyId};
+crates\omega-hot-path\src\simulator.rs:217:    fn make_bp(gas: u64, profit: u128, expiry: u64, sim: Simulator) ->
+ExecutionBlueprint {
+crates\omega-hot-path\src\simulator.rs:218:        ExecutionBlueprint {
+crates\omega-loss-attribution\src\classifier.rs:35:// on `ExecutionBlueprint`.  The original `[u8; 32]` was an
+arbitrary
+crates\omega-loss-attribution\src\classifier.rs:259:/// `blueprint_hash` is `B256` — the same type used on
+`ExecutionBlueprint`
+crates\omega-loss-attribution\src\classifier.rs:266:    /// Matches `ExecutionBlueprint::blueprint_hash`.
+crates\omega-relay\benches\relay_throughput.rs:19:    client::{BundlePayload, MockRelayClient, RelayClient},
+crates\omega-relay\benches\relay_throughput.rs:64:fn bundle(i: usize) -> BundlePayload {
+crates\omega-relay\benches\relay_throughput.rs:65:    BundlePayload {
+crates\omega-relay\src\backpressure.rs:43:use crate::client::{BundlePayload, RelayClient, SubmissionOutcome};
+crates\omega-relay\src\backpressure.rs:120:    pub async fn submit_cascade(&self, bundles: Vec<BundlePayload>) ->
+Vec<CascadeResult> {
+crates\omega-relay\src\backpressure.rs:135:                .submit_bundle_to_all_relays(&bundle, &submission_order)
+crates\omega-relay\src\backpressure.rs:143:    async fn submit_bundle_to_all_relays(
+crates\omega-relay\src\backpressure.rs:145:        bundle: &BundlePayload,
+crates\omega-relay\src\backpressure.rs:158:                        let outcome = client.submit_bundle(bundle).await;
+crates\omega-relay\src\backpressure.rs:219:    bundle:            &BundlePayload,
+crates\omega-relay\src\backpressure.rs:245:    bundle:            BundlePayload,
+crates\omega-relay\src\backpressure.rs:275:                    let outcome = client.submit_bundle(bundle).await;
+crates\omega-relay\src\backpressure.rs:372:            BundlePayload { bundle_hash: "0xaaa".into(),
+..Default::default() },
+crates\omega-relay\src\backpressure.rs:373:            BundlePayload { bundle_hash: "0xbbb".into(),
+..Default::default() },
+crates\omega-relay\src\backpressure.rs:388:            .submit_cascade(vec![BundlePayload { bundle_hash:
+"0xrej".into(), ..Default::default() }])
+crates\omega-relay\src\backpressure.rs:401:            .submit_cascade(vec![BundlePayload {
+crates\omega-relay\src\backpressure.rs:429:            BundlePayload { bundle_hash: "0x1".into(), ..Default::default()
+},
+crates\omega-relay\src\backpressure.rs:430:            BundlePayload { bundle_hash: "0x2".into(), ..Default::default()
+},
+crates\omega-relay\src\backpressure.rs:431:            BundlePayload { bundle_hash: "0x3".into(), ..Default::default()
+},
+crates\omega-relay\src\backpressure.rs:446:            .submit_cascade(vec![BundlePayload { bundle_hash: "0x0".into(),
+..Default::default() }])
+crates\omega-relay\src\client.rs:19:pub struct BundlePayload {
+crates\omega-relay\src\client.rs:60:    async fn submit_bundle(&self, bundle: BundlePayload) ->
+RelayResult<SubmissionOutcome>;
+crates\omega-relay\src\client.rs:132:    async fn submit_bundle(&self, bundle: BundlePayload) ->
+RelayResult<SubmissionOutcome> {
+crates\omega-relay\src\client.rs:252:    async fn submit_bundle(&self, bundle: BundlePayload) ->
+RelayResult<SubmissionOutcome> {
+crates\omega-relay\src\client.rs:274:            .submit_bundle(BundlePayload { bundle_hash: "0xtest".into(),
+..Default::default() })
+crates\omega-relay\src\client.rs:285:            .submit_bundle(BundlePayload { bundle_hash: "0xtest".into(),
+..Default::default() })
+crates\omega-relay\src\client.rs:296:                .submit_bundle(BundlePayload {
+crates\omega-relay\src\confirmation.rs:39:use crate::client::BundlePayload;
+crates\omega-relay\src\confirmation.rs:85:    pub fn track(&self, relay: RelayName, bundle: &BundlePayload) ->
+RelayResult<()> {
+crates\omega-relay\src\confirmation.rs:249:        let bundle = BundlePayload {
+crates\omega-relay\src\confirmation.rs:262:        let bundle = BundlePayload {
+crates\omega-relay\src\confirmation.rs:277:        let bundle = BundlePayload {
+crates\omega-relay\src\lib.rs:27:pub use client::{BundlePayload, RelayClient, SubmissionOutcome};
+crates\omega-relay\src\lib.rs:124:    pub async fn cascade_submit(&self, bundles: Vec<BundlePayload>) ->
+Vec<CascadeResult> {
+crates\omega-relay\src\lib.rs:129:    pub async fn submit_single(&self, bundle: BundlePayload) -> RelayResult<bool> {
+crates\omega-relay\src\lib.rs:265:            BundlePayload { bundle_hash: "0x001".into(), ..Default::default() },
+crates\omega-relay\src\lib.rs:266:            BundlePayload { bundle_hash: "0x002".into(), ..Default::default() },
+crates\omega-relay\src\lib.rs:275:        let bundle = BundlePayload {
+crates\omega-risk\src\checks.rs:95:// `ExecutionBlueprint` + `alloy::primitives::U256` directly, bypassing the
+crates\omega-risk\src\checks.rs:148:// We accept a `BlueprintFields` struct (not the full ExecutionBlueprint) to keep
+crates\omega-risk\src\checks.rs:153:/// Extracted from ExecutionBlueprint by the caller.
+crates\omega-risk\src\whitelist.rs:8://      Checked against ExecutionBlueprint.strategy_bytecode_hash.
+crates\omega-security\src\replay.rs:10://   ExecutionBlueprint.nonce_key():
+crates\omega-security\src\replay.rs:147:/// Mirrors `ExecutionBlueprint::nonce_key()` in omega-core.
+crates\omega-security\src\signer.rs:6://   1. Sign the keccak256 of every ExecutionBlueprint before relay submission.
+crates\omega-strategies\src\cnry.rs:7:// `build_blueprint` here never actually constructs an `ExecutionBlueprint`
+crates\omega-strategies\src\cnry.rs:12:// adding the three new `ExecutionBlueprint` fields (`signal_id`,
+crates\omega-strategies\src\cnry.rs:14:// literals below, since `ExecutionBlueprint` now requires them at every
+crates\omega-strategies\src\cnry.rs:27:use omega_core::types::blueprint::{ExecutionBlueprint, StrategyId};
+crates\omega-strategies\src\cnry.rs:125:    async fn build_blueprint(&self, _signal: &SignalState) ->
+Result<ExecutionBlueprint> {
+crates\omega-strategies\src\cnry.rs:129:    async fn simulate(&self, _bp: &ExecutionBlueprint) -> Result<SimResult> {
+crates\omega-strategies\src\cnry.rs:133:    fn encode_calldata(&self, _bp: &ExecutionBlueprint) -> Bytes {
+Bytes::new() }
+crates\omega-strategies\src\cnry.rs:169:    fn test_blueprint() -> ExecutionBlueprint {
+crates\omega-strategies\src\cnry.rs:172:            ExecutionBlueprint::derive_client_order_id(StrategyId::Cnry,
+42161, 0, signal_id);
+crates\omega-strategies\src\cnry.rs:173:        ExecutionBlueprint {
+crates\omega-strategies\src\la.rs:10:// `ExecutionBlueprint::compute_hash()`'s canonical encoding. Fixed to
+crates\omega-strategies\src\la.rs:24:use omega_core::types::blueprint::{ExecutionBlueprint, StrategyId};
+crates\omega-strategies\src\la.rs:182:    async fn build_blueprint(&self, signal: &SignalState) ->
+Result<ExecutionBlueprint> {
+crates\omega-strategies\src\la.rs:202:            ExecutionBlueprint::derive_client_order_id(StrategyId::La,
+self.chain_id, nonce, signal_id);
+crates\omega-strategies\src\la.rs:208:        let mut bp = ExecutionBlueprint {
+crates\omega-strategies\src\la.rs:248:    async fn simulate(&self, bp: &ExecutionBlueprint) -> Result<SimResult> {
+crates\omega-strategies\src\la.rs:259:    fn encode_calldata(&self, bp: &ExecutionBlueprint) -> Bytes {
+bp.calldata.clone() }
+crates\omega-strategies\src\la.rs:344:        // ExecutionBlueprint::compute_hash()'s canonical encoding.
+crates\omega-strategies\src\mev.rs:57:// `ExecutionBlueprint::compute_hash()`'s canonical encoding, and
+crates\omega-strategies\src\mev.rs:75:use omega_core::types::blueprint::{ExecutionBlueprint, StrategyId};
+crates\omega-strategies\src\mev.rs:304:    async fn build_blueprint(&self, signal: &SignalState) ->
+Result<ExecutionBlueprint> {
+crates\omega-strategies\src\mev.rs:316:            ExecutionBlueprint::derive_client_order_id(StrategyId::Mev,
+self.chain_id, nonce, signal_id);
+crates\omega-strategies\src\mev.rs:319:        let mut bp = ExecutionBlueprint {
+crates\omega-strategies\src\mev.rs:385:    async fn simulate(&self, bp: &ExecutionBlueprint) -> Result<SimResult> {
+crates\omega-strategies\src\mev.rs:415:    fn encode_calldata(&self, bp: &ExecutionBlueprint) -> Bytes {
+crates\omega-strategies\src\msa.rs:36:// incompatible with, `ExecutionBlueprint::compute_hash()`'s canonical
+crates\omega-strategies\src\msa.rs:52:use omega_core::types::blueprint::{ExecutionBlueprint, StrategyId};
+crates\omega-strategies\src\msa.rs:248:    async fn build_blueprint(&self, signal: &SignalState) ->
+Result<ExecutionBlueprint> {
+crates\omega-strategies\src\msa.rs:271:            ExecutionBlueprint::derive_client_order_id(StrategyId::Msa,
+self.chain_id, nonce, signal_id);
+crates\omega-strategies\src\msa.rs:277:        let mut bp = ExecutionBlueprint {
+crates\omega-strategies\src\msa.rs:317:    async fn simulate(&self, bp: &ExecutionBlueprint) -> Result<SimResult> {
+crates\omega-strategies\src\msa.rs:335:    fn encode_calldata(&self, bp: &ExecutionBlueprint) -> Bytes {
+crates\omega-strategies\src\registry.rs:195:    use omega_core::types::blueprint::{ExecutionBlueprint, StrategyId};
+crates\omega-strategies\src\registry.rs:234:        async fn build_blueprint(&self, _: &SignalState) ->
+Result<ExecutionBlueprint> {
+crates\omega-strategies\src\registry.rs:237:        async fn simulate(&self, _: &ExecutionBlueprint) ->
+Result<SimResult> {
+crates\omega-strategies\src\registry.rs:240:        fn encode_calldata(&self, _: &ExecutionBlueprint) -> Bytes {
+crates\omega-strategies\src\sa.rs:10:// `ExecutionBlueprint::compute_hash()` (the canonical encoding defined in
+crates\omega-strategies\src\sa.rs:19:// `ExecutionBlueprint`'s own doc comments (omega-core) for what each is
+crates\omega-strategies\src\sa.rs:33:use omega_core::types::blueprint::{ExecutionBlueprint, StrategyId};
+crates\omega-strategies\src\sa.rs:192:    async fn build_blueprint(&self, signal: &SignalState) ->
+Result<ExecutionBlueprint> {
+crates\omega-strategies\src\sa.rs:208:            ExecutionBlueprint::derive_client_order_id(StrategyId::Sa,
+self.chain_id, nonce, signal_id);
+crates\omega-strategies\src\sa.rs:214:        let mut bp = ExecutionBlueprint {
+crates\omega-strategies\src\sa.rs:254:    async fn simulate(&self, bp: &ExecutionBlueprint) -> Result<SimResult> {
+crates\omega-strategies\src\sa.rs:265:    fn encode_calldata(&self, bp: &ExecutionBlueprint) -> Bytes {
+bp.calldata.clone() }
+crates\omega-strategies\src\sa.rs:369:        // ExecutionBlueprint::compute_hash(), so verify_hash() would have
+crates\omega-zk\src\commitment.rs:3:// Proof commitment derivation (spec: ExecutionBlueprint.zk_proof_commitment:
+Option<B256>).
+crates\omega-zk\src\commitment.rs:11:// This commitment is embedded in the ExecutionBlueprint before relay submission
+crates\omega-zk\src\commitment.rs:24:/// A 32-byte proof commitment embedded in ExecutionBlueprint.zk_proof_commitment.
+crates\omega-zk\src\commitment.rs:49:/// * `blueprint_hash`   — keccak256 of the encoded ExecutionBlueprint (32 bytes).
+omega_backup_20260514_071110\crates\omega-compliance\src\ofa.rs:39:use
+omega_core::types::blueprint::ExecutionBlueprint;
+omega_backup_20260514_071110\crates\omega-compliance\src\ofa.rs:252:        bp:      &ExecutionBlueprint,
+omega_backup_20260514_071110\crates\omega-compliance\src\ofa.rs:307:        bp:            &ExecutionBlueprint,
+omega_backup_20260514_071110\crates\omega-compliance\src\ofa.rs:329:    use
+omega_core::types::blueprint::{ExecutionBlueprint, Simulator, StrategyId};
+omega_backup_20260514_071110\crates\omega-compliance\src\ofa.rs:356:    fn dummy_bp(price_impact_bps: Option<u16>) ->
+ExecutionBlueprint {
+omega_backup_20260514_071110\crates\omega-compliance\src\ofa.rs:357:        ExecutionBlueprint {
+omega_backup_20260514_071110\crates\omega-core\src\lib.rs:29://   types/blueprint.rs  â€” ExecutionBlueprint,
+StrategyId
+omega_backup_20260514_071110\crates\omega-core\src\lib.rs:42:// Downstream crates can write `use
+omega_core::ExecutionBlueprint` rather
+omega_backup_20260514_071110\crates\omega-core\src\lib.rs:61:    ExecutionBlueprint,
+omega_backup_20260514_071110\crates\omega-core\src\types\blueprint.rs:3:// ExecutionBlueprint â€” the central data
+structure of the Omega Engine.
+omega_backup_20260514_071110\crates\omega-core\src\types\blueprint.rs:100:// ExecutionBlueprint
+omega_backup_20260514_071110\crates\omega-core\src\types\blueprint.rs:122:pub struct ExecutionBlueprint {
+omega_backup_20260514_071110\crates\omega-core\src\types\blueprint.rs:257:impl ExecutionBlueprint {
+omega_backup_20260514_071110\crates\omega-core\src\types\health.rs:28:/// A layer at Halted MUST NOT produce
+ExecutionBlueprints or submit
+omega_backup_20260514_071110\crates\omega-core\src\types\lane.rs:10:// Simulator is recorded on ExecutionBlueprint so
+downstream crates
+omega_backup_20260514_071110\crates\omega-core\src\types\lane.rs:32:/// Recorded on [`ExecutionBlueprint`] at
+construction time.  Downstream
+omega_backup_20260514_071110\crates\omega-core\src\types\mod.rs:23:// crates can write `use
+omega_core::types::ExecutionBlueprint` rather
+omega_backup_20260514_071110\crates\omega-core\src\types\mod.rs:25:pub use blueprint::{ExecutionBlueprint, StrategyId};
+omega_backup_20260514_071110\crates\omega-core\src\types\strategy.rs:23:use
+crate::types::blueprint::{ExecutionBlueprint, StrategyId};
+omega_backup_20260514_071110\crates\omega-core\src\types\strategy.rs:113:/// Result of simulating an
+[`ExecutionBlueprint`].
+omega_backup_20260514_071110\crates\omega-core\src\types\strategy.rs:212:    /// Build a fully-specified
+[`ExecutionBlueprint`] for the given
+omega_backup_20260514_071110\crates\omega-core\src\types\strategy.rs:220:    ///   4. Set `simulator` via
+`ExecutionBlueprint::select_simulator`.
+omega_backup_20260514_071110\crates\omega-core\src\types\strategy.rs:221:    async fn build_blueprint(&self, signal:
+&SignalState) -> Result<ExecutionBlueprint>;
+omega_backup_20260514_071110\crates\omega-core\src\types\strategy.rs:229:    async fn simulate(&self, bp:
+&ExecutionBlueprint) -> Result<SimResult>;
+omega_backup_20260514_071110\crates\omega-core\src\types\strategy.rs:237:    fn encode_calldata(&self, bp:
+&ExecutionBlueprint) -> Bytes;
+omega_backup_20260514_071110\crates\omega-dag\src\scheduler.rs:31://   Nodes: each admits one `ExecutionBlueprint`
+identified by `blueprint_hash`.
+omega_backup_20260514_071110\crates\omega-dag\src\scheduler.rs:70:use omega_core::types::blueprint::ExecutionBlueprint;
+omega_backup_20260514_071110\crates\omega-dag\src\scheduler.rs:81:    blueprint: ExecutionBlueprint,
+omega_backup_20260514_071110\crates\omega-dag\src\scheduler.rs:149:        blueprint:    ExecutionBlueprint,
+omega_backup_20260514_071110\crates\omega-dag\src\tests.rs:11:use omega_core::types::blueprint::{ExecutionBlueprint,
+Simulator, StrategyId};
+omega_backup_20260514_071110\crates\omega-dag\src\tests.rs:27:fn make_bp(hash_byte: u8, strategy: StrategyId, lane:
+Lane) -> ExecutionBlueprint {
+omega_backup_20260514_071110\crates\omega-dag\src\tests.rs:30:    ExecutionBlueprint {
+omega_backup_20260514_071110\crates\omega-hot-path\src\gate.rs:29:use omega_core::types::blueprint::ExecutionBlueprint;
+omega_backup_20260514_071110\crates\omega-hot-path\src\gate.rs:94:    pub fn admit(&self, bp: &ExecutionBlueprint) ->
+AdmissionResult {
+omega_backup_20260514_071110\crates\omega-hot-path\src\gate.rs:216:    use
+omega_core::types::blueprint::{ExecutionBlueprint, Simulator, StrategyId};
+omega_backup_20260514_071110\crates\omega-hot-path\src\gate.rs:224:    ) -> ExecutionBlueprint {
+omega_backup_20260514_071110\crates\omega-hot-path\src\gate.rs:225:        ExecutionBlueprint {
+omega_backup_20260514_071110\crates\omega-hot-path\src\gate.rs:259:    fn valid_bp() -> ExecutionBlueprint {
+omega_backup_20260514_071110\crates\omega-hot-path\src\lib.rs:51:use omega_core::types::blueprint::ExecutionBlueprint;
+omega_backup_20260514_071110\crates\omega-hot-path\src\lib.rs:64:    pub blueprint: ExecutionBlueprint,
+omega_backup_20260514_071110\crates\omega-hot-path\src\lib.rs:225:    use
+omega_core::types::blueprint::{ExecutionBlueprint, StrategyId};
+omega_backup_20260514_071110\crates\omega-hot-path\src\lib.rs:228:    fn make_bp(strategy: StrategyId, gas: u64,
+hash_byte: u8) -> ExecutionBlueprint {
+omega_backup_20260514_071110\crates\omega-hot-path\src\lib.rs:231:        ExecutionBlueprint {
+omega_backup_20260514_071110\crates\omega-hot-path\src\simulator.rs:39:use
+omega_core::types::blueprint::ExecutionBlueprint;
+omega_backup_20260514_071110\crates\omega-hot-path\src\simulator.rs:118:        bp:          &ExecutionBlueprint,
+omega_backup_20260514_071110\crates\omega-hot-path\src\simulator.rs:197:    fn estimate_reads(&self, bp:
+&ExecutionBlueprint) -> u8 {
+omega_backup_20260514_071110\crates\omega-hot-path\src\simulator.rs:211:    use
+omega_core::types::blueprint::{ExecutionBlueprint, StrategyId};
+omega_backup_20260514_071110\crates\omega-hot-path\src\simulator.rs:216:    fn make_bp(gas: u64, profit: u128, expiry:
+u64, sim: Simulator) -> ExecutionBlueprint {
+omega_backup_20260514_071110\crates\omega-hot-path\src\simulator.rs:217:        ExecutionBlueprint {
+omega_backup_20260514_071110\crates\omega-loss-attribution\src\classifier.rs:35:// on `ExecutionBlueprint`.  The
+original `[u8; 32]` was an arbitrary
+omega_backup_20260514_071110\crates\omega-loss-attribution\src\classifier.rs:251:/// `blueprint_hash` is `B256` â€”
+the same type used on `ExecutionBlueprint`
+omega_backup_20260514_071110\crates\omega-loss-attribution\src\classifier.rs:258:    /// Matches
+`ExecutionBlueprint::blueprint_hash`.
+omega_backup_20260514_071110\crates\omega-relay\benches\relay_throughput.rs:14:    client::{BundlePayload,
+MockRelayClient, RelayClient},
+omega_backup_20260514_071110\crates\omega-relay\benches\relay_throughput.rs:59:fn bundle(i: usize) -> BundlePayload {
+omega_backup_20260514_071110\crates\omega-relay\benches\relay_throughput.rs:60:    BundlePayload {
+omega_backup_20260514_071110\crates\omega-relay\src\backpressure.rs:31:use crate::client::{BundlePayload, RelayClient,
+SubmissionOutcome};
+omega_backup_20260514_071110\crates\omega-relay\src\backpressure.rs:114:        bundles: Vec<BundlePayload>,
+omega_backup_20260514_071110\crates\omega-relay\src\backpressure.rs:132:
+.submit_bundle_to_all_relays(&bundle, &submission_order)
+omega_backup_20260514_071110\crates\omega-relay\src\backpressure.rs:141:    async fn submit_bundle_to_all_relays(
+omega_backup_20260514_071110\crates\omega-relay\src\backpressure.rs:143:        bundle: &BundlePayload,
+omega_backup_20260514_071110\crates\omega-relay\src\backpressure.rs:156:                        let outcome =
+client.submit_bundle(bundle).await;
+omega_backup_20260514_071110\crates\omega-relay\src\backpressure.rs:228:    bundle: BundlePayload,
+omega_backup_20260514_071110\crates\omega-relay\src\backpressure.rs:258:                    let outcome =
+client.submit_bundle(bundle).await;
+omega_backup_20260514_071110\crates\omega-relay\src\backpressure.rs:358:            BundlePayload { bundle_hash:
+"0xaaa".into(), ..Default::default() },
+omega_backup_20260514_071110\crates\omega-relay\src\backpressure.rs:359:            BundlePayload { bundle_hash:
+"0xbbb".into(), ..Default::default() },
+omega_backup_20260514_071110\crates\omega-relay\src\backpressure.rs:386:            BundlePayload { bundle_hash:
+"0x1".into(), ..Default::default() },
+omega_backup_20260514_071110\crates\omega-relay\src\backpressure.rs:387:            BundlePayload { bundle_hash:
+"0x2".into(), ..Default::default() },
+omega_backup_20260514_071110\crates\omega-relay\src\backpressure.rs:388:            BundlePayload { bundle_hash:
+"0x3".into(), ..Default::default() },
+omega_backup_20260514_071110\crates\omega-relay\src\backpressure.rs:407:            .submit_cascade(vec![BundlePayload
+{
+omega_backup_20260514_071110\crates\omega-relay\src\client.rs:23:pub struct BundlePayload {
+omega_backup_20260514_071110\crates\omega-relay\src\client.rs:55:    async fn submit_bundle(&self, bundle:
+BundlePayload) -> RelayResult<SubmissionOutcome>;
+omega_backup_20260514_071110\crates\omega-relay\src\client.rs:120:    async fn submit_bundle(&self, bundle:
+BundlePayload) -> RelayResult<SubmissionOutcome> {
+omega_backup_20260514_071110\crates\omega-relay\src\client.rs:237:    async fn submit_bundle(&self, bundle:
+BundlePayload) -> RelayResult<SubmissionOutcome> {
+omega_backup_20260514_071110\crates\omega-relay\src\client.rs:260:            .submit_bundle(BundlePayload {
+omega_backup_20260514_071110\crates\omega-relay\src\client.rs:274:            .submit_bundle(BundlePayload {
+omega_backup_20260514_071110\crates\omega-relay\src\client.rs:288:                .submit_bundle(BundlePayload {
+omega_backup_20260514_071110\crates\omega-relay\src\lib.rs:47:pub use client::{BundlePayload, RelayClient,
+SubmissionOutcome};
+omega_backup_20260514_071110\crates\omega-relay\src\lib.rs:123:    pub async fn cascade_submit(&self, bundles:
+Vec<BundlePayload>) -> Vec<CascadeResult> {
+omega_backup_20260514_071110\crates\omega-relay\src\lib.rs:130:    pub async fn submit_single(&self, bundle:
+BundlePayload) -> RelayResult<bool> {
+omega_backup_20260514_071110\crates\omega-relay\src\lib.rs:239:            BundlePayload { bundle_hash:
+"0x001".into(), ..Default::default() },
+omega_backup_20260514_071110\crates\omega-relay\src\lib.rs:240:            BundlePayload { bundle_hash:
+"0x002".into(), ..Default::default() },
+omega_backup_20260514_071110\crates\omega-risk\src\checks.rs:54:// We accept a `BlueprintFields` struct (not the full
+ExecutionBlueprint) to keep
+omega_backup_20260514_071110\crates\omega-risk\src\checks.rs:59:/// Extracted from ExecutionBlueprint by the caller.
+omega_backup_20260514_071110\crates\omega-risk\src\lib.rs:5:// Responsibility: pre-trade risk gate for every
+ExecutionBlueprint.
+omega_backup_20260514_071110\crates\omega-risk\src\whitelist.rs:8://      Checked against
+ExecutionBlueprint.strategy_bytecode_hash.
+omega_backup_20260514_071110\crates\omega-security\src\replay.rs:10://   ExecutionBlueprint.nonce_key():
+omega_backup_20260514_071110\crates\omega-security\src\replay.rs:147:/// Mirrors `ExecutionBlueprint::nonce_key()` in
+omega-core.
+omega_backup_20260514_071110\crates\omega-security\src\signer.rs:6://   1. Sign the keccak256 of every
+ExecutionBlueprint before relay submission.
+omega_backup_20260514_071110\crates\omega-strategies\src\cnry.rs:44:use
+omega_core::types::blueprint::{ExecutionBlueprint, StrategyId};
+omega_backup_20260514_071110\crates\omega-strategies\src\cnry.rs:166:    async fn build_blueprint(&self, _signal:
+&SignalState) -> Result<ExecutionBlueprint> {
+omega_backup_20260514_071110\crates\omega-strategies\src\cnry.rs:173:    async fn simulate(&self, _bp:
+&ExecutionBlueprint) -> Result<SimResult> {
+omega_backup_20260514_071110\crates\omega-strategies\src\cnry.rs:180:    fn encode_calldata(&self, _bp:
+&ExecutionBlueprint) -> Bytes {
+omega_backup_20260514_071110\crates\omega-strategies\src\cnry.rs:243:        let bp = ExecutionBlueprint {
+omega_backup_20260514_071110\crates\omega-strategies\src\cnry.rs:281:        let bp = ExecutionBlueprint {
+omega_backup_20260514_071110\crates\omega-strategies\src\la.rs:44:use
+omega_core::types::blueprint::{ExecutionBlueprint, Simulator, StrategyId};
+omega_backup_20260514_071110\crates\omega-strategies\src\la.rs:217:    async fn build_blueprint(&self, signal:
+&SignalState) -> Result<ExecutionBlueprint> {
+omega_backup_20260514_071110\crates\omega-strategies\src\la.rs:241:        Ok(ExecutionBlueprint {
+omega_backup_20260514_071110\crates\omega-strategies\src\la.rs:275:    async fn simulate(&self, bp:
+&ExecutionBlueprint) -> Result<SimResult> {
+omega_backup_20260514_071110\crates\omega-strategies\src\la.rs:286:    fn encode_calldata(&self, bp:
+&ExecutionBlueprint) -> Bytes {
+omega_backup_20260514_071110\crates\omega-strategies\src\mev.rs:60:use
+omega_core::types::blueprint::{ExecutionBlueprint, Simulator, StrategyId};
+omega_backup_20260514_071110\crates\omega-strategies\src\mev.rs:187:    fn compute_blueprint_hash(bp:
+&ExecutionBlueprint) -> B256 {
+omega_backup_20260514_071110\crates\omega-strategies\src\mev.rs:291:    async fn build_blueprint(&self, signal:
+&SignalState) -> Result<ExecutionBlueprint> {
+omega_backup_20260514_071110\crates\omega-strategies\src\mev.rs:302:        let mut bp = ExecutionBlueprint {
+omega_backup_20260514_071110\crates\omega-strategies\src\mev.rs:364:    async fn simulate(&self, bp:
+&ExecutionBlueprint) -> Result<SimResult> {
+omega_backup_20260514_071110\crates\omega-strategies\src\mev.rs:394:    fn encode_calldata(&self, bp:
+&ExecutionBlueprint) -> Bytes {
+omega_backup_20260514_071110\crates\omega-strategies\src\msa.rs:44:use
+omega_core::types::blueprint::{ExecutionBlueprint, StrategyId};
+omega_backup_20260514_071110\crates\omega-strategies\src\msa.rs:166:    async fn build_blueprint(&self, _signal:
+&SignalState) -> Result<ExecutionBlueprint> {
+omega_backup_20260514_071110\crates\omega-strategies\src\msa.rs:173:    async fn simulate(&self, _bp:
+&ExecutionBlueprint) -> Result<SimResult> {
+omega_backup_20260514_071110\crates\omega-strategies\src\msa.rs:180:    fn encode_calldata(&self, _bp:
+&ExecutionBlueprint) -> Bytes {
+omega_backup_20260514_071110\crates\omega-strategies\src\msa.rs:243:        let bp = ExecutionBlueprint {
+omega_backup_20260514_071110\crates\omega-strategies\src\msa.rs:281:        let bp = ExecutionBlueprint {
+omega_backup_20260514_071110\crates\omega-strategies\src\registry.rs:198:    use
+omega_core::types::blueprint::{ExecutionBlueprint, StrategyId};
+omega_backup_20260514_071110\crates\omega-strategies\src\registry.rs:220:        async fn build_blueprint(&self, _:
+&SignalState)  -> Result<ExecutionBlueprint> {
+omega_backup_20260514_071110\crates\omega-strategies\src\registry.rs:223:        async fn simulate(&self, _:
+&ExecutionBlueprint)  -> Result<SimResult> {
+omega_backup_20260514_071110\crates\omega-strategies\src\registry.rs:226:        fn encode_calldata(&self, _:
+&ExecutionBlueprint) -> Bytes { Bytes::new() }
+omega_backup_20260514_071110\crates\omega-strategies\src\sa.rs:33://   an `AtomicU64`.  The nonce key is
+`ExecutionBlueprint::nonce_key`.
+omega_backup_20260514_071110\crates\omega-strategies\src\sa.rs:44:use
+omega_core::types::blueprint::{ExecutionBlueprint, Simulator, StrategyId};
+omega_backup_20260514_071110\crates\omega-strategies\src\sa.rs:227:    async fn build_blueprint(&self, signal:
+&SignalState) -> Result<ExecutionBlueprint> {
+omega_backup_20260514_071110\crates\omega-strategies\src\sa.rs:255:        Ok(ExecutionBlueprint {
+omega_backup_20260514_071110\crates\omega-strategies\src\sa.rs:289:    async fn simulate(&self, bp:
+&ExecutionBlueprint) -> Result<SimResult> {
+omega_backup_20260514_071110\crates\omega-strategies\src\sa.rs:308:    fn encode_calldata(&self, bp:
+&ExecutionBlueprint) -> Bytes {
+omega_backup_20260514_071110\crates\omega-zk\src\commitment.rs:3:// Proof commitment derivation (spec:
+ExecutionBlueprint.zk_proof_commitment: Option<B256>).
+omega_backup_20260514_071110\crates\omega-zk\src\commitment.rs:11:// This commitment is embedded in the
+ExecutionBlueprint before relay submission
+omega_backup_20260514_071110\crates\omega-zk\src\commitment.rs:24:/// A 32-byte proof commitment embedded in
+ExecutionBlueprint.zk_proof_commitment.
+omega_backup_20260514_071110\crates\omega-zk\src\commitment.rs:49:/// * `blueprint_hash`   â€” keccak256 of the
+encoded ExecutionBlueprint (32 bytes).
+omega_backup_20260514_071110\crates\omega-zk\src\lib.rs:14://   ExecutionBlueprint â€” zk_proof_commitment:
+Option<B256>.
+omega_backup_20260514_071110\crates\omega-zk\src\prover.rs:13://   that a valid ExecutionBlueprint with that hash
+exists and produces at least
+omega_backup_20260514_071110\crates\omega-zk\src\prover.rs:121:    /// * `blueprint_hash`  â€” keccak256 of the
+encoded ExecutionBlueprint.
+
+
+PS C:\Users\silve\Documents\omega-engine># config/arbitrum.toml
 [chain]
 chain_id    = 42161
 name        = "arbitrum"

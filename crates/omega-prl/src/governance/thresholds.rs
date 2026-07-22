@@ -1,5 +1,18 @@
 // omega-prl/src/governance/thresholds.rs
 //! Governance-controlled threshold configuration — §20.1
+//!
+//! ## Audit fix (this revision)
+//!
+//! `validate()` previously checked 3 of the ~13 governance-controlled
+//! fields on this struct. `oracle_deviation_warn`/`_critical` had no
+//! ordering check even though the identical bug class (warn ≥ critical)
+//! was already caught for `gas_escalation_z_warn`/`_critical` two lines
+//! away. `relay_leak_zscore`, `relay_latency_spike_multiplier`,
+//! `sequencer_restart_dedup_threshold`, and `confidence_overrides`
+//! values were entirely unvalidated — a governance action could set any
+//! of these to a nonsensical value (a negative z-score, a sub-1.0
+//! "spike" multiplier, an override outside [0,1]) with no rejection.
+//! All are now validated.
 
 use crate::patterns::signatures::PatternDomain;
 use crate::scoring::ranking::MinConfidenceThresholds;
@@ -73,6 +86,37 @@ impl ThresholdConfig {
         if self.gas_escalation_z_warn >= self.gas_escalation_z_critical {
             return Err("gas_escalation_z_warn must be < z_critical".into());
         }
+        // Previously unchecked — same bug class as the gas z-score pair
+        // above, just missed for oracle deviation.
+        if self.oracle_deviation_warn >= self.oracle_deviation_critical {
+            return Err("oracle_deviation_warn must be < oracle_deviation_critical".into());
+        }
+        if self.relay_leak_zscore <= 0.0 {
+            return Err(format!(
+                "relay_leak_zscore must be > 0.0: {}",
+                self.relay_leak_zscore
+            ));
+        }
+        if self.relay_latency_spike_multiplier <= 1.0 {
+            return Err(format!(
+                "relay_latency_spike_multiplier must be > 1.0 (a sub-1.0 \
+                 'spike' multiplier is nonsensical): {}",
+                self.relay_latency_spike_multiplier
+            ));
+        }
+        if !(0.0..=1.0).contains(&self.sequencer_restart_dedup_threshold) {
+            return Err(format!(
+                "sequencer_restart_dedup_threshold out of range [0.0, 1.0]: {}",
+                self.sequencer_restart_dedup_threshold
+            ));
+        }
+        for (&domain, &value) in &self.confidence_overrides {
+            if !(0.0..=1.0).contains(&value) {
+                return Err(format!(
+                    "confidence_overrides[{domain}] out of range [0.0, 1.0]: {value}"
+                ));
+            }
+        }
         Ok(())
     }
 }
@@ -88,7 +132,6 @@ mod tests {
 
     #[test]
     fn bad_z_order_fails() {
-        // FIX: field_reassign_with_default → single struct literal
         let c = ThresholdConfig {
             gas_escalation_z_warn:     5.0,
             gas_escalation_z_critical: 2.0,
@@ -103,5 +146,83 @@ mod tests {
         c.confidence_overrides
             .insert(PatternDomain::GasWar as u8, 0.99);
         assert_eq!(c.min_confidence_for(PatternDomain::GasWar), 0.99);
+    }
+
+    #[test]
+    fn oracle_deviation_bad_order_fails() {
+        let c = ThresholdConfig {
+            oracle_deviation_warn:     0.20,
+            oracle_deviation_critical: 0.10,
+            ..Default::default()
+        };
+        assert!(c.validate().is_err());
+    }
+
+    #[test]
+    fn relay_leak_zscore_must_be_positive() {
+        let c = ThresholdConfig {
+            relay_leak_zscore: 0.0,
+            ..Default::default()
+        };
+        assert!(c.validate().is_err());
+
+        let c2 = ThresholdConfig {
+            relay_leak_zscore: -1.0,
+            ..Default::default()
+        };
+        assert!(c2.validate().is_err());
+    }
+
+    #[test]
+    fn spike_multiplier_below_one_fails() {
+        let c = ThresholdConfig {
+            relay_latency_spike_multiplier: 0.5,
+            ..Default::default()
+        };
+        assert!(c.validate().is_err());
+    }
+
+    #[test]
+    fn spike_multiplier_exactly_one_fails() {
+        // Exactly 1.0 means "no spike at all" is the trigger — nonsensical,
+        // must be strictly greater than 1.0.
+        let c = ThresholdConfig {
+            relay_latency_spike_multiplier: 1.0,
+            ..Default::default()
+        };
+        assert!(c.validate().is_err());
+    }
+
+    #[test]
+    fn dedup_threshold_out_of_range_fails() {
+        let c = ThresholdConfig {
+            sequencer_restart_dedup_threshold: 1.5,
+            ..Default::default()
+        };
+        assert!(c.validate().is_err());
+
+        let c2 = ThresholdConfig {
+            sequencer_restart_dedup_threshold: -0.1,
+            ..Default::default()
+        };
+        assert!(c2.validate().is_err());
+    }
+
+    #[test]
+    fn confidence_override_out_of_range_fails() {
+        let mut c = ThresholdConfig::default();
+        c.confidence_overrides.insert(PatternDomain::GasWar as u8, 1.5);
+        assert!(c.validate().is_err());
+
+        let mut c2 = ThresholdConfig::default();
+        c2.confidence_overrides.insert(PatternDomain::GasWar as u8, -0.2);
+        assert!(c2.validate().is_err());
+    }
+
+    #[test]
+    fn valid_confidence_override_still_passes() {
+        let mut c = ThresholdConfig::default();
+        c.confidence_overrides.insert(PatternDomain::GasWar as u8, 0.9);
+        assert!(c.validate().is_ok());
     }
 }

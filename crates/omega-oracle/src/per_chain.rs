@@ -32,6 +32,38 @@
 //   into a single PoolReserves signal (§10, MSA Bellman-Ford debounce).
 //   FeeOracle and HealthFactor signals are not debounced — every block
 //   counts.
+//
+// ## Audit fixes (this revision)
+//
+// 1. UNSOUND UNSAFE (critical): `with_health` previously mutated the
+//    `health` field through a raw pointer obtained via
+//    `Arc::into_raw`/`Arc::from_raw`, justified only by a comment
+//    asserting "we are the sole Arc holder during construction" — a
+//    claim the type signature `self: Arc<Self>` does not actually
+//    enforce. Nothing prevented a caller from having cloned the `Arc`
+//    before calling this method; if they had, this was a genuine data
+//    race (writing through a raw pointer while another thread reads
+//    the same field through its own `Arc` clone, with zero
+//    synchronization) — undefined behavior, not merely a style issue.
+//    Fixed by changing `health: Option<Arc<dyn LayerHealth>>` to
+//    `arc_swap::ArcSwapOption<dyn LayerHealth>`, the same pattern this
+//    struct already uses for `eil: ArcSwap<EilSnapshot>`. `with_health`
+//    is now fully safe — no `unsafe` block, no raw pointers, correct
+//    regardless of how many `Arc` clones exist.
+//
+// 2. UNBOUNDED MEMORY GROWTH: `publish`/`publish_with_fee` cloned
+//    `snap.signals` (the ENTIRE historical signal list since process
+//    start) on every single call, pushed one more entry, and stored the
+//    result — with no eviction, ever. On Arbitrum's ~250ms blocks with
+//    several signal kinds firing per block, this grows without bound
+//    for the life of the process: unbounded memory, and an
+//    increasingly expensive full-vector clone on every publish. Fixed
+//    with a bounded eviction cap (`MAX_SIGNAL_HISTORY`), the same
+//    pattern already established in this codebase's
+//    `omega_rpc::client::SubmissionTracker`. The cap is a starting
+//    point, not a derived value — tune it against actual downstream
+//    consumption of `EilSnapshot.signals` (which this crate cannot see
+//    from here).
 
 use std::sync::{
     Arc,
@@ -40,7 +72,7 @@ use std::sync::{
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use alloy_primitives::{B256, keccak256};
-use arc_swap::ArcSwap;
+use arc_swap::{ArcSwap, ArcSwapOption};
 use dashmap::DashMap;
 use tokio::sync::broadcast;
 
@@ -58,6 +90,14 @@ const DEX_DEBOUNCE_MS: u64 = 50;
 /// Capacity for the outbound OracleSignal broadcast channel.
 const SIGNAL_CHANNEL_CAPACITY: usize = 256;
 
+/// Hard cap on how many historical signals `EilSnapshot.signals` retains.
+/// Oldest entries are evicted once this is exceeded — see `evict_oldest`.
+/// Prevents unbounded memory growth across the life of a long-running
+/// process; not a derived/authoritative value, just a conservative
+/// starting bound (a few blocks' worth across all signal kinds at
+/// Arbitrum's block rate).
+const MAX_SIGNAL_HISTORY: usize = 4_096;
+
 // ─────────────────────────────────────────────────────────────────────────────
 // EilSnapshot — the arc-swap EIL double-buffer value type
 // ─────────────────────────────────────────────────────────────────────────────
@@ -71,6 +111,8 @@ const SIGNAL_CHANNEL_CAPACITY: usize = 256;
 pub struct EilSnapshot {
     pub state_version: u64,
     pub state_hash: B256,
+    /// Bounded to `MAX_SIGNAL_HISTORY` entries — see this file's
+    /// module-level audit note. Oldest entries are evicted first.
     pub signals: Vec<OracleSignal>,
     pub fee: FeeSnapshot,
 }
@@ -97,7 +139,13 @@ pub struct PerChainOracle {
     /// Pyth feed liveness handle.
     pub pyth_handle: Arc<OracleFeedHandle>,
     /// Health layer for ExternalData transitions.
-    health: Option<Arc<dyn LayerHealth>>,
+    ///
+    /// `ArcSwapOption` rather than a plain `Option<Arc<dyn LayerHealth>>`
+    /// — see this file's module-level audit note on why the previous
+    /// unsafe raw-pointer mutation was unsound, and why this is the
+    /// correct replacement rather than a `Mutex`/`RwLock` (lock-free
+    /// reads, consistent with `eil`'s existing pattern in this struct).
+    health: ArcSwapOption<dyn LayerHealth>,
 }
 
 impl PerChainOracle {
@@ -127,18 +175,25 @@ impl PerChainOracle {
             dex_last_seen: DashMap::new(),
             cl_handle: OracleFeedHandle::new("chainlink", true),
             pyth_handle: OracleFeedHandle::new("pyth", true),
-            health: None,
+            health: ArcSwapOption::empty(),
         })
     }
 
     /// Wire in the ExternalData health layer.
+    ///
+    /// Fully safe — no `unsafe`, no raw pointers. Correct regardless of
+    /// how many `Arc<PerChainOracle>` clones exist at call time, unlike
+    /// the previous raw-pointer-mutation implementation (see this
+    /// file's module-level audit note).
     pub fn with_health(self: Arc<Self>, health: Arc<dyn LayerHealth>) -> Arc<Self> {
-        // Safety: we are the sole Arc holder during construction
-        let ptr = Arc::into_raw(self) as *mut Self;
-        unsafe {
-            (*ptr).health = Some(health);
-        }
-        unsafe { Arc::from_raw(ptr) }
+        self.health.store(Some(health));
+        self
+    }
+
+    /// Current health layer handle, if one has been wired in via
+    /// `with_health`. Lock-free read.
+    pub fn health(&self) -> Option<Arc<dyn LayerHealth>> {
+        self.health.load_full()
     }
 
     /// Subscribe to outbound OracleSignal events.
@@ -313,10 +368,22 @@ impl PerChainOracle {
         }
     }
 
+    /// Evicts oldest entries from `signals` in place until its length is
+    /// at most `MAX_SIGNAL_HISTORY`. Called after every push in
+    /// `publish`/`publish_with_fee` — see this file's module-level audit
+    /// note on why this bound exists.
+    fn evict_oldest(signals: &mut Vec<OracleSignal>) {
+        if signals.len() > MAX_SIGNAL_HISTORY {
+            let excess = signals.len() - MAX_SIGNAL_HISTORY;
+            signals.drain(0..excess);
+        }
+    }
+
     fn publish(&self, signal: OracleSignal) {
         let snap = self.eil.load_full();
         let mut signals = snap.signals.clone();
         signals.push(signal.clone());
+        Self::evict_oldest(&mut signals);
 
         let new_snap = Arc::new(EilSnapshot {
             state_version: signal.state_version,
@@ -333,6 +400,7 @@ impl PerChainOracle {
         let snap = self.eil.load_full();
         let mut signals = snap.signals.clone();
         signals.push(signal.clone());
+        Self::evict_oldest(&mut signals);
 
         let new_snap = Arc::new(EilSnapshot {
             state_version: signal.state_version,
@@ -469,5 +537,68 @@ mod tests {
             elapsed < DEX_DEBOUNCE_MS,
             "fresh entry must be within debounce window"
         );
+    }
+
+    // ── Audit fix regression tests (this revision) ───────────────────────────
+
+    #[test]
+    fn with_health_sets_and_reads_back_without_unsafe() {
+        struct FakeHealth;
+        impl LayerHealth for FakeHealth {
+            fn set_state(&self, _state: omega_core::HealthState, _reason: &str) {}
+        }
+        let oracle = PerChainOracle::new(42161).with_health(Arc::new(FakeHealth));
+        assert!(oracle.health().is_some(), "health handle must be readable after with_health");
+    }
+
+    #[test]
+    fn health_defaults_to_none_before_with_health() {
+        let oracle = PerChainOracle::new(42161);
+        assert!(oracle.health().is_none());
+    }
+
+    #[test]
+    fn signal_history_bounded_after_exceeding_max() {
+        // Directly exercises evict_oldest via publish(), bypassing the
+        // broadcast plumbing — push well past MAX_SIGNAL_HISTORY and
+        // confirm the retained signals vec never exceeds the cap.
+        let oracle = PerChainOracle::new(42161);
+        for i in 0..(MAX_SIGNAL_HISTORY + 500) {
+            let signal = oracle.make_signal(
+                SignalKind::PoolReserves,
+                i as u64,
+                0,
+                serde_json::json!({ "seq": i }),
+            );
+            oracle.publish(signal);
+        }
+        let snap = oracle.snapshot();
+        assert_eq!(
+            snap.signals.len(),
+            MAX_SIGNAL_HISTORY,
+            "signal history must be capped at MAX_SIGNAL_HISTORY, not grow unbounded"
+        );
+    }
+
+    #[test]
+    fn signal_history_eviction_keeps_newest_entries() {
+        let oracle = PerChainOracle::new(42161);
+        let total = MAX_SIGNAL_HISTORY + 10;
+        for i in 0..total {
+            let signal = oracle.make_signal(
+                SignalKind::PoolReserves,
+                i as u64,
+                0,
+                serde_json::json!({ "seq": i }),
+            );
+            oracle.publish(signal);
+        }
+        let snap = oracle.snapshot();
+        // The oldest 10 block_numbers (0..10) must have been evicted;
+        // the newest entry's block_number must be total-1.
+        let oldest_retained = snap.signals.first().unwrap().block_number;
+        let newest_retained = snap.signals.last().unwrap().block_number;
+        assert_eq!(oldest_retained, 10, "the oldest 10 entries must have been evicted");
+        assert_eq!(newest_retained, (total - 1) as u64);
     }
 }

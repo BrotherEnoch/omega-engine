@@ -10,6 +10,13 @@
 //   §3  — Replay guard (Certora C5)
 //   §3  — Nonce registry (chain-scoped per-strategy)
 //   §16 — Prometheus metrics
+//
+// ## Audit fix (this revision)
+//
+// Re-exports `StrategyDeployment` / `DeploymentManifest` /
+// `strategy_entries_from_manifest` alongside the existing integrity exports —
+// see `integrity.rs`'s own audit note for why the old placeholder-shipping
+// `default_strategy_entries()` was removed and replaced with these.
 
 pub mod error;
 pub mod integrity;
@@ -25,7 +32,10 @@ mod tests;
 // ── Re-exports ────────────────────────────────────────────────────────────────
 
 pub use error::SecurityError;
-pub use integrity::{IntegrityRegistry, StrategyEntry, StrategyFreezeGuard};
+pub use integrity::{
+    strategy_entries_from_manifest, DeploymentManifest, IntegrityRegistry, StrategyDeployment,
+    StrategyEntry, StrategyFreezeGuard,
+};
 pub use key_manager::{KeyManager, KeyRotationState, ROTATION_WINDOW_BLOCKS};
 pub use ofa::{
     default_rule_set, OfaComplianceInput, OfaComplianceResult, OfaRule, OfaRuleRegistry,

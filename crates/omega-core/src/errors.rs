@@ -39,6 +39,30 @@
 // deliberately, with a chosen tagging scheme, if/when a concrete
 // consumer needs it.
 //
+// ## Audit fix (this revision): three new DropCode variants
+//
+// Added `MissExposureLimit`, `StaleBlueprint`, `DuplicateIdempotencyKey`.
+// `MissExposureLimit` closes a gap from an earlier pass: omega-risk's
+// `checks::check_account_exposure` (check 14) already referenced this
+// exact variant — it just didn't exist here yet, since this enum hadn't
+// been shared at the time.
+//
+// Classification restraint, matching this file's own existing precedent
+// (see the note below on `WrongChain`/`WrongChainId` and
+// `is_critical()`/`is_expected_miss()`): none of the three new variants
+// are added to `is_simulation_error()`, `is_expected_miss()`, or
+// `is_critical()`. Each of those methods encodes a specific taxonomy
+// this crate's own files don't have enough downstream context to assign
+// correctly — e.g. whether hitting an exposure cap should alert
+// (arguably the risk system working as intended, arguably worth
+// operator visibility) or whether a duplicate idempotency key should
+// feed the ML loss model (arguably not, since catching a duplicate is
+// success, not a loss) is a domain/spec judgment call, not something to
+// guess at here. All three currently fall through to the *default*
+// (not simulation, not expected-miss, not critical) for every
+// classification method, which is the same neutral starting point
+// `WrongChain`/`WrongChainId` were left at previously.
+//
 // Spec references:
 //   §3    — Health FSM: layer transitions triggered by OmegaError variants
 //   §7    — Gas model: MissGas, MissGasSpike DropCodes
@@ -86,6 +110,15 @@ pub enum DropCode {
     // ── Timing ───────────────────────────────────────────────────────────
     /// Blueprint's `expiry_block` has passed before submission.
     MissExpiry,
+
+    /// Blueprint's signal/state binding (`signal_state_hash`,
+    /// `state_version`) no longer matches the current EIL snapshot at
+    /// the point of use — distinct from `SimulationStateMismatch`
+    /// (which is specifically about a stale revm cache during
+    /// simulation, §6/§13.4); this covers staleness detected at other
+    /// points in the pipeline (e.g. a pre-submission integrity check
+    /// via `ExecutionBlueprint::verify_hash()`).
+    StaleBlueprint,
 
     // ── Gas / fee model (§7) ─────────────────────────────────────────────
     /// Estimated gas cost exceeds the dynamic_min_profit threshold.
@@ -145,6 +178,11 @@ pub enum DropCode {
     /// all execution halted until oracle stabilises.
     MissFlashCrash,
 
+    /// Account's total exposure, including this blueprint's flashloan
+    /// principal, would exceed the configured cap
+    /// (`omega_risk::checks::check_account_exposure`, check 14).
+    MissExposureLimit,
+
     // ── DAG ──────────────────────────────────────────────────────────────
     /// DAG dependency resolution detected a cycle; blueprint cannot be
     /// scheduled (§9).
@@ -169,6 +207,16 @@ pub enum DropCode {
 
     /// OFA order validation failed (malformed or expired order).
     MissOfaOrder,
+
+    // ── Submission / idempotency ─────────────────────────────────────────
+    /// A blueprint with this same idempotency key was already submitted
+    /// (see `ExecutionBlueprint::compute_idempotency_key` /
+    /// `verify_idempotency_key`, omega-core, and the RPC-layer
+    /// submission dedup tracker in omega-rpc). Distinct from those two:
+    /// this code is for a pre-signing-stage duplicate rejection in the
+    /// blueprint pipeline itself, not the post-signing transaction-hash
+    /// dedup in `omega_rpc::client::SubmissionTracker`.
+    DuplicateIdempotencyKey,
 
     // ── Simulation sub-classification (§13.4, fix M3) ────────────────────
     /// Simulation passed but on-chain state differed from the revm cache
@@ -205,6 +253,7 @@ impl fmt::Display for DropCode {
             DropCode::WrongChain => "WRONG_CHAIN",
             DropCode::WrongChainId => "WRONG_CHAIN_ID",
             DropCode::MissExpiry => "MISS_EXPIRY",
+            DropCode::StaleBlueprint => "STALE_BLUEPRINT",
             DropCode::MissGas => "MISS_GAS",
             DropCode::MissGasSpike => "MISS_GAS_SPIKE",
             DropCode::MissWhitelist => "MISS_WHITELIST",
@@ -220,12 +269,14 @@ impl fmt::Display for DropCode {
             DropCode::MissCapacityNormal => "MISS_CAPACITY_NORMAL",
             DropCode::MissRisk => "MISS_RISK",
             DropCode::MissFlashCrash => "MISS_FLASH_CRASH",
+            DropCode::MissExposureLimit => "MISS_EXPOSURE_LIMIT",
             DropCode::MissDagCycle => "MISS_DAG_CYCLE",
             DropCode::MissFlashloan => "MISS_FLASHLOAN",
             DropCode::MissHfNotLiquidatable => "MISS_HF_NOT_LIQUIDATABLE",
             DropCode::MissOfaConsent => "MISS_OFA_CONSENT",
             DropCode::MissOfaSlippage => "MISS_OFA_SLIPPAGE",
             DropCode::MissOfaOrder => "MISS_OFA_ORDER",
+            DropCode::DuplicateIdempotencyKey => "DUPLICATE_IDEMPOTENCY_KEY",
             DropCode::SimulationStateMismatch => "SIMULATION_STATE_MISMATCH",
             DropCode::SimulationExecutionRevert => "SIMULATION_EXECUTION_REVERT",
             DropCode::SimulationGasMiscalc => "SIMULATION_GAS_MISCALC",
@@ -285,7 +336,10 @@ impl DropCode {
 // considered during this audit: whether e.g. `WrongChain`/`WrongChainId`
 // should also be `is_critical()` is a domain/spec judgment call this
 // crate's own files don't have enough context to settle — flagged in
-// the accompanying review rather than changed speculatively.)
+// the accompanying review rather than changed speculatively. The three
+// new variants added in this revision (`MissExposureLimit`,
+// `StaleBlueprint`, `DuplicateIdempotencyKey`) are held to the same
+// standard — see the module-level audit note above.)
 
 // ─────────────────────────────────────────────────────────────────────────────
 // OmegaError
@@ -406,6 +460,16 @@ mod tests {
     }
 
     #[test]
+    fn new_drop_codes_display_screaming_snake() {
+        assert_eq!(DropCode::MissExposureLimit.to_string(), "MISS_EXPOSURE_LIMIT");
+        assert_eq!(DropCode::StaleBlueprint.to_string(), "STALE_BLUEPRINT");
+        assert_eq!(
+            DropCode::DuplicateIdempotencyKey.to_string(),
+            "DUPLICATE_IDEMPOTENCY_KEY"
+        );
+    }
+
+    #[test]
     fn drop_code_serde_wire_format_matches_display() {
         // Confirms the newly-added Serialize/Deserialize derive
         // produces exactly the same string as the hand-written Display
@@ -415,6 +479,7 @@ mod tests {
             DropCode::WrongChain,
             DropCode::WrongChainId,
             DropCode::MissExpiry,
+            DropCode::StaleBlueprint,
             DropCode::MissGas,
             DropCode::MissGasSpike,
             DropCode::MissWhitelist,
@@ -430,12 +495,14 @@ mod tests {
             DropCode::MissCapacityNormal,
             DropCode::MissRisk,
             DropCode::MissFlashCrash,
+            DropCode::MissExposureLimit,
             DropCode::MissDagCycle,
             DropCode::MissFlashloan,
             DropCode::MissHfNotLiquidatable,
             DropCode::MissOfaConsent,
             DropCode::MissOfaSlippage,
             DropCode::MissOfaOrder,
+            DropCode::DuplicateIdempotencyKey,
             DropCode::SimulationStateMismatch,
             DropCode::SimulationExecutionRevert,
             DropCode::SimulationGasMiscalc,
@@ -455,6 +522,7 @@ mod tests {
         assert!(DropCode::SimulationGasMiscalc.is_simulation_error());
         assert!(!DropCode::MissGas.is_simulation_error());
         assert!(!DropCode::MissProfit.is_simulation_error());
+        assert!(!DropCode::StaleBlueprint.is_simulation_error());
     }
 
     #[test]
@@ -473,6 +541,24 @@ mod tests {
         // Engineering faults are NOT expected misses
         assert!(!DropCode::SimulationExecutionRevert.is_expected_miss());
         assert!(!DropCode::MissGas.is_expected_miss());
+    }
+
+    #[test]
+    fn new_drop_codes_are_unclassified_by_default() {
+        // Deliberate: this file's own precedent is to leave classification
+        // of a new/ambiguous code unassigned rather than guess — see the
+        // module-level audit note on MissExposureLimit/StaleBlueprint/
+        // DuplicateIdempotencyKey. This test pins that "unclassified"
+        // default so a future accidental match-arm edit is caught.
+        for code in [
+            DropCode::MissExposureLimit,
+            DropCode::StaleBlueprint,
+            DropCode::DuplicateIdempotencyKey,
+        ] {
+            assert!(!code.is_simulation_error(), "{code} should not be pre-classified");
+            assert!(!code.is_expected_miss(), "{code} should not be pre-classified");
+            assert!(!code.is_critical(), "{code} should not be pre-classified");
+        }
     }
 
     #[test]

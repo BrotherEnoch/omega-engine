@@ -3,17 +3,33 @@
 pragma solidity 0.8.24;
 
 import "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
-import "@openzeppelin/contracts/security/ReentrancyGuard.sol";
+import "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
 import "@openzeppelin/contracts/access/AccessControl.sol";
 
-/// @title OmegaVault — v12 Final (OmegaDAO 5% fee split)
-/// @notice One-way profit bridge: Orchestrator → Vault (pending) → PIL (confirmed)
+/// @title OmegaVault — v13 Final (OmegaDAO 5% fee split)
+/// @notice One-way profit bridge: Orchestrator -> Vault (pending) -> PIL (confirmed)
 /// @dev    Certora invariants:
 ///           C6: profit released only after valid STARK proof AND depth >= 12
 ///           C9: profit_to_pil + profit_to_dao == netProfit AND dao_fee <= 10%
 ///         Per-transfer cap 50 ETH (in token equivalent). Daily cap 500 ETH.
 ///         ZK proof gate: IStarkVerifier.verify() must pass before any release.
 ///         OPIL minted on pil_share only — OPIL holders not diluted by DAO fee.
+///
+/// CHANGES vs prior version:
+///   1. FIXED (critical) — `receivePendingProfit` previously only incremented an internal
+///      accounting mapping (`pending_profit[hash] += netProfit`) and never moved a single
+///      token into this contract. `releaseProfit` then tries to `safeTransfer` out of the
+///      Vault's own balance — which, with the prior code, would never actually hold the
+///      tokens it thinks it's tracking, and would revert (or worse, silently pay out of
+///      unrelated funds that happened to be sitting in the Vault for some other reason).
+///      Fixed: `receivePendingProfit` now pulls the tokens via `safeTransferFrom`, requiring
+///      the Orchestrator to have approved this contract for `netProfit` beforehand. This
+///      makes the accounting update and the actual asset movement happen atomically and
+///      auditably in the same call, rather than trusting a transfer happened separately.
+///   2. Interface note — this Vault holds and pays out exactly one token (`profit_token`,
+///      immutable). The Orchestrator must only ever forward profit in that same token; see
+///      OmegaOrchestrator.sol's explicit check for this. This was implicit before; it's
+///      called out explicitly here so it isn't a silent assumption.
 contract OmegaVault is ReentrancyGuard, AccessControl {
     using SafeERC20 for IERC20;
 
@@ -37,11 +53,9 @@ contract OmegaVault is ReentrancyGuard, AccessControl {
     address public dao_fee_address;   // OmegaDAO multisig — 48h timelock to change
     uint256 public dao_fee_bps;       // default 500 = 5%; max 1000 = 10%
 
-    // Pending governance change for dao_fee_address (48h timelock)
     address public pending_dao_fee_address;
     uint256 public dao_fee_address_unlock_time;
 
-    // Pending governance change for dao_fee_bps (48h timelock via L3)
     uint256 public pending_dao_fee_bps;
     uint256 public dao_fee_bps_unlock_time;
 
@@ -56,7 +70,6 @@ contract OmegaVault is ReentrancyGuard, AccessControl {
     uint256 public immutable PER_TRANSFER_CAP;   // 50 ETH equivalent
     uint256 public immutable DAILY_CAP;           // 500 ETH equivalent
 
-    // Daily cap tracking
     uint256 public daily_released;
     uint256 public daily_window_start;
 
@@ -99,6 +112,7 @@ contract OmegaVault is ReentrancyGuard, AccessControl {
     error TimelockNotExpired(uint256 unlockTime);
     error NoPendingChange();
     error ZeroAddress();
+    error ZeroAmount();
 
     // ─────────────────────────────────────────────────────────────────────────
     // Constructor
@@ -129,18 +143,32 @@ contract OmegaVault is ReentrancyGuard, AccessControl {
         _grantRole(DEFAULT_ADMIN_ROLE,  _admin);
         _grantRole(GOVERNANCE_ROLE,     _admin);
         _grantRole(ORCHESTRATOR_ROLE,   _orchestrator);
+        // NOTE: DEPTH_UPDATER_ROLE is intentionally not granted here — there is no default
+        // depth-updating relayer. After deployment you must call
+        // grantRole(DEPTH_UPDATER_ROLE, <your relayer address>) yourself (DEFAULT_ADMIN_ROLE
+        // is the admin of every role that isn't otherwise configured, so _admin can do this).
+        // Skipping this step means updateConfirmationDepth can never be called by anyone,
+        // and no profit can ever clear the C6 gate.
     }
 
     // ─────────────────────────────────────────────────────────────────────────
     // Step 1: Orchestrator deposits pending profit
     // ─────────────────────────────────────────────────────────────────────────
 
-    /// @notice Called by OmegaOrchestrator immediately after execution.
-    ///         Profit sits in pending state until proof + depth are satisfied.
+    /// @notice Called by OmegaOrchestrator immediately after execution. Pulls `netProfit`
+    ///         of `profit_token` from the caller (the Orchestrator must have approved this
+    ///         contract for at least `netProfit` beforehand) and records it as pending,
+    ///         gated behind proof + confirmation depth before it can be released.
     function receivePendingProfit(
         bytes32 blueprintHash,
         uint256 netProfit
-    ) external onlyRole(ORCHESTRATOR_ROLE) {
+    ) external onlyRole(ORCHESTRATOR_ROLE) nonReentrant {
+        if (netProfit == 0) revert ZeroAmount();
+
+        // Pull real tokens in the same call that updates the accounting — the two can't
+        // drift apart the way a bare mapping increment (with no transfer) previously could.
+        profit_token.safeTransferFrom(msg.sender, address(this), netProfit);
+
         pending_profit[blueprintHash] += netProfit;
         emit PendingProfitReceived(blueprintHash, netProfit);
     }
@@ -164,8 +192,9 @@ contract OmegaVault is ReentrancyGuard, AccessControl {
     // Step 3: STARK proof submission (C6)
     // ─────────────────────────────────────────────────────────────────────────
 
-    /// @notice Submit and verify STARK proof for a blueprint.
-    ///         Must be called before releaseProfit.
+    /// @notice Submit and verify STARK proof for a blueprint. Must be called before
+    ///         releaseProfit. Permissionless by design — the proof is self-verifying via
+    ///         IStarkVerifier; an invalid proof simply fails verify() and reverts here.
     function submitProof(
         bytes32        blueprintHash,
         bytes calldata starkProof
@@ -180,25 +209,22 @@ contract OmegaVault is ReentrancyGuard, AccessControl {
     // Step 4: Release profit (C6 + C9)
     // ─────────────────────────────────────────────────────────────────────────
 
-    /// @notice Release confirmed profit: 95% → PIL, 5% → OmegaDAO.
+    /// @notice Release confirmed profit: 95% -> PIL, 5% -> OmegaDAO.
     ///         Requires: proof verified AND confirmation_depth >= 12.
     /// @dev    Certora C6: gated by proof + depth.
     ///         Certora C9: pil_share + dao_fee == netProfit, dao_fee <= 10%.
     function releaseProfit(bytes32 blueprintHash) external nonReentrant {
-        // ── C6 guards ────────────────────────────────────────────────────────
         if (!proof_verified[blueprintHash])
             revert ProofNotVerified(blueprintHash);
         if (confirmation_depth[blueprintHash] < MIN_CONFIRMATION_DEPTH)
             revert InsufficientDepth(confirmation_depth[blueprintHash], MIN_CONFIRMATION_DEPTH);
 
-        // ── Replay protection ────────────────────────────────────────────────
         if (released[blueprintHash])
             revert AlreadyReleased(blueprintHash);
 
         uint256 net = pending_profit[blueprintHash];
         if (net == 0) revert NoPendingProfit(blueprintHash);
 
-        // ── Transfer caps ─────────────────────────────────────────────────────
         if (net > PER_TRANSFER_CAP)
             revert ExceedsPerTransferCap(net, PER_TRANSFER_CAP);
 
@@ -215,11 +241,12 @@ contract OmegaVault is ReentrancyGuard, AccessControl {
         uint256 dao_fee   = (net * dao_fee_bps) / 10_000;
         uint256 pil_share = net - dao_fee;
 
-        // Hard invariant check — never exceeds 10% regardless of storage value
+        // Hard invariant check — mathematically implied by dao_fee_bps <= MAX_DAO_FEE_BPS
+        // already being enforced on every path that can set dao_fee_bps, but kept as an
+        // explicit belt-and-suspenders check rather than relying on that alone.
         if (dao_fee > net / 10)
             revert DaoFeeExceedsMax(dao_fee_bps, MAX_DAO_FEE_BPS);
 
-        // ── Transfers ─────────────────────────────────────────────────────────
         profit_token.safeTransfer(pil_treasury,    pil_share);
         profit_token.safeTransfer(dao_fee_address, dao_fee);
 
