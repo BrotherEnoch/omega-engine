@@ -10,18 +10,31 @@ edition = "2021"
 # via `Uuid::new_v4()` in `build_blueprint` now that
 # `ExecutionBlueprint` (omega-core) has that field; cnry.rs's test
 # module also constructs one. Not previously a dependency of this crate.
+#
+# Added `omega-flashloan` — la.rs's `build_blueprint` now calls
+# `omega_flashloan::select_provider` and `LaStrategy::new` takes an
+# `Arc<LiquidityRegistry>`, both real (not trait-object) dependencies on
+# this crate's types. This is a deliberate departure from the
+# §22.1 "injected as trait objects" architecture note below — flagged
+# here rather than silently contradicting that note. See la.rs's own
+# module comment for the reasoning.
 
 [dependencies]
 omega-core             = { path = "../omega-core" }
-omega-gas-war          = { path = "../omega-gas-war" }
-omega-loss-attribution = { path = "../omega-loss-attribution" }
+omega-gas-war           = { path = "../omega-gas-war" }
+omega-loss-attribution  = { path = "../omega-loss-attribution" }
+omega-flashloan         = { path = "../omega-flashloan" }
 
 # ARCHITECTURAL NOTE (§22.1):
 # omega-strategies depends on omega-core, omega-gas-war, and
-# omega-loss-attribution.  It does NOT depend on omega-oracle,
-# omega-risk, or omega-flashloan — those are injected as trait objects
-# so omega-strategies stays compilable without the full dependency tree.
-# omega-rpc is also excluded — strategies never call RPC directly.
+# omega-loss-attribution.  It does NOT depend on omega-oracle or
+# omega-risk — those are injected as trait objects so omega-strategies
+# stays compilable without the full dependency tree. omega-rpc is also
+# excluded — strategies never call RPC directly.
+#
+# omega-flashloan is now a real dependency (see audit-fix note above) —
+# this note is left in place rather than rewritten so the deviation from
+# the original §22.1 design is visible, not smoothed over.
 
 # EVM primitive types (shared with omega-core — no full alloy transport)
 alloy-primitives = { workspace = true }

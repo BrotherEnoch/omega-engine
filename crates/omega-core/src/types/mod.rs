@@ -11,6 +11,21 @@
 //   The only exception is internal helpers that are pub(crate) — these
 //   are implementation details of the type constructors within this
 //   module.
+//
+// ## Fix (this revision)
+//
+// `FlashloanProviderType` was being re-exported from BOTH
+// `blueprint::FlashloanProviderType` and
+// `flashloan_provider::FlashloanProviderType` — two different enums
+// with the same name, an `E0252` conflict (and, worse, two genuinely
+// different types silently pretending to be one, depending which
+// import path a caller happened to use). `flashloan_provider.rs` is
+// this type's real, pre-existing home (see that module's own file);
+// `blueprint.rs` was WRONGLY declaring a second, competing definition
+// of the same name — that duplicate definition needs to be deleted
+// from `blueprint.rs` and replaced with
+// `use crate::types::flashloan_provider::FlashloanProviderType;` there
+// instead. This file now re-exports only the real one.
 
 pub mod blueprint;
 pub mod flashloan_provider;

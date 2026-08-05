@@ -1,5 +1,6 @@
 // ops/control-plane/src/ws.rs
 //
+//
 // WebSocket event stream — ws://<host>/ws/events (spec §17, §17.1).
 //
 // ## Rate limits (§17.1, fix M4)
@@ -41,10 +42,30 @@
 //   Every event frame has shape:
 //     { "type": "<snake_case_variant>", "payload": { … } }
 //
-//   This matches `state::WsEvent`'s
+//   This matches `omega_control_contracts::ws::WsEvent`'s
 //   `#[serde(tag = "type", content = "payload", rename_all = "snake_case")]`
-//   attribute and the frontend's `omega-control-contracts::ws::WsEvent`
-//   which uses the identical attribute.
+//   attribute and the frontend's copy of the same type.
+//
+// ## Fix (this revision)
+//
+// The test module previously imported `WsEvent` and
+// `WS_CHANNEL_CAPACITY` from `crate::state` — a module that does not
+// exist in this crate (no `mod state;` in `main.rs`; confirmed the same
+// way `grpc.rs`'s own module comment already documented for its
+// equivalent `AppState`/`WsEvent`/`ALL_LAYER_IDS` imports). Fixed by
+// importing `WsEvent` from `omega_control_contracts::ws`, the same
+// shared type `grpc.rs`, `obs_bridge.rs`, and the frontend dashboard
+// already agree on — see this file's own module doc comment above,
+// which already said this was the wire-format source of truth even
+// before the import itself was fixed to match.
+//
+// `WS_CHANNEL_CAPACITY` is assumed to live alongside `AppState` in
+// `main.rs`, mirroring how `grpc.rs` reaches `crate::AppState` directly
+// — referenced here as `crate::WS_CHANNEL_CAPACITY`. THIS IS AN
+// ASSUMPTION, not a confirmed fact (main.rs's contents were not
+// available when this fix was made) — if the real constant lives
+// somewhere else (or under a different name), update this one import
+// line accordingly; nothing else in this file depends on its location.
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -267,11 +288,12 @@ async fn negotiate_auth(socket: &mut WebSocket, api_token: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::state::WsEvent;
+    use omega_control_contracts::ws::WsEvent;
     use tokio::sync::broadcast;
 
-    // WS_CHANNEL_CAPACITY lives in state.rs alongside WsEvent.
-    use crate::state::WS_CHANNEL_CAPACITY;
+    // See this file's module-level "Fix (this revision)" note: this is
+    // an assumed location, not a confirmed one — update if wrong.
+    use crate::WS_CHANNEL_CAPACITY;
 
     #[test]
     fn rate_limits_match_spec() {
@@ -283,8 +305,9 @@ mod tests {
 
     // ── Wire format correctness ───────────────────────────────────────────────
     // These tests mirror the frontend's deserialisation expectations.
-    // state::WsEvent uses `#[serde(tag = "type", content = "payload")]`,
-    // so every serialised frame must contain both fields.
+    // omega_control_contracts::ws::WsEvent uses
+    // `#[serde(tag = "type", content = "payload")]`, so every serialised
+    // frame must contain both fields.
 
     #[test]
     fn config_reloaded_serialises_with_type_and_payload() {

@@ -47,6 +47,32 @@
 // `uint32` in the same revision, but every value assigned to them here
 // is the literal `0`, which infers to the correct type automatically —
 // no code change needed for that one.
+//
+// ## Clippy fixes (this revision)
+//
+// 1. UNUSED IMPORT: `RelayWinRate` was imported from `proto::` but never
+//    referenced anywhere in this file (`get_win_rates` returns
+//    `WinRateReport { relays: vec![] }` directly, never constructing a
+//    `RelayWinRate` itself — that type is presumably only touched inside
+//    a real relay-metrics feed, which this file's own comment on
+//    `get_win_rates` says doesn't exist yet in standalone control-plane
+//    mode). Removed from the `use proto::{...}` list rather than
+//    `#[allow(unused_imports)]`-ing it, since the actual fix is just not
+//    importing what isn't used.
+//
+// 2. RESULT_LARGE_ERR on `check_metadata`: `tonic::Status` is at least
+//    176 bytes, so `Result<(), Status>` makes every `?`/early-return
+//    through this function move that many bytes around regardless of
+//    whether the `Ok` path is ever taken. Clippy's own suggested fixes
+//    are boxing the error or shrinking `Status` — neither is realistic
+//    here without either a wrapper type at every call site (this is a
+//    tonic service, `Status` is what every RPC handler is expected to
+//    return) or vendoring a change into `tonic` itself. Silenced with a
+//    scoped `#[allow(clippy::result_large_err)]` on this one function
+//    rather than a crate-wide allow, since this genuinely is the correct
+//    shape for a gRPC auth-check helper — the alternative isn't a better
+//    design, just a different set of trade-offs clippy can't see from
+//    here.
 
 use std::pin::Pin;
 use std::sync::Arc;
@@ -74,7 +100,7 @@ use proto::{
     omega_control_server::{OmegaControl, OmegaControlServer},
     CommandResult, Empty, HealthEvent, HealthReport, LatencyReport,
     LayerHealth as ProtoLayerHealth, LayerIdMsg, LayerLatency, PnLReport, PnLRequest, QueueReport,
-    RelayWinRate, RolloutTier, StrategyId, WinRateReport,
+    RolloutTier, StrategyId, WinRateReport,
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -96,6 +122,10 @@ fn chrono_to_proto_timestamp(dt: chrono::DateTime<chrono::Utc>) -> prost_types::
 // Auth
 // ─────────────────────────────────────────────────────────────────────────────
 
+/// `Status` is at least 176 bytes — see this file's module-level Clippy
+/// fixes note, change 2, for why this is a scoped allow rather than a
+/// signature change.
+#[allow(clippy::result_large_err)]
 fn check_metadata<T>(req: &Request<T>, api_token: &str) -> Result<(), Status> {
     let token = req
         .metadata()
@@ -268,7 +298,9 @@ impl OmegaControl for OmegaControlService {
         // Win rates are maintained by omega-gas-war::LaRelayMetrics.
         // In standalone control-plane mode, there is no live relay metrics
         // feed — return an empty list.  The full engine wires this via a
-        // shared Arc<LaRelayMetrics> in AppState.
+        // shared Arc<LaRelayMetrics> in AppState. (No RelayWinRate value
+        // is constructed on this path — see this file's module-level
+        // Clippy fixes note, change 1, for why that import was removed.)
         Ok(Response::new(WinRateReport { relays: vec![] }))
     }
 

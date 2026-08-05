@@ -10,21 +10,58 @@
 //
 // ## This revision
 //
-// Added `max_base_fee_gwei` (gas model group) — the off-chain half of
-// OmegaOrchestrator's new on-chain `maxBaseFee` guard (Solidity
-// `BaseFeeTooHigh` revert in `execute()`). Set via
+// Added three fields to support real flashloan provider/pool selection
+// (`omega_flashloan::select_provider`, wired in from `omega-strategies`'
+// `la.rs`, which was constructing this struct with these field names
+// before they existed here — E0560 "no field named" at compile time):
+//
+//   - `flashloan_provider_type: FlashloanProviderType` — imported from
+//     `crate::types::flashloan_provider` (NOT redefined here — an
+//     earlier draft of this file wrongly declared a second, competing
+//     `FlashloanProviderType` enum locally, which collided with the
+//     real one at the `types/mod.rs` re-export boundary (E0252). The
+//     real type's ordinals (Balancer=0, AaveV3=1, UniswapV3=2) are
+//     confirmed against `OmegaOrchestrator.sol`'s own enum order — see
+//     that file's header for the full reasoning and the on-chain ABI
+//     load-bearing warning about never reordering the variants.
+//   - `provider_contract: Address` — the actual selected provider/pool
+//     address from `SelectionResult`. Per `flashloan_provider.rs`'s own
+//     doc comments: for Balancer/AaveV3 this is NOT read on-chain (the
+//     Orchestrator uses its own admin-configured address instead); it
+//     is load-bearing only for UniswapV3, where a specific pool must be
+//     identified per token pair/fee tier. Still recorded unconditionally
+//     for all three variants at construction (see `la.rs`), since
+//     `compute_hash()` treats it as a fixed identity field regardless
+//     of whether the on-chain path reads it for a given variant.
+//   - `flashloan_token: Address` — the ERC20 being flash-borrowed. Not
+//     a "no flashloan" Address::ZERO-sentinel field: strategies that
+//     borrow nothing simply never populate it (see `la.rs`'s explicit
+//     debt-token guard, which refuses to build rather than default to
+//     zero).
+//
+// All three are included in `compute_hash()`'s input set (construction-
+// time identity fields, same treatment as the earlier flashloan
+// fields). Only `flashloan_token` is added to
+// `compute_idempotency_key()`'s input set — `flashloan_provider_type`
+// and `provider_contract` are fully redundant with the existing
+// `flashloan_provider` field for dedup purposes (same address,
+// re-classified), so hashing them in a second time would add nothing;
+// `flashloan_token` is genuinely new economic information (WHICH asset
+// is being borrowed) that nothing else in the key previously captured.
+//
+// Also added `max_base_fee_gwei` in an earlier pass of this revision —
+// the off-chain half of OmegaOrchestrator's on-chain `maxBaseFee` guard
+// (Solidity `BaseFeeTooHigh` revert in `execute()`). Set via
 // `derive_max_base_fee_gwei()` from `base_fee_at_creation` plus a
 // buffer factor, same shape as `l2_buffer_factor`/`l1_data_buffer_factor`.
-// Included in `compute_hash()`'s input set (fixed at construction, like
-// its sibling gas-model fields); excluded from `compute_idempotency_key()`
-// (a risk parameter, not economic trade identity — same treatment as
-// `dynamic_min_profit`). See `max_base_fee_wei()` for the required
-// gwei→wei conversion before ABI-encoding into `blueprintCalldata` — the
-// Solidity side compares directly against `block.basefee`, which is
-// wei-denominated.
+// Included in `compute_hash()`'s input set; excluded from
+// `compute_idempotency_key()` (a risk parameter, not economic trade
+// identity — same treatment as `dynamic_min_profit`). See
+// `max_base_fee_wei()` for the required gwei→wei conversion before
+// ABI-encoding into `blueprintCalldata`.
 //
 // NOTE ON THIS FILE'S PRIOR AUDIT-FINDINGS HISTORY: this revision only
-// shows the diff for the change above; the numbered "Audit findings
+// shows the diff for the changes above; the numbered "Audit findings
 // fixed in this pass" history from earlier revisions of this file
 // (boundary-disagreement fix, gas-budget rounding, hash-integrity
 // helpers, idempotency-key fields, dead-code removal, idempotency-key/
@@ -44,6 +81,7 @@ use alloy_primitives::{keccak256, Address, Bytes, B256, U256};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+use crate::types::flashloan_provider::FlashloanProviderType;
 use crate::types::lane::{Lane, Simulator};
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -136,7 +174,7 @@ impl std::fmt::Display for StrategyId {
 /// |----------------|-----------------------------------------------------|
 /// | Identity       | blueprint_hash, chain_id, strategy_id, lane, simulator |
 /// | Signal binding | signal_state_hash, state_version, signal_id         |
-/// | Execution      | flashloan_*, calldata, strategy_bytecode_hash      |
+/// | Execution      | flashloan_*, provider_contract, calldata, strategy_bytecode_hash |
 /// | Gas model (§7) | l2_exec_gas_estimate, l1_data_gas_estimate, …      |
 /// | Economics      | expected_profit_net, dynamic_min_profit, slippage_bps |
 /// | Timing         | expiry_block, nonce, confirmation_depth, client_order_id |
@@ -194,8 +232,14 @@ pub struct ExecutionBlueprint {
     pub signal_id: Uuid,
 
     // ── Execution ────────────────────────────────────────────────────────
-    /// Flashloan provider contract address (Aave v3, Balancer, etc.).
-    /// Zero address signals no flashloan — capital sourced from PIL (§7).
+    /// Flashloan provider contract address (Aave v3 Pool, Balancer
+    /// Vault, etc.).  Zero address signals no flashloan — capital
+    /// sourced from PIL (§7).
+    ///
+    /// LEGACY FIELD — kept for backward compatibility with existing
+    /// readers. For strategies that use real provider selection (see
+    /// `la.rs`), this is set to the same value as `provider_contract`
+    /// below; see that field's doc comment for why both exist.
     pub flashloan_provider: Address,
 
     /// Requested flashloan principal in wei.  Must be ≤ flashloan_available.
@@ -205,6 +249,59 @@ pub struct ExecutionBlueprint {
     /// signal snapshot time.  Used to gate blueprint construction —
     /// never submit a blueprint where flashloan_amount > flashloan_available.
     pub flashloan_available: U256,
+
+    /// Provider kind — must match on-chain `FlashloanProviderType`
+    /// (`crate::types::flashloan_provider::FlashloanProviderType`;
+    /// Balancer=0, AaveV3=1, UniswapV3=2, load-bearing ABI ordinal — see
+    /// that type's own doc comment). Used for on-chain routing logic
+    /// (different providers need different callback ABI handling) — see
+    /// `omega_strategies::flashloan_select::to_blueprint_provider_type`
+    /// for where this is derived from `omega_flashloan::select_provider`'s
+    /// result.
+    ///
+    /// Construction-time identity field — included in `compute_hash()`'s
+    /// input set. NOT included in `compute_idempotency_key()`: it is
+    /// fully redundant with `flashloan_provider` (the same address,
+    /// classified) for dedup purposes, so hashing it in a second time
+    /// adds nothing.
+    pub flashloan_provider_type: FlashloanProviderType,
+
+    /// The actual selected provider/pool contract address returned by
+    /// `omega_flashloan::select_provider`. Distinct from the legacy
+    /// `flashloan_provider` field only in name — both are set to the
+    /// same value at construction (see `la.rs`'s `build_blueprint`).
+    ///
+    /// Per `FlashloanProviderType`'s own doc comments: for
+    /// `Balancer`/`AaveV3` this is NOT read on-chain — the Orchestrator
+    /// calls its own admin-configured provider address for those two
+    /// variants regardless of what's here. It IS load-bearing for
+    /// `UniswapV3`, where a specific pool must be identified per token
+    /// pair/fee tier; the Orchestrator reads it directly and derives
+    /// argument placement from the pool's own `token0()`/`token1()`
+    /// on-chain, rather than trusting an off-chain-supplied flag.
+    ///
+    /// Construction-time identity field — included in `compute_hash()`'s
+    /// input set regardless of variant. NOT included in
+    /// `compute_idempotency_key()` for the same redundancy reason as
+    /// `flashloan_provider_type` above.
+    pub provider_contract: Address,
+
+    /// ERC20 token address being flash-borrowed. `Address::ZERO` is NOT
+    /// a valid "no flashloan" sentinel here the way it is for
+    /// `flashloan_provider` — a strategy that borrows nothing should
+    /// never reach construction with this field populated at all; see
+    /// `la.rs::LaStrategy::build_blueprint`'s explicit guard, which
+    /// refuses to build a blueprint rather than default this to zero.
+    ///
+    /// Construction-time identity field — included in BOTH
+    /// `compute_hash()`'s input set AND `compute_idempotency_key()`'s:
+    /// this is genuinely new economic information (WHICH asset is being
+    /// borrowed) that no other idempotency-key field captures, unlike
+    /// `flashloan_provider_type`/`provider_contract` above. Two
+    /// blueprints borrowing different tokens against the same
+    /// provider/nonce/profit figures are different trades and must not
+    /// collide on the same idempotency key.
+    pub flashloan_token: Address,
 
     /// Fully-encoded call to the strategy contract.  Includes flashloan
     /// callback data, swap routing, and profit extraction.
@@ -602,13 +699,14 @@ impl ExecutionBlueprint {
     /// `chain_id`, `strategy_id`, `lane`, `simulator`,
     /// `signal_state_hash`, `state_version`, `signal_id`,
     /// `flashloan_provider`, `flashloan_amount`, `flashloan_available`,
-    /// `calldata`, `strategy_bytecode_hash`, `l2_exec_gas_estimate`,
-    /// `l1_data_gas_estimate`, `extraction_gas`, `expected_profit_net`,
-    /// `dynamic_min_profit`, `l2_buffer_factor`, `l1_data_buffer_factor`,
-    /// `slippage_bps`, `base_fee_at_creation`, `l1_data_fee_at_creation`,
-    /// `priority_fee_gwei`, `max_base_fee_gwei`, `price_impact_bps`,
-    /// `ofa_compliant`, `expiry_block`, `nonce`, `confirmation_depth`,
-    /// `client_order_id`.
+    /// `flashloan_provider_type`, `provider_contract`,
+    /// `flashloan_token`, `calldata`, `strategy_bytecode_hash`,
+    /// `l2_exec_gas_estimate`, `l1_data_gas_estimate`, `extraction_gas`,
+    /// `expected_profit_net`, `dynamic_min_profit`, `l2_buffer_factor`,
+    /// `l1_data_buffer_factor`, `slippage_bps`, `base_fee_at_creation`,
+    /// `l1_data_fee_at_creation`, `priority_fee_gwei`,
+    /// `max_base_fee_gwei`, `price_impact_bps`, `ofa_compliant`,
+    /// `expiry_block`, `nonce`, `confirmation_depth`, `client_order_id`.
     ///
     /// ## Encoding
     ///
@@ -636,7 +734,7 @@ impl ExecutionBlueprint {
     /// see that code to confirm which direction the alignment needs to
     /// go.
     pub fn compute_hash(&self) -> B256 {
-        let mut buf = Vec::with_capacity(640);
+        let mut buf = Vec::with_capacity(704);
         buf.extend_from_slice(&self.chain_id.to_be_bytes());
         buf.extend_from_slice(self.strategy_id.to_string().as_bytes());
         buf.push(match self.lane {
@@ -653,6 +751,13 @@ impl ExecutionBlueprint {
         buf.extend_from_slice(self.flashloan_provider.as_slice());
         buf.extend_from_slice(&self.flashloan_amount.to_be_bytes::<32>());
         buf.extend_from_slice(&self.flashloan_available.to_be_bytes::<32>());
+        // FlashloanProviderType's discriminant IS the Solidity ABI
+        // ordinal (repr(u8), load-bearing per that type's own doc
+        // comment) — `as u8` here is not an arbitrary cast, it's the
+        // same value that gets ABI-encoded on-chain.
+        buf.push(self.flashloan_provider_type as u8);
+        buf.extend_from_slice(self.provider_contract.as_slice());
+        buf.extend_from_slice(self.flashloan_token.as_slice());
         buf.extend_from_slice(&self.calldata);
         buf.extend_from_slice(self.strategy_bytecode_hash.as_slice());
         buf.extend_from_slice(&self.l2_exec_gas_estimate.to_be_bytes());
@@ -725,7 +830,8 @@ impl ExecutionBlueprint {
     /// Deterministically recomputes what `idempotency_key` should be
     /// from this blueprint's economic-identity fields: `strategy_id`,
     /// `chain_id`, `nonce`, `strategy_bytecode_hash`,
-    /// `flashloan_provider`, `flashloan_amount`, `expected_profit_net`.
+    /// `flashloan_provider`, `flashloan_token`, `flashloan_amount`,
+    /// `expected_profit_net`.
     ///
     /// Deliberately does NOT use a `target_contract_address` field —
     /// this struct has no such field; `strategy_bytecode_hash` already
@@ -739,6 +845,13 @@ impl ExecutionBlueprint {
     /// two different idempotency keys, defeating the entire point of
     /// this key. This was a real bug in an earlier revision; see
     /// finding 6 in this file's module doc comment.
+    ///
+    /// Deliberately does NOT use `flashloan_provider_type` or
+    /// `provider_contract` — both are fully redundant with
+    /// `flashloan_provider` for dedup purposes (see each field's own
+    /// doc comment on `ExecutionBlueprint`). `flashloan_token` IS
+    /// included: it's genuinely new economic information (which asset
+    /// is being borrowed) that nothing else here captures.
     ///
     /// `strategy_id` IS included (it was not, previously): `nonce` is
     /// only unique per `(strategy_id, chain_id)` (see `nonce_key`), so
@@ -761,7 +874,7 @@ impl ExecutionBlueprint {
     /// trade re-derived with a different fee ceiling is still the same
     /// submission for dedup purposes.
     pub fn compute_idempotency_key(&self) -> B256 {
-        let mut buf = Vec::with_capacity(128);
+        let mut buf = Vec::with_capacity(160);
         buf.extend_from_slice(&self.chain_id.to_be_bytes());
         // Length-prefixed even though StrategyId's Display output is
         // short and fixed-set today — cheap insurance against a future
@@ -772,6 +885,7 @@ impl ExecutionBlueprint {
         buf.extend_from_slice(&self.nonce.to_be_bytes());
         buf.extend_from_slice(self.strategy_bytecode_hash.as_slice());
         buf.extend_from_slice(self.flashloan_provider.as_slice());
+        buf.extend_from_slice(self.flashloan_token.as_slice());
         buf.extend_from_slice(&self.flashloan_amount.to_be_bytes::<32>());
         buf.extend_from_slice(&self.expected_profit_net.to_be_bytes::<32>());
         keccak256(&buf)
@@ -818,9 +932,12 @@ mod tests {
             signal_state_hash: B256::from([0xABu8; 32]),
             state_version: 7,
             signal_id,
-            flashloan_provider: Address::ZERO,
+            flashloan_provider: Address::from([0x70u8; 20]),
             flashloan_amount: U256::from(1_000_000u64),
             flashloan_available: U256::from(2_000_000u64),
+            flashloan_provider_type: FlashloanProviderType::Balancer,
+            provider_contract: Address::from([0x70u8; 20]),
+            flashloan_token: Address::from([0x77u8; 20]),
             calldata: Bytes::from_static(&[0xde, 0xad, 0xbe, 0xef]),
             strategy_bytecode_hash: B256::from([0xCDu8; 32]),
             l2_exec_gas_estimate: 100_000,
@@ -1071,6 +1188,58 @@ mod tests {
         assert!(bp.is_canary());
         bp.strategy_id = StrategyId::Sa;
         assert!(!bp.is_canary());
+    }
+
+    // ── Flashloan provider/token fields (this revision) ──────────────────────
+
+    #[test]
+    fn verify_hash_fails_after_mutating_flashloan_token() {
+        let mut bp = sample_blueprint();
+        assert!(bp.verify_hash());
+        bp.flashloan_token = Address::from([0x99u8; 20]);
+        assert!(
+            !bp.verify_hash(),
+            "flashloan_token is a construction-time field and must be hashed into blueprint_hash"
+        );
+    }
+
+    #[test]
+    fn verify_hash_fails_after_mutating_provider_contract() {
+        let mut bp = sample_blueprint();
+        assert!(bp.verify_hash());
+        bp.provider_contract = Address::from([0x99u8; 20]);
+        assert!(!bp.verify_hash());
+    }
+
+    #[test]
+    fn verify_hash_fails_after_mutating_flashloan_provider_type() {
+        let mut bp = sample_blueprint();
+        assert!(bp.verify_hash());
+        bp.flashloan_provider_type = FlashloanProviderType::AaveV3;
+        assert!(!bp.verify_hash());
+    }
+
+    #[test]
+    fn idempotency_key_changes_with_flashloan_token() {
+        let bp1 = sample_blueprint();
+        let mut bp2 = sample_blueprint();
+        bp2.flashloan_token = Address::from([0x88u8; 20]);
+        assert_ne!(
+            bp1.compute_idempotency_key(),
+            bp2.compute_idempotency_key(),
+            "borrowing a different token is a different trade for dedup purposes"
+        );
+    }
+
+    #[test]
+    fn idempotency_key_unaffected_by_provider_contract_or_type_mutation() {
+        // Both are redundant with flashloan_provider for dedup purposes —
+        // see ExecutionBlueprint's field doc comments.
+        let mut bp = sample_blueprint();
+        let key_before = bp.compute_idempotency_key();
+        bp.provider_contract = Address::from([0x99u8; 20]);
+        bp.flashloan_provider_type = FlashloanProviderType::UniswapV3;
+        assert_eq!(bp.compute_idempotency_key(), key_before);
     }
 
     // ── Idempotency key / client order ID ────────────────────────────────────

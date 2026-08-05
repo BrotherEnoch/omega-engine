@@ -3633,6 +3633,7 @@ dependencies = [
  "dashmap 5.5.3",
  "futures",
  "omega-core",
+ "omega-flashloan",
  "omega-gas-war",
  "omega-loss-attribution",
  "rand 0.8.6",
