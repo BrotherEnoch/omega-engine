@@ -27,6 +27,58 @@
 //     chunk boundary (data chunking has no awareness of line or even
 //     UTF-8 character boundaries), with a bounded buffer size so a
 //     misbehaving server can't grow it unboundedly.
+//   - (external audit response) every broadcast send now goes through
+//     `send_or_log`, which logs a warning when there are zero active
+//     receivers instead of silently discarding the event via
+//     `let _ = tx.send(...)`. A trading engine that stops receiving
+//     signals because its consumer crashed or fell behind, while the
+//     producer loop keeps running and looks healthy, is exactly the
+//     kind of silent failure worth surfacing. This does NOT add retry
+//     or buffering — it's an observability fix, not a delivery
+//     guarantee.
+//   - (external audit response) `run_lending_once` and
+//     `run_dex_sync_once` now skip (and warn on) any `Log` the RPC
+//     marked `removed: true` — logs the node itself is telling us were
+//     orphaned by a reorg. Forwarding a removed log as a live signal
+//     could send the LA/MSA engines chasing a liquidation or arb
+//     opportunity that the chain has already un-happened.
+//   - (this revision) removed an unnecessary `as u128` cast in
+//     `run_fee_oracle_once` — `block.header.base_fee_per_gas` is
+//     already `Option<u128>` here, so `.unwrap_or(0) as u128` was
+//     casting u128 to u128. Functionally harmless, but flagged by
+//     clippy's `unnecessary_cast` lint under this workspace's
+//     `-D warnings` clippy invocation.
+//
+// ## Known follow-ups NOT fixed in this pass (flagged, not silently skipped)
+//
+// An external audit of this file also raised these; they're valid, but
+// each needs infrastructure (a shared health/watchdog service, a
+// cross-provider dedup cache, a stateful subscription manager) that
+// doesn't exist in this crate today, so a same-file patch here would be
+// either fake or would invent a design the rest of the system hasn't
+// agreed to:
+//   - Freshness / staleness watchdog: nothing here notices a WS
+//     connection that stays open but stops delivering messages (a dead
+//     TCP session with no FIN). A `last_message_at` timestamp per
+//     stream, checked by an external health monitor, would catch this;
+//     that monitor and its polling contract live outside this crate.
+//   - Subscription identity re-verification after reconnect: chain_id
+//     IS re-verified on every reconnect (`ws_provider`), which catches
+//     the dangerous "silently pointed at the wrong chain" case. Full
+//     subscription-ID continuity checking across a provider-side
+//     reconnect/rebalance is a reasonable further hardening step for a
+//     stateful subscription manager, not a stateless per-call helper
+//     like the ones in this file.
+//   - Cross-provider replay/duplicate-event detection (`already_seen`
+//     by tx_hash/log_index/block+tx+log): a real gap for exactly the
+//     reason raised — a provider replaying already-delivered events on
+//     reconnect could produce duplicate downstream signals. This
+//     belongs in a shared dedup cache keyed the same way across all
+//     signal sources (mempool, logs, MEV-Share), not duplicated
+//     per-stream in this file; `omega_relay::dedup::PositionKey` and
+//     `ExecutionBlueprint::idempotency_key` (omega-core) already
+//     provide dedup at later pipeline stages, but neither operates at
+//     the raw-event layer these streams produce.
 
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -53,13 +105,16 @@ fn now_unix_ms() -> u64 {
 }
 
 const BACKOFF_INITIAL_MS: u64 = 1_000;
-const BACKOFF_MAX_MS:     u64 = 30_000;
+const BACKOFF_MAX_MS: u64 = 30_000;
 
 /// Connects and verifies chain_id in one step — every subscription
 /// function in this file goes through this rather than connecting
 /// directly, so chain-ID verification can't be skipped at one call site
 /// while present at another.
-async fn ws_provider(ws_url: &str, expected_chain_id: u64) -> Result<impl Provider, RpcClientError> {
+async fn ws_provider(
+    ws_url: &str,
+    expected_chain_id: u64,
+) -> Result<impl Provider, RpcClientError> {
     validate_ws_scheme(ws_url)?;
     let provider = ProviderBuilder::new()
         .on_builtin(ws_url)
@@ -69,6 +124,31 @@ async fn ws_provider(ws_url: &str, expected_chain_id: u64) -> Result<impl Provid
     Ok(provider)
 }
 
+/// Sends an event on a broadcast channel, logging (rather than
+/// silently discarding) the case where there are no active receivers.
+///
+/// `broadcast::Sender::send` returns `Err` exactly when there are zero
+/// live `Receiver`s — the previous code everywhere in this file did
+/// `let _ = tx.send(...)`, which drops that signal on the floor. For a
+/// trading engine, "the signal pipeline has no listener" and "the
+/// signal pipeline is healthy but idle" are very different states, and
+/// only this function's caller can currently tell them apart — so it
+/// logs it rather than continuing to look healthy while producing
+/// events nobody consumes.
+///
+/// This is deliberately just a log, not a retry/buffer/backpressure
+/// mechanism: broadcast channels are fire-and-forget by design, and
+/// adding delivery guarantees here would be a bigger design change
+/// than an audit-response patch should make unilaterally.
+fn send_or_log<T>(tx: &broadcast::Sender<T>, event: T, stream: &'static str) {
+    if tx.send(event).is_err() {
+        tracing::warn!(
+            stream,
+            "broadcast send: no active receivers — event dropped"
+        );
+    }
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // PendingTxStream — SA / MSA order flow
 // ─────────────────────────────────────────────────────────────────────────────
@@ -76,19 +156,19 @@ async fn ws_provider(ws_url: &str, expected_chain_id: u64) -> Result<impl Provid
 /// A pending transaction observed in the mempool.
 #[derive(Debug, Clone)]
 pub struct PendingTxEvent {
-    pub tx_hash:             B256,
+    pub tx_hash: B256,
     pub received_at_unix_ms: u64,
-    pub chain_id:            u64,
+    pub chain_id: u64,
 }
 
 /// Subscribe to pending transactions and forward to `tx`. Runs
 /// indefinitely; reconnects on transient error, stops on a fatal one.
 /// Spawn as a Tokio task.
 pub async fn run_pending_tx_stream(
-    ws_url:   String,
+    ws_url: String,
     chain_id: u64,
-    limiter:  Arc<RpcRateLimiter>,
-    tx:       broadcast::Sender<PendingTxEvent>,
+    limiter: Arc<RpcRateLimiter>,
+    tx: broadcast::Sender<PendingTxEvent>,
 ) {
     let mut delay_ms = BACKOFF_INITIAL_MS;
     loop {
@@ -112,9 +192,9 @@ pub async fn run_pending_tx_stream(
 }
 
 async fn run_pending_tx_once(
-    ws_url:   &str,
+    ws_url: &str,
     chain_id: u64,
-    tx:       &broadcast::Sender<PendingTxEvent>,
+    tx: &broadcast::Sender<PendingTxEvent>,
 ) -> Result<(), RpcClientError> {
     let provider = ws_provider(ws_url, chain_id).await?;
 
@@ -127,11 +207,15 @@ async fn run_pending_tx_once(
     tracing::info!(chain_id, "Pending tx subscription active");
 
     while let Some(hash) = stream.next().await {
-        let _ = tx.send(PendingTxEvent {
-            tx_hash:             hash,
-            received_at_unix_ms: now_unix_ms(),
-            chain_id,
-        });
+        send_or_log(
+            tx,
+            PendingTxEvent {
+                tx_hash: hash,
+                received_at_unix_ms: now_unix_ms(),
+                chain_id,
+            },
+            "pending_tx",
+        );
     }
     Ok(())
 }
@@ -143,10 +227,10 @@ async fn run_pending_tx_once(
 /// A parsed lending protocol event.
 #[derive(Debug, Clone)]
 pub struct LendingProtocolEvent {
-    pub log:                 Log,
-    pub protocol:            LendingProtocol,
+    pub log: Log,
+    pub protocol: LendingProtocol,
     pub received_at_unix_ms: u64,
-    pub chain_id:            u64,
+    pub chain_id: u64,
 }
 
 /// Identifies which lending protocol emitted the event.
@@ -163,8 +247,7 @@ mod arbitrum_addrs {
     use alloy::primitives::{address, Address};
 
     /// Real, verified: Aave V3 Pool on Arbitrum.
-    pub const AAVE_V3_POOL: Address =
-        address!("794a61358D6845594F94dc1DB02A252b5b4814aD");
+    pub const AAVE_V3_POOL: Address = address!("794a61358D6845594F94dc1DB02A252b5b4814aD");
 
     /// UNVERIFIED PLACEHOLDERS — not real deployed contracts. Replace
     /// with the verified current addresses for Compound V3's Comet
@@ -173,12 +256,9 @@ mod arbitrum_addrs {
     /// refuses to start while these remain unset (see
     /// `ensure_addresses_configured`) rather than silently subscribing
     /// to the wrong (or nonexistent) contracts.
-    pub const COMPOUND_V3: Address =
-        address!("0000000000000000000000000000000000000001");
-    pub const MORPHO: Address =
-        address!("0000000000000000000000000000000000000002");
-    pub const EULER_V2: Address =
-        address!("eeee15a3a7de0b6a7d1e5c6c4a4b8e5e2e6e6ddd");
+    pub const COMPOUND_V3: Address = address!("0000000000000000000000000000000000000001");
+    pub const MORPHO: Address = address!("0000000000000000000000000000000000000002");
+    pub const EULER_V2: Address = address!("eeee15a3a7de0b6a7d1e5c6c4a4b8e5e2e6e6ddd");
 
     pub const PLACEHOLDER_ADDRESSES: [Address; 3] = [COMPOUND_V3, MORPHO, EULER_V2];
 }
@@ -209,14 +289,15 @@ fn ensure_lending_addresses_configured() -> anyhow::Result<()> {
 /// module doc comment) if `chain_id != 42161` or if placeholder
 /// addresses are still configured.
 pub async fn run_lending_protocol_stream(
-    ws_url:   String,
+    ws_url: String,
     chain_id: u64,
-    limiter:  Arc<RpcRateLimiter>,
-    tx:       broadcast::Sender<LendingProtocolEvent>,
+    limiter: Arc<RpcRateLimiter>,
+    tx: broadcast::Sender<LendingProtocolEvent>,
 ) {
     if chain_id != LENDING_STREAM_CHAIN_ID {
         tracing::error!(
-            chain_id, expected = LENDING_STREAM_CHAIN_ID,
+            chain_id,
+            expected = LENDING_STREAM_CHAIN_ID,
             "run_lending_protocol_stream refuses to start: hardcoded addresses are \
              Arbitrum-specific"
         );
@@ -249,9 +330,9 @@ pub async fn run_lending_protocol_stream(
 }
 
 async fn run_lending_once(
-    ws_url:   &str,
+    ws_url: &str,
     chain_id: u64,
-    tx:       &broadcast::Sender<LendingProtocolEvent>,
+    tx: &broadcast::Sender<LendingProtocolEvent>,
 ) -> Result<(), RpcClientError> {
     let provider = ws_provider(ws_url, chain_id).await?;
 
@@ -271,22 +352,40 @@ async fn run_lending_once(
     tracing::info!(chain_id, "Lending protocol subscription active");
 
     while let Some(log) = stream.next().await {
+        // A reorg can orphan a log the node already delivered; the RPC
+        // marks it `removed: true` rather than silently un-sending it.
+        // Forwarding it anyway would let the LA engine chase a
+        // liquidation opportunity the chain no longer has.
+        if log.removed {
+            tracing::warn!(
+                chain_id,
+                block_number = ?log.block_number,
+                tx_hash = ?log.transaction_hash,
+                "Lending protocol log removed by reorg — not forwarding"
+            );
+            continue;
+        }
+
         let protocol = match log.address() {
             a if a == arbitrum_addrs::AAVE_V3_POOL => LendingProtocol::AaveV3,
-            a if a == arbitrum_addrs::COMPOUND_V3  => LendingProtocol::CompoundV3,
-            a if a == arbitrum_addrs::MORPHO       => LendingProtocol::Morpho,
-            a if a == arbitrum_addrs::EULER_V2     => LendingProtocol::EulerV2,
+            a if a == arbitrum_addrs::COMPOUND_V3 => LendingProtocol::CompoundV3,
+            a if a == arbitrum_addrs::MORPHO => LendingProtocol::Morpho,
+            a if a == arbitrum_addrs::EULER_V2 => LendingProtocol::EulerV2,
             other => {
                 tracing::warn!(addr = %other, "Unknown lending contract in log");
                 continue;
             }
         };
-        let _ = tx.send(LendingProtocolEvent {
-            log,
-            protocol,
-            received_at_unix_ms: now_unix_ms(),
-            chain_id,
-        });
+        send_or_log(
+            tx,
+            LendingProtocolEvent {
+                log,
+                protocol,
+                received_at_unix_ms: now_unix_ms(),
+                chain_id,
+            },
+            "lending_protocol",
+        );
     }
     Ok(())
 }
@@ -298,23 +397,22 @@ async fn run_lending_once(
 /// A DEX pool reserve update event.
 #[derive(Debug, Clone)]
 pub struct DexSyncEvent {
-    pub log:                 Log,
-    pub pool:                Address,
+    pub log: Log,
+    pub pool: Address,
     pub received_at_unix_ms: u64,
-    pub chain_id:            u64,
+    pub chain_id: u64,
 }
 
 /// keccak256("Sync(uint112,uint112)") — UniswapV2 Sync event topic.
-const SYNC_TOPIC: B256 = alloy::primitives::b256!(
-    "1c411e9a96e071241c2f21f7726b17ae89e3cab4c78be50e062b03a9fffbbad1"
-);
+const SYNC_TOPIC: B256 =
+    alloy::primitives::b256!("1c411e9a96e071241c2f21f7726b17ae89e3cab4c78be50e062b03a9fffbbad1");
 
 /// Subscribe to DEX pool Sync events.
 pub async fn run_dex_sync_stream(
-    ws_url:   String,
+    ws_url: String,
     chain_id: u64,
-    limiter:  Arc<RpcRateLimiter>,
-    tx:       broadcast::Sender<DexSyncEvent>,
+    limiter: Arc<RpcRateLimiter>,
+    tx: broadcast::Sender<DexSyncEvent>,
 ) {
     let mut delay_ms = BACKOFF_INITIAL_MS;
     loop {
@@ -338,12 +436,12 @@ pub async fn run_dex_sync_stream(
 }
 
 async fn run_dex_sync_once(
-    ws_url:   &str,
+    ws_url: &str,
     chain_id: u64,
-    tx:       &broadcast::Sender<DexSyncEvent>,
+    tx: &broadcast::Sender<DexSyncEvent>,
 ) -> Result<(), RpcClientError> {
     let provider = ws_provider(ws_url, chain_id).await?;
-    let filter   = Filter::new().event_signature(SYNC_TOPIC);
+    let filter = Filter::new().event_signature(SYNC_TOPIC);
 
     let mut stream = provider
         .subscribe_logs(&filter)
@@ -354,12 +452,28 @@ async fn run_dex_sync_once(
     tracing::info!(chain_id, "DEX sync subscription active");
 
     while let Some(log) = stream.next().await {
-        let _ = tx.send(DexSyncEvent {
-            pool:                log.address(),
-            log,
-            received_at_unix_ms: now_unix_ms(),
-            chain_id,
-        });
+        // Same reorg-safety reasoning as run_lending_once: don't forward
+        // a Sync event the node has already told us was orphaned.
+        if log.removed {
+            tracing::warn!(
+                chain_id,
+                block_number = ?log.block_number,
+                pool = %log.address(),
+                "DEX sync log removed by reorg — not forwarding"
+            );
+            continue;
+        }
+
+        send_or_log(
+            tx,
+            DexSyncEvent {
+                pool: log.address(),
+                log,
+                received_at_unix_ms: now_unix_ms(),
+                chain_id,
+            },
+            "dex_sync",
+        );
     }
     Ok(())
 }
@@ -371,18 +485,18 @@ async fn run_dex_sync_once(
 /// A fee oracle update from a new block header.
 #[derive(Debug, Clone)]
 pub struct FeeOracleEvent {
-    pub base_fee_gwei:       u64,
-    pub block_number:        u64,
+    pub base_fee_gwei: u64,
+    pub block_number: u64,
     pub received_at_unix_ms: u64,
-    pub chain_id:            u64,
+    pub chain_id: u64,
 }
 
 /// Subscribe to new block headers and emit fee oracle events.
 pub async fn run_fee_oracle_stream(
-    ws_url:   String,
+    ws_url: String,
     chain_id: u64,
-    limiter:  Arc<RpcRateLimiter>,
-    tx:       broadcast::Sender<FeeOracleEvent>,
+    limiter: Arc<RpcRateLimiter>,
+    tx: broadcast::Sender<FeeOracleEvent>,
 ) {
     let mut delay_ms = BACKOFF_INITIAL_MS;
     loop {
@@ -406,9 +520,9 @@ pub async fn run_fee_oracle_stream(
 }
 
 async fn run_fee_oracle_once(
-    ws_url:   &str,
+    ws_url: &str,
     chain_id: u64,
-    tx:       &broadcast::Sender<FeeOracleEvent>,
+    tx: &broadcast::Sender<FeeOracleEvent>,
 ) -> Result<(), RpcClientError> {
     let provider = ws_provider(ws_url, chain_id).await?;
 
@@ -422,14 +536,19 @@ async fn run_fee_oracle_once(
 
     while let Some(block) = stream.next().await {
         // Saturating, not truncating — see net::wei_to_gwei_saturating.
-        let base_fee_gwei =
-            wei_to_gwei_saturating(block.header.base_fee_per_gas.unwrap_or(0) as u128);
-        let _ = tx.send(FeeOracleEvent {
-            base_fee_gwei,
-            block_number:        block.header.number,
-            received_at_unix_ms: now_unix_ms(),
-            chain_id,
-        });
+        // No `as u128` here: base_fee_per_gas is already Option<u128>
+        // on this Block type, so `.unwrap_or(0)` already yields u128.
+        let base_fee_gwei = wei_to_gwei_saturating(block.header.base_fee_per_gas.unwrap_or(0));
+        send_or_log(
+            tx,
+            FeeOracleEvent {
+                base_fee_gwei,
+                block_number: block.header.number,
+                received_at_unix_ms: now_unix_ms(),
+                chain_id,
+            },
+            "fee_oracle",
+        );
     }
     Ok(())
 }
@@ -441,7 +560,7 @@ async fn run_fee_oracle_once(
 /// A Flashbots MEV-Share bundle event.
 #[derive(Debug, Clone)]
 pub struct MevShareEvent {
-    pub payload:             serde_json::Value,
+    pub payload: serde_json::Value,
     pub received_at_unix_ms: u64,
 }
 
@@ -480,7 +599,7 @@ pub async fn run_mev_share_stream(tx: broadcast::Sender<MevShareEvent>) {
 
 async fn run_mev_share_once(
     client: &reqwest::Client,
-    tx:     &broadcast::Sender<MevShareEvent>,
+    tx: &broadcast::Sender<MevShareEvent>,
 ) -> anyhow::Result<()> {
     tracing::info!("Connecting to MEV-Share SSE stream");
 
@@ -497,4 +616,64 @@ async fn run_mev_share_once(
 
     tracing::info!("MEV-Share SSE stream connected");
 
-    // Byte buffer across
+    // Byte buffer across HTTP chunks — a chunk boundary has no
+    // awareness of line or UTF-8 character boundaries, so a naive
+    // "parse each chunk independently" approach silently drops or
+    // corrupts any SSE event whose bytes straddle two chunks. Instead
+    // we accumulate bytes here and only pull out and process complete
+    // (`\n`-terminated) lines, leaving any trailing partial line in the
+    // buffer for the next chunk.
+    let mut buffer: Vec<u8> = Vec::new();
+
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .map_err(|e| anyhow::anyhow!("MEV-Share SSE read: {e}"))?
+    {
+        buffer.extend_from_slice(&chunk);
+
+        if buffer.len() > MAX_SSE_LINE_BUFFER_BYTES {
+            return Err(anyhow::anyhow!(
+                "MEV-Share SSE line buffer exceeded {} bytes without a newline — \
+                 refusing to grow further",
+                MAX_SSE_LINE_BUFFER_BYTES
+            ));
+        }
+
+        // Process every complete line currently in the buffer; any
+        // trailing partial line (no newline yet) is left behind for
+        // the next chunk. `\n` is single-byte in UTF-8 and never
+        // appears inside a multi-byte sequence, so splitting on it is
+        // always safe even if a chunk boundary landed mid-character
+        // somewhere else in the line.
+        while let Some(newline_pos) = buffer.iter().position(|&b| b == b'\n') {
+            let line_bytes: Vec<u8> = buffer.drain(..=newline_pos).collect();
+            let line = String::from_utf8_lossy(&line_bytes);
+            let line = line.trim_end_matches(['\r', '\n']);
+
+            if let Some(data) = line.strip_prefix("data:") {
+                let data = data.trim();
+                if data.is_empty() || data == "[DONE]" {
+                    continue;
+                }
+                match serde_json::from_str::<serde_json::Value>(data) {
+                    Ok(payload) => {
+                        send_or_log(
+                            tx,
+                            MevShareEvent {
+                                payload,
+                                received_at_unix_ms: now_unix_ms(),
+                            },
+                            "mev_share",
+                        );
+                    }
+                    Err(e) => {
+                        tracing::warn!(error = %e, "MEV-Share SSE: failed to parse event JSON");
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(())
+}

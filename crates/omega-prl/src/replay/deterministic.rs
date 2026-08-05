@@ -22,7 +22,7 @@ use crate::governance::thresholds::ThresholdConfig;
 use crate::ingestion::event_bus::PatternEvent;
 use crate::ingestion::wal::EventWal;
 use crate::patterns::matcher::PatternMatcher;
-use crate::patterns::signatures::{PatternDomain, builtin_signatures};
+use crate::patterns::signatures::{builtin_signatures, PatternDomain};
 use crate::scoring::confidence::ConfidenceScore;
 
 // ─────────────────────────────────────────────────────────────────────────────

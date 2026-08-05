@@ -21,6 +21,23 @@
 //
 //   §4 mandates: max 8 reads per Microtx blueprint.  The gate records
 //   the read budget on admission and the simulator enforces it.
+//
+// ## Audit fix (this revision): test helper missing required fields
+//
+// `tests::make_bp` constructed `ExecutionBlueprint` without `signal_id`,
+// `client_order_id`, or `idempotency_key` — all three are required,
+// non-`Option` fields on the real struct (added in an earlier revision
+// for submission idempotency; see `omega-core::types::blueprint`'s own
+// module doc comment), so this was a plain compile error
+// (`error[E0063]: missing field ...`) unrelated to anything this file's
+// own logic does. `HotPathGate::admit` itself never reads any of the
+// three — admission is purely canary/strategy/lane/gas/profit/capacity —
+// so this is exactly and only a test-construction fix, not a behavior
+// change. `signal_id` is generated the same way every other test
+// blueprint in this workspace generates one (`Uuid::from_bytes`), and
+// `client_order_id`/`idempotency_key` are derived/computed the same way
+// `ExecutionBlueprint`'s own doc comments specify for every other
+// legitimate construction site.
 
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::Arc;
@@ -215,9 +232,13 @@ mod tests {
     use alloy_primitives::{Address, B256, U256};
     use omega_core::types::blueprint::{ExecutionBlueprint, StrategyId};
     use omega_core::types::lane::{Lane, Simulator};
+    use uuid::Uuid;
 
     fn make_bp(strategy: StrategyId, lane: Lane, gas: u64, profit: u128) -> ExecutionBlueprint {
-        ExecutionBlueprint {
+        let signal_id = Uuid::from_bytes([7u8; 16]);
+        let client_order_id =
+            ExecutionBlueprint::derive_client_order_id(strategy, 42161, 0, signal_id);
+        let mut bp = ExecutionBlueprint {
             blueprint_hash: B256::from([1u8; 32]),
             chain_id: 42161,
             strategy_id: strategy,
@@ -225,6 +246,7 @@ mod tests {
             simulator: Simulator::Revm,
             signal_state_hash: B256::ZERO,
             state_version: 1,
+            signal_id,
             flashloan_provider: Address::ZERO,
             flashloan_amount: U256::ZERO,
             flashloan_available: U256::ZERO,
@@ -246,9 +268,20 @@ mod tests {
             expiry_block: 2_000_000,
             nonce: 0,
             confirmation_depth: 12,
+            client_order_id,
+            idempotency_key: B256::ZERO, // placeholder; overwritten below
             relay_targets: vec!["relay_a".into()],
             zk_proof_commitment: None,
-        }
+        };
+        // HotPathGate::admit never calls verify_hash()/verify_idempotency_key(),
+        // so these tests don't strictly need real values here — but computing
+        // them for real (rather than leaving B256::ZERO) costs nothing and
+        // means this helper produces a genuinely well-formed blueprint,
+        // consistent with every other test helper in this workspace that
+        // constructs one.
+        bp.idempotency_key = bp.compute_idempotency_key();
+        bp.blueprint_hash = bp.compute_hash();
+        bp
     }
 
     fn valid_bp() -> ExecutionBlueprint {
@@ -419,4 +452,3 @@ mod tests {
         );
     }
 }
-

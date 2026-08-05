@@ -15,28 +15,28 @@
 //   9. Metrics: register_all() and increment paths smoke-tested.
 //  10. End-to-end: sign → replay check → nonce validate → OFA check → integrity check.
 
+use secp256k1::{Secp256k1, SecretKey};
 use std::sync::Arc;
-use secp256k1::{SecretKey, Secp256k1};
 
 use crate::error::SecurityError;
 use crate::integrity::{IntegrityRegistry, StrategyEntry, StrategyFreezeGuard};
 use crate::key_manager::{KeyManager, KeyRotationState, ROTATION_WINDOW_BLOCKS};
 use crate::metrics;
-use crate::ofa::{
-    default_rule_set, OfaComplianceInput, OfaRuleRegistry, OfaRuleSet, OfaRule,
-};
+use crate::ofa::{default_rule_set, OfaComplianceInput, OfaRule, OfaRuleRegistry, OfaRuleSet};
 use crate::replay::{NonceRegistry, ReplayGuard};
-use crate::signer::{BlueprintSigner, keccak256, secret_key_to_address};
+use crate::signer::{keccak256, secret_key_to_address, BlueprintSigner};
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
-fn sk(byte: u8) -> SecretKey { SecretKey::from_slice(&[byte; 32]).unwrap() }
+fn sk(byte: u8) -> SecretKey {
+    SecretKey::from_slice(&[byte; 32]).unwrap()
+}
 
 fn make_signer(byte: u8) -> (BlueprintSigner, [u8; 20]) {
-    let secp   = Secp256k1::new();
+    let secp = Secp256k1::new();
     let secret = sk(byte);
-    let addr   = secret_key_to_address(&secp, &secret);
-    let km     = Arc::new(KeyManager::from_secret_key(secret));
+    let addr = secret_key_to_address(&secp, &secret);
+    let km = Arc::new(KeyManager::from_secret_key(secret));
     (BlueprintSigner::new(Arc::clone(&km)), addr)
 }
 
@@ -46,10 +46,10 @@ fn blueprint_hash(n: u8) -> [u8; 32] {
 
 fn sa_entry() -> StrategyEntry {
     StrategyEntry {
-        strategy_id:      "SA".into(),
-        bytecode_hash:    [0xab; 32],
+        strategy_id: "SA".into(),
+        bytecode_hash: [0xab; 32],
         contract_address: [0x01; 20],
-        min_phase:        1,
+        min_phase: 1,
     }
 }
 
@@ -58,8 +58,8 @@ fn sa_entry() -> StrategyEntry {
 #[test]
 fn sign_verify_replay_full_pipeline() {
     let (signer, addr) = make_signer(0x10);
-    let guard          = ReplayGuard::new();
-    let hash           = blueprint_hash(1);
+    let guard = ReplayGuard::new();
+    let hash = blueprint_hash(1);
 
     let bundle = signer.sign(&hash).unwrap();
     assert_eq!(bundle.blueprint_hash, hash);
@@ -78,18 +78,18 @@ fn sign_verify_replay_full_pipeline() {
 
 #[test]
 fn dual_key_window_both_keys_valid_then_rotation_completes() {
-    let secp         = Secp256k1::new();
-    let km           = Arc::new(KeyManager::from_secret_key(sk(0x01)));
-    let signer       = BlueprintSigner::new(Arc::clone(&km));
-    let active_addr  = km.active_address();
-    let new_sk       = sk(0x02);
+    let secp = Secp256k1::new();
+    let km = Arc::new(KeyManager::from_secret_key(sk(0x01)));
+    let signer = BlueprintSigner::new(Arc::clone(&km));
+    let active_addr = km.active_address();
+    let new_sk = sk(0x02);
     let pending_addr = secret_key_to_address(&secp, &new_sk);
 
     let state = km.initiate_rotation(new_sk, 1000).unwrap();
     assert!(matches!(state, KeyRotationState::Rotating { .. }));
 
     let window_block = 1000 + ROTATION_WINDOW_BLOCKS / 2;
-    assert!(km.accepts_address(&active_addr,  window_block));
+    assert!(km.accepts_address(&active_addr, window_block));
     assert!(km.accepts_address(&pending_addr, window_block));
 
     let after_window = 1000 + ROTATION_WINDOW_BLOCKS + 1;
@@ -99,14 +99,14 @@ fn dual_key_window_both_keys_valid_then_rotation_completes() {
     assert_eq!(km.active_address(), pending_addr);
     assert!(!km.rotation_state().is_rotating());
 
-    let hash   = blueprint_hash(2);
+    let hash = blueprint_hash(2);
     let bundle = signer.sign(&hash).unwrap();
     assert!(signer.verify(&bundle, &pending_addr).is_ok());
 }
 
 #[test]
 fn cancel_rotation_restores_single_key_state() {
-    let km            = Arc::new(KeyManager::from_secret_key(sk(0x05)));
+    let km = Arc::new(KeyManager::from_secret_key(sk(0x05)));
     let original_addr = km.active_address();
     km.initiate_rotation(sk(0x06), 500).unwrap();
     assert!(km.rotation_state().is_rotating());
@@ -139,7 +139,7 @@ fn nonces_scoped_per_chain_and_strategy() {
     let reg = NonceRegistry::new();
     reg.advance("SA", 42161).unwrap();
     assert_eq!(reg.next_nonce("SA", 42161), 1);
-    assert_eq!(reg.next_nonce("SA", 1),     0);
+    assert_eq!(reg.next_nonce("SA", 1), 0);
     assert_eq!(reg.next_nonce("LA", 42161), 0);
 }
 
@@ -159,11 +159,24 @@ fn on_chain_sync_overrides_local_nonce() {
 fn all_four_ofa_rules_enforced() {
     let reg = OfaRuleRegistry::with_default_rules();
 
-    #[allow(clippy::type_complexity)]    let test_cases: Vec<(Box<dyn Fn(&mut OfaComplianceInput)>, &str)> = vec![
-        (Box::new(|i: &mut OfaComplianceInput| i.has_consent_sig    = false),        "missing_consent"),
-        (Box::new(|i: &mut OfaComplianceInput| i.excess_slippage_bps = 51),          "slippage"),
-        (Box::new(|i: &mut OfaComplianceInput| i.user_tx_is_first   = false),        "order"),
-        (Box::new(|i: &mut OfaComplianceInput| i.target_relay        = "public".into()), "relay"),
+    #[allow(clippy::type_complexity)]
+    let test_cases: Vec<(Box<dyn Fn(&mut OfaComplianceInput)>, &str)> = vec![
+        (
+            Box::new(|i: &mut OfaComplianceInput| i.has_consent_sig = false),
+            "missing_consent",
+        ),
+        (
+            Box::new(|i: &mut OfaComplianceInput| i.excess_slippage_bps = 51),
+            "slippage",
+        ),
+        (
+            Box::new(|i: &mut OfaComplianceInput| i.user_tx_is_first = false),
+            "order",
+        ),
+        (
+            Box::new(|i: &mut OfaComplianceInput| i.target_relay = "public".into()),
+            "relay",
+        ),
     ];
 
     for (mutate, desc) in test_cases {
@@ -171,14 +184,15 @@ fn all_four_ofa_rules_enforced() {
         mutate(&mut input);
         assert!(
             !reg.check(&input).is_compliant(),
-            "rule '{}' should fail", desc
+            "rule '{}' should fail",
+            desc
         );
     }
 }
 
 #[test]
 fn ofa_hot_swap_takes_immediate_effect() {
-    let reg   = OfaRuleRegistry::new();
+    let reg = OfaRuleRegistry::new();
     let input = OfaComplianceInput::compliant("0xabc", "MEV");
 
     assert!(reg.check(&input).is_compliant());
@@ -187,13 +201,13 @@ fn ofa_hot_swap_takes_immediate_effect() {
     assert!(reg.check(&input).is_compliant());
 
     reg.load_rules(OfaRuleSet {
-        version:        2,
+        version: 2,
         effective_date: "2027-01-01".into(),
-        rules:          vec![OfaRule::EnforceUserSlippage { max_excess_bps: 0 }],
+        rules: vec![OfaRule::EnforceUserSlippage { max_excess_bps: 0 }],
     });
     assert_eq!(reg.current_version(), Some(2));
 
-    let mut tight_input          = input.clone();
+    let mut tight_input = input.clone();
     tight_input.excess_slippage_bps = 1;
     assert!(!reg.check(&tight_input).is_compliant());
 }
@@ -221,25 +235,28 @@ fn frozen_strategy_rejects_all_blueprints() {
 
 #[test]
 fn freeze_guard_hot_reads_registry_state() {
-    let reg   = IntegrityRegistry::new();
+    let reg = IntegrityRegistry::new();
     reg.register(sa_entry());
     let guard = StrategyFreezeGuard::new(Arc::clone(&reg));
 
     assert!(!guard.is_frozen("SA"));
     reg.freeze("SA");
     assert!(guard.is_frozen("SA"));
-    assert!(matches!(guard.check("SA"), Err(SecurityError::StrategyFrozen { .. })));
+    assert!(matches!(
+        guard.check("SA"),
+        Err(SecurityError::StrategyFrozen { .. })
+    ));
 }
 
 // ─── 6. Signer tracks key rotation ───────────────────────────────────────────
 
 #[test]
 fn signer_uses_new_key_after_rotation_completes() {
-    let secp     = Secp256k1::new();
-    let km       = Arc::new(KeyManager::from_secret_key(sk(0x07)));
-    let signer   = BlueprintSigner::new(Arc::clone(&km));
+    let secp = Secp256k1::new();
+    let km = Arc::new(KeyManager::from_secret_key(sk(0x07)));
+    let signer = BlueprintSigner::new(Arc::clone(&km));
     let old_addr = km.active_address();
-    let new_sk   = sk(0x08);
+    let new_sk = sk(0x08);
     let new_addr = secret_key_to_address(&secp, &new_sk);
 
     km.initiate_rotation(new_sk, 200).unwrap();
@@ -259,21 +276,29 @@ fn concurrent_replay_guard_exactly_one_thread_wins() {
     use std::thread;
 
     let guard = Arc::new(ReplayGuard::new());
-    let wins  = Arc::new(Mutex::new(0u32));
-    let hash  = blueprint_hash(9);
+    let wins = Arc::new(Mutex::new(0u32));
+    let hash = blueprint_hash(9);
 
-    let handles: Vec<_> = (0..32).map(|_| {
-        let g = Arc::clone(&guard);
-        let w = Arc::clone(&wins);
-        thread::spawn(move || {
-            if g.check_and_mark(&hash, 42161).is_ok() {
-                *w.lock().unwrap() += 1;
-            }
+    let handles: Vec<_> = (0..32)
+        .map(|_| {
+            let g = Arc::clone(&guard);
+            let w = Arc::clone(&wins);
+            thread::spawn(move || {
+                if g.check_and_mark(&hash, 42161).is_ok() {
+                    *w.lock().unwrap() += 1;
+                }
+            })
         })
-    }).collect();
+        .collect();
 
-    for h in handles { h.join().unwrap(); }
-    assert_eq!(*wins.lock().unwrap(), 1, "exactly one thread must win the replay race");
+    for h in handles {
+        h.join().unwrap();
+    }
+    assert_eq!(
+        *wins.lock().unwrap(),
+        1,
+        "exactly one thread must win the replay race"
+    );
 }
 
 // ─── 8. SecurityError categorisation ─────────────────────────────────────────
@@ -281,19 +306,34 @@ fn concurrent_replay_guard_exactly_one_thread_wins() {
 #[test]
 fn halt_worthy_errors_are_correctly_identified() {
     let halt_worthy = [
-        SecurityError::ReplayDetected  { hash: "0x".into(), chain_id: 1 },
-        SecurityError::BytecodeMismatch { strategy_id: "SA".into() },
-        SecurityError::ChainIdMismatch  { bp_chain: 1, expected_chain: 42161 },
+        SecurityError::ReplayDetected {
+            hash: "0x".into(),
+            chain_id: 1,
+        },
+        SecurityError::BytecodeMismatch {
+            strategy_id: "SA".into(),
+        },
+        SecurityError::ChainIdMismatch {
+            bp_chain: 1,
+            expected_chain: 42161,
+        },
     ];
     for e in &halt_worthy {
         assert!(e.is_halt_worthy(), "{} should be halt-worthy", e);
     }
 
     let non_halt = [
-        SecurityError::MissingConsentSig { blueprint_hash: "0x".into() },
-        SecurityError::SlippageExceeded  { excess_bps: 51, max_bps: 50 },
+        SecurityError::MissingConsentSig {
+            blueprint_hash: "0x".into(),
+        },
+        SecurityError::SlippageExceeded {
+            excess_bps: 51,
+            max_bps: 50,
+        },
         SecurityError::BundleOrderViolation,
-        SecurityError::NonPrivateRelay   { relay: "public".into() },
+        SecurityError::NonPrivateRelay {
+            relay: "public".into(),
+        },
     ];
     for e in &non_halt {
         assert!(!e.is_halt_worthy(), "{} should NOT be halt-worthy", e);
@@ -303,18 +343,28 @@ fn halt_worthy_errors_are_correctly_identified() {
 #[test]
 fn ofa_errors_are_correctly_categorised() {
     let ofa_errors = [
-        SecurityError::MissingConsentSig { blueprint_hash: "0x".into() },
-        SecurityError::SlippageExceeded  { excess_bps: 51, max_bps: 50 },
+        SecurityError::MissingConsentSig {
+            blueprint_hash: "0x".into(),
+        },
+        SecurityError::SlippageExceeded {
+            excess_bps: 51,
+            max_bps: 50,
+        },
         SecurityError::BundleOrderViolation,
-        SecurityError::NonPrivateRelay   { relay: "x".into() },
+        SecurityError::NonPrivateRelay { relay: "x".into() },
     ];
     for e in &ofa_errors {
         assert!(e.is_ofa_violation(), "{} should be OFA violation", e);
     }
 
     let non_ofa = [
-        SecurityError::ReplayDetected  { hash: "0x".into(), chain_id: 1 },
-        SecurityError::BytecodeMismatch { strategy_id: "SA".into() },
+        SecurityError::ReplayDetected {
+            hash: "0x".into(),
+            chain_id: 1,
+        },
+        SecurityError::BytecodeMismatch {
+            strategy_id: "SA".into(),
+        },
         SecurityError::NoActiveKey,
     ];
     for e in &non_ofa {
@@ -332,11 +382,11 @@ fn metrics_register_and_increment_without_panic() {
     let _ = signer.sign(&blueprint_hash(20));
 
     let guard = ReplayGuard::new();
-    let _     = guard.check_and_mark(&blueprint_hash(21), 42161);
-    let _     = guard.check_and_mark(&blueprint_hash(21), 42161);
+    let _ = guard.check_and_mark(&blueprint_hash(21), 42161);
+    let _ = guard.check_and_mark(&blueprint_hash(21), 42161);
 
     let km = Arc::new(KeyManager::from_secret_key(sk(0x21)));
-    let _  = km.initiate_rotation(sk(0x22), 0);
+    let _ = km.initiate_rotation(sk(0x22), 0);
 
     let reg = IntegrityRegistry::new();
     reg.register(sa_entry());
@@ -346,7 +396,7 @@ fn metrics_register_and_increment_without_panic() {
 
     let ofa = OfaRuleRegistry::with_default_rules();
     let bad = {
-        let mut i       = OfaComplianceInput::compliant("0x", "MEV");
+        let mut i = OfaComplianceInput::compliant("0x", "MEV");
         i.has_consent_sig = false;
         i
     };
@@ -360,7 +410,7 @@ fn end_to_end_security_pipeline_passes() {
     metrics::register_all();
 
     let chain_id = 42161u64;
-    let hash     = blueprint_hash(42);
+    let hash = blueprint_hash(42);
 
     let (signer, addr) = make_signer(0x42);
     let bundle = signer.sign(&hash).unwrap();
@@ -373,23 +423,23 @@ fn end_to_end_security_pipeline_passes() {
     nonces.validate("LA", chain_id, 0).unwrap();
     nonces.advance("LA", chain_id).unwrap();
 
-    let ofa   = OfaRuleRegistry::with_default_rules();
+    let ofa = OfaRuleRegistry::with_default_rules();
     let input = OfaComplianceInput::compliant(&hex::encode(hash), "MEV");
     assert!(ofa.check(&input).is_compliant());
 
     let integrity = IntegrityRegistry::new();
     integrity.register(StrategyEntry {
-        strategy_id:      "LA".into(),
-        bytecode_hash:    [0x42; 32],
+        strategy_id: "LA".into(),
+        bytecode_hash: [0x42; 32],
         contract_address: [0x03; 20],
-        min_phase:        3,
+        min_phase: 3,
     });
     integrity.full_integrity_check("LA", &[0x42; 32]).unwrap();
 }
 
 #[test]
 fn end_to_end_replay_on_second_submission_is_blocked() {
-    let hash   = blueprint_hash(43);
+    let hash = blueprint_hash(43);
     let replay = ReplayGuard::new();
 
     replay.check_and_mark(&hash, 42161).unwrap();
@@ -404,10 +454,10 @@ fn end_to_end_replay_on_second_submission_is_blocked() {
 fn end_to_end_bytecode_tampering_is_detected() {
     let reg = IntegrityRegistry::new();
     reg.register(StrategyEntry {
-        strategy_id:      "MEV".into(),
-        bytecode_hash:    [0x77; 32],
+        strategy_id: "MEV".into(),
+        bytecode_hash: [0x77; 32],
         contract_address: [0x04; 20],
-        min_phase:        4,
+        min_phase: 4,
     });
 
     assert!(matches!(

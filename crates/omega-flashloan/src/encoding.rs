@@ -38,7 +38,7 @@
 //   the same thing and has worked since Rust 1.0 — no reason to require a
 //   newer toolchain than the rest of this crate needs.
 
-use alloy_primitives::{Address, Bytes, U256, keccak256};
+use alloy_primitives::{keccak256, Address, Bytes, U256};
 
 use crate::FlashloanProvider;
 
@@ -82,9 +82,14 @@ pub fn encode_flashloan_call(
     match provider {
         FlashloanProvider::AaveV3 => encode_aave_v3(receiver, asset, amount_wei, callback_data),
         FlashloanProvider::Balancer => encode_balancer(receiver, asset, amount_wei, callback_data),
-        FlashloanProvider::UniswapV3 => {
-            encode_uniswap_v3(contract_addr, receiver, asset, amount_wei, asset_is_token0, callback_data)
-        }
+        FlashloanProvider::UniswapV3 => encode_uniswap_v3(
+            contract_addr,
+            receiver,
+            asset,
+            amount_wei,
+            asset_is_token0,
+            callback_data,
+        ),
     }
 }
 
@@ -168,7 +173,7 @@ fn encode_uniswap_v3(
     _pool: Address, // pool's own address — not encoded, used for routing upstream
     recipient: Address,
     _asset: Address, // kept for API symmetry / documentation; the actual routing
-                     // decision is `asset_is_token0`, supplied explicitly below
+    // decision is `asset_is_token0`, supplied explicitly below
     amount_wei: U256,
     asset_is_token0: bool,
     data: &[u8],

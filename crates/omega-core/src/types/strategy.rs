@@ -313,13 +313,25 @@ mod tests {
 
     #[test]
     fn should_proceed_requires_positive_score_and_profit() {
-        let score = OpScore { score: 0.5, expected_profit: U256::from(1u64), competition_prob: 0.2 };
+        let score = OpScore {
+            score: 0.5,
+            expected_profit: U256::from(1u64),
+            competition_prob: 0.2,
+        };
         assert!(score.should_proceed());
 
-        let zero_score = OpScore { score: 0.0, expected_profit: U256::from(1u64), competition_prob: 0.2 };
+        let zero_score = OpScore {
+            score: 0.0,
+            expected_profit: U256::from(1u64),
+            competition_prob: 0.2,
+        };
         assert!(!zero_score.should_proceed());
 
-        let zero_profit = OpScore { score: 0.5, expected_profit: U256::ZERO, competition_prob: 0.2 };
+        let zero_profit = OpScore {
+            score: 0.5,
+            expected_profit: U256::ZERO,
+            competition_prob: 0.2,
+        };
         assert!(!zero_profit.should_proceed());
     }
 
@@ -340,28 +352,55 @@ mod tests {
 
     #[test]
     fn is_well_formed_rejects_nan_and_infinite() {
-        let nan_score = OpScore { score: f64::NAN, expected_profit: U256::from(1u64), competition_prob: 0.2 };
+        let nan_score = OpScore {
+            score: f64::NAN,
+            expected_profit: U256::from(1u64),
+            competition_prob: 0.2,
+        };
         assert!(!nan_score.is_well_formed());
 
-        let inf_score = OpScore { score: f64::INFINITY, expected_profit: U256::from(1u64), competition_prob: 0.2 };
-        assert!(!inf_score.is_well_formed(), "should_proceed() would wrongly accept this; is_well_formed() must reject it");
+        let inf_score = OpScore {
+            score: f64::INFINITY,
+            expected_profit: U256::from(1u64),
+            competition_prob: 0.2,
+        };
+        assert!(
+            !inf_score.is_well_formed(),
+            "should_proceed() would wrongly accept this; is_well_formed() must reject it"
+        );
 
-        let inf_competition = OpScore { score: 0.5, expected_profit: U256::from(1u64), competition_prob: f64::INFINITY };
+        let inf_competition = OpScore {
+            score: 0.5,
+            expected_profit: U256::from(1u64),
+            competition_prob: f64::INFINITY,
+        };
         assert!(!inf_competition.is_well_formed());
     }
 
     #[test]
     fn is_well_formed_rejects_out_of_range() {
-        let over = OpScore { score: 1.5, expected_profit: U256::from(1u64), competition_prob: 0.2 };
+        let over = OpScore {
+            score: 1.5,
+            expected_profit: U256::from(1u64),
+            competition_prob: 0.2,
+        };
         assert!(!over.is_well_formed());
 
-        let negative = OpScore { score: -0.1, expected_profit: U256::from(1u64), competition_prob: 0.2 };
+        let negative = OpScore {
+            score: -0.1,
+            expected_profit: U256::from(1u64),
+            competition_prob: 0.2,
+        };
         assert!(!negative.is_well_formed());
     }
 
     #[test]
     fn is_well_formed_accepts_valid_score() {
-        let ok = OpScore { score: 0.75, expected_profit: U256::from(1u64), competition_prob: 0.3 };
+        let ok = OpScore {
+            score: 0.75,
+            expected_profit: U256::from(1u64),
+            competition_prob: 0.3,
+        };
         assert!(ok.is_well_formed());
     }
 
@@ -388,6 +427,9 @@ mod tests {
             simulator: "revm".to_string(),
             success: true,
         };
-        assert_eq!(result.profit_net_if_successful(), Some(U256::from(1_000_000u64)));
+        assert_eq!(
+            result.profit_net_if_successful(),
+            Some(U256::from(1_000_000u64))
+        );
     }
 }

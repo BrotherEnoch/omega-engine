@@ -63,13 +63,13 @@ use tokio::sync::mpsc;
 /// breaking-but-correct fixes elsewhere in this codebase: the alternative
 /// (silently eating the channel) is strictly worse.
 pub struct MultiRelayClient {
-    submitter:         CascadeSubmitter,
-    dedup:             Arc<SequencerRestartHandler>,
-    reorg_guard:       Arc<LaReorgGuard>,
-    blacklist:         Arc<BuilderBlacklist>,
-    metrics:           Arc<LaRelayMetrics>,
-    relay_clients:     Arc<HashMap<String, Arc<dyn RelayClient>>>,
-    rate_limiters:     Arc<RelayRateLimiters>,
+    submitter: CascadeSubmitter,
+    dedup: Arc<SequencerRestartHandler>,
+    reorg_guard: Arc<LaReorgGuard>,
+    blacklist: Arc<BuilderBlacklist>,
+    metrics: Arc<LaRelayMetrics>,
+    relay_clients: Arc<HashMap<String, Arc<dyn RelayClient>>>,
+    rate_limiters: Arc<RelayRateLimiters>,
     inclusion_tracker: Arc<InclusionTracker>,
 }
 
@@ -84,9 +84,9 @@ impl MultiRelayClient {
     /// choice is now theirs to make, not made silently for them.
     pub fn new(
         relay_clients: HashMap<String, Arc<dyn RelayClient>>,
-        metrics:       Arc<LaRelayMetrics>,
-        blacklist:     Arc<BuilderBlacklist>,
-        cfg:           &RelayConfig,
+        metrics: Arc<LaRelayMetrics>,
+        blacklist: Arc<BuilderBlacklist>,
+        cfg: &RelayConfig,
         startup_block: u64,
     ) -> (Arc<Self>, mpsc::UnboundedReceiver<LaReorgRiskEvent>) {
         let relay_clients = Arc::new(relay_clients);
@@ -231,10 +231,10 @@ mod integration_tests {
     /// revision. Tests are an intentional exception: nothing here sends a
     /// reorg event, so there's nothing to lose by not consuming it.
     fn make_multi_relay(startup_block: u64) -> Arc<MultiRelayClient> {
-        let f        = make_blacklist_file();
+        let f = make_blacklist_file();
         let blacklist = BuilderBlacklist::load(f.path()).unwrap();
 
-        let addr    = ExecutionAddress("0xINTEGRATION".into());
+        let addr = ExecutionAddress("0xINTEGRATION".into());
         let metrics = LaRelayMetrics::new(100, addr.clone());
 
         for i in 0..20 {
@@ -254,7 +254,8 @@ mod integration_tests {
         };
 
         let _ = f;
-        let (mr, _event_rx) = MultiRelayClient::new(clients, metrics, blacklist, &cfg, startup_block);
+        let (mr, _event_rx) =
+            MultiRelayClient::new(clients, metrics, blacklist, &cfg, startup_block);
         mr
     }
 
@@ -262,8 +263,14 @@ mod integration_tests {
     async fn cascade_submit_returns_results_for_all_bundles() {
         let mr = make_multi_relay(100);
         let bundles = vec![
-            BundlePayload { bundle_hash: "0x001".into(), ..Default::default() },
-            BundlePayload { bundle_hash: "0x002".into(), ..Default::default() },
+            BundlePayload {
+                bundle_hash: "0x001".into(),
+                ..Default::default()
+            },
+            BundlePayload {
+                bundle_hash: "0x002".into(),
+                ..Default::default()
+            },
         ];
         let results = mr.cascade_submit(bundles).await;
         assert_eq!(results.len(), 2);
@@ -279,18 +286,24 @@ mod integration_tests {
             ..Default::default()
         };
         mr.cascade_submit(vec![bundle]).await;
-        assert_eq!(mr.pending_confirmations(), 1, "accepted bundle must be pending confirmation");
+        assert_eq!(
+            mr.pending_confirmations(),
+            1,
+            "accepted bundle must be pending confirmation"
+        );
 
         // Past target block + grace window, with an unreachable confirmation RPC —
         // must resolve (as not-included) rather than staying pending forever.
-        let results = mr.reconcile_inclusions(100 + CONFIRMATION_GRACE_BLOCKS).await;
+        let results = mr
+            .reconcile_inclusions(100 + CONFIRMATION_GRACE_BLOCKS)
+            .await;
         assert_eq!(results.len(), 1);
         assert_eq!(mr.pending_confirmations(), 0);
     }
 
     #[tokio::test]
     async fn dedup_prevents_double_submission() {
-        let mr  = make_multi_relay(50);
+        let mr = make_multi_relay(50);
         let pos = PositionKey::from_bytes(b"aave:0xabc:usdc");
         assert!(mr.claim_position(&pos, 50).is_ok());
         let result = mr.claim_position(&pos, 51);
@@ -303,7 +316,7 @@ mod integration_tests {
     #[tokio::test]
     async fn blacklist_check_works() {
         let mr = make_multi_relay(0);
-        assert!( mr.is_builder_blacklisted("0xbad"));
+        assert!(mr.is_builder_blacklisted("0xbad"));
         assert!(!mr.is_builder_blacklisted("0xgood"));
     }
 
@@ -317,7 +330,7 @@ mod integration_tests {
 
     #[test]
     fn sequencer_restart_clears_dedup() {
-        let mr  = make_multi_relay(100);
+        let mr = make_multi_relay(100);
         let pos = PositionKey::from_bytes(b"compound:0xdef:weth");
         mr.claim_position(&pos, 100).unwrap();
         mr.on_sequencer_restart(200);
@@ -326,7 +339,7 @@ mod integration_tests {
 
     #[test]
     fn ranked_relays_non_empty_after_seeding() {
-        let mr     = make_multi_relay(0);
+        let mr = make_multi_relay(0);
         let ranked = mr.ranked_relays();
         assert_eq!(ranked.len(), 2);
         assert_eq!(ranked[0].relay, RelayName::Flashbots);
@@ -336,12 +349,15 @@ mod integration_tests {
 
     #[tokio::test]
     async fn new_returns_a_live_reorg_event_receiver() {
-        let f        = make_blacklist_file();
+        let f = make_blacklist_file();
         let blacklist = BuilderBlacklist::load(f.path()).unwrap();
-        let metrics  = LaRelayMetrics::new(10, ExecutionAddress("0xEVT".into()));
+        let metrics = LaRelayMetrics::new(10, ExecutionAddress("0xEVT".into()));
         let mut clients: HashMap<String, Arc<dyn RelayClient>> = HashMap::new();
         clients.insert("flashbots".into(), Arc::new(MockRelayClient::new(true)));
-        let cfg = RelayConfig { confirmation_rpc_url: "http://localhost:1".into(), ..Default::default() };
+        let cfg = RelayConfig {
+            confirmation_rpc_url: "http://localhost:1".into(),
+            ..Default::default()
+        };
 
         let (mr, mut event_rx) = MultiRelayClient::new(clients, metrics, blacklist, &cfg, 0);
 

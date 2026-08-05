@@ -38,8 +38,7 @@ pub use integrity::{
 };
 pub use key_manager::{KeyManager, KeyRotationState, ROTATION_WINDOW_BLOCKS};
 pub use ofa::{
-    default_rule_set, OfaComplianceInput, OfaComplianceResult, OfaRule, OfaRuleRegistry,
-    OfaRuleSet,
+    default_rule_set, OfaComplianceInput, OfaComplianceResult, OfaRule, OfaRuleRegistry, OfaRuleSet,
 };
 pub use replay::{NonceRegistry, NonceState, ReplayGuard};
 pub use signer::{

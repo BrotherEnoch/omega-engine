@@ -35,6 +35,15 @@
 //     module's job is to publish "when did this last check in," not to
 //     own the alerting threshold logic, since Prometheus already owns
 //     rate/staleness evaluation.
+//
+// ## Audit fix (this revision): deprecated chrono API
+//
+// The fallback in `status()`/`all_statuses()` for a `max_silence` whose
+// `std::time::Duration` doesn't fit in `chrono::Duration`'s range now
+// uses `chrono::Duration::MAX` instead of the deprecated
+// `chrono::Duration::max_value()`. See the matching note in
+// `kill_switch.rs`'s module doc comment — same fix, same reasoning,
+// applied to the other three call sites in this crate.
 
 use chrono::Utc;
 use dashmap::DashMap;
@@ -60,7 +69,9 @@ impl Default for HeartbeatConfig {
     /// hourly reconciliation job should register with a much longer
     /// max_silence, not inherit this one).
     fn default() -> Self {
-        Self { max_silence: Duration::from_secs(120) }
+        Self {
+            max_silence: Duration::from_secs(120),
+        }
     }
 }
 
@@ -87,7 +98,9 @@ pub struct HeartbeatRegistry {
 
 impl HeartbeatRegistry {
     pub fn new() -> Self {
-        Self { components: Arc::new(DashMap::new()) }
+        Self {
+            components: Arc::new(DashMap::new()),
+        }
     }
 
     /// Explicitly register a component with a non-default tolerance.
@@ -97,8 +110,13 @@ impl HeartbeatRegistry {
     /// rather than implied by whatever the default happens to be.
     pub fn register(&self, component: &str, config: HeartbeatConfig) {
         let now = Utc::now();
-        self.components
-            .insert(component.to_string(), ComponentState { last_beat: now, config });
+        self.components.insert(
+            component.to_string(),
+            ComponentState {
+                last_beat: now,
+                config,
+            },
+        );
         metrics::HEARTBEAT_LAST_BEAT_TIMESTAMP
             .with_label_values(&[component])
             .set(now.timestamp() as f64);
@@ -112,7 +130,10 @@ impl HeartbeatRegistry {
         self.components
             .entry(component.to_string())
             .and_modify(|s| s.last_beat = now)
-            .or_insert_with(|| ComponentState { last_beat: now, config: HeartbeatConfig::default() });
+            .or_insert_with(|| ComponentState {
+                last_beat: now,
+                config: HeartbeatConfig::default(),
+            });
 
         metrics::HEARTBEAT_LAST_BEAT_TIMESTAMP
             .with_label_values(&[component])
@@ -130,7 +151,7 @@ impl HeartbeatRegistry {
             Some(state) => {
                 let silence = Utc::now() - state.last_beat;
                 let max_silence = chrono::Duration::from_std(state.config.max_silence)
-                    .unwrap_or(chrono::Duration::max_value());
+                    .unwrap_or(chrono::Duration::MAX);
                 silence > max_silence
             }
             None => true,
@@ -142,9 +163,7 @@ impl HeartbeatRegistry {
     pub fn status(&self, component: &str) -> Option<ComponentStatus> {
         self.components.get(component).map(|state| {
             let now = Utc::now();
-            let silence = (now - state.last_beat)
-                .to_std()
-                .unwrap_or(Duration::ZERO);
+            let silence = (now - state.last_beat).to_std().unwrap_or(Duration::ZERO);
             ComponentStatus {
                 component: component.to_string(),
                 last_beat: state.last_beat,
@@ -189,7 +208,9 @@ impl HeartbeatRegistry {
 }
 
 impl Default for HeartbeatRegistry {
-    fn default() -> Self { Self::new() }
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 #[cfg(test)]
@@ -216,7 +237,9 @@ mod tests {
         let reg = HeartbeatRegistry::new();
         reg.register(
             "fast-loop",
-            HeartbeatConfig { max_silence: Duration::from_millis(50) },
+            HeartbeatConfig {
+                max_silence: Duration::from_millis(50),
+            },
         );
         assert!(!reg.is_stale("fast-loop"));
         sleep(Duration::from_millis(120));
@@ -228,7 +251,9 @@ mod tests {
         let reg = HeartbeatRegistry::new();
         reg.register(
             "fast-loop",
-            HeartbeatConfig { max_silence: Duration::from_millis(50) },
+            HeartbeatConfig {
+                max_silence: Duration::from_millis(50),
+            },
         );
         sleep(Duration::from_millis(120));
         assert!(reg.is_stale("fast-loop"));
@@ -248,18 +273,44 @@ mod tests {
     #[test]
     fn components_are_independent() {
         let reg = HeartbeatRegistry::new();
-        reg.register("slow-job", HeartbeatConfig { max_silence: Duration::from_secs(3600) });
-        reg.register("fast-loop", HeartbeatConfig { max_silence: Duration::from_millis(50) });
+        reg.register(
+            "slow-job",
+            HeartbeatConfig {
+                max_silence: Duration::from_secs(3600),
+            },
+        );
+        reg.register(
+            "fast-loop",
+            HeartbeatConfig {
+                max_silence: Duration::from_millis(50),
+            },
+        );
         sleep(Duration::from_millis(120));
-        assert!(!reg.is_stale("slow-job"), "slow job with 1h tolerance should still be fresh");
-        assert!(reg.is_stale("fast-loop"), "fast loop with 50ms tolerance should be stale");
+        assert!(
+            !reg.is_stale("slow-job"),
+            "slow job with 1h tolerance should still be fresh"
+        );
+        assert!(
+            reg.is_stale("fast-loop"),
+            "fast loop with 50ms tolerance should be stale"
+        );
     }
 
     #[test]
     fn all_healthy_false_if_any_component_stale() {
         let reg = HeartbeatRegistry::new();
-        reg.register("ok-job", HeartbeatConfig { max_silence: Duration::from_secs(3600) });
-        reg.register("dead-job", HeartbeatConfig { max_silence: Duration::from_millis(50) });
+        reg.register(
+            "ok-job",
+            HeartbeatConfig {
+                max_silence: Duration::from_secs(3600),
+            },
+        );
+        reg.register(
+            "dead-job",
+            HeartbeatConfig {
+                max_silence: Duration::from_millis(50),
+            },
+        );
         sleep(Duration::from_millis(120));
         assert!(!reg.all_healthy());
     }
@@ -267,7 +318,12 @@ mod tests {
     #[test]
     fn all_healthy_true_when_nothing_stale() {
         let reg = HeartbeatRegistry::new();
-        reg.register("ok-job", HeartbeatConfig { max_silence: Duration::from_secs(3600) });
+        reg.register(
+            "ok-job",
+            HeartbeatConfig {
+                max_silence: Duration::from_secs(3600),
+            },
+        );
         reg.beat("ok-job");
         assert!(reg.all_healthy());
     }

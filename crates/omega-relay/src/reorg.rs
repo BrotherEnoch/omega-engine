@@ -38,18 +38,18 @@ pub enum BlueprintState {
 #[derive(Debug, Clone)]
 pub struct LaReorgRiskEvent {
     /// Blueprint transaction hash that entered `ReorgRisk`.
-    pub tx_hash:          TxHash,
+    pub tx_hash: TxHash,
     /// Orphaned block that triggered the reorg-risk transition.
-    pub orphaned_block:   u64,
+    pub orphaned_block: u64,
     /// Block number at which rescoring should be attempted.
     pub rescore_at_block: u64,
 }
 
 /// Tracks submitted LA blueprints and detects reorgs during the LA window.
 pub struct LaReorgGuard {
-    submitted:        DashMap<TxHash, BlueprintState>,
+    submitted: DashMap<TxHash, BlueprintState>,
     canonical_hashes: DashMap<u64, [u8; 32]>,
-    event_tx:         mpsc::UnboundedSender<LaReorgRiskEvent>,
+    event_tx: mpsc::UnboundedSender<LaReorgRiskEvent>,
 }
 
 impl LaReorgGuard {
@@ -70,7 +70,9 @@ impl LaReorgGuard {
     pub fn on_submitted(&self, tx_hash: TxHash, block: u64) {
         self.submitted.insert(
             tx_hash.clone(),
-            BlueprintState::Submitted { submitted_at_block: block },
+            BlueprintState::Submitted {
+                submitted_at_block: block,
+            },
         );
         info!(tx_hash = %tx_hash.0, block, "reorg-guard: blueprint submitted");
     }
@@ -106,7 +108,7 @@ impl LaReorgGuard {
         for mut entry in self.submitted.iter_mut() {
             if let BlueprintState::Submitted { submitted_at_block } = *entry.value() {
                 if submitted_at_block == orphaned_block {
-                    let tx_hash    = entry.key().clone();
+                    let tx_hash = entry.key().clone();
                     let rescore_at = orphaned_block + STABILITY_WINDOW_BLOCKS;
 
                     *entry.value_mut() = BlueprintState::ReorgRisk { orphaned_block };
@@ -167,8 +169,12 @@ impl LaReorgGuard {
 mod tests {
     use super::*;
 
-    fn hash(n: u8) -> [u8; 32] { [n; 32] }
-    fn tx(s: &str) -> TxHash   { TxHash(s.into()) }
+    fn hash(n: u8) -> [u8; 32] {
+        [n; 32]
+    }
+    fn tx(s: &str) -> TxHash {
+        TxHash(s.into())
+    }
 
     #[test]
     fn submitted_blueprint_moves_to_reorg_risk_on_orphan() {
@@ -178,7 +184,12 @@ mod tests {
         guard.on_new_block(100, hash(2));
         let state = guard.state(&tx("0xabc")).unwrap();
         assert!(
-            matches!(state, BlueprintState::ReorgRisk { orphaned_block: 100 }),
+            matches!(
+                state,
+                BlueprintState::ReorgRisk {
+                    orphaned_block: 100
+                }
+            ),
             "blueprint must be ReorgRisk, got {state:?}"
         );
     }
@@ -186,20 +197,25 @@ mod tests {
     #[test]
     fn blueprint_at_different_block_not_affected_by_reorg() {
         let (guard, _rx) = LaReorgGuard::new();
-        guard.on_submitted(tx("0xsafe"),  99);
+        guard.on_submitted(tx("0xsafe"), 99);
         guard.on_submitted(tx("0xrisky"), 100);
-        guard.on_new_block(99,  hash(1));
+        guard.on_new_block(99, hash(1));
         guard.on_new_block(100, hash(1));
         guard.on_new_block(100, hash(2));
         assert!(
             matches!(
                 guard.state(&tx("0xsafe")).unwrap(),
-                BlueprintState::Submitted { submitted_at_block: 99 }
+                BlueprintState::Submitted {
+                    submitted_at_block: 99
+                }
             ),
             "block-99 blueprint must remain Submitted"
         );
         assert!(
-            matches!(guard.state(&tx("0xrisky")).unwrap(), BlueprintState::ReorgRisk { .. }),
+            matches!(
+                guard.state(&tx("0xrisky")).unwrap(),
+                BlueprintState::ReorgRisk { .. }
+            ),
             "block-100 blueprint must be ReorgRisk"
         );
     }
@@ -224,7 +240,10 @@ mod tests {
         guard.on_new_block(50, hash(1));
         guard.on_new_block(50, hash(2));
         assert!(
-            matches!(guard.state(&tx("0xinc")).unwrap(), BlueprintState::Included { .. }),
+            matches!(
+                guard.state(&tx("0xinc")).unwrap(),
+                BlueprintState::Included { .. }
+            ),
             "included blueprint must not be moved to ReorgRisk"
         );
     }
@@ -244,6 +263,9 @@ mod tests {
 
     #[test]
     fn stability_window_is_five_blocks() {
-        assert_eq!(STABILITY_WINDOW_BLOCKS, 5, "§11.4: 5-block chain stability window");
+        assert_eq!(
+            STABILITY_WINDOW_BLOCKS, 5,
+            "§11.4: 5-block chain stability window"
+        );
     }
 }

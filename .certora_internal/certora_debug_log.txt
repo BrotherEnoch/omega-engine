@@ -1,0 +1,47 @@
+Package path node_modules/@openzeppelin/contracts does not exist or is not a directory
+Saving last configuration file to run.conf
+You are using certora-cli version 8.17.1; however, version 8.18.0 is available. It is recommended to upgrade by running: pip install certora-cli --upgrade
+or
+pip3 install certora-cli --upgrade
+There is no TAC file. Going to script CertoraProver\certoraBuild.py to main_with_args()
+main build cache key computed based on {'files': ['contracts\\lib\\openzeppelin-contracts\\contracts\\token\\ERC20\\ERC20.sol', 'contracts\\src\\OmegaVault.sol'], 'link': ['OmegaVault:profit_token=ERC20'], 'package_version_for_build_cache': 'certora-cli 8.17.1', 'packages': ['@openzeppelin/contracts=contracts\\lib\\openzeppelin-contracts\\contracts'], 'packages_path': 'node_modules', 'solc': 'solc.exe', 'solc_allow_path': 'contracts', 'test_condition': 'True'}
+Creating dir C:/Users/silve/Documents/omega-engine/.certora_config
+In C:\Users\silve\Documents\omega-engine\certora\specs\OmegaVaultRescueAndPending.spec, found the imports: []
+copying spec file C:/Users/silve/Documents/omega-engine/certora/specs/OmegaVaultRescueAndPending.spec to C:/Users/silve/Documents/omega-engine/.certora_sources/.0_OmegaVaultRescueAndPending.spec.spec
+writing C:/Users/silve/Documents/omega-engine/.certora_verify.json
+Failed to run Certora Prover typechecker locally.
+Please check the errors below for problems in the specifications (.spec files) or the prover_args defined in the .conf file.
+[main] ERROR ALWAYS - Found errors in certora/specs/OmegaVaultRescueAndPending.spec:
+[main] ERROR ALWAYS - Error in spec file (OmegaVaultRescueAndPending.spec:179:46): Since CVL 2, invariants must end with `;`
+[main] ERROR ALWAYS - Error in spec file (OmegaVaultRescueAndPending.spec:183:42): Since CVL 2, invariants must end with `;`
+[main] ERROR ALWAYS - Error in spec file (OmegaVaultRescueAndPending.spec:299:9): Syntax error: unexpected token near `"than the surplus observed before the call"`
+[main] ERROR ALWAYS - Error in spec file (OmegaVaultRescueAndPending.spec:306:9): Syntax error: unexpected token near `"i.e. the rescue moved real tokens without desyncing the derived accounting"`
+[main] ERROR ALWAYS - Error in spec file (OmegaVaultRescueAndPending.spec:354:9): Syntax error: unexpected token near `"positive netProfit — the two documented preconditions for success"`
+[main] ERROR ALWAYS - Error in spec file (OmegaVaultRescueAndPending.spec:374:9): Syntax error: unexpected token near `"must revert (ProfitAlreadyPending)"`
+[main] ERROR ALWAYS - Error in spec file (OmegaVaultRescueAndPending.spec:392:9): Syntax error: unexpected token near `"positive netProfit"`
+[main] ERROR ALWAYS - Error in spec file (OmegaVaultRescueAndPending.spec:423:9): Syntax error: unexpected token near `"entry before release"`
+[main] ERROR ALWAYS - Error in spec file (OmegaVaultRescueAndPending.spec:440:9): Syntax error: unexpected token near `"not-yet-released status, and a positive pending amount — the "`
+build failed
+Saving last configuration file to run.conf
+You are using certora-cli version 8.17.1; however, version 8.18.0 is available. It is recommended to upgrade by running: pip install certora-cli --upgrade
+or
+pip3 install certora-cli --upgrade
+There is no TAC file. Going to script CertoraProver\certoraBuild.py to main_with_args()
+main build cache key computed based on {'files': ['contracts\\lib\\openzeppelin-contracts\\contracts\\token\\ERC20\\ERC20.sol', 'contracts\\src\\OmegaVault.sol'], 'link': ['OmegaVault:profit_token=ERC20'], 'package_version_for_build_cache': 'certora-cli 8.17.1', 'packages': ['@openzeppelin/contracts=contracts\\lib\\openzeppelin-contracts\\contracts'], 'packages_path': 'node_modules', 'solc': 'solc.exe', 'solc_allow_path': 'contracts', 'test_condition': 'True'}
+Creating dir C:/Users/silve/Documents/omega-engine/.certora_config
+In C:\Users\silve\Documents\omega-engine\certora\specs\OmegaVaultRescueAndPending.spec, found the imports: []
+copying spec file C:/Users/silve/Documents/omega-engine/certora/specs/OmegaVaultRescueAndPending.spec to C:/Users/silve/Documents/omega-engine/.certora_sources/.0_OmegaVaultRescueAndPending.spec.spec
+writing C:/Users/silve/Documents/omega-engine/.certora_verify.json
+Failed to run Certora Prover typechecker locally.
+Please check the errors below for problems in the specifications (.spec files) or the prover_args defined in the .conf file.
+[main] ERROR ALWAYS - Found errors in certora/specs/OmegaVaultRescueAndPending.spec:
+[main] ERROR ALWAYS - Error in spec file (OmegaVaultRescueAndPending.spec:179:46): Since CVL 2, invariants must end with `;`
+[main] ERROR ALWAYS - Error in spec file (OmegaVaultRescueAndPending.spec:183:42): Since CVL 2, invariants must end with `;`
+[main] ERROR ALWAYS - Error in spec file (OmegaVaultRescueAndPending.spec:299:9): Syntax error: unexpected token near `"than the surplus observed before the call"`
+[main] ERROR ALWAYS - Error in spec file (OmegaVaultRescueAndPending.spec:306:9): Syntax error: unexpected token near `"i.e. the rescue moved real tokens without desyncing the derived accounting"`
+[main] ERROR ALWAYS - Error in spec file (OmegaVaultRescueAndPending.spec:354:9): Syntax error: unexpected token near `"positive netProfit — the two documented preconditions for success"`
+[main] ERROR ALWAYS - Error in spec file (OmegaVaultRescueAndPending.spec:374:9): Syntax error: unexpected token near `"must revert (ProfitAlreadyPending)"`
+[main] ERROR ALWAYS - Error in spec file (OmegaVaultRescueAndPending.spec:392:9): Syntax error: unexpected token near `"positive netProfit"`
+[main] ERROR ALWAYS - Error in spec file (OmegaVaultRescueAndPending.spec:423:9): Syntax error: unexpected token near `"entry before release"`
+[main] ERROR ALWAYS - Error in spec file (OmegaVaultRescueAndPending.spec:440:9): Syntax error: unexpected token near `"not-yet-released status, and a positive pending amount — the "`
+build failed

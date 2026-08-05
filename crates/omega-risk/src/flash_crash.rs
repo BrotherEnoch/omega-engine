@@ -29,13 +29,13 @@ use std::collections::VecDeque;
 // ─── Spec constants ───────────────────────────────────────────────────────────
 
 /// Spike detection window in blocks (spec: 5 blocks).
-pub const SPIKE_WINDOW_BLOCKS:    usize = 5;
+pub const SPIKE_WINDOW_BLOCKS: usize = 5;
 /// Drift detection window in blocks (spec: 20 blocks).
-pub const DRIFT_WINDOW_BLOCKS:    usize = 20;
+pub const DRIFT_WINDOW_BLOCKS: usize = 20;
 /// Spike price move threshold (spec: >10 %).
-pub const SPIKE_THRESHOLD:        f64 = 0.10;
+pub const SPIKE_THRESHOLD: f64 = 0.10;
 /// Drift price move threshold (spec: >15 %).
-pub const DRIFT_THRESHOLD:        f64 = 0.15;
+pub const DRIFT_THRESHOLD: f64 = 0.15;
 
 /// Maximum liquidation size during flash-crash response (50 % of normal).
 pub const FLASH_CRASH_MAX_SIZE_PCT: f64 = 0.50;
@@ -54,9 +54,9 @@ pub enum FlashCrashResponse {
     /// Flash-crash detected — apply graduated adjustments.
     Graduated {
         /// Maximum liquidation size as a fraction of the blueprint amount (e.g., 0.50).
-        max_size_fraction:    f64,
+        max_size_fraction: f64,
         /// Minimum profit multiplier applied on top of the normal dynamic_min_profit.
-        min_profit_mult:      f64,
+        min_profit_mult: f64,
         /// Tightened oracle price-agreement threshold (e.g., 0.001 = 0.1 %).
         oracle_agreement_pct: f64,
         /// True when HF < 1.001 — max priority fee overrides the response.
@@ -76,7 +76,13 @@ impl FlashCrashResponse {
     /// True when flash crash is active AND the position is NOT in the imminent window.
     /// In the imminent window (HF < 1.001), we proceed at max priority fee regardless.
     pub fn should_reduce_size(&self) -> bool {
-        matches!(self, FlashCrashResponse::Graduated { imminent_liquidation: false, .. })
+        matches!(
+            self,
+            FlashCrashResponse::Graduated {
+                imminent_liquidation: false,
+                ..
+            }
+        )
     }
 }
 
@@ -128,8 +134,8 @@ impl FlashCrashGuard {
         let imminent = health_factor < 1.001;
 
         FlashCrashResponse::Graduated {
-            max_size_fraction:    FLASH_CRASH_MAX_SIZE_PCT,
-            min_profit_mult:      FLASH_CRASH_MIN_PROFIT_MULT,
+            max_size_fraction: FLASH_CRASH_MAX_SIZE_PCT,
+            min_profit_mult: FLASH_CRASH_MIN_PROFIT_MULT,
             oracle_agreement_pct: FLASH_CRASH_ORACLE_AGREEMENT_PCT,
             imminent_liquidation: imminent,
         }
@@ -142,7 +148,9 @@ impl FlashCrashGuard {
         }
         let current = *prices.last().unwrap();
         let baseline = prices[prices.len() - SPIKE_WINDOW_BLOCKS];
-        if baseline <= 0.0 { return false; }
+        if baseline <= 0.0 {
+            return false;
+        }
         let move_pct = (current - baseline).abs() / baseline;
         move_pct > SPIKE_THRESHOLD
     }
@@ -152,9 +160,11 @@ impl FlashCrashGuard {
         if prices.len() < DRIFT_WINDOW_BLOCKS {
             return false;
         }
-        let oldest  = prices[0];
+        let oldest = prices[0];
         let current = *prices.last().unwrap();
-        if oldest <= 0.0 { return false; }
+        if oldest <= 0.0 {
+            return false;
+        }
         let move_pct = (current - oldest).abs() / oldest;
         move_pct > DRIFT_THRESHOLD
     }
@@ -166,7 +176,9 @@ impl FlashCrashGuard {
 }
 
 impl Default for FlashCrashGuard {
-    fn default() -> Self { Self::new() }
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 #[cfg(test)]
@@ -202,7 +214,9 @@ mod flash_crash_tests {
     fn spike_above_10pct_in_5_blocks_triggers_graduated() {
         let g = FlashCrashGuard::new();
         // Stable prices
-        for _ in 0..15 { g.push_price(2000.0); }
+        for _ in 0..15 {
+            g.push_price(2000.0);
+        }
         // Sudden 15 % drop in last sample
         g.push_price(1700.0);
         assert!(g.evaluate(1.05).is_graduated());
@@ -211,7 +225,9 @@ mod flash_crash_tests {
     #[test]
     fn small_move_below_10pct_stays_normal() {
         let g = FlashCrashGuard::new();
-        for _ in 0..19 { g.push_price(2000.0); }
+        for _ in 0..19 {
+            g.push_price(2000.0);
+        }
         g.push_price(2050.0); // 2.5 % — below 10 %
         assert!(g.evaluate(1.05).is_normal());
     }
@@ -243,10 +259,17 @@ mod flash_crash_tests {
     #[test]
     fn graduated_response_has_correct_values() {
         let g = FlashCrashGuard::new();
-        for _ in 0..19 { g.push_price(2000.0); }
+        for _ in 0..19 {
+            g.push_price(2000.0);
+        }
         g.push_price(1700.0); // spike
         match g.evaluate(1.05) {
-            FlashCrashResponse::Graduated { max_size_fraction, min_profit_mult, oracle_agreement_pct, .. } => {
+            FlashCrashResponse::Graduated {
+                max_size_fraction,
+                min_profit_mult,
+                oracle_agreement_pct,
+                ..
+            } => {
                 assert!((max_size_fraction - 0.50).abs() < 1e-9);
                 assert!((min_profit_mult - 2.50).abs() < 1e-9);
                 assert!((oracle_agreement_pct - 0.001).abs() < 1e-9);
@@ -258,10 +281,15 @@ mod flash_crash_tests {
     #[test]
     fn imminent_liquidation_flag_set_when_hf_below_1_001() {
         let g = FlashCrashGuard::new();
-        for _ in 0..19 { g.push_price(2000.0); }
+        for _ in 0..19 {
+            g.push_price(2000.0);
+        }
         g.push_price(1700.0);
         match g.evaluate(1.0005) {
-            FlashCrashResponse::Graduated { imminent_liquidation: true, .. } => {}
+            FlashCrashResponse::Graduated {
+                imminent_liquidation: true,
+                ..
+            } => {}
             other => panic!("expected imminent=true, got {:?}", other),
         }
     }
@@ -269,10 +297,15 @@ mod flash_crash_tests {
     #[test]
     fn non_imminent_hf_does_not_set_imminent_flag() {
         let g = FlashCrashGuard::new();
-        for _ in 0..19 { g.push_price(2000.0); }
+        for _ in 0..19 {
+            g.push_price(2000.0);
+        }
         g.push_price(1700.0);
         match g.evaluate(1.05) {
-            FlashCrashResponse::Graduated { imminent_liquidation: false, .. } => {}
+            FlashCrashResponse::Graduated {
+                imminent_liquidation: false,
+                ..
+            } => {}
             other => panic!("expected imminent=false, got {:?}", other),
         }
     }
@@ -281,7 +314,9 @@ mod flash_crash_tests {
     fn rolling_window_evicts_oldest_prices() {
         let g = FlashCrashGuard::new();
         // Fill 20 blocks of stable prices.
-        for _ in 0..20 { g.push_price(2000.0); }
+        for _ in 0..20 {
+            g.push_price(2000.0);
+        }
         assert_eq!(g.history_len(), 20);
         // Push one more — should evict oldest (still 20).
         g.push_price(2010.0);

@@ -60,6 +60,19 @@
 //     client configured with a non-default `rps_limit` — fixed to
 //     track and report the actual configured capacity.
 //
+// ## Fix (this revision): fetch_chainlink_round / chainlink_agg
+//
+// Added `chainlink_agg` — the AggregatorV3Interface `sol!` binding and
+// `OmegaRpcClient::fetch_chainlink_round` (client.rs), giving
+// omega-oracle's new Chainlink poll loop a real eth_call path instead of
+// a cache with nothing feeding it. Deliberately contains no reference to
+// any omega-oracle type (e.g. `ChainlinkOracle`) — this crate has no
+// dependency on omega-oracle and must not gain one, since omega-oracle
+// already depends on omega-rpc; a reverse reference here would create a
+// cycle. The "fetch then update the cache" wiring lives in
+// omega-oracle's `chainlink_poll.rs` instead, which already has this
+// crate as a dependency.
+//
 // ## Module map
 //
 //   net.rs            — shared boundary-safety helpers: RpcClientError,
@@ -70,8 +83,14 @@
 //   client.rs         — OmegaRpcClient: rate-limited WS client with a
 //                       shared persistent connection, block subscription
 //                       with reorg flagging, health integration,
-//                       chain-ID-verified reconnect, and transaction
-//                       de-duplication.
+//                       chain-ID-verified reconnect, transaction
+//                       de-duplication, and Chainlink AggregatorV3 reads
+//                       (this revision).
+//
+//   chainlink_agg.rs  — AggregatorV3Interface sol! binding,
+//                       ChainlinkRound, scale_chainlink_answer (this
+//                       revision). No omega-oracle dependency — see
+//                       module-level note above.
 //
 //   rate_limiter.rs   — RpcRateLimiter: token-bucket per request kind
 //                       (Read 400 rps, Write 50 rps, Subscribe 20 rps by
@@ -85,6 +104,7 @@
 //                         run_fee_oracle_stream       (§7 gas model input)
 //                         run_mev_share_stream        (Phase 4 MEV-OFA)
 
+mod chainlink_agg;
 mod net;
 
 pub mod client;
@@ -92,6 +112,8 @@ pub mod rate_limiter;
 pub mod subscriptions;
 
 // ── Re-exports ────────────────────────────────────────────────────────────────
+
+pub use chainlink_agg::ChainlinkRound;
 
 pub use client::{BlockEvent, OmegaRpcClient, RpcClientConfig};
 

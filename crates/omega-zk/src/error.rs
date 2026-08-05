@@ -6,7 +6,10 @@ use thiserror::Error;
 pub enum ZkError {
     // ── Prover ────────────────────────────────────────────────────────────────
     #[error("Proof generation failed for blueprint {blueprint_hash}: {detail}")]
-    ProofGenerationFailed { blueprint_hash: String, detail: String },
+    ProofGenerationFailed {
+        blueprint_hash: String,
+        detail: String,
+    },
 
     #[error("Proof generation timed out after {elapsed_ms}ms (SLA: {sla_ms}ms)")]
     ProofTimeout { elapsed_ms: u64, sla_ms: u64 },
@@ -50,7 +53,10 @@ pub enum ZkError {
 
     // ── Commitment ────────────────────────────────────────────────────────────
     #[error("Commitment derivation failed for blueprint {blueprint_hash}: {detail}")]
-    CommitmentFailed { blueprint_hash: String, detail: String },
+    CommitmentFailed {
+        blueprint_hash: String,
+        detail: String,
+    },
 
     // ── Internal ──────────────────────────────────────────────────────────────
     #[error("Internal ZK error: {0}")]
@@ -65,6 +71,9 @@ impl ZkError {
 
     /// True for errors that move the ZK layer to DEGRADED (not full HALT).
     pub fn is_degraded_worthy(&self) -> bool {
-        matches!(self, ZkError::QueueSuspended { .. } | ZkError::ProofTimeout { .. })
+        matches!(
+            self,
+            ZkError::QueueSuspended { .. } | ZkError::ProofTimeout { .. }
+        )
     }
 }

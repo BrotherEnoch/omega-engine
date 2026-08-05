@@ -5,10 +5,10 @@
 mod flashloan_tests {
     use crate::encoding::encode_flashloan_call;
     use crate::{
-        AAVE_V3_PREMIUM_BPS, BALANCER_PREMIUM_BPS, FlashloanError, FlashloanProvider,
-        LiquidityRegistry, UNISWAP_V3_PREMIUM_BPS, premium_wei, repayment_wei, select_provider,
+        premium_wei, repayment_wei, select_provider, FlashloanError, FlashloanProvider,
+        LiquidityRegistry, AAVE_V3_PREMIUM_BPS, BALANCER_PREMIUM_BPS, UNISWAP_V3_PREMIUM_BPS,
     };
-    use alloy_primitives::{Address, U256, keccak256};
+    use alloy_primitives::{keccak256, Address, U256};
     use omega_core::errors::{DropCode, OmegaError};
     use std::sync::Arc;
 
@@ -47,14 +47,17 @@ mod flashloan_tests {
     #[test]
     fn repayment_is_principal_plus_premium() {
         let amount = eth(5);
-        let prem   = premium_wei(FlashloanProvider::AaveV3, amount);
-        let repay  = repayment_wei(FlashloanProvider::AaveV3, amount);
+        let prem = premium_wei(FlashloanProvider::AaveV3, amount);
+        let repay = repayment_wei(FlashloanProvider::AaveV3, amount);
         assert_eq!(repay, amount + prem);
     }
 
     #[test]
     fn zero_amount_has_zero_premium() {
-        assert_eq!(premium_wei(FlashloanProvider::AaveV3, U256::ZERO), U256::ZERO);
+        assert_eq!(
+            premium_wei(FlashloanProvider::AaveV3, U256::ZERO),
+            U256::ZERO
+        );
     }
 
     #[test]
@@ -68,7 +71,7 @@ mod flashloan_tests {
 
     #[test]
     fn unknown_provider_returns_none() {
-        let reg  = test_registry();
+        let reg = test_registry();
         let snap = reg.snapshot(42161, FlashloanProvider::Balancer, addr(0xBB));
         assert!(snap.is_none());
     }
@@ -90,18 +93,21 @@ mod flashloan_tests {
     fn selects_balancer_over_aave_when_both_available() {
         let reg = test_registry();
         reg.update(42161, FlashloanProvider::Balancer, addr(0xB0), eth(100), 1);
-        reg.update(42161, FlashloanProvider::AaveV3,   addr(0xA0), eth(100), 1);
+        reg.update(42161, FlashloanProvider::AaveV3, addr(0xA0), eth(100), 1);
         let result = select_provider(&reg, 42161, eth(50)).unwrap();
-        assert_eq!(result.provider, FlashloanProvider::Balancer,
-            "Balancer (0 bps) must be preferred over Aave v3 (9 bps)");
+        assert_eq!(
+            result.provider,
+            FlashloanProvider::Balancer,
+            "Balancer (0 bps) must be preferred over Aave v3 (9 bps)"
+        );
         assert_eq!(result.premium_wei, U256::ZERO);
     }
 
     #[test]
     fn falls_back_to_aave_when_balancer_insufficient() {
         let reg = test_registry();
-        reg.update(42161, FlashloanProvider::Balancer, addr(0xB0), eth(10),  1);
-        reg.update(42161, FlashloanProvider::AaveV3,   addr(0xA0), eth(100), 1);
+        reg.update(42161, FlashloanProvider::Balancer, addr(0xB0), eth(10), 1);
+        reg.update(42161, FlashloanProvider::AaveV3, addr(0xA0), eth(100), 1);
         let result = select_provider(&reg, 42161, eth(50)).unwrap();
         assert_eq!(result.provider, FlashloanProvider::AaveV3);
     }
@@ -112,9 +118,15 @@ mod flashloan_tests {
         reg.update(42161, FlashloanProvider::AaveV3, addr(0xA0), eth(5), 1);
         let err = select_provider(&reg, 42161, eth(50)).unwrap_err();
         assert!(matches!(err, FlashloanError::NoneAvailable { .. }));
-        if let FlashloanError::NoneAvailable { best_available_wei, .. } = err {
-            assert_eq!(best_available_wei, eth(5),
-                "best_available_wei must report the closest we got");
+        if let FlashloanError::NoneAvailable {
+            best_available_wei, ..
+        } = err
+        {
+            assert_eq!(
+                best_available_wei,
+                eth(5),
+                "best_available_wei must report the closest we got"
+            );
         }
     }
 
@@ -130,7 +142,7 @@ mod flashloan_tests {
 
     #[test]
     fn selection_result_contract_addr_matches_registry() {
-        let reg      = test_registry();
+        let reg = test_registry();
         let provider = addr(0xCC);
         reg.update(42161, FlashloanProvider::AaveV3, provider, eth(100), 1);
         let result = select_provider(&reg, 42161, eth(50)).unwrap();
@@ -140,20 +152,28 @@ mod flashloan_tests {
     #[test]
     fn error_maps_to_miss_flashloan_drop_code() {
         let err = FlashloanError::NoneAvailable {
-            amount_wei:         eth(1),
-            chain_id:           42161,
+            amount_wei: eth(1),
+            chain_id: 42161,
             best_available_wei: U256::ZERO,
         };
         assert!(matches!(
             err.to_omega_error(),
-            OmegaError::Dropped { code: DropCode::MissFlashloan }
+            OmegaError::Dropped {
+                code: DropCode::MissFlashloan
+            }
         ));
     }
 
     #[test]
     fn aave_calldata_has_correct_selector() {
         let calldata = encode_flashloan_call(
-            FlashloanProvider::AaveV3, addr(0xAA), addr(0xBB), addr(0xCC), eth(10), true, b"callback",
+            FlashloanProvider::AaveV3,
+            addr(0xAA),
+            addr(0xBB),
+            addr(0xCC),
+            eth(10),
+            true,
+            b"callback",
         );
         let expected_selector =
             &keccak256(b"flashLoanSimple(address,address,uint256,bytes,uint16)")[..4];
@@ -163,17 +183,28 @@ mod flashloan_tests {
     #[test]
     fn balancer_calldata_has_correct_selector() {
         let calldata = encode_flashloan_call(
-            FlashloanProvider::Balancer, addr(0xAA), addr(0xBB), addr(0xCC), eth(10), true, b"callback",
+            FlashloanProvider::Balancer,
+            addr(0xAA),
+            addr(0xBB),
+            addr(0xCC),
+            eth(10),
+            true,
+            b"callback",
         );
-        let expected_selector =
-            &keccak256(b"flashLoan(address,address[],uint256[],bytes)")[..4];
+        let expected_selector = &keccak256(b"flashLoan(address,address[],uint256[],bytes)")[..4];
         assert_eq!(&calldata[..4], expected_selector);
     }
 
     #[test]
     fn uniswap_calldata_has_correct_selector() {
         let calldata = encode_flashloan_call(
-            FlashloanProvider::UniswapV3, addr(0xAA), addr(0xBB), addr(0xCC), eth(10), true, b"callback",
+            FlashloanProvider::UniswapV3,
+            addr(0xAA),
+            addr(0xBB),
+            addr(0xCC),
+            eth(10),
+            true,
+            b"callback",
         );
         let expected_selector = &keccak256(b"flash(address,uint256,uint256,bytes)")[..4];
         assert_eq!(&calldata[..4], expected_selector);
@@ -186,25 +217,53 @@ mod flashloan_tests {
     #[test]
     fn uniswap_asset_is_token1_places_amount_in_amount1_slot() {
         let calldata = encode_flashloan_call(
-            FlashloanProvider::UniswapV3, addr(0xAA), addr(0xBB), addr(0xCC), eth(10), false, b"callback",
+            FlashloanProvider::UniswapV3,
+            addr(0xAA),
+            addr(0xBB),
+            addr(0xCC),
+            eth(10),
+            false,
+            b"callback",
         );
         let amount0_bytes = &calldata[4 + 32..4 + 64];
         let amount1_bytes = &calldata[4 + 64..4 + 96];
         let zero = [0u8; 32];
-        assert_eq!(amount0_bytes, &zero[..], "amount0 must be zero when asset is token1");
-        assert_ne!(amount1_bytes, &zero[..], "amount1 must carry amount_wei when asset is token1");
+        assert_eq!(
+            amount0_bytes,
+            &zero[..],
+            "amount0 must be zero when asset is token1"
+        );
+        assert_ne!(
+            amount1_bytes,
+            &zero[..],
+            "amount1 must carry amount_wei when asset is token1"
+        );
     }
 
     #[test]
     fn uniswap_asset_is_token0_places_amount_in_amount0_slot() {
         let calldata = encode_flashloan_call(
-            FlashloanProvider::UniswapV3, addr(0xAA), addr(0xBB), addr(0xCC), eth(10), true, b"callback",
+            FlashloanProvider::UniswapV3,
+            addr(0xAA),
+            addr(0xBB),
+            addr(0xCC),
+            eth(10),
+            true,
+            b"callback",
         );
         let amount0_bytes = &calldata[4 + 32..4 + 64];
         let amount1_bytes = &calldata[4 + 64..4 + 96];
         let zero = [0u8; 32];
-        assert_ne!(amount0_bytes, &zero[..], "amount0 must carry amount_wei when asset is token0");
-        assert_eq!(amount1_bytes, &zero[..], "amount1 must be zero when asset is token0");
+        assert_ne!(
+            amount0_bytes,
+            &zero[..],
+            "amount0 must carry amount_wei when asset is token0"
+        );
+        assert_eq!(
+            amount1_bytes,
+            &zero[..],
+            "amount1 must be zero when asset is token0"
+        );
     }
 
     #[test]
@@ -215,10 +274,17 @@ mod flashloan_tests {
             FlashloanProvider::UniswapV3,
         ] {
             let cd = encode_flashloan_call(
-                provider, addr(0x01), addr(0x02), addr(0x03), eth(1), true, b"test_data",
+                provider,
+                addr(0x01),
+                addr(0x02),
+                addr(0x03),
+                eth(1),
+                true,
+                b"test_data",
             );
             assert_eq!(
-                (cd.len() - 4) % 32, 0,
+                (cd.len() - 4) % 32,
+                0,
                 "provider {provider}: calldata tail must be 32-byte aligned"
             );
         }
@@ -226,14 +292,20 @@ mod flashloan_tests {
 
     #[test]
     fn balancer_has_lowest_priority_number() {
-        assert!(FlashloanProvider::Balancer.priority()  < FlashloanProvider::AaveV3.priority());
-        assert!(FlashloanProvider::AaveV3.priority()    < FlashloanProvider::UniswapV3.priority());
+        assert!(FlashloanProvider::Balancer.priority() < FlashloanProvider::AaveV3.priority());
+        assert!(FlashloanProvider::AaveV3.priority() < FlashloanProvider::UniswapV3.priority());
     }
 
     #[test]
     fn premium_bps_match_constants() {
-        assert_eq!(FlashloanProvider::AaveV3.premium_bps(),    AAVE_V3_PREMIUM_BPS);
-        assert_eq!(FlashloanProvider::Balancer.premium_bps(),  BALANCER_PREMIUM_BPS);
-        assert_eq!(FlashloanProvider::UniswapV3.premium_bps(), UNISWAP_V3_PREMIUM_BPS);
+        assert_eq!(FlashloanProvider::AaveV3.premium_bps(), AAVE_V3_PREMIUM_BPS);
+        assert_eq!(
+            FlashloanProvider::Balancer.premium_bps(),
+            BALANCER_PREMIUM_BPS
+        );
+        assert_eq!(
+            FlashloanProvider::UniswapV3.premium_bps(),
+            UNISWAP_V3_PREMIUM_BPS
+        );
     }
 }

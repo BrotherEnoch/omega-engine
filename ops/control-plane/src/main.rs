@@ -72,6 +72,28 @@
 //   engine crate that holds an `Arc<AppState>` (or an `Arc<LayerHealthImpl>`
 //   cloned from `state.health_layers`) can call `set_state` the same way.
 //
+// ## Audit fix (this revision): omega-control-contracts::rest shape changes
+//
+// Two REST contract types changed in this same audit pass (see that
+// crate's own CHANGES notes in rest.rs):
+//   1. `LayerHealthEntry.layer` -> `.layer_id` (matches
+//      `proto::LayerHealth.layer_id` naming exactly), plus a new
+//      required `reason: String` field this handler never populated.
+//      `LayerHealthImpl` doesn't expose a reason getter here any more
+//      than it does in `grpc.rs`'s equivalent `ProtoLayerHealth`
+//      construction, so `reason: String::new()` is used for the same
+//      reason `grpc.rs` already does it that way — nothing else in this
+//      file has a source for that value.
+//   2. `DaoFeeResponse.dao_fee_pct` is no longer a stored field — it's
+//      now a method, `DaoFeeResponse::dao_fee_pct()`, computed on
+//      demand instead of carried and trusted (see rest.rs's own note on
+//      why). The struct literal below no longer sets it.
+//   3. `VaultConfig::per_transfer_cap_wei`/`daily_cap_wei` are now
+//      `WeiAmount`, not a raw integer (see config.rs's own module doc
+//      comment on why a TOML-safe u128 wrapper was needed) — `as f64`
+//      doesn't compile on a non-primitive newtype. Fixed via
+//      `WeiAmount::as_wei()`, which returns the underlying `u128`.
+//
 // ## CLI
 //
 //   omega-control-plane \
@@ -137,11 +159,7 @@ pub struct ControlPlaneArgs {
     /// on Windows without requiring /var/omega/checkpoints to exist.
     /// Override with --checkpoint-dir or OMEGA_CHECKPOINT_DIR if you want
     /// an absolute path in production.
-    #[arg(
-        long,
-        default_value = "checkpoints",
-        env = "OMEGA_CHECKPOINT_DIR"
-    )]
+    #[arg(long, default_value = "checkpoints", env = "OMEGA_CHECKPOINT_DIR")]
     pub checkpoint_dir: String,
 
     /// MEV-Boost builder blacklist TOML path (§12.3).
@@ -329,9 +347,13 @@ async fn get_health(State(state): State<Arc<AppState>>) -> impl IntoResponse {
         .health_layers
         .iter()
         .map(|l| LayerHealthEntry {
-            layer: l.layer_id().to_string(),
+            layer_id: l.layer_id().to_string(),
             state: l.state().to_string(),
             is_operational: l.is_operational(),
+            // LayerHealthImpl exposes no reason getter here, same as
+            // grpc.rs's equivalent ProtoLayerHealth construction — see
+            // this file's module-level audit note.
+            reason: String::new(),
         })
         .collect();
 
@@ -578,9 +600,17 @@ async fn get_dao_fee(
         StatusCode::OK,
         Json(DaoFeeResponse {
             dao_fee_bps: vault.dao_fee_bps,
-            dao_fee_pct: vault.dao_fee_bps as f64 / 100.0,
-            per_transfer_cap_eth: vault.per_transfer_cap_wei as f64 / 1e18,
-            daily_cap_eth: vault.daily_cap_wei as f64 / 1e18,
+            // dao_fee_pct is no longer a field on DaoFeeResponse — it's
+            // now DaoFeeResponse::dao_fee_pct(), computed on demand by
+            // the caller. See this file's module-level audit note.
+            //
+            // WeiAmount::as_wei() -> u128, then cast to f64 — a plain
+            // `as f64` on WeiAmount itself doesn't compile, since it's
+            // a non-primitive newtype (see config.rs's own module doc
+            // comment on why per_transfer_cap_wei/daily_cap_wei are
+            // WeiAmount rather than a raw integer).
+            per_transfer_cap_eth: vault.per_transfer_cap_wei.as_wei() as f64 / 1e18,
+            daily_cap_eth: vault.daily_cap_wei.as_wei() as f64 / 1e18,
             confirmation_depth: vault.confirmation_depth,
         }),
     )
@@ -833,10 +863,7 @@ mod tests {
         let args = ControlPlaneArgs {
             bind: "127.0.0.1:0".into(),
             config_path: tmp_config.path().to_str().unwrap().into(),
-            checkpoint_dir: std::env::temp_dir()
-                .to_str()
-                .unwrap()
-                .into(),
+            checkpoint_dir: std::env::temp_dir().to_str().unwrap().into(),
             blacklist_path: tmp_blacklist.path().to_str().unwrap().into(),
             api_token: "test-token".into(),
         };
@@ -868,10 +895,7 @@ mod tests {
         let args = ControlPlaneArgs {
             bind: "127.0.0.1:0".into(),
             config_path: tmp_config.path().to_str().unwrap().into(),
-            checkpoint_dir: std::env::temp_dir()
-                .to_str()
-                .unwrap()
-                .into(),
+            checkpoint_dir: std::env::temp_dir().to_str().unwrap().into(),
             blacklist_path: tmp_blacklist.path().to_str().unwrap().into(),
             api_token: "test-token".into(),
         };
@@ -910,10 +934,7 @@ mod tests {
         let args = ControlPlaneArgs {
             bind: "127.0.0.1:0".into(),
             config_path: tmp_config.path().to_str().unwrap().into(),
-            checkpoint_dir: std::env::temp_dir()
-                .to_str()
-                .unwrap()
-                .into(),
+            checkpoint_dir: std::env::temp_dir().to_str().unwrap().into(),
             blacklist_path: tmp_blacklist.path().to_str().unwrap().into(),
             api_token: "test-token".into(),
         };
@@ -932,10 +953,7 @@ mod tests {
         let args = ControlPlaneArgs {
             bind: "127.0.0.1:0".into(),
             config_path: tmp_config.path().to_str().unwrap().into(),
-            checkpoint_dir: std::env::temp_dir()
-                .to_str()
-                .unwrap()
-                .into(),
+            checkpoint_dir: std::env::temp_dir().to_str().unwrap().into(),
             blacklist_path: tmp_blacklist.path().to_str().unwrap().into(),
             api_token: "test-token".into(),
         };
@@ -947,6 +965,9 @@ mod tests {
         });
 
         let received = rx.try_recv();
-        assert!(received.is_ok(), "publish() must reach an active subscriber");
+        assert!(
+            received.is_ok(),
+            "publish() must reach an active subscriber"
+        );
     }
 }

@@ -32,6 +32,18 @@ tower-http = { workspace = true, features = ["trace", "cors"] }
 tonic  = { workspace = true }
 prost  = "0.12"
 
+# ## Audit fix (this revision): missing prost-types dependency
+#
+# The recovered proto/omega_control.proto uses `google.protobuf.
+# Timestamp` for HealthReport.generated_at and HealthEvent.timestamp
+# (replacing the prior bare RFC-3339 strings — see that file's own
+# audit-alignment note). prost-build generates
+# `::prost_types::Timestamp` references for those fields, which don't
+# resolve without this crate declared — the E0433 "cannot find
+# prost_types in the crate root" build errors. Same version as `prost`
+# above, per the proto file's own note on this.
+prost-types = "0.12"
+
 # Async runtime
 tokio        = { workspace = true }
 # "sync" feature required for tokio_stream::wrappers::BroadcastStream,

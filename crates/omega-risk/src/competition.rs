@@ -47,9 +47,8 @@ impl AssetTier {
     pub fn from_symbol(symbol: &str) -> Self {
         match symbol.to_uppercase().as_str() {
             "WETH" | "WBTC" | "ETH" | "BTC" => AssetTier::Major,
-            "LINK" | "UNI"  | "AAVE" | "CRV" | "SNX" | "MKR"
-            | "COMP" | "BAL" | "YFI" | "SUSHI" | "USDC" | "USDT"
-            | "DAI" | "FRAX" | "LUSD" => AssetTier::Mid,
+            "LINK" | "UNI" | "AAVE" | "CRV" | "SNX" | "MKR" | "COMP" | "BAL" | "YFI" | "SUSHI"
+            | "USDC" | "USDT" | "DAI" | "FRAX" | "LUSD" => AssetTier::Mid,
             _ => AssetTier::LongTail,
         }
     }
@@ -57,8 +56,8 @@ impl AssetTier {
     /// Base competition probability before urgency and size adjustments.
     pub fn base_competition(self) -> f64 {
         match self {
-            AssetTier::Major    => 0.85,
-            AssetTier::Mid      => 0.60,
+            AssetTier::Major => 0.85,
+            AssetTier::Mid => 0.60,
             AssetTier::LongTail => 0.25,
         }
     }
@@ -68,10 +67,15 @@ impl AssetTier {
 
 /// Urgency multiplier based on health factor (spec S11).
 fn hf_urgency_multiplier(health_factor: f64) -> f64 {
-    if health_factor < 1.001 { 1.5 }
-    else if health_factor < 1.005 { 1.2 }
-    else if health_factor < 1.01  { 1.0 }
-    else { 0.9 }
+    if health_factor < 1.001 {
+        1.5
+    } else if health_factor < 1.005 {
+        1.2
+    } else if health_factor < 1.01 {
+        1.0
+    } else {
+        0.9
+    }
 }
 
 /// Size multiplier — larger liquidations attract more bots (spec: log10 scaling).
@@ -92,13 +96,13 @@ fn size_multiplier(liquidation_eth: f64) -> f64 {
 /// * `health_factor`       — current HF of the target position
 /// * `liquidation_eth`     — estimated liquidation size in ETH
 pub fn competition_probability(
-    asset_tier:       AssetTier,
-    health_factor:    f64,
-    liquidation_eth:  f64,
+    asset_tier: AssetTier,
+    health_factor: f64,
+    liquidation_eth: f64,
 ) -> f64 {
-    let base  = asset_tier.base_competition();
+    let base = asset_tier.base_competition();
     let urgency = hf_urgency_multiplier(health_factor);
-    let size    = size_multiplier(liquidation_eth);
+    let size = size_multiplier(liquidation_eth);
 
     (base * urgency * size).min(0.99)
 }
@@ -107,17 +111,26 @@ pub fn competition_probability(
 
 /// Urgency multiplier for priority fee (spec S12: separate from competition model).
 fn fee_urgency_multiplier(health_factor: f64) -> f64 {
-    if health_factor < 1.001      { 3.0 }
-    else if health_factor < 1.005 { 2.0 }
-    else if health_factor < 1.01  { 1.5 }
-    else { 1.0 }
+    if health_factor < 1.001 {
+        3.0
+    } else if health_factor < 1.005 {
+        2.0
+    } else if health_factor < 1.01 {
+        1.5
+    } else {
+        1.0
+    }
 }
 
 /// Win-rate multiplier: losing bots must bid higher to improve odds (spec S12).
 fn win_rate_multiplier(historical_win_rate: f64) -> f64 {
-    if historical_win_rate < 0.30      { 1.8 }
-    else if historical_win_rate < 0.50 { 1.3 }
-    else { 1.0 }
+    if historical_win_rate < 0.30 {
+        1.8
+    } else if historical_win_rate < 0.50 {
+        1.3
+    } else {
+        1.0
+    }
 }
 
 /// Compute suggested priority fee in gwei (spec S12 adaptive cap).
@@ -131,14 +144,14 @@ fn win_rate_multiplier(historical_win_rate: f64) -> f64 {
 /// * `health_factor`       — current HF
 /// * `historical_win_rate` — rolling 30-day win rate for this strategy/asset
 pub fn priority_fee_gwei(
-    expected_bonus_eth:  f64,
-    health_factor:       f64,
+    expected_bonus_eth: f64,
+    health_factor: f64,
     historical_win_rate: f64,
 ) -> u64 {
     // 5 % of bonus / 21_000 gas (minimum profitable gas unit cost).
     let base_cap = (expected_bonus_eth * 1e9 * 0.05 / 21_000.0).max(0.0) as u64;
 
-    let urgency  = fee_urgency_multiplier(health_factor);
+    let urgency = fee_urgency_multiplier(health_factor);
     let win_mult = win_rate_multiplier(historical_win_rate);
 
     let raw = (base_cap as f64 * urgency * win_mult) as u64;
@@ -213,7 +226,7 @@ mod competition_tests {
 
     #[test]
     fn imminent_hf_raises_fee_vs_safe_hf() {
-        let low  = priority_fee_gwei(1.0, 1.10, 0.60);
+        let low = priority_fee_gwei(1.0, 1.10, 0.60);
         let high = priority_fee_gwei(1.0, 1.0001, 0.60);
         assert!(high >= low, "imminent HF should not lower fee");
     }
@@ -221,7 +234,7 @@ mod competition_tests {
     #[test]
     fn low_win_rate_raises_fee() {
         let good_rate = priority_fee_gwei(0.1, 1.02, 0.80);
-        let bad_rate  = priority_fee_gwei(0.1, 1.02, 0.20);
+        let bad_rate = priority_fee_gwei(0.1, 1.02, 0.20);
         assert!(bad_rate >= good_rate);
     }
 }

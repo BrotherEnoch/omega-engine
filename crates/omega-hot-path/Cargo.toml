@@ -11,12 +11,28 @@ edition = "2021"
 #   - HotPathMetrics: latency histogram, slot utilisation, EV tracking
 #
 # Dependency graph (§22.1):
-#   omega-hot-path ← omega-core, omega-zk
+#   omega-hot-path ← omega-core, omega-risk, omega-zk
 #
 # NOTE: omega-zk is NOT listed here because hot-path blueprints do not
 # require ZK proofs before relay submission (the ZK gate is at the Vault
 # level, not the submission level).  omega-hot-path is intentionally
 # dependency-minimal to keep compile times low.
+#
+# ## Audit fix (this revision): omega-risk dependency
+#
+# Added `omega-risk`, path-dependency style matching `omega-core` below.
+# `crates/omega-hot-path/src/simulator.rs` now calls
+# `omega_risk::checks::{oracle_freshness_check, oracle_hierarchy_check,
+# oracle_price_sanity_check, slippage_check}` and uses
+# `omega_risk::context::{OracleSnapshot, MAX_SLIPPAGE_BPS_SA, ...}` to run
+# oracle-freshness, price-sanity, and slippage checks before the hot path
+# can report a successful simulation — see that file's own audit note for
+# the full reasoning. Without this dependency, `simulator.rs` does not
+# compile. This crate remains dependency-minimal otherwise; `omega-risk`
+# itself has no dependency on `omega-zk`/`omega-relay`/other heavier
+# crates, so this does not reintroduce the compile-time concern the
+# module doc comment above otherwise guards against with the omega-zk
+# exclusion.
 #
 # ## Audit fix (this revision): lint enforcement + uuid
 #
@@ -36,6 +52,7 @@ edition = "2021"
 
 [dependencies]
 omega-core = { path = "../omega-core" }
+omega-risk = { path = "../omega-risk" }
 
 # EVM primitive types — blueprint_hash (B256), U256 profit arithmetic
 alloy-primitives = { workspace = true }

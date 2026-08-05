@@ -88,7 +88,11 @@ impl InclusionTracker {
             bundle.txs.iter().map(|t| tx_hash_of_raw(t)).collect();
         self.pending.insert(
             bundle.bundle_hash.clone(),
-            PendingBundle { relay, tx_hashes: tx_hashes?, target_block },
+            PendingBundle {
+                relay,
+                tx_hashes: tx_hashes?,
+                target_block,
+            },
         );
         Ok(())
     }
@@ -108,7 +112,9 @@ impl InclusionTracker {
         let mut resolved = Vec::with_capacity(due.len());
 
         for bundle_hash in due {
-            let Some((_, pending)) = self.pending.remove(&bundle_hash) else { continue };
+            let Some((_, pending)) = self.pending.remove(&bundle_hash) else {
+                continue;
+            };
 
             let included = self.check_all_included(&pending.tx_hashes).await;
 
@@ -128,7 +134,11 @@ impl InclusionTracker {
                 "confirmation: bundle resolved"
             );
 
-            resolved.push(ConfirmationResult { bundle_hash, relay: pending.relay, included });
+            resolved.push(ConfirmationResult {
+                bundle_hash,
+                relay: pending.relay,
+                included,
+            });
         }
 
         resolved

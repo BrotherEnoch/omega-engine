@@ -74,8 +74,8 @@
 //            SimulationExecutionRevert, SimulationGasMiscalc
 //   §16   — Observability: all DropCodes are always-sampled LA events
 
-use std::fmt;
 use serde::{Deserialize, Serialize};
+use std::fmt;
 use thiserror::Error;
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -461,7 +461,10 @@ mod tests {
 
     #[test]
     fn new_drop_codes_display_screaming_snake() {
-        assert_eq!(DropCode::MissExposureLimit.to_string(), "MISS_EXPOSURE_LIMIT");
+        assert_eq!(
+            DropCode::MissExposureLimit.to_string(),
+            "MISS_EXPOSURE_LIMIT"
+        );
         assert_eq!(DropCode::StaleBlueprint.to_string(), "STALE_BLUEPRINT");
         assert_eq!(
             DropCode::DuplicateIdempotencyKey.to_string(),
@@ -509,9 +512,16 @@ mod tests {
         ];
         for code in all_codes {
             let json = serde_json::to_string(&code).unwrap();
-            assert_eq!(json, format!("\"{code}\""), "wire format must match Display for {code}");
+            assert_eq!(
+                json,
+                format!("\"{code}\""),
+                "wire format must match Display for {code}"
+            );
             let back: DropCode = serde_json::from_str(&json).unwrap();
-            assert_eq!(back, code, "round-trip must preserve the variant for {code}");
+            assert_eq!(
+                back, code,
+                "round-trip must preserve the variant for {code}"
+            );
         }
     }
 
@@ -555,8 +565,14 @@ mod tests {
             DropCode::StaleBlueprint,
             DropCode::DuplicateIdempotencyKey,
         ] {
-            assert!(!code.is_simulation_error(), "{code} should not be pre-classified");
-            assert!(!code.is_expected_miss(), "{code} should not be pre-classified");
+            assert!(
+                !code.is_simulation_error(),
+                "{code} should not be pre-classified"
+            );
+            assert!(
+                !code.is_expected_miss(),
+                "{code} should not be pre-classified"
+            );
             assert!(!code.is_critical(), "{code} should not be pre-classified");
         }
     }

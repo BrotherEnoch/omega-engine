@@ -4,8 +4,8 @@ pragma solidity 0.8.24;
 
 import "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
-import "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
-import "@openzeppelin/contracts/utils/Pausable.sol";
+import "@openzeppelin/contracts/security/ReentrancyGuard.sol";
+import "@openzeppelin/contracts/security/Pausable.sol";
 import "@openzeppelin/contracts/access/AccessControl.sol";
 import "@openzeppelin/contracts/utils/math/Math.sol";
 
@@ -152,11 +152,11 @@ contract PilTreasury is ReentrancyGuard, Pausable, AccessControl {
     ///      shares. Borrowed deliberately from OZ's already-audited approach rather than
     ///      inventing a new one.
     function _convertToShares(uint256 assets, uint256 assetsBefore, uint256 supply) internal pure returns (uint256) {
-        return assets.mulDiv(supply + 1, assetsBefore + 1, Math.Rounding.Floor);
+        return assets.mulDiv(supply + 1, assetsBefore + 1, Math.Rounding.Down);
     }
 
     function _convertToAssets(uint256 shares, uint256 assetsNow, uint256 supply) internal pure returns (uint256) {
-        return shares.mulDiv(assetsNow + 1, supply + 1, Math.Rounding.Floor);
+        return shares.mulDiv(assetsNow + 1, supply + 1, Math.Rounding.Down);
     }
 
     /// @notice Preview how many shares a deposit of `assets` would currently mint.

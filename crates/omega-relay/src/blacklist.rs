@@ -17,11 +17,11 @@ use crate::error::{RelayError, RelayResult};
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BlacklistedBuilderEntry {
     /// Builder public key or coinbase address (hex, `0x`-prefixed).
-    pub key:    String,
+    pub key: String,
     /// Human-readable reason for blacklisting.
     pub reason: String,
     /// ISO-8601 date the entry was added.
-    pub added:  String,
+    pub added: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -34,17 +34,17 @@ struct BlacklistFile {
 
 /// Thread-safe, hot-reloadable builder blacklist (§12.3).
 pub struct BuilderBlacklist {
-    keys:    RwLock<HashSet<String>>,
+    keys: RwLock<HashSet<String>>,
     entries: RwLock<Vec<BlacklistedBuilderEntry>>,
-    path:    PathBuf,
+    path: PathBuf,
 }
 
 impl BuilderBlacklist {
     /// Load from `path`.
     pub fn load(path: impl AsRef<Path>) -> RelayResult<Arc<Self>> {
         let path = path.as_ref().to_path_buf();
-        let bl   = Arc::new(Self {
-            keys:    RwLock::new(HashSet::new()),
+        let bl = Arc::new(Self {
+            keys: RwLock::new(HashSet::new()),
             entries: RwLock::new(Vec::new()),
             path,
         });
@@ -59,14 +59,14 @@ impl BuilderBlacklist {
     }
 
     fn reload_inner(&self) -> RelayResult<()> {
-        let raw = std::fs::read_to_string(&self.path)
-            .map_err(|e| RelayError::BlacklistLoadFailed {
-                path:   self.path.display().to_string(),
+        let raw =
+            std::fs::read_to_string(&self.path).map_err(|e| RelayError::BlacklistLoadFailed {
+                path: self.path.display().to_string(),
                 source: e,
             })?;
 
-        let file: BlacklistFile = toml::from_str(&raw)
-            .map_err(|e| RelayError::BlacklistParseFailed(e.to_string()))?;
+        let file: BlacklistFile =
+            toml::from_str(&raw).map_err(|e| RelayError::BlacklistParseFailed(e.to_string()))?;
 
         let new_keys: HashSet<String> = file
             .blacklisted_builders
@@ -75,7 +75,7 @@ impl BuilderBlacklist {
             .collect();
 
         let count = new_keys.len();
-        *self.keys.write()    = new_keys;
+        *self.keys.write() = new_keys;
         *self.entries.write() = file.blacklisted_builders;
 
         info!(path = %self.path.display(), entries = count, "builder blacklist reloaded");
@@ -97,7 +97,7 @@ impl BuilderBlacklist {
     pub fn add_entry(&self, entry: BlacklistedBuilderEntry) -> RelayResult<()> {
         let norm = normalise_key(&entry.key);
         {
-            let mut keys    = self.keys.write();
+            let mut keys = self.keys.write();
             let mut entries = self.entries.write();
             if keys.contains(&norm) {
                 warn!(key = %norm, "blacklist add: key already present");
@@ -111,22 +111,26 @@ impl BuilderBlacklist {
 
     /// Remove an entry at runtime (L3 48 h timelock path).
     pub fn remove_entry(&self, key: &str) -> RelayResult<bool> {
-        let norm    = normalise_key(key);
+        let norm = normalise_key(key);
         let removed = {
-            let mut keys    = self.keys.write();
+            let mut keys = self.keys.write();
             let mut entries = self.entries.write();
-            let before      = keys.len();
+            let before = keys.len();
             keys.remove(&norm);
             entries.retain(|e| normalise_key(&e.key) != norm);
             keys.len() < before
         };
-        if removed { self.persist()?; }
+        if removed {
+            self.persist()?;
+        }
         Ok(removed)
     }
 
     fn persist(&self) -> RelayResult<()> {
-        let file = BlacklistFile { blacklisted_builders: self.entries.read().clone() };
-        let raw  = toml::to_string_pretty(&file)
+        let file = BlacklistFile {
+            blacklisted_builders: self.entries.read().clone(),
+        };
+        let raw = toml::to_string_pretty(&file)
             .map_err(|e| RelayError::BlacklistParseFailed(e.to_string()))?;
         std::fs::write(&self.path, raw)?;
         info!(path = %self.path.display(), "builder blacklist persisted to disk");
@@ -136,7 +140,11 @@ impl BuilderBlacklist {
 
 fn normalise_key(key: &str) -> String {
     let trimmed = key.trim().to_lowercase();
-    if trimmed.starts_with("0x") { trimmed } else { format!("0x{trimmed}") }
+    if trimmed.starts_with("0x") {
+        trimmed
+    } else {
+        format!("0x{trimmed}")
+    }
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -162,17 +170,17 @@ mod tests {
 
     #[test]
     fn contains_normalises_case() {
-        let f  = write_blacklist(&[("0xDeAdBeEf", "test")]);
+        let f = write_blacklist(&[("0xDeAdBeEf", "test")]);
         let bl = BuilderBlacklist::load(f.path()).unwrap();
-        assert!( bl.contains("0xdeadbeef"));
-        assert!( bl.contains("0XDEADBEEF"));
-        assert!( bl.contains("deadbeef"));
+        assert!(bl.contains("0xdeadbeef"));
+        assert!(bl.contains("0XDEADBEEF"));
+        assert!(bl.contains("deadbeef"));
         assert!(!bl.contains("0xcafe"));
     }
 
     #[test]
     fn empty_blacklist_is_valid() {
-        let f  = write_blacklist(&[]);
+        let f = write_blacklist(&[]);
         let bl = BuilderBlacklist::load(f.path()).unwrap();
         assert!(!bl.contains("0xanything"));
         assert!(bl.entries().is_empty());
@@ -180,9 +188,9 @@ mod tests {
 
     #[test]
     fn hot_reload_picks_up_new_entries() {
-        let mut f  = write_blacklist(&[("0xaaa", "first")]);
-        let bl     = BuilderBlacklist::load(f.path()).unwrap();
-        assert!( bl.contains("0xaaa"));
+        let mut f = write_blacklist(&[("0xaaa", "first")]);
+        let bl = BuilderBlacklist::load(f.path()).unwrap();
+        assert!(bl.contains("0xaaa"));
         assert!(!bl.contains("0xbbb"));
 
         f.rewind().unwrap();
@@ -197,18 +205,18 @@ mod tests {
         let n = bl.reload().unwrap();
         assert_eq!(n, 1);
         assert!(!bl.contains("0xaaa"), "old key must be gone after reload");
-        assert!( bl.contains("0xbbb"), "new key must appear after reload");
+        assert!(bl.contains("0xbbb"), "new key must appear after reload");
     }
 
     #[test]
     fn add_and_remove_runtime() {
-        let f  = write_blacklist(&[("0xaaa", "seed")]);
+        let f = write_blacklist(&[("0xaaa", "seed")]);
         let bl = BuilderBlacklist::load(f.path()).unwrap();
 
         bl.add_entry(BlacklistedBuilderEntry {
-            key:    "0xbbb".into(),
+            key: "0xbbb".into(),
             reason: "runtime add".into(),
-            added:  "2026-05-01".into(),
+            added: "2026-05-01".into(),
         })
         .unwrap();
         assert!(bl.contains("0xbbb"));

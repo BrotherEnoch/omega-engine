@@ -34,8 +34,8 @@ pub const RESTART_WINDOW_BLOCKS: u64 = 60;
 
 /// Thread-safe double-spend guard for sequencer restart windows (§11.3).
 pub struct SequencerRestartHandler {
-    submitted_positions:   Arc<DashMap<PositionKey, u64>>,
-    restart_block:         AtomicU64,
+    submitted_positions: Arc<DashMap<PositionKey, u64>>,
+    restart_block: AtomicU64,
     restart_window_blocks: u64,
 }
 
@@ -43,8 +43,8 @@ impl SequencerRestartHandler {
     /// Create a handler using the default 60-block restart window.
     pub fn new(restart_block: u64) -> Arc<Self> {
         Arc::new(Self {
-            submitted_positions:   Arc::new(DashMap::new()),
-            restart_block:         AtomicU64::new(restart_block),
+            submitted_positions: Arc::new(DashMap::new()),
+            restart_block: AtomicU64::new(restart_block),
             restart_window_blocks: RESTART_WINDOW_BLOCKS,
         })
     }
@@ -52,8 +52,8 @@ impl SequencerRestartHandler {
     /// Create a handler with an explicitly configured restart window length.
     pub fn with_window(restart_block: u64, window_blocks: u64) -> Arc<Self> {
         Arc::new(Self {
-            submitted_positions:   Arc::new(DashMap::new()),
-            restart_block:         AtomicU64::new(restart_block),
+            submitted_positions: Arc::new(DashMap::new()),
+            restart_block: AtomicU64::new(restart_block),
             restart_window_blocks: window_blocks,
         })
     }
@@ -61,7 +61,7 @@ impl SequencerRestartHandler {
     /// Called once per new block. Prunes entries older than `restart_window_blocks`.
     pub fn on_new_block(&self, block: u64) {
         let threshold = block.saturating_sub(self.restart_window_blocks);
-        let before    = self.submitted_positions.len();
+        let before = self.submitted_positions.len();
         self.submitted_positions
             .retain(|_, &mut submission_block| submission_block >= threshold);
         let pruned = before - self.submitted_positions.len();
@@ -81,7 +81,7 @@ impl SequencerRestartHandler {
                 Ok(true)
             }
             Entry::Occupied(e) => Err(RelayError::DuplicateSubmission {
-                position_key:    position.as_hex(),
+                position_key: position.as_hex(),
                 submitted_block: *e.get(),
             }),
         }
@@ -182,7 +182,7 @@ mod tests {
     fn concurrent_submit_race_only_one_winner() {
         use std::sync::atomic::{AtomicUsize, Ordering};
 
-        let h      = SequencerRestartHandler::new(0);
+        let h = SequencerRestartHandler::new(0);
         let winner = Arc::new(AtomicUsize::new(0));
 
         let threads: Vec<_> = (0..8)
@@ -197,7 +197,9 @@ mod tests {
             })
             .collect();
 
-        for t in threads { t.join().unwrap(); }
+        for t in threads {
+            t.join().unwrap();
+        }
 
         assert_eq!(
             winner.load(Ordering::Relaxed),

@@ -48,6 +48,23 @@
 //    constructed. This pipeline only calls the synchronous
 //    `on_bundle_submitted` bookkeeping method, which doesn't require
 //    draining that channel.
+//
+// ## Fix (this revision): expected_profit_net overflow fails open
+//
+// `blueprint_to_check_fields` previously mapped
+// `bp.expected_profit_net.try_into().unwrap_or(u128::MAX)`. Confirmed
+// against `omega_risk::checks::check_dynamic_profit`'s real body
+// (`bp.expected_profit_net_wei < bp.dynamic_min_profit_wei`) that an
+// overflow coerced to `u128::MAX` makes this comparison false for any
+// realistic threshold — i.e. the exact check meant to reject an
+// unprofitable blueprint would instead PASS a garbage-large one. Fixed
+// by rejecting the overflow via the new `ExecutionError::
+// BlueprintFieldOverflow` variant (see error.rs) instead of coercing it.
+// `dynamic_min_profit` and `flashloan_amount` are unchanged — their
+// overflow direction fails CLOSED (confirmed against
+// `check_dynamic_profit`, `check_flashloan_liquidity`, and
+// `check_account_exposure`'s real bodies), so coercing to `u128::MAX`
+// there is the conservative, correct behavior already.
 
 use std::sync::{Arc, Mutex};
 
@@ -101,7 +118,11 @@ struct DagSlotGuard {
 
 impl DagSlotGuard {
     fn new(dag: Arc<Mutex<omega_dag::ExecutionDag>>, blueprint_hash: B256) -> Self {
-        Self { dag, blueprint_hash, released: false }
+        Self {
+            dag,
+            blueprint_hash,
+            released: false,
+        }
     }
 
     /// Explicit release on the normal (non-panicking) path, so the slot
@@ -150,7 +171,10 @@ pub enum ExecutionOutcome {
     /// Submitted via `MultiRelayClient::submit_single`.
     SubmittedSingle { any_accepted: bool },
     /// Submitted via `MultiRelayClient::cascade_submit`.
-    SubmittedCascade { any_accepted: bool, relay_count: usize },
+    SubmittedCascade {
+        any_accepted: bool,
+        relay_count: usize,
+    },
 }
 
 /// Bridges `ExecutionBlueprint` to `omega_relay::MultiRelayClient`, gated
@@ -159,23 +183,23 @@ pub enum ExecutionOutcome {
 /// so this type is fully constructible and testable without a real
 /// transaction signer existing yet — see signer.rs.
 pub struct ExecutionPipeline<S: TransactionSigner> {
-    kill_switches:     Arc<KillSwitchRegistry>,
+    kill_switches: Arc<KillSwitchRegistry>,
     integrity_registry: Arc<omega_security::IntegrityRegistry>,
-    relay:             Arc<MultiRelayClient>,
-    dag:               Arc<Mutex<omega_dag::ExecutionDag>>,
-    idempotency:       IdempotencyCache,
-    signer:            Arc<S>,
-    chain_id:          u64,
+    relay: Arc<MultiRelayClient>,
+    dag: Arc<Mutex<omega_dag::ExecutionDag>>,
+    idempotency: IdempotencyCache,
+    signer: Arc<S>,
+    chain_id: u64,
 }
 
 impl<S: TransactionSigner> ExecutionPipeline<S> {
     pub fn new(
-        kill_switches:      Arc<KillSwitchRegistry>,
+        kill_switches: Arc<KillSwitchRegistry>,
         integrity_registry: Arc<omega_security::IntegrityRegistry>,
-        relay:              Arc<MultiRelayClient>,
-        dag:                Arc<Mutex<omega_dag::ExecutionDag>>,
-        signer:             Arc<S>,
-        chain_id:           u64,
+        relay: Arc<MultiRelayClient>,
+        dag: Arc<Mutex<omega_dag::ExecutionDag>>,
+        signer: Arc<S>,
+        chain_id: u64,
     ) -> Self {
         Self {
             kill_switches,
@@ -231,7 +255,13 @@ impl<S: TransactionSigner> ExecutionPipeline<S> {
         let guard = DagSlotGuard::new(Arc::clone(&self.dag), bp.blueprint_hash);
 
         let result = self
-            .execute_inner(&bp, active_phase, risk_ctx, current_block, current_block_timestamp_secs)
+            .execute_inner(
+                &bp,
+                active_phase,
+                risk_ctx,
+                current_block,
+                current_block_timestamp_secs,
+            )
             .await;
 
         // Stage 6 (partial): free the DAG slot on every exit path, success
@@ -255,7 +285,11 @@ impl<S: TransactionSigner> ExecutionPipeline<S> {
     /// unbounded across a long-running process — see this crate's top
     /// doc comment for this exact caveat; this method makes eviction
     /// *possible*, it does not make it *automatic*.
-    pub fn evict_idempotency_cache(&self, max_age: chrono::Duration, now: chrono::DateTime<chrono::Utc>) {
+    pub fn evict_idempotency_cache(
+        &self,
+        max_age: chrono::Duration,
+        now: chrono::DateTime<chrono::Utc>,
+    ) {
         self.idempotency.evict_older_than(max_age, now);
     }
 
@@ -377,7 +411,10 @@ impl<S: TransactionSigner> ExecutionPipeline<S> {
                 let results = self.relay.cascade_submit(vec![payload]).await;
                 let any_accepted = results.iter().any(|r| r.any_accepted);
                 let relay_count = results.first().map(|r| r.relay_outcomes.len()).unwrap_or(0);
-                ExecutionOutcome::SubmittedCascade { any_accepted, relay_count }
+                ExecutionOutcome::SubmittedCascade {
+                    any_accepted,
+                    relay_count,
+                }
             }
         };
 
@@ -400,25 +437,57 @@ impl<S: TransactionSigner> ExecutionPipeline<S> {
 /// every field except `flashloan_provider_id` — see
 /// `resolve_flashloan_provider_id`'s doc comment for why that one field
 /// fails closed instead of being filled with a placeholder.
+///
+/// ## U256 -> u128 mapping policy (this revision)
+///
+/// - `expected_profit_net`: MUST fit in `u128`. Overflow returns
+///   `ExecutionError::BlueprintFieldOverflow` rather than coercing to
+///   `u128::MAX` — confirmed against `check_dynamic_profit`'s real body
+///   that coercion fails OPEN (`MAX < dynamic_min_profit_wei` is false
+///   for any realistic threshold). See this file's module-level "Fix
+///   (this revision)" note and error.rs's matching note.
+/// - `dynamic_min_profit` / `flashloan_amount`: overflow still maps to
+///   `u128::MAX` — confirmed this direction fails CLOSED in checks 5,
+///   10, and 14 respectively, so coercion remains the correct,
+///   conservative behavior for these two fields specifically. NOT
+///   changed to the same overflow-rejecting treatment as
+///   `expected_profit_net`, deliberately — the two fields have opposite
+///   failure directions and should not be treated identically.
+///
+/// ## Fix (earlier revision): missing `nonce` field
+///
+/// `BlueprintFields` gained a `nonce: u64` field (see omega-risk::checks's
+/// own audit note, check 15 / `StaleBlueprint`) that this mapping was
+/// never updated for — `cargo build` fails with `E0063: missing field
+/// nonce`. `bp.nonce` is a direct 1:1 copy, same as every other field
+/// below; no derivation or fallback needed.
 fn blueprint_to_check_fields(bp: &ExecutionBlueprint) -> Result<BlueprintFields, ExecutionError> {
     let flashloan_provider_id = resolve_flashloan_provider_id(bp.flashloan_provider)?;
 
+    let expected_profit_net_wei: u128 =
+        bp.expected_profit_net
+            .try_into()
+            .map_err(|_| ExecutionError::BlueprintFieldOverflow {
+                field: "expected_profit_net",
+            })?;
+
     Ok(BlueprintFields {
-        chain_id:                bp.chain_id,
-        expiry_block:            bp.expiry_block,
-        l2_exec_gas_estimate:    bp.l2_exec_gas_estimate,
-        l1_data_gas_estimate:    bp.l1_data_gas_estimate,
-        extraction_gas:          bp.extraction_gas,
-        expected_profit_net_wei: bp.expected_profit_net.try_into().unwrap_or(u128::MAX),
-        dynamic_min_profit_wei:  bp.dynamic_min_profit.try_into().unwrap_or(u128::MAX),
+        chain_id: bp.chain_id,
+        expiry_block: bp.expiry_block,
+        l2_exec_gas_estimate: bp.l2_exec_gas_estimate,
+        l1_data_gas_estimate: bp.l1_data_gas_estimate,
+        extraction_gas: bp.extraction_gas,
+        expected_profit_net_wei,
+        dynamic_min_profit_wei: bp.dynamic_min_profit.try_into().unwrap_or(u128::MAX),
         l1_data_fee_at_creation: bp.l1_data_fee_at_creation,
-        slippage_bps:            bp.slippage_bps,
-        flashloan_amount:        bp.flashloan_amount.try_into().unwrap_or(u128::MAX),
+        slippage_bps: bp.slippage_bps,
+        flashloan_amount: bp.flashloan_amount.try_into().unwrap_or(u128::MAX),
         flashloan_provider_id,
-        strategy_id:             strategy_id_label(bp.strategy_id),
-        strategy_bytecode_hash:  bp.strategy_bytecode_hash.0,
-        price_impact_bps:        bp.price_impact_bps,
-        ofa_compliant:           bp.ofa_compliant,
+        strategy_id: strategy_id_label(bp.strategy_id),
+        strategy_bytecode_hash: bp.strategy_bytecode_hash.0,
+        price_impact_bps: bp.price_impact_bps,
+        ofa_compliant: bp.ofa_compliant,
+        nonce: bp.nonce,
     })
 }
 
@@ -446,17 +515,19 @@ fn resolve_flashloan_provider_id(addr: Address) -> Result<&'static str, Executio
         // in this case, so "none" is accurate, not a placeholder.
         return Ok("none");
     }
-    Err(ExecutionError::UnknownFlashloanProvider { address: format!("{addr:?}") })
+    Err(ExecutionError::UnknownFlashloanProvider {
+        address: format!("{addr:?}"),
+    })
 }
 
 fn strategy_id_label(id: omega_core::types::blueprint::StrategyId) -> &'static str {
     use omega_core::types::blueprint::StrategyId;
     match id {
-        StrategyId::Sa   => "SA",
+        StrategyId::Sa => "SA",
         StrategyId::Cnry => "CNRY",
-        StrategyId::Msa  => "MSA",
-        StrategyId::La   => "LA",
-        StrategyId::Mev  => "MEV",
+        StrategyId::Msa => "MSA",
+        StrategyId::La => "LA",
+        StrategyId::Mev => "MEV",
     }
 }
 
@@ -497,7 +568,9 @@ mod tests {
                 relay_bundle_id: Some(bundle.bundle_hash),
             })
         }
-        fn name(&self) -> &str { "always-accept" }
+        fn name(&self) -> &str {
+            "always-accept"
+        }
     }
 
     fn blacklist_file() -> NamedTempFile {
@@ -514,7 +587,10 @@ mod tests {
     /// custom `RelayClient` (latency, call-counting) and a custom
     /// per-relay rate limit, without duplicating `MultiRelayClient`
     /// construction (blacklist file, metrics, config) at every call site.
-    fn make_relay_with(client: Arc<dyn RelayClient>, max_per_second: usize) -> Arc<MultiRelayClient> {
+    fn make_relay_with(
+        client: Arc<dyn RelayClient>,
+        max_per_second: usize,
+    ) -> Arc<MultiRelayClient> {
         let f = blacklist_file();
         let blacklist = BuilderBlacklist::load(f.path()).unwrap();
         let metrics = LaRelayMetrics::new(50, ExecutionAddress("0xTEST".into()));
@@ -645,10 +721,10 @@ mod tests {
     fn make_integrity_registry() -> Arc<omega_security::IntegrityRegistry> {
         let reg = omega_security::IntegrityRegistry::new();
         reg.register(omega_security::StrategyEntry {
-            strategy_id:      "SA".into(),
-            bytecode_hash:    [0xaa; 32],
+            strategy_id: "SA".into(),
+            bytecode_hash: [0xaa; 32],
             contract_address: [0x01; 20],
-            min_phase:        1,
+            min_phase: 1,
         });
         reg
     }
@@ -674,7 +750,14 @@ mod tests {
         kill_switches: Arc<KillSwitchRegistry>,
         signer: Arc<S>,
     ) -> ExecutionPipeline<S> {
-        ExecutionPipeline::new(kill_switches, make_integrity_registry(), relay, dag, signer, 42161)
+        ExecutionPipeline::new(
+            kill_switches,
+            make_integrity_registry(),
+            relay,
+            dag,
+            signer,
+            42161,
+        )
     }
 
     // ── Stage 0 ────────────────────────────────────────────────────────
@@ -713,11 +796,16 @@ mod tests {
         let pipeline = make_pipeline();
         let bp = sample_bp(3);
         pipeline.dag.lock().unwrap().admit(bp.clone(), &[]).unwrap();
-        pipeline.kill_switches.trip_manual("SA", "alice", "test trip");
+        pipeline
+            .kill_switches
+            .trip_manual("SA", "alice", "test trip");
 
         let ctx = passing_ctx(bp.strategy_bytecode_hash.0);
         let result = pipeline.execute(bp, 1, &ctx, 500, 1_700_000_000).await;
-        assert!(matches!(result, Err(ExecutionError::KillSwitchTripped { .. })));
+        assert!(matches!(
+            result,
+            Err(ExecutionError::KillSwitchTripped { .. })
+        ));
     }
 
     // ── Stage 2b (bytecode integrity registry — Gap 9) ──────────────────
@@ -735,7 +823,10 @@ mod tests {
         pipeline.dag.lock().unwrap().admit(bp.clone(), &[]).unwrap();
         let ctx = passing_ctx(bp.strategy_bytecode_hash.0);
         let result = pipeline.execute(bp, 1, &ctx, 500, 1_700_000_000).await;
-        assert!(result.is_ok(), "registered strategy with matching hash must pass Stage 2b");
+        assert!(
+            result.is_ok(),
+            "registered strategy with matching hash must pass Stage 2b"
+        );
     }
 
     #[tokio::test]
@@ -915,6 +1006,48 @@ mod tests {
         assert!(matches!(result, Err(ExecutionError::RiskCheckFailed(_))));
     }
 
+    // ── expected_profit_net overflow (this revision) ─────────────────────
+
+    /// Regression guard for this revision's fix: an `expected_profit_net`
+    /// that doesn't fit in u128 must be REJECTED at the mapping step, not
+    /// silently coerced to u128::MAX (which would fail open in
+    /// check_dynamic_profit — see this file's and error.rs's module-level
+    /// notes for the confirmed reasoning).
+    #[test]
+    fn expected_profit_overflow_fails_closed_at_mapping() {
+        let mut bp = sample_bp(0xEE);
+        // U256 wider than u128::MAX — guaranteed overflow on try_into::<u128>().
+        bp.expected_profit_net = U256::from(u128::MAX) + U256::from(1u64);
+        bp.idempotency_key = bp.compute_idempotency_key();
+        bp.blueprint_hash = bp.compute_hash();
+
+        let err = blueprint_to_check_fields(&bp).unwrap_err();
+        assert!(matches!(
+            err,
+            ExecutionError::BlueprintFieldOverflow {
+                field: "expected_profit_net"
+            }
+        ));
+    }
+
+    /// Confirms the OTHER two U256->u128 mappings still saturate to MAX
+    /// on overflow rather than erroring — the deliberately different
+    /// treatment this revision's doc comments describe, since their
+    /// overflow direction fails closed in checks 10/14 rather than open.
+    #[test]
+    fn dynamic_min_profit_and_flashloan_amount_still_saturate_on_overflow() {
+        let mut bp = sample_bp(0xEF);
+        bp.dynamic_min_profit = U256::from(u128::MAX) + U256::from(1u64);
+        bp.flashloan_amount = U256::from(u128::MAX) + U256::from(1u64);
+        bp.idempotency_key = bp.compute_idempotency_key();
+        bp.blueprint_hash = bp.compute_hash();
+
+        let fields = blueprint_to_check_fields(&bp)
+            .expect("overflow on these two fields must NOT error — they saturate instead");
+        assert_eq!(fields.dynamic_min_profit_wei, u128::MAX);
+        assert_eq!(fields.flashloan_amount, u128::MAX);
+    }
+
     // ── Stage 3 ────────────────────────────────────────────────────────
 
     #[tokio::test]
@@ -927,13 +1060,18 @@ mod tests {
         }
         let ctx = passing_ctx(bp.strategy_bytecode_hash.0);
 
-        let first = pipeline.execute(bp.clone(), 1, &ctx, 500, 1_700_000_000).await;
+        let first = pipeline
+            .execute(bp.clone(), 1, &ctx, 500, 1_700_000_000)
+            .await;
         assert!(first.is_ok());
 
         // Second call with the identical blueprint (identical idempotency_key)
         pipeline.dag.lock().unwrap().admit(bp.clone(), &[]).ok(); // may be a dup DAG admit; irrelevant to this test
         let second = pipeline.execute(bp, 1, &ctx, 500, 1_700_000_000).await;
-        assert!(matches!(second, Err(ExecutionError::DuplicateIdempotencyKey)));
+        assert!(matches!(
+            second,
+            Err(ExecutionError::DuplicateIdempotencyKey)
+        ));
     }
 
     #[tokio::test]
@@ -975,7 +1113,10 @@ mod tests {
             .filter(|r| matches!(r, Err(ExecutionError::DuplicateIdempotencyKey)))
             .count();
         assert_eq!(ok_count, 1, "exactly one concurrent call must succeed");
-        assert_eq!(dup_count, 1, "the other must fail as a duplicate, not silently succeed or panic");
+        assert_eq!(
+            dup_count, 1,
+            "the other must fail as a duplicate, not silently succeed or panic"
+        );
     }
 
     #[tokio::test]
@@ -1004,7 +1145,10 @@ mod tests {
                 ok_count += 1;
             }
         }
-        assert_eq!(ok_count, 8, "all 8 distinct blueprints must succeed independently");
+        assert_eq!(
+            ok_count, 8,
+            "all 8 distinct blueprints must succeed independently"
+        );
         assert_eq!(
             pipeline.dag.lock().unwrap().microtx_count(),
             0,
@@ -1022,7 +1166,10 @@ mod tests {
         let ctx = passing_ctx(bp.strategy_bytecode_hash.0);
 
         let result = pipeline.execute(bp, 1, &ctx, 500, 1_700_000_000).await;
-        assert!(matches!(result, Ok(ExecutionOutcome::SubmittedSingle { any_accepted: true })));
+        assert!(matches!(
+            result,
+            Ok(ExecutionOutcome::SubmittedSingle { any_accepted: true })
+        ));
     }
 
     #[tokio::test]
@@ -1038,7 +1185,10 @@ mod tests {
         let result = pipeline.execute(bp, 1, &ctx, 500, 1_700_000_000).await;
         assert!(matches!(
             result,
-            Ok(ExecutionOutcome::SubmittedCascade { any_accepted: true, .. })
+            Ok(ExecutionOutcome::SubmittedCascade {
+                any_accepted: true,
+                ..
+            })
         ));
     }
 
@@ -1052,7 +1202,9 @@ mod tests {
         assert_eq!(pipeline.dag.lock().unwrap().microtx_count(), 1);
 
         let ctx = passing_ctx(bp.strategy_bytecode_hash.0);
-        let _ = pipeline.execute(bp.clone(), 1, &ctx, 500, 1_700_000_000).await;
+        let _ = pipeline
+            .execute(bp.clone(), 1, &ctx, 500, 1_700_000_000)
+            .await;
 
         assert_eq!(
             pipeline.dag.lock().unwrap().microtx_count(),
@@ -1089,7 +1241,10 @@ mod tests {
         let bp = sample_bp(11);
         pipeline.dag.lock().unwrap().admit(bp.clone(), &[]).unwrap();
         let ctx = passing_ctx(bp.strategy_bytecode_hash.0);
-        pipeline.execute(bp, 1, &ctx, 500, 1_700_000_000).await.unwrap();
+        pipeline
+            .execute(bp, 1, &ctx, 500, 1_700_000_000)
+            .await
+            .unwrap();
 
         assert_eq!(pipeline.idempotency_cache_len(), 1);
         let far_future = chrono::Utc::now() + chrono::Duration::days(365);
@@ -1113,7 +1268,9 @@ mod tests {
 
     impl CountingRelay {
         fn new() -> Self {
-            Self { calls: std::sync::atomic::AtomicUsize::new(0) }
+            Self {
+                calls: std::sync::atomic::AtomicUsize::new(0),
+            }
         }
         fn call_count(&self) -> usize {
             self.calls.load(std::sync::atomic::Ordering::SeqCst)
@@ -1127,9 +1284,14 @@ mod tests {
             bundle: omega_relay::BundlePayload,
         ) -> omega_relay::RelayResult<SubmissionOutcome> {
             self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            Ok(SubmissionOutcome { accepted: true, relay_bundle_id: Some(bundle.bundle_hash) })
+            Ok(SubmissionOutcome {
+                accepted: true,
+                relay_bundle_id: Some(bundle.bundle_hash),
+            })
         }
-        fn name(&self) -> &str { "counting" }
+        fn name(&self) -> &str {
+            "counting"
+        }
     }
 
     /// Sleeps for `delay` before accepting, to simulate real relay/network
@@ -1146,9 +1308,14 @@ mod tests {
             bundle: omega_relay::BundlePayload,
         ) -> omega_relay::RelayResult<SubmissionOutcome> {
             tokio::time::sleep(self.delay).await;
-            Ok(SubmissionOutcome { accepted: true, relay_bundle_id: Some(bundle.bundle_hash) })
+            Ok(SubmissionOutcome {
+                accepted: true,
+                relay_bundle_id: Some(bundle.bundle_hash),
+            })
         }
-        fn name(&self) -> &str { "slow" }
+        fn name(&self) -> &str {
+            "slow"
+        }
     }
 
     /// Sleeps for `delay` before signing, to simulate real HSM/KMS
@@ -1222,7 +1389,10 @@ mod tests {
         let bp_ok = sample_bp(31);
         dag.lock().unwrap().admit(bp_ok.clone(), &[]).unwrap();
         let ctx_ok = passing_ctx(bp_ok.strategy_bytecode_hash.0);
-        assert!(pipeline.execute(bp_ok, 1, &ctx_ok, 500, 1_700_000_000).await.is_ok());
+        assert!(pipeline
+            .execute(bp_ok, 1, &ctx_ok, 500, 1_700_000_000)
+            .await
+            .is_ok());
 
         // 2. Fails integrity (tampered after admit).
         let mut bp_bad_hash = sample_bp(32);
@@ -1230,7 +1400,9 @@ mod tests {
         let ctx_bad_hash = passing_ctx(bp_bad_hash.strategy_bytecode_hash.0);
         bp_bad_hash.expected_profit_net = U256::from(1u64);
         assert!(matches!(
-            pipeline.execute(bp_bad_hash, 1, &ctx_bad_hash, 500, 1_700_000_000).await,
+            pipeline
+                .execute(bp_bad_hash, 1, &ctx_bad_hash, 500, 1_700_000_000)
+                .await,
             Err(ExecutionError::IntegrityFailure)
         ));
 
@@ -1240,7 +1412,9 @@ mod tests {
         dag.lock().unwrap().admit(bp_ks.clone(), &[]).unwrap();
         let ctx_ks = passing_ctx(bp_ks.strategy_bytecode_hash.0);
         assert!(matches!(
-            pipeline.execute(bp_ks, 1, &ctx_ks, 500, 1_700_000_000).await,
+            pipeline
+                .execute(bp_ks, 1, &ctx_ks, 500, 1_700_000_000)
+                .await,
             Err(ExecutionError::KillSwitchTripped { .. })
         ));
 
@@ -1259,7 +1433,10 @@ mod tests {
         let ctx = passing_ctx(bp.strategy_bytecode_hash.0);
 
         assert_eq!(pipeline.idempotency_cache_len(), 0);
-        pipeline.execute(bp, 1, &ctx, 500, 1_700_000_000).await.unwrap();
+        pipeline
+            .execute(bp, 1, &ctx, 500, 1_700_000_000)
+            .await
+            .unwrap();
         assert_eq!(
             pipeline.idempotency_cache_len(),
             1,
@@ -1290,7 +1467,10 @@ mod tests {
             dag.lock().unwrap().admit(bp.clone(), &[]).unwrap();
             let ctx = passing_ctx(bp.strategy_bytecode_hash.0);
             let result = pipeline.execute(bp, 1, &ctx, 500, 1_700_000_000).await;
-            assert!(matches!(result, Err(ExecutionError::KillSwitchTripped { .. })));
+            assert!(matches!(
+                result,
+                Err(ExecutionError::KillSwitchTripped { .. })
+            ));
         }
 
         assert_eq!(
@@ -1330,7 +1510,10 @@ mod tests {
             }
         }
         assert_eq!(ok_count, 1, "exactly one of 16 racing calls must succeed");
-        assert_eq!(dup_count, 15, "the other 15 must all fail as duplicates, none silently lost or double-counted");
+        assert_eq!(
+            dup_count, 15,
+            "the other 15 must all fail as duplicates, none silently lost or double-counted"
+        );
     }
 
     // ── Load tests ────────────────────────────────────────────────────
@@ -1367,7 +1550,9 @@ mod tests {
 
         let mut ok = 0;
         for h in handles {
-            if h.await.unwrap().is_ok() { ok += 1; }
+            if h.await.unwrap().is_ok() {
+                ok += 1;
+            }
         }
         assert_eq!(ok, 100);
         assert_eq!(pipeline.dag.lock().unwrap().microtx_count(), 0);
@@ -1397,10 +1582,19 @@ mod tests {
 
         let mut ok = 0;
         for h in handles {
-            if h.await.unwrap().is_ok() { ok += 1; }
+            if h.await.unwrap().is_ok() {
+                ok += 1;
+            }
         }
-        assert_eq!(ok, 1000, "all 1000 concurrent distinct blueprints must succeed independently");
-        assert_eq!(pipeline.dag.lock().unwrap().microtx_count(), 0, "no leaked slots at 1000-way concurrency");
+        assert_eq!(
+            ok, 1000,
+            "all 1000 concurrent distinct blueprints must succeed independently"
+        );
+        assert_eq!(
+            pipeline.dag.lock().unwrap().microtx_count(),
+            0,
+            "no leaked slots at 1000-way concurrency"
+        );
     }
 
     #[tokio::test]
@@ -1441,7 +1635,10 @@ mod tests {
             }
         }
         assert_eq!(ok, 50, "exactly the untampered half must succeed");
-        assert_eq!(integrity_failures, 50, "exactly the tampered half must fail integrity, nothing else");
+        assert_eq!(
+            integrity_failures, 50,
+            "exactly the tampered half must fail integrity, nothing else"
+        );
         assert_eq!(pipeline.dag.lock().unwrap().microtx_count(), 0);
     }
 
@@ -1454,7 +1651,9 @@ mod tests {
             make_kill_switches(),
             make_integrity_registry(),
             make_relay_with(
-                Arc::new(SlowRelay { delay: std::time::Duration::from_millis(PER_CALL_DELAY_MS) }),
+                Arc::new(SlowRelay {
+                    delay: std::time::Duration::from_millis(PER_CALL_DELAY_MS),
+                }),
                 10_000, // high rate limit so governor doesn't confound the timing measurement
             ),
             make_dag_with_capacity(50),
@@ -1503,7 +1702,9 @@ mod tests {
             make_integrity_registry(),
             make_relay_with(Arc::new(AlwaysAcceptRelay), 10_000),
             make_dag_with_capacity(50),
-            Arc::new(SlowSigner { delay: std::time::Duration::from_millis(PER_CALL_DELAY_MS) }),
+            Arc::new(SlowSigner {
+                delay: std::time::Duration::from_millis(PER_CALL_DELAY_MS),
+            }),
             42161,
         ));
 
@@ -1572,7 +1773,12 @@ mod tests {
                 Err(ExecutionError::KillSwitchTripped { .. })
             ));
         }
-        assert_eq!(counting_relay.call_count(), 0, "no call in the post-trip burst may reach the relay");
+
+        assert_eq!(
+            counting_relay.call_count(),
+            0,
+            "no call in the post-trip burst may reach the relay"
+        );
     }
 
     /// Like `sample_bp`, but accepts a wider index so load tests can
@@ -1632,12 +1838,18 @@ mod tests {
 
     #[test]
     fn zero_address_resolves_to_none() {
-        assert_eq!(resolve_flashloan_provider_id(Address::ZERO).unwrap(), "none");
+        assert_eq!(
+            resolve_flashloan_provider_id(Address::ZERO).unwrap(),
+            "none"
+        );
     }
 
     #[test]
     fn nonzero_address_fails_closed() {
         let result = resolve_flashloan_provider_id(Address::from([0x11u8; 20]));
-        assert!(matches!(result, Err(ExecutionError::UnknownFlashloanProvider { .. })));
+        assert!(matches!(
+            result,
+            Err(ExecutionError::UnknownFlashloanProvider { .. })
+        ));
     }
 }

@@ -22,39 +22,39 @@ use std::collections::HashMap;
 /// Complete governance-controlled threshold configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ThresholdConfig {
-    pub version:                          u32,
-    pub confidence_overrides:             HashMap<u8, f64>,
-    pub max_inference_latency_us:         u64,
-    pub relay_leak_zscore:                f64,
-    pub relay_inclusion_drop:             f64,
-    pub relay_latency_spike_multiplier:   f32,
-    pub gas_escalation_z_warn:            f64,
-    pub gas_escalation_z_critical:        f64,
-    pub oracle_deviation_warn:            f64,
-    pub oracle_deviation_critical:        f64,
+    pub version: u32,
+    pub confidence_overrides: HashMap<u8, f64>,
+    pub max_inference_latency_us: u64,
+    pub relay_leak_zscore: f64,
+    pub relay_inclusion_drop: f64,
+    pub relay_latency_spike_multiplier: f32,
+    pub gas_escalation_z_warn: f64,
+    pub gas_escalation_z_critical: f64,
+    pub oracle_deviation_warn: f64,
+    pub oracle_deviation_critical: f64,
     pub sequencer_restart_dedup_threshold: f32,
-    pub is_emergency:                     bool,
-    pub applied_by:                       String,
-    pub applied_at:                       u64,
+    pub is_emergency: bool,
+    pub applied_by: String,
+    pub applied_at: u64,
 }
 
 impl Default for ThresholdConfig {
     fn default() -> Self {
         Self {
-            version:                          1,
-            confidence_overrides:             HashMap::new(),
-            max_inference_latency_us:         50,
-            relay_leak_zscore:                3.0,
-            relay_inclusion_drop:             0.15,
-            relay_latency_spike_multiplier:   2.0,
-            gas_escalation_z_warn:            2.0,
-            gas_escalation_z_critical:        3.0,
-            oracle_deviation_warn:            0.05,
-            oracle_deviation_critical:        0.10,
+            version: 1,
+            confidence_overrides: HashMap::new(),
+            max_inference_latency_us: 50,
+            relay_leak_zscore: 3.0,
+            relay_inclusion_drop: 0.15,
+            relay_latency_spike_multiplier: 2.0,
+            gas_escalation_z_warn: 2.0,
+            gas_escalation_z_critical: 3.0,
+            oracle_deviation_warn: 0.05,
+            oracle_deviation_critical: 0.10,
             sequencer_restart_dedup_threshold: 0.85,
-            is_emergency:                     false,
-            applied_by:                       "genesis".into(),
-            applied_at:                       0,
+            is_emergency: false,
+            applied_by: "genesis".into(),
+            applied_at: 0,
         }
     }
 }
@@ -133,7 +133,7 @@ mod tests {
     #[test]
     fn bad_z_order_fails() {
         let c = ThresholdConfig {
-            gas_escalation_z_warn:     5.0,
+            gas_escalation_z_warn: 5.0,
             gas_escalation_z_critical: 2.0,
             ..Default::default()
         };
@@ -151,7 +151,7 @@ mod tests {
     #[test]
     fn oracle_deviation_bad_order_fails() {
         let c = ThresholdConfig {
-            oracle_deviation_warn:     0.20,
+            oracle_deviation_warn: 0.20,
             oracle_deviation_critical: 0.10,
             ..Default::default()
         };
@@ -211,18 +211,21 @@ mod tests {
     #[test]
     fn confidence_override_out_of_range_fails() {
         let mut c = ThresholdConfig::default();
-        c.confidence_overrides.insert(PatternDomain::GasWar as u8, 1.5);
+        c.confidence_overrides
+            .insert(PatternDomain::GasWar as u8, 1.5);
         assert!(c.validate().is_err());
 
         let mut c2 = ThresholdConfig::default();
-        c2.confidence_overrides.insert(PatternDomain::GasWar as u8, -0.2);
+        c2.confidence_overrides
+            .insert(PatternDomain::GasWar as u8, -0.2);
         assert!(c2.validate().is_err());
     }
 
     #[test]
     fn valid_confidence_override_still_passes() {
         let mut c = ThresholdConfig::default();
-        c.confidence_overrides.insert(PatternDomain::GasWar as u8, 0.9);
+        c.confidence_overrides
+            .insert(PatternDomain::GasWar as u8, 0.9);
         assert!(c.validate().is_ok());
     }
 }

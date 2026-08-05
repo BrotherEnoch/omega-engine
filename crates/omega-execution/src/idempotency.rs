@@ -30,7 +30,9 @@ pub struct IdempotencyCache {
 
 impl IdempotencyCache {
     pub fn new() -> Self {
-        Self { seen: Arc::new(DashMap::new()) }
+        Self {
+            seen: Arc::new(DashMap::new()),
+        }
     }
 
     /// Atomically checks and marks `key` as seen. Returns
@@ -58,12 +60,15 @@ impl IdempotencyCache {
     /// pattern already used by `omega_risk::kill_switch`'s window_history
     /// and `omega_relay::dedup::SequencerRestartHandler::on_new_block`.
     pub fn evict_older_than(&self, max_age: chrono::Duration, now: DateTime<Utc>) {
-        self.seen.retain(|_, seen_at| now.signed_duration_since(*seen_at) <= max_age);
+        self.seen
+            .retain(|_, seen_at| now.signed_duration_since(*seen_at) <= max_age);
     }
 }
 
 impl Default for IdempotencyCache {
-    fn default() -> Self { Self::new() }
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 #[cfg(test)]
@@ -112,7 +117,9 @@ mod tests {
                 })
             })
             .collect();
-        for h in handles { h.join().unwrap(); }
+        for h in handles {
+            h.join().unwrap();
+        }
         assert_eq!(wins.load(std::sync::atomic::Ordering::Relaxed), 1);
     }
 
@@ -122,7 +129,10 @@ mod tests {
         let key = B256::from([6u8; 32]);
         let t0 = Utc::now();
         cache.seen.insert(key, t0);
-        cache.evict_older_than(chrono::Duration::seconds(60), t0 + chrono::Duration::seconds(120));
+        cache.evict_older_than(
+            chrono::Duration::seconds(60),
+            t0 + chrono::Duration::seconds(120),
+        );
         assert!(cache.is_empty());
     }
 
@@ -132,7 +142,10 @@ mod tests {
         let key = B256::from([7u8; 32]);
         let t0 = Utc::now();
         cache.seen.insert(key, t0);
-        cache.evict_older_than(chrono::Duration::seconds(60), t0 + chrono::Duration::seconds(30));
+        cache.evict_older_than(
+            chrono::Duration::seconds(60),
+            t0 + chrono::Duration::seconds(30),
+        );
         assert_eq!(cache.len(), 1);
     }
 }

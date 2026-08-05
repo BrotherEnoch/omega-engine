@@ -7,8 +7,7 @@
 
 use once_cell::sync::Lazy;
 use prometheus::{
-    register_counter, register_counter_vec, register_gauge_vec,
-    Counter, CounterVec, GaugeVec,
+    register_counter, register_counter_vec, register_gauge_vec, Counter, CounterVec, GaugeVec,
 };
 
 // ─── Signing ──────────────────────────────────────────────────────────────────

@@ -28,14 +28,14 @@ impl ProverTier {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ZkProof {
-    pub blueprint_hash:    [u8; 32],
-    pub net_profit_wei:    u128,
-    pub chain_id:          u64,
-    pub strategy_id:       String,
-    pub proof_bytes:       Vec<u8>,
-    pub prover_tier:       ProverTier,
-    pub generation_ms:     u64,
-    pub proof_size_bytes:  usize,
+    pub blueprint_hash: [u8; 32],
+    pub net_profit_wei: u128,
+    pub chain_id: u64,
+    pub strategy_id: String,
+    pub proof_bytes: Vec<u8>,
+    pub prover_tier: ProverTier,
+    pub generation_ms: u64,
+    pub proof_size_bytes: usize,
 }
 
 impl ZkProof {
@@ -71,12 +71,12 @@ impl T1SoftwareProver {
                 detail: e.to_string(),
             })?;
 
-        let generation_ms    = started.elapsed().as_millis() as u64;
+        let generation_ms = started.elapsed().as_millis() as u64;
         let proof_size_bytes = proof_bytes.len();
 
         tracing::debug!(
             blueprint_hash = hex::encode(blueprint_hash),
-            strategy       = strategy_id,
+            strategy = strategy_id,
             generation_ms,
             proof_size_bytes,
             "ZK proof generated"
@@ -99,22 +99,18 @@ impl T1SoftwareProver {
         blueprint_hash: &[u8; 32],
         net_profit_wei: u128,
     ) -> anyhow::Result<Vec<u8>> {
-        use winterfell::{FieldExtension, ProofOptions, Prover, math::fields::f128::BaseElement};
+        use winterfell::{math::fields::f128::BaseElement, FieldExtension, ProofOptions, Prover};
 
         let pub_inputs = BlueprintPublicInputs {
             hash_commitment: hash_to_field_elements(blueprint_hash),
-            net_profit_hi:   BaseElement::new(net_profit_wei >> 64),
-            net_profit_lo:   BaseElement::new(net_profit_wei as u64 as u128),
-            chain_id:        BaseElement::new(self.chain_id as u128),
+            net_profit_hi: BaseElement::new(net_profit_wei >> 64),
+            net_profit_lo: BaseElement::new(net_profit_wei as u64 as u128),
+            chain_id: BaseElement::new(self.chain_id as u128),
         };
 
         let trace = build_blueprint_trace(&pub_inputs);
 
-        let options = ProofOptions::new(
-            28, 8, 0,
-            FieldExtension::None,
-            8, 127,
-        );
+        let options = ProofOptions::new(28, 8, 0, FieldExtension::None, 8, 127);
 
         let prover = BlueprintProver {
             options,
@@ -131,28 +127,28 @@ impl T1SoftwareProver {
 // ─── Winterfell AIR types ─────────────────────────────────────────────────────
 
 use winterfell::{
+    crypto::{hashers::Blake3_256, DefaultRandomCoin},
+    math::{fields::f128::BaseElement, FieldElement, ToElements},
     Air, AirContext, Assertion, AuxTraceRandElements, ConstraintCompositionCoefficients,
     DefaultConstraintEvaluator, DefaultTraceLde, EvaluationFrame, ProofOptions, Prover, TraceInfo,
     TracePolyTable, TraceTable, TransitionConstraintDegree,
-    crypto::{DefaultRandomCoin, hashers::Blake3_256},
-    math::{FieldElement, ToElements, fields::f128::BaseElement},
 };
 
 #[derive(Debug, Clone)]
 pub(crate) struct BlueprintPublicInputs {
     hash_commitment: [BaseElement; 4],
-    net_profit_hi:   BaseElement,
-    net_profit_lo:   BaseElement,
-    chain_id:        BaseElement,
+    net_profit_hi: BaseElement,
+    net_profit_lo: BaseElement,
+    chain_id: BaseElement,
 }
 
 impl BlueprintPublicInputs {
     pub(crate) fn new(blueprint_hash: &[u8; 32], net_profit_wei: u128, chain_id: u64) -> Self {
         Self {
             hash_commitment: hash_to_field_elements(blueprint_hash),
-            net_profit_hi:   BaseElement::new(net_profit_wei >> 64),
-            net_profit_lo:   BaseElement::new(net_profit_wei as u64 as u128),
-            chain_id:        BaseElement::new(chain_id as u128),
+            net_profit_hi: BaseElement::new(net_profit_wei >> 64),
+            net_profit_lo: BaseElement::new(net_profit_wei as u64 as u128),
+            chain_id: BaseElement::new(chain_id as u128),
         }
     }
 }
@@ -166,15 +162,19 @@ impl ToElements<BaseElement> for BlueprintPublicInputs {
 }
 
 pub(crate) struct BlueprintAir {
-    context:    AirContext<BaseElement>,
+    context: AirContext<BaseElement>,
     pub_inputs: BlueprintPublicInputs,
 }
 
 impl Air for BlueprintAir {
-    type BaseField    = BaseElement;
+    type BaseField = BaseElement;
     type PublicInputs = BlueprintPublicInputs;
 
-    fn new(trace_info: TraceInfo, pub_inputs: BlueprintPublicInputs, options: ProofOptions) -> Self {
+    fn new(
+        trace_info: TraceInfo,
+        pub_inputs: BlueprintPublicInputs,
+        options: ProofOptions,
+    ) -> Self {
         let degrees = vec![TransitionConstraintDegree::new(1)];
         Self {
             context: AirContext::new(trace_info, degrees, 7, options),
@@ -182,13 +182,15 @@ impl Air for BlueprintAir {
         }
     }
 
-    fn context(&self) -> &AirContext<Self::BaseField> { &self.context }
+    fn context(&self) -> &AirContext<Self::BaseField> {
+        &self.context
+    }
 
     fn evaluate_transition<E: FieldElement<BaseField = Self::BaseField>>(
         &self,
-        frame:    &EvaluationFrame<E>,
+        frame: &EvaluationFrame<E>,
         _periodic: &[E],
-        result:   &mut [E],
+        result: &mut [E],
     ) {
         result[0] = frame.next()[0] - frame.current()[0] - E::ONE;
     }
@@ -207,15 +209,15 @@ impl Air for BlueprintAir {
 }
 
 pub(crate) struct BlueprintProver {
-    options:    ProofOptions,
+    options: ProofOptions,
     pub_inputs: BlueprintPublicInputs,
 }
 
 impl Prover for BlueprintProver {
     type BaseField = BaseElement;
-    type Air       = BlueprintAir;
-    type Trace     = TraceTable<BaseElement>;
-    type HashFn    = Blake3_256<BaseElement>;
+    type Air = BlueprintAir;
+    type Trace = TraceTable<BaseElement>;
+    type HashFn = Blake3_256<BaseElement>;
     type RandomCoin = DefaultRandomCoin<Self::HashFn>;
     type TraceLde<E>
         = DefaultTraceLde<E, Self::HashFn>
@@ -230,13 +232,15 @@ impl Prover for BlueprintProver {
         self.pub_inputs.clone()
     }
 
-    fn options(&self) -> &ProofOptions { &self.options }
+    fn options(&self) -> &ProofOptions {
+        &self.options
+    }
 
     fn new_trace_lde<E>(
         &self,
-        trace_info:  &TraceInfo,
-        main_trace:  &winterfell::matrix::ColMatrix<Self::BaseField>,
-        domain:      &winterfell::StarkDomain<Self::BaseField>,
+        trace_info: &TraceInfo,
+        main_trace: &winterfell::matrix::ColMatrix<Self::BaseField>,
+        domain: &winterfell::StarkDomain<Self::BaseField>,
     ) -> (Self::TraceLde<E>, TracePolyTable<E>)
     where
         E: FieldElement<BaseField = Self::BaseField>,
@@ -246,8 +250,8 @@ impl Prover for BlueprintProver {
 
     fn new_evaluator<'a, E>(
         &self,
-        air:                      &'a Self::Air,
-        aux_rand_elements:        AuxTraceRandElements<E>,
+        air: &'a Self::Air,
+        aux_rand_elements: AuxTraceRandElements<E>,
         composition_coefficients: ConstraintCompositionCoefficients<E>,
     ) -> Self::ConstraintEvaluator<'a, E>
     where
@@ -261,8 +265,8 @@ impl Prover for BlueprintProver {
 
 pub(crate) fn build_blueprint_trace(inputs: &BlueprintPublicInputs) -> TraceTable<BaseElement> {
     let trace_length = 64;
-    let num_cols     = 7;
-    let mut trace    = TraceTable::new(num_cols, trace_length);
+    let num_cols = 7;
+    let mut trace = TraceTable::new(num_cols, trace_length);
 
     trace.fill(
         |state| {
@@ -303,12 +307,14 @@ mod prover_tests {
     // StarkField must be in scope for .as_int() — fixes E0599
     use winterfell::math::StarkField;
 
-    fn hash(b: u8) -> [u8; 32] { [b; 32] }
+    fn hash(b: u8) -> [u8; 32] {
+        [b; 32]
+    }
 
     #[test]
     fn prove_produces_non_empty_proof() {
         let prover = T1SoftwareProver::new(42161);
-        let proof  = prover.prove(hash(0x01), 1_000_000_000, "LA").unwrap();
+        let proof = prover.prove(hash(0x01), 1_000_000_000, "LA").unwrap();
         assert!(!proof.proof_bytes.is_empty());
         assert_eq!(proof.blueprint_hash, hash(0x01));
         assert_eq!(proof.net_profit_wei, 1_000_000_000);
@@ -320,28 +326,31 @@ mod prover_tests {
     #[test]
     fn different_inputs_produce_different_proofs() {
         let prover = T1SoftwareProver::new(42161);
-        let p1     = prover.prove(hash(0x01), 1_000, "SA").unwrap();
-        let p2     = prover.prove(hash(0x02), 1_000, "SA").unwrap();
+        let p1 = prover.prove(hash(0x01), 1_000, "SA").unwrap();
+        let p2 = prover.prove(hash(0x02), 1_000, "SA").unwrap();
         assert_ne!(p1.proof_bytes, p2.proof_bytes);
     }
 
     #[test]
     fn proof_records_generation_time() {
         let prover = T1SoftwareProver::new(42161);
-        let proof  = prover.prove(hash(0xaa), 500, "MSA").unwrap();
+        let proof = prover.prove(hash(0xaa), 500, "MSA").unwrap();
         assert!(proof.generation_ms < 60_000, "proof took unreasonably long");
     }
 
     #[test]
     fn within_sla_check() {
         let prover = T1SoftwareProver::new(42161);
-        let proof  = prover.prove(hash(0xbb), 100, "CNRY").unwrap();
-        assert!(proof.within_sla(4000), "proof should complete within normal SLA in tests");
+        let proof = prover.prove(hash(0xbb), 100, "CNRY").unwrap();
+        assert!(
+            proof.within_sla(4000),
+            "proof should complete within normal SLA in tests"
+        );
     }
 
     #[test]
     fn hash_to_field_elements_is_deterministic() {
-        let h  = hash(0x42);
+        let h = hash(0x42);
         let e1 = hash_to_field_elements(&h);
         let e2 = hash_to_field_elements(&h);
         // .as_int() requires StarkField in scope (imported above)

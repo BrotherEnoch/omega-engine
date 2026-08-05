@@ -1,180 +1,182 @@
 ﻿// ops/control-plane/proto/omega_control.proto
-//! Prost message types matching `ops/control-plane/proto/omega_control.proto`.
-//!
-//! These are kept in a shared crate so frontend code can consume the same
-//! binary contract shape as backend gRPC. In environments where `protoc` is
-//! available, this module can be regenerated from the proto without changing
-//! downstream imports.
-//!
-//! ## CHANGES — verified by compiling and round-trip-encoding each one, not just written
-//!
-//! 1. `generated_at` / `timestamp` changed from `string` to
-//!    `google.protobuf.Timestamp` (`prost_types::Timestamp`). The prior bare
-//!    string had no format guarantee — `rest.rs` and `ws.rs`, the other two
-//!    contract layers in this crate, both already use a real typed timestamp
-//!    for the same conceptual data. **Wire-format-breaking**:
-//!    `ops/control-plane/proto/omega_control.proto` needs the matching change
-//!    (`string` → `google.protobuf.Timestamp`) — I don't have that file, so
-//!    that side of the pair is on you. Requires a new `prost-types` dependency
-//!    (same version as `prost`) in `Cargo.toml`.
-//! 2. `RolloutTier.fraction: f64` → `RolloutTier.rollout_bps: u32`. Same
-//!    ambiguity flagged in the `.env` review — a raw fraction float is one
-//!    typo (`0.10` vs `1.0`) from meaning 10% vs 100% rollout. Matches the
-//!    `DAO_FEE_BPS` integer-basis-points convention already used elsewhere in
-//!    this system. Also wire-format-breaking (double → varint).
-//! 3. `sample_count`, `microtx_slots`, `normal_slots`, `zk_queue_depth`,
-//!    `relay_queue_depth` changed from signed to unsigned — none can ever be
-//!    negative, and the signed types allowed representing an illegal state.
-//!    NOT wire-breaking: protobuf's `int32`/`uint32` (and `int64`/`uint64`)
-//!    encode identically for non-negative values, so any correctly-behaving
-//!    existing sender/receiver round-trips the same bytes either way. Verified
-//!    with an explicit round-trip encode/decode test, not assumed.
-//! 4. CORRECTION to something I said in the audit: I claimed these messages
-//!    were "missing `Debug`, inconsistent with the rest of the project" and
-//!    should have it added. That was wrong, and I only caught it by actually
-//!    trying to compile the change: `::prost::Message`'s derive macro already
-//!    generates a working `Debug` impl on its own — explicitly adding `Debug`
-//!    to the derive list produces a conflicting-implementation compile error.
-//!    No change made here; flagging the correction rather than quietly
-//!    dropping the point.
+//
+// OmegaControl gRPC service — internal observability and command interface.
+//
+// Transport: plaintext gRPC on :50051 (TLS terminated at the sidecar).
+// Authentication: Bearer token in `authorization` metadata key.
+//
+// Command governance:
+//   PauseStrategy, ResumeStrategy, ClearHalt — L2 fast-approve required.
+//   AdjustRollout                             — L2 fast-approve required.
+//   All Get* RPCs                             — L1 (Bearer token only).
+//
+// ## Recovery + audit-alignment note (this revision)
+//
+// This file was found overwritten with Rust source (a prost-derive
+// mirror crate's contents) instead of protobuf syntax, which is why
+// `protoc` failed with cascading "Expected top-level statement" errors.
+// Recovered from `git show d0ca6736:ops/control-plane/proto/omega_control.proto`
+// — the last commit before the file was clobbered — with the service
+// definition, package name, and per-field comments restored exactly as
+// they were there. See `git log --oneline -- ops/control-plane/proto/omega_control.proto`
+// to confirm 0c2d4969 (this repo's most recent commit) is the one that
+// did the clobbering.
+//
+// Three message-shape changes are applied on top of that recovered
+// baseline, matching the CHANGES already documented in this codebase's
+// Rust mirror crate (the same file that ended up here by mistake) for
+// this same commit:
+//   1. `generated_at` / `timestamp`: `string` (RFC-3339) -> `google.
+//      protobuf.Timestamp`. The prior bare string had no format
+//      guarantee; the Rust-side control-plane code already uses a real
+//      typed timestamp for the same conceptual data elsewhere.
+//   2. `RolloutTier.fraction: double` -> `RolloutTier.rollout_bps:
+//      uint32`. A raw [0.0, 1.0] fraction is one typo (0.10 vs 1.0) from
+//      meaning 10% vs 100% rollout; basis points match the
+//      `DAO_FEE_BPS` integer convention already used elsewhere in this
+//      system.
+//   3. `microtx_slots`, `normal_slots`, `zk_queue_depth`,
+//      `relay_queue_depth`, `sample_count`: signed -> unsigned. None can
+//      ever be negative; the signed types allowed representing an
+//      illegal state. NOT wire-breaking on its own (protobuf's
+//      int32/uint32 and int64/uint64 encode identically for
+//      non-negative values).
+//
+// These three changes are WIRE-FORMAT-BREAKING for (1) and (2) — any
+// existing client/server built against the pre-audit .proto will not
+// interoperate with this version until rebuilt from it. Confirm nothing
+// external to this workspace depends on the old wire format before
+// deploying.
 
-#[derive(Clone, PartialEq, ::prost::Message)]
-pub struct Empty {}
+syntax = "proto3";
+package omega;
 
-#[derive(Clone, PartialEq, ::prost::Message)]
-pub struct CommandResult {
-    #[prost(bool, tag = "1")]
-    pub ok: bool,
-    #[prost(string, tag = "2")]
-    pub message: ::prost::alloc::string::String,
+import "google/protobuf/timestamp.proto";
+
+service OmegaControl {
+  // ── Observability ─────────────────────────────────────────────────────────
+  // Point-in-time health snapshot across all 16 layers.
+  rpc GetSystemHealth  (Empty)        returns (HealthReport);
+  // Server-streaming health events — caller receives one event per FSM
+  // transition.  Stream runs until the client cancels.
+  rpc WatchHealth      (Empty)        returns (stream HealthEvent);
+  // Net-profit breakdown for a strategy / chain combination (§15).
+  rpc GetPnL           (PnLRequest)   returns (PnLReport);
+  // Per-layer p50/p95/p99 latency vs budget (§4).
+  rpc GetLatency       (Empty)        returns (LatencyReport);
+  // Microtx / normal / ZK / relay queue depths.
+  rpc GetQueueDepths   (Empty)        returns (QueueReport);
+  // Per-relay, per-strategy 24h win rates (§relay_la_metrics).
+  rpc GetWinRates      (Empty)        returns (WinRateReport);
+
+  // ── Commands (L2 fast-approve required) ──────────────────────────────────
+  // Pause a strategy (no new blueprints produced; in-flight allowed to settle).
+  rpc PauseStrategy    (StrategyId)   returns (CommandResult);
+  // Resume a previously paused strategy.
+  rpc ResumeStrategy   (StrategyId)   returns (CommandResult);
+  // Clear the halt flag on a specific layer after governance review (§3).
+  rpc ClearHalt        (LayerIdMsg)   returns (CommandResult);
+  // Adjust the EV-weighted rollout tier (§19).
+  rpc AdjustRollout    (RolloutTier)  returns (CommandResult);
 }
 
-#[derive(Clone, PartialEq, ::prost::Message)]
-pub struct HealthReport {
-    #[prost(message, repeated, tag = "1")]
-    pub layers: ::prost::alloc::vec::Vec<LayerHealth>,
-    #[prost(bool, tag = "2")]
-    pub system_halted: bool,
-    #[prost(message, optional, tag = "3")]
-    pub generated_at: ::core::option::Option<::prost_types::Timestamp>,
+// ── Shared ────────────────────────────────────────────────────────────────────
+message Empty {}
+
+message CommandResult {
+  bool   ok      = 1;
+  string message = 2;
 }
 
-#[derive(Clone, PartialEq, ::prost::Message)]
-pub struct LayerHealth {
-    #[prost(string, tag = "1")]
-    pub layer_id: ::prost::alloc::string::String,
-    #[prost(string, tag = "2")]
-    pub state: ::prost::alloc::string::String,
-    #[prost(string, tag = "3")]
-    pub reason: ::prost::alloc::string::String,
+// ── Health ────────────────────────────────────────────────────────────────────
+message HealthReport {
+  repeated LayerHealth layers        = 1;
+  bool                 system_halted = 2;
+  // Was `string generated_at` (RFC-3339 UTC) — see this file's
+  // module-level audit-alignment note, change 1.
+  google.protobuf.Timestamp generated_at = 3;
 }
 
-#[derive(Clone, PartialEq, ::prost::Message)]
-pub struct HealthEvent {
-    #[prost(string, tag = "1")]
-    pub layer_id: ::prost::alloc::string::String,
-    #[prost(string, tag = "2")]
-    pub from: ::prost::alloc::string::String,
-    #[prost(string, tag = "3")]
-    pub to: ::prost::alloc::string::String,
-    #[prost(string, tag = "4")]
-    pub reason: ::prost::alloc::string::String,
-    #[prost(message, optional, tag = "5")]
-    pub timestamp: ::core::option::Option<::prost_types::Timestamp>,
+message LayerHealth {
+  string layer_id = 1;  // canonical snake_case (§LayerId::Display)
+  string state    = 2;  // "HEALTHY" | "DEGRADED" | "HALTED"
+  string reason   = 3;  // last set_state reason, or "" if Healthy
 }
 
-#[derive(Clone, PartialEq, ::prost::Message)]
-pub struct PnLRequest {
-    #[prost(string, tag = "1")]
-    pub chain_id: ::prost::alloc::string::String,
-    #[prost(string, tag = "2")]
-    pub strategy_id: ::prost::alloc::string::String,
+message HealthEvent {
+  string layer_id  = 1;
+  string from      = 2;
+  string to        = 3;
+  string reason    = 4;
+  // Was `string timestamp` (RFC-3339 UTC) — see this file's
+  // module-level audit-alignment note, change 1.
+  google.protobuf.Timestamp timestamp = 5;
 }
 
-#[derive(Clone, PartialEq, ::prost::Message)]
-pub struct PnLReport {
-    #[prost(double, tag = "1")]
-    pub gross_profit_eth: f64,
-    #[prost(double, tag = "2")]
-    pub gas_cost_eth: f64,
-    #[prost(double, tag = "3")]
-    pub net_profit_eth: f64,
-    #[prost(double, tag = "4")]
-    pub dao_fee_eth: f64,
-    #[prost(double, tag = "5")]
-    pub pil_share_eth: f64,
-    #[prost(string, tag = "6")]
-    pub period: ::prost::alloc::string::String,
+// ── PnL ───────────────────────────────────────────────────────────────────────
+message PnLRequest {
+  string chain_id    = 1;  // "42161" | "1" | "8453"
+  string strategy_id = 2;  // "SA" | "MSA" | "LA" | "MEV" | "" (all)
 }
 
-#[derive(Clone, PartialEq, ::prost::Message)]
-pub struct LatencyReport {
-    #[prost(message, repeated, tag = "1")]
-    pub layers: ::prost::alloc::vec::Vec<LayerLatency>,
+message PnLReport {
+  double gross_profit_eth = 1;
+  double gas_cost_eth     = 2;
+  double net_profit_eth   = 3;
+  double dao_fee_eth      = 4;   // 5% of net (§15.1)
+  double pil_share_eth    = 5;   // 95% of net
+  string period           = 6;   // "24h" | "7d" | "30d"
 }
 
-#[derive(Clone, PartialEq, ::prost::Message)]
-pub struct LayerLatency {
-    #[prost(string, tag = "1")]
-    pub layer_id: ::prost::alloc::string::String,
-    #[prost(double, tag = "2")]
-    pub p50_us: f64,
-    #[prost(double, tag = "3")]
-    pub p95_us: f64,
-    #[prost(double, tag = "4")]
-    pub p99_us: f64,
-    #[prost(double, tag = "5")]
-    pub budget_us: f64,
+// ── Latency ───────────────────────────────────────────────────────────────────
+message LatencyReport {
+  repeated LayerLatency layers = 1;
 }
 
-#[derive(Clone, PartialEq, ::prost::Message)]
-pub struct QueueReport {
-    #[prost(uint32, tag = "1")]
-    pub microtx_slots: u32,
-    #[prost(uint32, tag = "2")]
-    pub normal_slots: u32,
-    #[prost(uint32, tag = "3")]
-    pub zk_queue_depth: u32,
-    #[prost(uint32, tag = "4")]
-    pub relay_queue_depth: u32,
+message LayerLatency {
+  string layer_id  = 1;
+  double p50_us    = 2;
+  double p95_us    = 3;
+  double p99_us    = 4;
+  double budget_us = 5;  // SLA budget; >budget means this layer is over-latency
 }
 
-#[derive(Clone, PartialEq, ::prost::Message)]
-pub struct WinRateReport {
-    #[prost(message, repeated, tag = "1")]
-    pub relays: ::prost::alloc::vec::Vec<RelayWinRate>,
+// ── Queue depths ──────────────────────────────────────────────────────────────
+message QueueReport {
+  // Were int32 — see this file's module-level audit-alignment note,
+  // change 3. None of these four can ever be negative.
+  uint32 microtx_slots     = 1;  // available Microtx execution slots (§4)
+  uint32 normal_slots      = 2;  // available Normal execution slots
+  uint32 zk_queue_depth    = 3;  // pending ZK proof requests
+  uint32 relay_queue_depth = 4;  // bundles awaiting relay submission
 }
 
-#[derive(Clone, PartialEq, ::prost::Message)]
-pub struct RelayWinRate {
-    #[prost(string, tag = "1")]
-    pub relay: ::prost::alloc::string::String,
-    #[prost(string, tag = "2")]
-    pub strategy: ::prost::alloc::string::String,
-    #[prost(string, tag = "3")]
-    pub chain: ::prost::alloc::string::String,
-    #[prost(double, tag = "4")]
-    pub rate_24h: f64,
-    #[prost(uint64, tag = "5")]
-    pub sample_count: u64,
+// ── Win rates ─────────────────────────────────────────────────────────────────
+message WinRateReport {
+  repeated RelayWinRate relays = 1;
 }
 
-#[derive(Clone, PartialEq, ::prost::Message)]
-pub struct StrategyId {
-    #[prost(string, tag = "1")]
-    pub id: ::prost::alloc::string::String,
+message RelayWinRate {
+  string relay        = 1;
+  string strategy     = 2;  // "SA" | "MSA" | "LA" | "MEV"
+  string chain        = 3;  // "arbitrum" | "ethereum" | "base"
+  double rate_24h      = 4;  // [0.0, 1.0]
+  // Was int64 — see this file's module-level audit-alignment note,
+  // change 3. Can never be negative.
+  uint64 sample_count = 5;
 }
 
-#[derive(Clone, PartialEq, ::prost::Message)]
-pub struct LayerIdMsg {
-    #[prost(string, tag = "1")]
-    pub id: ::prost::alloc::string::String,
+// ── Commands ──────────────────────────────────────────────────────────────────
+message StrategyId {
+  string id = 1;  // "SA" | "MSA" | "LA" | "MEV" | "CNRY"
 }
 
-#[derive(Clone, PartialEq, ::prost::Message)]
-pub struct RolloutTier {
-    /// Basis points, 0–10000 (0%–100%). Was `fraction: f64` — see module-level
-    /// CHANGES note.
-    #[prost(uint32, tag = "1")]
-    pub rollout_bps: u32,
+message LayerIdMsg {
+  string id = 1;  // canonical snake_case LayerId (§LayerId::Display)
+}
+
+message RolloutTier {
+  // Basis points, 0-10000 (0%-100%). Was `double fraction` in [0.0, 1.0]
+  // — see this file's module-level audit-alignment note, change 2.
+  uint32 rollout_bps = 1;
 }

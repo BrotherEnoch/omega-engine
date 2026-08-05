@@ -73,7 +73,9 @@ impl HealthStatus {
     pub const Healthy: Self = Self::Ok;
 
     /// Returns true when the layer is fully healthy.
-    pub fn is_healthy(self) -> bool { matches!(self, Self::Ok) }
+    pub fn is_healthy(self) -> bool {
+        matches!(self, Self::Ok)
+    }
 
     /// Returns true when the layer can be trusted to serve traffic.
     ///
@@ -103,9 +105,7 @@ pub type HealthState = HealthStatus;
 /// Serialises as SCREAMING_SNAKE_CASE. Display produces the same strings.
 /// Back-compat associated constants map pre-v12 names to canonical equivalents.
 #[derive(
-    Debug, Clone, Copy, PartialEq, Eq, Hash,
-    Serialize, Deserialize,
-    Display, EnumIter, EnumString,
+    Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Display, EnumIter, EnumString,
 )]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 #[strum(serialize_all = "SCREAMING_SNAKE_CASE")]
@@ -149,14 +149,14 @@ pub enum LayerId {
 /// unmodified while the canonical names are being adopted crate by crate.
 #[allow(non_upper_case_globals)]
 impl LayerId {
-    pub const SystemHealth:   Self = Self::Health;
-    pub const ExternalData:   Self = Self::Rpc;
-    pub const Eil:            Self = Self::Compliance;
-    pub const ChaosGuard:     Self = Self::Security;
-    pub const Strategy:       Self = Self::Strategies;
-    pub const Flashloan:      Self = Self::FlashLoan;
-    pub const Orchestrator:   Self = Self::GasWar;
-    pub const Vault:          Self = Self::AddressRotation;
+    pub const SystemHealth: Self = Self::Health;
+    pub const ExternalData: Self = Self::Rpc;
+    pub const Eil: Self = Self::Compliance;
+    pub const ChaosGuard: Self = Self::Security;
+    pub const Strategy: Self = Self::Strategies;
+    pub const Flashloan: Self = Self::FlashLoan;
+    pub const Orchestrator: Self = Self::GasWar;
+    pub const Vault: Self = Self::AddressRotation;
 }
 
 // ---------------------------------------------------------------------------
@@ -165,12 +165,16 @@ impl LayerId {
 
 /// Mutable health-controller interface implemented by `omega-health`.
 pub trait LayerHealth: Send + Sync {
-    fn state(&self)    -> HealthState;
+    fn state(&self) -> HealthState;
     fn layer_id(&self) -> LayerId;
     fn set_state(&self, new_state: HealthState, reason: &str);
 
-    fn is_healthy(&self)     -> bool { self.state().is_healthy() }
-    fn is_operational(&self) -> bool { self.state().is_operational() }
+    fn is_healthy(&self) -> bool {
+        self.state().is_healthy()
+    }
+    fn is_operational(&self) -> bool {
+        self.state().is_operational()
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -182,10 +186,10 @@ pub trait LayerHealth: Send + Sync {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LayerHealthReport {
     #[serde(alias = "layer_id")]
-    pub layer:     LayerId,
-    pub status:    HealthStatus,
+    pub layer: LayerId,
+    pub status: HealthStatus,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub message:   Option<String>,
+    pub message: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub updated_at_ms: Option<u64>,
 }
@@ -206,17 +210,17 @@ mod tests {
 
     #[test]
     fn health_status_display_is_screaming_snake() {
-        assert_eq!(HealthStatus::Ok.to_string(),        "OK");
-        assert_eq!(HealthStatus::Degraded.to_string(),  "DEGRADED");
-        assert_eq!(HealthStatus::Halted.to_string(),    "HALTED");
-        assert_eq!(HealthStatus::Recovering.to_string(),"RECOVERING");
-        assert_eq!(HealthStatus::Unknown.to_string(),   "UNKNOWN");
+        assert_eq!(HealthStatus::Ok.to_string(), "OK");
+        assert_eq!(HealthStatus::Degraded.to_string(), "DEGRADED");
+        assert_eq!(HealthStatus::Halted.to_string(), "HALTED");
+        assert_eq!(HealthStatus::Recovering.to_string(), "RECOVERING");
+        assert_eq!(HealthStatus::Unknown.to_string(), "UNKNOWN");
     }
 
     #[test]
     fn health_status_serde_roundtrip() {
         for s in HealthStatus::iter() {
-            let json  = serde_json::to_string(&s).unwrap();
+            let json = serde_json::to_string(&s).unwrap();
             let back: HealthStatus = serde_json::from_str(&json).unwrap();
             assert_eq!(s, back);
         }
@@ -224,26 +228,32 @@ mod tests {
 
     #[test]
     fn health_status_serde_wire_values() {
-        assert_eq!(serde_json::to_string(&HealthStatus::Ok).unwrap(),        r#""OK""#);
-        assert_eq!(serde_json::to_string(&HealthStatus::Halted).unwrap(),    r#""HALTED""#);
-        assert_eq!(serde_json::to_string(&HealthStatus::Degraded).unwrap(),  r#""DEGRADED""#);
+        assert_eq!(serde_json::to_string(&HealthStatus::Ok).unwrap(), r#""OK""#);
+        assert_eq!(
+            serde_json::to_string(&HealthStatus::Halted).unwrap(),
+            r#""HALTED""#
+        );
+        assert_eq!(
+            serde_json::to_string(&HealthStatus::Degraded).unwrap(),
+            r#""DEGRADED""#
+        );
     }
 
     #[test]
     fn layer_id_display_is_screaming_snake() {
-        assert_eq!(LayerId::Health.to_string(),          "HEALTH");
+        assert_eq!(LayerId::Health.to_string(), "HEALTH");
         assert_eq!(LayerId::LossAttribution.to_string(), "LOSS_ATTRIBUTION");
-        assert_eq!(LayerId::FlashLoan.to_string(),       "FLASH_LOAN");
+        assert_eq!(LayerId::FlashLoan.to_string(), "FLASH_LOAN");
     }
 
     #[test]
     fn back_compat_aliases_resolve() {
         assert_eq!(LayerId::SystemHealth, LayerId::Health);
         assert_eq!(LayerId::ExternalData, LayerId::Rpc);
-        assert_eq!(LayerId::Strategy,     LayerId::Strategies);
-        assert_eq!(LayerId::Flashloan,    LayerId::FlashLoan);
+        assert_eq!(LayerId::Strategy, LayerId::Strategies);
+        assert_eq!(LayerId::Flashloan, LayerId::FlashLoan);
         assert_eq!(LayerId::Orchestrator, LayerId::GasWar);
-        assert_eq!(LayerId::Vault,        LayerId::AddressRotation);
+        assert_eq!(LayerId::Vault, LayerId::AddressRotation);
     }
 
     #[test]

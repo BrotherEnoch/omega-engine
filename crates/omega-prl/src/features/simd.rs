@@ -16,9 +16,9 @@
 // resolve.  Without this import the compiler sees the method on f32x8 but
 // cannot call it (E0599 "items from traits can only be used if the trait is
 // in scope").
-use wide::{CmpGt, f32x8};
+use wide::{f32x8, CmpGt};
 
-use crate::features::extractor::{FEATURE_DIM, FeatureVector};
+use crate::features::extractor::{FeatureVector, FEATURE_DIM};
 
 // FEATURE_DIM (64) must be divisible by SIMD lane width (8). Compile-time check.
 const _: () = assert!(FEATURE_DIM.is_multiple_of(8));

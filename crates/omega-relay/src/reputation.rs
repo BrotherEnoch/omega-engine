@@ -26,11 +26,11 @@ pub fn carryover_pct(months_since_rotation: f64) -> f64 {
 
 /// Execute an address rotation, seeding the new address with time-decayed carryover.
 pub fn rotate_address(
-    metrics:                    &Arc<LaRelayMetrics>,
-    old_addr:                   &ExecutionAddress,
-    new_addr:                   ExecutionAddress,
+    metrics: &Arc<LaRelayMetrics>,
+    old_addr: &ExecutionAddress,
+    new_addr: ExecutionAddress,
     months_since_last_rotation: f64,
-    all_relays:                 &[RelayName],
+    all_relays: &[RelayName],
 ) -> RelayResult<usize> {
     if all_relays.is_empty() {
         return Err(RelayError::NoRelayMetrics);
@@ -69,7 +69,9 @@ pub fn shuffled_submission_order(mut band: Vec<RelayRateSnapshot>) -> Vec<RelayR
 /// Build the full submission order for a blueprint.
 pub fn submission_order(metrics: &Arc<LaRelayMetrics>) -> Vec<RelayRateSnapshot> {
     let ranked = metrics.la_ranked_relays();
-    if ranked.is_empty() { return ranked; }
+    if ranked.is_empty() {
+        return ranked;
+    }
 
     let Some(best) = ranked.first().map(|snapshot| snapshot.la_rate) else {
         return ranked;
@@ -132,14 +134,19 @@ mod tests {
         let old = ExecutionAddress("0xOLD".into());
         let new = ExecutionAddress("0xNEW".into());
         let m = LaRelayMetrics::new(100, old.clone());
-        for i in 0..100 { m.record(&RelayName::Flashbots, i < 80); }
+        for i in 0..100 {
+            m.record(&RelayName::Flashbots, i < 80);
+        }
 
         let relays = vec![RelayName::Flashbots];
         let seeded = rotate_address(&m, &old, new.clone(), 0.0, &relays).unwrap();
         assert_eq!(seeded, 1);
 
         let rate = m.rate_for(&RelayName::Flashbots, &new).unwrap();
-        assert!((rate - 0.40).abs() < 0.1, "expected ~0.40 seeded rate, got {rate}");
+        assert!(
+            (rate - 0.40).abs() < 0.1,
+            "expected ~0.40 seeded rate, got {rate}"
+        );
         assert_eq!(m.active_address(), new);
     }
 
@@ -165,10 +172,18 @@ mod tests {
     #[test]
     fn shuffled_submission_order_contains_all_relays() {
         let snapshots = vec![
-            RelayRateSnapshot { relay: RelayName::Flashbots, la_rate: 0.9,
-                total_submitted: 100, total_included: 90 },
-            RelayRateSnapshot { relay: RelayName::Bloxroute, la_rate: 0.88,
-                total_submitted: 100, total_included: 88 },
+            RelayRateSnapshot {
+                relay: RelayName::Flashbots,
+                la_rate: 0.9,
+                total_submitted: 100,
+                total_included: 90,
+            },
+            RelayRateSnapshot {
+                relay: RelayName::Bloxroute,
+                la_rate: 0.88,
+                total_submitted: 100,
+                total_included: 88,
+            },
         ];
         let shuffled = shuffled_submission_order(snapshots.clone());
         assert_eq!(shuffled.len(), snapshots.len());
@@ -183,7 +198,7 @@ mod tests {
         for i in 0..100 {
             m.record(&RelayName::Flashbots, i < 90);
             m.record(&RelayName::Bloxroute, i < 88);
-            m.record(&RelayName::Titan,     i < 50);
+            m.record(&RelayName::Titan, i < 50);
         }
         let order = submission_order(&m);
         assert_eq!(order.len(), 3);
@@ -201,7 +216,7 @@ mod tests {
         for i in 0..100 {
             m.record(&RelayName::Flashbots, i < 90); // 0.90
             m.record(&RelayName::Bloxroute, i < 86); // 0.86 -> in band (>= 0.855)
-            m.record(&RelayName::Titan, i < 50);     // 0.50 -> below band
+            m.record(&RelayName::Titan, i < 50); // 0.50 -> below band
         }
         let order = submission_order(&m);
         // Titan must be last (below band); flashbots and bloxroute both in band

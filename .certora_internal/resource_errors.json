@@ -1,0 +1,37 @@
+{
+    "topics": [
+        {
+            "name": "type_check",
+            "messages": [
+                {
+                    "message": "Error in spec file (OmegaVaultRescueAndPending.spec:299:9): Syntax error: unexpected token near `\"than the surplus observed before the call\"`",
+                    "location": []
+                },
+                {
+                    "message": "Error in spec file (OmegaVaultRescueAndPending.spec:306:9): Syntax error: unexpected token near `\"i.e. the rescue moved real tokens without desyncing the derived accounting\"`",
+                    "location": []
+                },
+                {
+                    "message": "Error in spec file (OmegaVaultRescueAndPending.spec:354:9): Syntax error: unexpected token near `\"positive netProfit \u2014 the two documented preconditions for success\"`",
+                    "location": []
+                },
+                {
+                    "message": "Error in spec file (OmegaVaultRescueAndPending.spec:374:9): Syntax error: unexpected token near `\"must revert (ProfitAlreadyPending)\"`",
+                    "location": []
+                },
+                {
+                    "message": "Error in spec file (OmegaVaultRescueAndPending.spec:392:9): Syntax error: unexpected token near `\"positive netProfit\"`",
+                    "location": []
+                },
+                {
+                    "message": "Error in spec file (OmegaVaultRescueAndPending.spec:423:9): Syntax error: unexpected token near `\"entry before release\"`",
+                    "location": []
+                },
+                {
+                    "message": "Error in spec file (OmegaVaultRescueAndPending.spec:440:9): Syntax error: unexpected token near `\"not-yet-released status, and a positive pending amount \u2014 the \"`",
+                    "location": []
+                }
+            ]
+        }
+    ]
+}

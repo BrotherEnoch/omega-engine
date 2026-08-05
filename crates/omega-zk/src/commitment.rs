@@ -56,8 +56,8 @@ impl std::fmt::Display for ProofCommitment {
 pub fn compute_proof_commitment(
     blueprint_hash: &[u8; 32],
     net_profit_wei: u128,
-    chain_id:       u64,
-    strategy_id:    &str,
+    chain_id: u64,
+    strategy_id: &str,
 ) -> ProofCommitment {
     let mut h = Keccak256::new();
     h.update(blueprint_hash);
@@ -71,11 +71,11 @@ pub fn compute_proof_commitment(
 ///
 /// Used in the Vault simulation path before submitting the proof on-chain.
 pub fn verify_commitment(
-    commitment:     &ProofCommitment,
+    commitment: &ProofCommitment,
     blueprint_hash: &[u8; 32],
     net_profit_wei: u128,
-    chain_id:       u64,
-    strategy_id:    &str,
+    chain_id: u64,
+    strategy_id: &str,
 ) -> bool {
     let expected = compute_proof_commitment(blueprint_hash, net_profit_wei, chain_id, strategy_id);
     commitment == &expected
@@ -85,7 +85,9 @@ pub fn verify_commitment(
 mod commitment_tests {
     use super::*;
 
-    fn hash(b: u8) -> [u8; 32] { [b; 32] }
+    fn hash(b: u8) -> [u8; 32] {
+        [b; 32]
+    }
 
     #[test]
     fn commitment_is_deterministic() {
@@ -111,7 +113,7 @@ mod commitment_tests {
     #[test]
     fn different_chain_produces_different_commitment() {
         let c1 = compute_proof_commitment(&hash(0x01), 100, 42161, "SA");
-        let c2 = compute_proof_commitment(&hash(0x01), 100, 1,     "SA");
+        let c2 = compute_proof_commitment(&hash(0x01), 100, 1, "SA");
         assert_ne!(c1, c2);
     }
 

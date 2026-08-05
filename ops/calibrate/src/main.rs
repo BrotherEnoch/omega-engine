@@ -492,8 +492,8 @@ async fn main() -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use std::io::Write;
     use super::*;
+    use std::io::Write;
 
     #[test]
     fn percentile_empty_returns_zero() {

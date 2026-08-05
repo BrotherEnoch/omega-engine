@@ -188,7 +188,10 @@ mod tests {
 
     #[test]
     fn redact_ws_url_handles_bare_host() {
-        assert_eq!(redact_ws_url("wss://node.example.com"), "wss://node.example.com/<redacted>");
+        assert_eq!(
+            redact_ws_url("wss://node.example.com"),
+            "wss://node.example.com/<redacted>"
+        );
     }
 
     #[test]
@@ -230,7 +233,10 @@ mod tests {
 
     #[test]
     fn chain_id_mismatch_is_fatal() {
-        let err = RpcClientError::ChainIdMismatch { expected: 42161, actual: 1 };
+        let err = RpcClientError::ChainIdMismatch {
+            expected: 42161,
+            actual: 1,
+        };
         assert!(err.is_fatal());
     }
 

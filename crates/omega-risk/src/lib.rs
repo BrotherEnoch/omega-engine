@@ -26,28 +26,38 @@
 //    <name>_tests { ... }`, so an additional top-level `tests` module was
 //    never wired to anything and can simply be deleted rather than
 //    replaced.
+//
+// ## Audit fix (this revision): export individual oracle checks
+//
+// omega-hot-path invokes check_oracle_freshness / check_oracle_hierarchy /
+// check_slippage directly (it does not run the full 15-check pipeline).
+// Those three functions are therefore re-exported here alongside the
+// existing run_all_checks surface.
 
 #![cfg_attr(not(test), deny(clippy::unwrap_used, clippy::expect_used))]
 
-pub mod gas_model;
 pub mod checks;
-pub mod context;
-pub mod whitelist;
-pub mod competition;
 pub mod circuit_breakers;
+pub mod competition;
+pub mod context;
 pub mod flash_crash;
-pub mod kill_switch;
+pub mod gas_model;
 pub mod heartbeat;
+pub mod kill_switch;
 pub mod metrics;
+pub mod whitelist;
 
-pub use checks::{run_all_checks, CheckResult, BlueprintFields};
-pub use context::CheckContext;
+pub use checks::{
+    check_oracle_freshness, check_oracle_hierarchy, check_slippage, run_all_checks,
+    BlueprintFields, CheckResult,
+};
 pub use circuit_breakers::{BreakerDiagnostics, CircuitBreakerRegistry, CircuitState};
+pub use competition::{competition_probability, priority_fee_gwei, AssetTier};
+pub use context::{CheckContext, FlashloanSnapshot, OracleSnapshot};
 pub use flash_crash::{FlashCrashGuard, FlashCrashResponse};
+pub use gas_model::{dynamic_min_profit, l1_adaptive_buffer, EXTRACTION_GAS, L2_EXEC_BUFFER};
+pub use heartbeat::{ComponentStatus, HeartbeatConfig, HeartbeatRegistry};
 pub use kill_switch::{
     KillSwitch, KillSwitchConfig, KillSwitchDiagnostics, KillSwitchRegistry, KillSwitchStatus,
     TripReason as KillSwitchTripReason, WindowLossEntry,
 };
-pub use heartbeat::{ComponentStatus, HeartbeatConfig, HeartbeatRegistry};
-pub use gas_model::{dynamic_min_profit, l1_adaptive_buffer, L2_EXEC_BUFFER, EXTRACTION_GAS};
-pub use competition::{competition_probability, priority_fee_gwei, AssetTier};

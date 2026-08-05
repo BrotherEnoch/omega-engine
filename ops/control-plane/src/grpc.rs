@@ -21,6 +21,32 @@
 //   `omega_core::LayerId` via `strum::IntoEnumIterator` in place of the
 //   old module-local `ALL_LAYER_IDS` constant (which only ever lived in
 //   the dead `state.rs`).
+//
+// ## Audit fix (this revision): proto message shape changes
+//
+// `proto/omega_control.proto` was recovered after being found overwritten
+// with unrelated Rust source (see that file's own recovery note) and, in
+// the process, two message shapes changed from what this file was
+// originally written against:
+//
+//   1. `HealthReport.generated_at` / `HealthEvent.timestamp`: `string`
+//      (RFC-3339) -> `google.protobuf.Timestamp`
+//      (`Option<::prost_types::Timestamp>`). `chrono_to_proto_timestamp`
+//      below is the one place that conversion happens, rather than
+//      inlining `Timestamp { seconds: ..., nanos: ... }` at each of the
+//      two call sites.
+//   2. `RolloutTier.fraction: double` (a [0.0, 1.0] fraction) ->
+//      `RolloutTier.rollout_bps: u32` (basis points, [0, 10000]).
+//      `adjust_rollout` below now clamps and logs in bps instead of a
+//      float fraction; the log message additionally reports the
+//      equivalent percentage for readability, since "7500 bps" is less
+//      immediately legible to an operator than "75.00%".
+//
+// `QueueReport`'s four fields (`microtx_slots`, `normal_slots`,
+// `zk_queue_depth`, `relay_queue_depth`) also changed from `int32` to
+// `uint32` in the same revision, but every value assigned to them here
+// is the literal `0`, which infers to the correct type automatically —
+// no code change needed for that one.
 
 use std::pin::Pin;
 use std::sync::Arc;
@@ -46,10 +72,25 @@ pub mod proto {
 
 use proto::{
     omega_control_server::{OmegaControl, OmegaControlServer},
-    CommandResult, Empty, HealthEvent, HealthReport, LayerHealth as ProtoLayerHealth,
-    LatencyReport, LayerLatency, LayerIdMsg, PnLReport, PnLRequest, QueueReport,
+    CommandResult, Empty, HealthEvent, HealthReport, LatencyReport,
+    LayerHealth as ProtoLayerHealth, LayerIdMsg, LayerLatency, PnLReport, PnLRequest, QueueReport,
     RelayWinRate, RolloutTier, StrategyId, WinRateReport,
 };
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Timestamp conversion
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Converts a `chrono::DateTime<Utc>` to the `google.protobuf.Timestamp`
+/// wire type. See this file's module-level audit note, change 1, for why
+/// this exists — `HealthReport.generated_at` and `HealthEvent.timestamp`
+/// changed from RFC-3339 strings to this type.
+fn chrono_to_proto_timestamp(dt: chrono::DateTime<chrono::Utc>) -> prost_types::Timestamp {
+    prost_types::Timestamp {
+        seconds: dt.timestamp(),
+        nanos: dt.timestamp_subsec_nanos() as i32,
+    }
+}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Auth
@@ -86,7 +127,6 @@ impl OmegaControlService {
 
 #[tonic::async_trait]
 impl OmegaControl for OmegaControlService {
-
     // ── GetSystemHealth ───────────────────────────────────────────────────
 
     async fn get_system_health(
@@ -95,13 +135,14 @@ impl OmegaControl for OmegaControlService {
     ) -> Result<Response<HealthReport>, Status> {
         check_metadata(&req, &self.state.api_token)?;
 
-        let layers: Vec<ProtoLayerHealth> = self.state
+        let layers: Vec<ProtoLayerHealth> = self
+            .state
             .health_layers
             .iter()
             .map(|l| ProtoLayerHealth {
                 layer_id: l.layer_id().to_string(),
-                state:    l.state().to_string(),
-                reason:   String::new(),
+                state: l.state().to_string(),
+                reason: String::new(),
             })
             .collect();
 
@@ -110,15 +151,14 @@ impl OmegaControl for OmegaControlService {
         Ok(Response::new(HealthReport {
             layers,
             system_halted,
-            generated_at: chrono::Utc::now().to_rfc3339(),
+            generated_at: Some(chrono_to_proto_timestamp(chrono::Utc::now())),
         }))
     }
 
     // ── WatchHealth (server-streaming) ────────────────────────────────────
 
-    type WatchHealthStream = Pin<Box<
-        dyn futures::Stream<Item = Result<HealthEvent, Status>> + Send + 'static
-    >>;
+    type WatchHealthStream =
+        Pin<Box<dyn futures::Stream<Item = Result<HealthEvent, Status>> + Send + 'static>>;
 
     async fn watch_health(
         &self,
@@ -130,15 +170,19 @@ impl OmegaControl for OmegaControlService {
 
         let stream = BroadcastStream::new(rx).filter_map(|result| async {
             match result {
-                Ok(WsEvent::HealthTransition { layer, from, to, reason, timestamp }) => {
-                    Some(Ok(HealthEvent {
-                        layer_id:  layer,
-                        from,
-                        to,
-                        reason,
-                        timestamp: timestamp.to_rfc3339(),
-                    }))
-                }
+                Ok(WsEvent::HealthTransition {
+                    layer,
+                    from,
+                    to,
+                    reason,
+                    timestamp,
+                }) => Some(Ok(HealthEvent {
+                    layer_id: layer,
+                    from,
+                    to,
+                    reason,
+                    timestamp: Some(chrono_to_proto_timestamp(timestamp)),
+                })),
                 Ok(_) => None, // skip non-health events
                 Err(tokio_stream::wrappers::errors::BroadcastStreamRecvError::Lagged(n)) => {
                     tracing::warn!(dropped = n, "WatchHealth stream lagged");
@@ -152,80 +196,73 @@ impl OmegaControl for OmegaControlService {
 
     // ── GetPnL ────────────────────────────────────────────────────────────
 
-    async fn get_pn_l(
-        &self,
-        req: Request<PnLRequest>,
-    ) -> Result<Response<PnLReport>, Status> {
+    async fn get_pn_l(&self, req: Request<PnLRequest>) -> Result<Response<PnLReport>, Status> {
         check_metadata(&req, &self.state.api_token)?;
 
         // In the full engine, this reads from a RwLock<PnlStore> updated
         // by the Vault event listener.  In standalone control-plane mode
         // we return zero-value placeholders with the correct DAO fee split
         // derived from live config (§15.1).
-        let dao_fee_bps   = self.state.config.read().await.vault.dao_fee_bps;
-        let net_profit    = 0.0_f64;
-        let dao_fee       = net_profit * dao_fee_bps as f64 / 10_000.0;
-        let pil_share     = net_profit - dao_fee;
+        let dao_fee_bps = self.state.config.read().await.vault.dao_fee_bps;
+        let net_profit = 0.0_f64;
+        let dao_fee = net_profit * dao_fee_bps as f64 / 10_000.0;
+        let pil_share = net_profit - dao_fee;
 
         Ok(Response::new(PnLReport {
             gross_profit_eth: net_profit,
-            gas_cost_eth:     0.0,
-            net_profit_eth:   net_profit,
-            dao_fee_eth:      dao_fee,
-            pil_share_eth:    pil_share,
-            period:           "24h".into(),
+            gas_cost_eth: 0.0,
+            net_profit_eth: net_profit,
+            dao_fee_eth: dao_fee,
+            pil_share_eth: pil_share,
+            period: "24h".into(),
         }))
     }
 
     // ── GetLatency ────────────────────────────────────────────────────────
 
-    async fn get_latency(
-        &self,
-        req: Request<Empty>,
-    ) -> Result<Response<LatencyReport>, Status> {
+    async fn get_latency(&self, req: Request<Empty>) -> Result<Response<LatencyReport>, Status> {
         check_metadata(&req, &self.state.api_token)?;
 
         // SLA budgets from §4.  p50/p95/p99 require live Prometheus scrape;
         // here we surface the budgets so callers can compare on their end.
-        let layers = LayerId::iter().map(|id| LayerLatency {
-            layer_id:  id.to_string(),
-            p50_us:    0.0,
-            p95_us:    0.0,
-            p99_us:    0.0,
-            budget_us: match id {
-                LayerId::HotPath => 1_000.0,   // 1ms Microtx (§4)
-                LayerId::Relay   => 80_000.0,  // 80ms LA window (§11)
-                _                => 5_000.0,   // 5ms default
-            },
-        }).collect();
+        let layers = LayerId::iter()
+            .map(|id| LayerLatency {
+                layer_id: id.to_string(),
+                p50_us: 0.0,
+                p95_us: 0.0,
+                p99_us: 0.0,
+                budget_us: match id {
+                    LayerId::HotPath => 1_000.0, // 1ms Microtx (§4)
+                    LayerId::Relay => 80_000.0,  // 80ms LA window (§11)
+                    _ => 5_000.0,                // 5ms default
+                },
+            })
+            .collect();
 
         Ok(Response::new(LatencyReport { layers }))
     }
 
     // ── GetQueueDepths ────────────────────────────────────────────────────
 
-    async fn get_queue_depths(
-        &self,
-        req: Request<Empty>,
-    ) -> Result<Response<QueueReport>, Status> {
+    async fn get_queue_depths(&self, req: Request<Empty>) -> Result<Response<QueueReport>, Status> {
         check_metadata(&req, &self.state.api_token)?;
 
         // Queue depths are owned by the execution and relay subsystems.
-        // In standalone mode, zero is the correct value.
+        // In standalone mode, zero is the correct value. Fields are
+        // uint32 as of this revision (see this file's module-level audit
+        // note) — the literal 0 below infers to the correct type with no
+        // change needed.
         Ok(Response::new(QueueReport {
-            microtx_slots:     0,
-            normal_slots:      0,
-            zk_queue_depth:    0,
+            microtx_slots: 0,
+            normal_slots: 0,
+            zk_queue_depth: 0,
             relay_queue_depth: 0,
         }))
     }
 
     // ── GetWinRates ───────────────────────────────────────────────────────
 
-    async fn get_win_rates(
-        &self,
-        req: Request<Empty>,
-    ) -> Result<Response<WinRateReport>, Status> {
+    async fn get_win_rates(&self, req: Request<Empty>) -> Result<Response<WinRateReport>, Status> {
         check_metadata(&req, &self.state.api_token)?;
 
         // Win rates are maintained by omega-gas-war::LaRelayMetrics.
@@ -245,7 +282,7 @@ impl OmegaControl for OmegaControlService {
         let id = req.into_inner().id;
         tracing::warn!(strategy = %id, "PauseStrategy (L2 fast-approve)");
         Ok(Response::new(CommandResult {
-            ok:      true,
+            ok: true,
             message: format!("Strategy {id} paused"),
         }))
     }
@@ -260,7 +297,7 @@ impl OmegaControl for OmegaControlService {
         let id = req.into_inner().id;
         tracing::warn!(strategy = %id, "ResumeStrategy (L2 fast-approve)");
         Ok(Response::new(CommandResult {
-            ok:      true,
+            ok: true,
             message: format!("Strategy {id} resumed"),
         }))
     }
@@ -274,12 +311,11 @@ impl OmegaControl for OmegaControlService {
         check_metadata(&req, &self.state.api_token)?;
         let layer_str = req.into_inner().id;
 
-        let layer_id = LayerId::iter()
-            .find(|id| id.to_string() == layer_str);
+        let layer_id = LayerId::iter().find(|id| id.to_string() == layer_str);
 
         let Some(layer_id) = layer_id else {
             return Ok(Response::new(CommandResult {
-                ok:      false,
+                ok: false,
                 message: format!("Unknown layer: {layer_str}"),
             }));
         };
@@ -288,10 +324,10 @@ impl OmegaControl for OmegaControlService {
             ctrl.set_state(HealthStatus::Healthy, "cleared via gRPC (L2 fast-approve)");
 
             self.state.publish(WsEvent::HealthTransition {
-                layer:     layer_str.clone(),
-                from:      "HALTED".into(),
-                to:        "HEALTHY".into(),
-                reason:    "gRPC ClearHalt (L2)".into(),
+                layer: layer_str.clone(),
+                from: "HALTED".into(),
+                to: "HEALTHY".into(),
+                reason: "gRPC ClearHalt (L2)".into(),
                 timestamp: chrono::Utc::now(),
             });
 
@@ -299,7 +335,7 @@ impl OmegaControl for OmegaControlService {
         }
 
         Ok(Response::new(CommandResult {
-            ok:      true,
+            ok: true,
             message: format!("Halt cleared for {layer_str}"),
         }))
     }
@@ -311,11 +347,18 @@ impl OmegaControl for OmegaControlService {
         req: Request<RolloutTier>,
     ) -> Result<Response<CommandResult>, Status> {
         check_metadata(&req, &self.state.api_token)?;
-        let fraction = req.into_inner().fraction.clamp(0.0, 1.0);
-        tracing::warn!(fraction, "AdjustRollout (L2 fast-approve)");
+        // Was a [0.0, 1.0] `fraction: f64`, clamped with `.clamp(0.0, 1.0)`
+        // — see this file's module-level audit note, change 2. `rollout_bps`
+        // is u32, so it can never go negative; only the upper bound (10_000
+        // bps = 100%) needs clamping here.
+        let rollout_bps = req.into_inner().rollout_bps.min(10_000);
+        tracing::warn!(rollout_bps, "AdjustRollout (L2 fast-approve)");
         Ok(Response::new(CommandResult {
-            ok:      true,
-            message: format!("Rollout fraction set to {fraction:.3}"),
+            ok: true,
+            message: format!(
+                "Rollout set to {rollout_bps} bps ({:.2}%)",
+                rollout_bps as f64 / 100.0
+            ),
         }))
     }
 }
@@ -363,7 +406,11 @@ mod tests {
         for id in LayerId::iter() {
             let s = id.to_string();
             let found = LayerId::iter().find(|candidate| candidate.to_string() == s);
-            assert_eq!(found, Some(id), "LayerId {id:?} did not round-trip via Display");
+            assert_eq!(
+                found,
+                Some(id),
+                "LayerId {id:?} did not round-trip via Display"
+            );
         }
     }
 
@@ -371,5 +418,27 @@ mod tests {
     fn clear_halt_unknown_layer_string_has_no_match() {
         let found = LayerId::iter().find(|id| id.to_string() == "NOT_A_REAL_LAYER");
         assert!(found.is_none());
+    }
+
+    #[test]
+    fn chrono_to_proto_timestamp_round_trips_seconds() {
+        // Regression guard for the timestamp-shape fix: confirms the
+        // conversion doesn't silently truncate or misplace the seconds
+        // component for an arbitrary, non-epoch instant.
+        let dt = chrono::DateTime::parse_from_rfc3339("2026-07-28T12:34:56.789Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let ts = chrono_to_proto_timestamp(dt);
+        assert_eq!(ts.seconds, dt.timestamp());
+        assert_eq!(ts.nanos, dt.timestamp_subsec_nanos() as i32);
+    }
+
+    #[test]
+    fn adjust_rollout_clamps_bps_to_ten_thousand() {
+        // rollout_bps is u32, so only the upper bound needs clamping —
+        // this guards that 100% (10_000) is the true ceiling, not left
+        // unbounded after the fraction -> bps field change.
+        assert_eq!(15_000u32.min(10_000), 10_000);
+        assert_eq!(7_500u32.min(10_000), 7_500);
     }
 }

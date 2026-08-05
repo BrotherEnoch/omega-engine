@@ -193,13 +193,25 @@ impl PropagationRouter {
                     LayerId::LossAttribution,
                 ],
             ),
-            (LayerId::ExternalData, &[LayerId::Eil, LayerId::Strategy, LayerId::HotPath]),
-            (LayerId::Eil, &[LayerId::Strategy, LayerId::HotPath, LayerId::Orchestrator]),
+            (
+                LayerId::ExternalData,
+                &[LayerId::Eil, LayerId::Strategy, LayerId::HotPath],
+            ),
+            (
+                LayerId::Eil,
+                &[LayerId::Strategy, LayerId::HotPath, LayerId::Orchestrator],
+            ),
             (LayerId::Risk, &[LayerId::Strategy, LayerId::Orchestrator]),
-            (LayerId::ChaosGuard, &[LayerId::Strategy, LayerId::Orchestrator]),
+            (
+                LayerId::ChaosGuard,
+                &[LayerId::Strategy, LayerId::Orchestrator],
+            ),
             (LayerId::Dag, &[LayerId::Strategy, LayerId::Orchestrator]),
             (LayerId::Zk, &[LayerId::Vault]),
-            (LayerId::Flashloan, &[LayerId::Strategy, LayerId::Orchestrator]),
+            (
+                LayerId::Flashloan,
+                &[LayerId::Strategy, LayerId::Orchestrator],
+            ),
             (LayerId::Strategy, &[LayerId::Orchestrator, LayerId::Relay]),
             (LayerId::Orchestrator, &[LayerId::Relay, LayerId::Vault]),
             (LayerId::LossAttribution, &[LayerId::Strategy]),
@@ -391,21 +403,17 @@ mod tests {
     #[test]
     fn router_zk_halts_vault() {
         let router = PropagationRouter::new();
-        assert!(
-            router
-                .halt_dependents(LayerId::Zk)
-                .contains(&LayerId::Vault)
-        );
+        assert!(router
+            .halt_dependents(LayerId::Zk)
+            .contains(&LayerId::Vault));
     }
 
     #[test]
     fn router_loss_attribution_halts_strategy() {
         let router = PropagationRouter::new();
-        assert!(
-            router
-                .halt_dependents(LayerId::LossAttribution)
-                .contains(&LayerId::Strategy),
-        );
+        assert!(router
+            .halt_dependents(LayerId::LossAttribution)
+            .contains(&LayerId::Strategy),);
     }
 
     #[test]

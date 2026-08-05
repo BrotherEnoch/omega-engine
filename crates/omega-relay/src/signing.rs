@@ -17,13 +17,13 @@
 //!   - bloXroute / Eden: a static bearer-style token header.
 //!
 //! VERIFIED, not just written: the signing / address-derivation / recovery logic below
-//! was checked in a real compiled Rust program against two independent known-answer
-//! tests before being written here —
+//! was checked in a real compiled Rust program against three independent known-answer
+//! checks before being written here:
 //!   1. private key = 1 recovers the well-known address `0x7E5F...95Bdf` for that key,
 //!   2. the EIP-55 checksum function reproduces EIP-55's own published test vector
-//!      (`5aAeb6053F3E94C9b9A09f33669435E7Ef1BeAed`) —
-//! and a full sign → recover round trip confirmed the recovered public key matches the
-//! signer's key.
+//!      (`5aAeb6053F3E94C9b9A09f33669435E7Ef1BeAed`), and
+//!   3. a full sign → recover round trip confirmed the recovered public key matches
+//!      the signer's key.
 //!
 //! NOT VERIFIED, flagged rather than guessed: bloXroute's and Eden's exact expected
 //! header name/format for their bearer tokens. This uses `Authorization: Bearer <token>`
@@ -53,7 +53,9 @@ impl RelayAuth {
     /// Construct a `FlashbotsStyle` auth from a raw `0x`-prefixed private key hex string
     /// (the `FLASHBOTS_AUTH_KEY` / `TITAN_AUTH_KEY` env values).
     pub fn flashbots_style(private_key_hex: &str) -> RelayResult<Self> {
-        Ok(RelayAuth::FlashbotsStyle(FlashbotsSigner::from_private_key_hex(private_key_hex)?))
+        Ok(RelayAuth::FlashbotsStyle(
+            FlashbotsSigner::from_private_key_hex(private_key_hex)?,
+        ))
     }
 
     /// The `(header name, header value)` pairs to attach to a submission for the exact
@@ -99,7 +101,10 @@ impl FlashbotsSigner {
         let signing_key = SigningKey::from_bytes((&arr).into())
             .map_err(|e| RelayError::ConfigInvalid(format!("invalid auth key: {e}")))?;
         let address_lower = derive_address(signing_key.verifying_key());
-        Ok(Self { signing_key, address_lower })
+        Ok(Self {
+            signing_key,
+            address_lower,
+        })
     }
 
     /// The reputation address this signer represents, EIP-55 checksummed.
@@ -139,11 +144,26 @@ fn eth_signed_message_hash(msg: &[u8]) -> [u8; 32] {
     hasher.finalize().into()
 }
 
+/// Derives the lowercase `0x`-prefixed Ethereum address for a verifying key:
+/// keccak256 of the 64-byte X||Y point (the uncompressed SEC1 encoding minus
+/// its leading `0x04` tag byte), address = the last 20 bytes of that hash.
+///
+/// Uses `.get(..)` rather than `&bytes[..]`/`&hash[..]` throughout — this
+/// crate denies `clippy::indexing_slicing` crate-wide (see `lib.rs`), so raw
+/// slice-indexing syntax is a hard compile error here regardless of whether
+/// a panic is actually reachable. `to_encoded_point(false)` on a valid
+/// `VerifyingKey` always yields exactly 65 bytes (tag + 32-byte X + 32-byte
+/// Y), and `keccak256` always returns exactly 32 bytes, so both `.get()`
+/// calls below are infallible in practice for any key this type can hold;
+/// the `unwrap_or(&[])` fallback exists only to satisfy the lint without
+/// introducing a panic path, not because either branch is expected to run.
 fn derive_address(vk: &VerifyingKey) -> String {
     let uncompressed = vk.to_encoded_point(false);
     let bytes = uncompressed.as_bytes();
-    let hash = keccak256(&bytes[1..]); // skip the 0x04 uncompressed-point prefix byte
-    format!("0x{}", hex::encode(&hash[12..]))
+    let point_bytes = bytes.get(1..).unwrap_or(&[]); // skip the 0x04 uncompressed-point prefix byte
+    let hash = keccak256(point_bytes);
+    let address_bytes = hash.get(12..).unwrap_or(&[]);
+    format!("0x{}", hex::encode(address_bytes))
 }
 
 fn to_checksum_address(addr_lower: &str) -> String {
@@ -155,8 +175,15 @@ fn to_checksum_address(addr_lower: &str) -> String {
         if c.is_ascii_digit() {
             out.push(c);
         } else {
-            let nibble = hash_hex.get(i..i + 1).and_then(|s| u8::from_str_radix(s, 16).ok()).unwrap_or(0);
-            out.push(if nibble >= 8 { c.to_ascii_uppercase() } else { c });
+            let nibble = hash_hex
+                .get(i..i + 1)
+                .and_then(|s| u8::from_str_radix(s, 16).ok())
+                .unwrap_or(0);
+            out.push(if nibble >= 8 {
+                c.to_ascii_uppercase()
+            } else {
+                c
+            });
         }
     }
     out
@@ -207,7 +234,10 @@ mod tests {
     fn bearer_token_header_format() {
         let auth = RelayAuth::BearerToken("secret123".into());
         let headers = auth.headers_for_body(b"anything").unwrap();
-        assert_eq!(headers, vec![("Authorization", "Bearer secret123".to_string())]);
+        assert_eq!(
+            headers,
+            vec![("Authorization", "Bearer secret123".to_string())]
+        );
     }
 
     #[test]

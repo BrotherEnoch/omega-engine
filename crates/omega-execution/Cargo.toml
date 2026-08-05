@@ -38,6 +38,21 @@ serde            = { workspace = true }
 # directly, same as omega-security's Cargo.toml does for the same crate.
 hex = "0.4"
 
+# ADDED (this revision): required by signer.rs's KeyManagerTransactionSigner,
+# which signs the outer EIP-1559 transaction envelope directly (Message,
+# Secp256k1, sign_ecdsa_recoverable) rather than only consuming a SecretKey
+# value produced elsewhere. Without this, omega-execution fails to compile
+# with E0433 (unresolved crate `secp256k1`) — the type flows in from
+# omega_security::KeyManager::active_secret_key(), but naming the crate's
+# own functions/methods requires it as a direct dependency of THIS crate,
+# not just a transitive one. Pinned to the same version/features as
+# omega-security's Cargo.toml (not the "recovery"-only subset — this crate
+# also needs "global-context" the same way omega-security does, since
+# Secp256k1::new() constructs a fresh context here rather than reusing a
+# global one) so the two crates' secp256k1 types are guaranteed
+# ABI-compatible rather than merely semver-compatible.
+secp256k1 = { version = "0.28", features = ["recovery", "global-context"] }
+
 [dev-dependencies]
 uuid     = { workspace = true }
 # Used by pipeline.rs's tests to write a real temp blacklist file for

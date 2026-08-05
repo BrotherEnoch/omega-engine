@@ -98,14 +98,14 @@ pub struct IntegrityRegistry {
     /// strategy_id → StrategyEntry (hot-swappable on L3 deployment).
     entries: DashMap<String, StrategyEntry>,
     /// Set of frozen strategy IDs (write-once; can never be removed).
-    frozen:  DashSet<String>,
+    frozen: DashSet<String>,
 }
 
 impl IntegrityRegistry {
     pub fn new() -> Arc<Self> {
         Arc::new(Self {
             entries: DashMap::new(),
-            frozen:  DashSet::new(),
+            frozen: DashSet::new(),
         })
     }
 
@@ -129,7 +129,9 @@ impl IntegrityRegistry {
 
     /// Register multiple strategies at once (called from startup).
     pub fn register_all(&self, entries: impl IntoIterator<Item = StrategyEntry>) {
-        for e in entries { self.register(e); }
+        for e in entries {
+            self.register(e);
+        }
     }
 
     // ── Bytecode integrity check (Certora C4) ─────────────────────────────────
@@ -148,19 +150,22 @@ impl IntegrityRegistry {
     ///   `Err(StrategyFrozen)`        — strategy frozen; must be caught by freeze check first.
     pub fn check_bytecode(
         &self,
-        strategy_id:         &str,
+        strategy_id: &str,
         actual_bytecode_hash: &[u8; 32],
     ) -> Result<(), SecurityError> {
-        let entry = self.entries.get(strategy_id).ok_or_else(|| {
-            SecurityError::StrategyUnknown { strategy_id: strategy_id.to_string() }
-        })?;
+        let entry =
+            self.entries
+                .get(strategy_id)
+                .ok_or_else(|| SecurityError::StrategyUnknown {
+                    strategy_id: strategy_id.to_string(),
+                })?;
 
         if &entry.bytecode_hash != actual_bytecode_hash {
             metrics::BYTECODE_FAILURES.inc();
             tracing::error!(
-                strategy       = strategy_id,
-                expected       = hex::encode(entry.bytecode_hash),
-                actual         = hex::encode(actual_bytecode_hash),
+                strategy = strategy_id,
+                expected = hex::encode(entry.bytecode_hash),
+                actual = hex::encode(actual_bytecode_hash),
                 "BYTECODE INTEGRITY FAILURE (Certora C4)"
             );
             return Err(SecurityError::BytecodeMismatch {
@@ -193,7 +198,10 @@ impl IntegrityRegistry {
     pub fn freeze(&self, strategy_id: &str) {
         self.frozen.insert(strategy_id.to_string());
         metrics::STRATEGY_FREEZES.inc();
-        tracing::warn!(strategy = strategy_id, "strategy FROZEN — no further blueprints permitted");
+        tracing::warn!(
+            strategy = strategy_id,
+            "strategy FROZEN — no further blueprints permitted"
+        );
     }
 
     /// True if the strategy is frozen.
@@ -226,10 +234,10 @@ impl IntegrityRegistry {
     /// This is the primary entry point called by the blueprint submission path.
     pub fn full_integrity_check(
         &self,
-        strategy_id:          &str,
+        strategy_id: &str,
         actual_bytecode_hash: &[u8; 32],
     ) -> Result<(), SecurityError> {
-        self.check_frozen(strategy_id)?;     // C7 — cheap; first
+        self.check_frozen(strategy_id)?; // C7 — cheap; first
         self.check_bytecode(strategy_id, actual_bytecode_hash)?; // C4 — lookup
         Ok(())
     }
@@ -256,7 +264,7 @@ impl Default for IntegrityRegistry {
     fn default() -> Self {
         Self {
             entries: DashMap::new(),
-            frozen:  DashSet::new(),
+            frozen: DashSet::new(),
         }
     }
 }
@@ -340,7 +348,10 @@ fn parse_bytecode_hash(hex_str: &str, strategy_id: &str) -> Result<[u8; 32], Sec
     if bytes.len() != 32 {
         return Err(SecurityError::InvalidDeploymentEntry {
             strategy_id: strategy_id.to_string(),
-            detail: format!("bytecode_hash must be exactly 32 bytes, got {}", bytes.len()),
+            detail: format!(
+                "bytecode_hash must be exactly 32 bytes, got {}",
+                bytes.len()
+            ),
         });
     }
     let mut arr = [0u8; 32];
@@ -350,7 +361,8 @@ fn parse_bytecode_hash(hex_str: &str, strategy_id: &str) -> Result<[u8; 32], Sec
             strategy_id: strategy_id.to_string(),
             detail: "bytecode_hash is all-zero — this is placeholder data, not a real \
                       deployed bytecode hash; refusing to register a strategy with no \
-                      actual integrity check behind it".to_string(),
+                      actual integrity check behind it"
+                .to_string(),
         });
     }
     Ok(arr)
@@ -369,7 +381,10 @@ fn parse_contract_address(hex_str: &str, strategy_id: &str) -> Result<[u8; 20], 
     if bytes.len() != 20 {
         return Err(SecurityError::InvalidDeploymentEntry {
             strategy_id: strategy_id.to_string(),
-            detail: format!("contract_address must be exactly 20 bytes, got {}", bytes.len()),
+            detail: format!(
+                "contract_address must be exactly 20 bytes, got {}",
+                bytes.len()
+            ),
         });
     }
     let mut arr = [0u8; 20];
@@ -378,7 +393,8 @@ fn parse_contract_address(hex_str: &str, strategy_id: &str) -> Result<[u8; 20], 
         return Err(SecurityError::InvalidDeploymentEntry {
             strategy_id: strategy_id.to_string(),
             detail: "contract_address is all-zero — this is placeholder data, not a real \
-                      deployed contract address; refusing to register".to_string(),
+                      deployed contract address; refusing to register"
+                .to_string(),
         });
     }
     Ok(arr)
@@ -397,14 +413,14 @@ fn parse_contract_address(hex_str: &str, strategy_id: &str) -> Result<[u8; 20], 
 /// worse than refusing to start.
 pub fn strategy_entries_from_manifest(
     manifest: &DeploymentManifest,
-    phase:    u8,
+    phase: u8,
 ) -> Result<Vec<StrategyEntry>, SecurityError> {
     manifest
         .strategies
         .iter()
         .filter(|dep| dep.min_phase <= phase)
         .map(|dep| {
-            let bytecode_hash    = parse_bytecode_hash(&dep.bytecode_hash, &dep.strategy_id)?;
+            let bytecode_hash = parse_bytecode_hash(&dep.bytecode_hash, &dep.strategy_id)?;
             let contract_address = parse_contract_address(&dep.contract_address, &dep.strategy_id)?;
             Ok(StrategyEntry {
                 strategy_id: dep.strategy_id.clone(),
@@ -423,10 +439,10 @@ mod integrity_tests {
     fn reg_with_sa() -> Arc<IntegrityRegistry> {
         let reg = IntegrityRegistry::new();
         reg.register(StrategyEntry {
-            strategy_id:      "SA".into(),
-            bytecode_hash:    [0xaa; 32],
+            strategy_id: "SA".into(),
+            bytecode_hash: [0xaa; 32],
             contract_address: [0x01; 20],
-            min_phase:        1,
+            min_phase: 1,
         });
         reg
     }
@@ -489,10 +505,10 @@ mod integrity_tests {
         let reg = IntegrityRegistry::new();
         for id in ["SA", "LA", "MEV"] {
             reg.register(StrategyEntry {
-                strategy_id:      id.into(),
-                bytecode_hash:    [0xcc; 32],
+                strategy_id: id.into(),
+                bytecode_hash: [0xcc; 32],
                 contract_address: [0x02; 20],
-                min_phase:        1,
+                min_phase: 1,
             });
         }
         reg.freeze("MEV");
@@ -533,7 +549,7 @@ mod integrity_tests {
 
     #[test]
     fn freeze_guard_reflects_registry_state() {
-        let reg   = reg_with_sa();
+        let reg = reg_with_sa();
         let guard = StrategyFreezeGuard::new(Arc::clone(&reg));
         assert!(!guard.is_frozen("SA"));
         reg.freeze("SA");
@@ -546,10 +562,10 @@ mod integrity_tests {
     fn registered_ids_returns_all() {
         let reg = reg_with_sa();
         reg.register(StrategyEntry {
-            strategy_id:      "LA".into(),
-            bytecode_hash:    [0xbb; 32],
+            strategy_id: "LA".into(),
+            bytecode_hash: [0xbb; 32],
             contract_address: [0x02; 20],
-            min_phase:        3,
+            min_phase: 3,
         });
         let ids = reg.registered_ids();
         assert_eq!(ids.len(), 2);
@@ -561,10 +577,10 @@ mod integrity_tests {
     fn frozen_ids_lists_only_frozen() {
         let reg = reg_with_sa();
         reg.register(StrategyEntry {
-            strategy_id:      "LA".into(),
-            bytecode_hash:    [0xbb; 32],
+            strategy_id: "LA".into(),
+            bytecode_hash: [0xbb; 32],
             contract_address: [0x02; 20],
-            min_phase:        3,
+            min_phase: 3,
         });
         reg.freeze("LA");
         let frozen = reg.frozen_ids();
@@ -586,34 +602,34 @@ mod integrity_tests {
         DeploymentManifest {
             strategies: vec![
                 StrategyDeployment {
-                    strategy_id:      "CNRY".into(),
-                    bytecode_hash:    format!("0x{}", "11".repeat(32)),
+                    strategy_id: "CNRY".into(),
+                    bytecode_hash: format!("0x{}", "11".repeat(32)),
                     contract_address: format!("0x{}", "21".repeat(20)),
-                    min_phase:        0,
+                    min_phase: 0,
                 },
                 StrategyDeployment {
-                    strategy_id:      "SA".into(),
-                    bytecode_hash:    format!("0x{}", "12".repeat(32)),
+                    strategy_id: "SA".into(),
+                    bytecode_hash: format!("0x{}", "12".repeat(32)),
                     contract_address: format!("0x{}", "22".repeat(20)),
-                    min_phase:        1,
+                    min_phase: 1,
                 },
                 StrategyDeployment {
-                    strategy_id:      "MSA".into(),
-                    bytecode_hash:    format!("0x{}", "13".repeat(32)),
+                    strategy_id: "MSA".into(),
+                    bytecode_hash: format!("0x{}", "13".repeat(32)),
                     contract_address: format!("0x{}", "23".repeat(20)),
-                    min_phase:        2,
+                    min_phase: 2,
                 },
                 StrategyDeployment {
-                    strategy_id:      "LA".into(),
-                    bytecode_hash:    format!("0x{}", "14".repeat(32)),
+                    strategy_id: "LA".into(),
+                    bytecode_hash: format!("0x{}", "14".repeat(32)),
                     contract_address: format!("0x{}", "24".repeat(20)),
-                    min_phase:        3,
+                    min_phase: 3,
                 },
                 StrategyDeployment {
-                    strategy_id:      "MEV".into(),
-                    bytecode_hash:    format!("0x{}", "15".repeat(32)),
+                    strategy_id: "MEV".into(),
+                    bytecode_hash: format!("0x{}", "15".repeat(32)),
                     contract_address: format!("0x{}", "25".repeat(20)),
-                    min_phase:        4,
+                    min_phase: 4,
                 },
             ],
         }
@@ -633,15 +649,21 @@ mod integrity_tests {
         let entries = strategy_entries_from_manifest(&sample_manifest(), 4).unwrap();
         assert_eq!(entries.len(), 5);
         for e in &entries {
-            assert_ne!(e.bytecode_hash, [0u8; 32], "no entry may carry a placeholder hash");
-            assert_ne!(e.contract_address, [0u8; 20], "no entry may carry a placeholder address");
+            assert_ne!(
+                e.bytecode_hash, [0u8; 32],
+                "no entry may carry a placeholder hash"
+            );
+            assert_ne!(
+                e.contract_address, [0u8; 20],
+                "no entry may carry a placeholder address"
+            );
         }
     }
 
     #[test]
     fn manifest_hex_prefix_is_optional() {
         let mut m = sample_manifest();
-        m.strategies[0].bytecode_hash    = "11".repeat(32); // no 0x prefix
+        m.strategies[0].bytecode_hash = "11".repeat(32); // no 0x prefix
         m.strategies[0].contract_address = "21".repeat(20);
         let entries = strategy_entries_from_manifest(&m, 0).unwrap();
         assert_eq!(entries.len(), 1);
@@ -652,7 +674,11 @@ mod integrity_tests {
         let entries = strategy_entries_from_manifest(&sample_manifest(), 4).unwrap();
         let reg = IntegrityRegistry::new();
         reg.register_all(entries);
-        let sa = sample_manifest().strategies.into_iter().find(|s| s.strategy_id == "SA").unwrap();
+        let sa = sample_manifest()
+            .strategies
+            .into_iter()
+            .find(|s| s.strategy_id == "SA")
+            .unwrap();
         let hash = parse_bytecode_hash(&sa.bytecode_hash, "SA").unwrap();
         assert!(reg.full_integrity_check("SA", &hash).is_ok());
     }
@@ -675,7 +701,10 @@ mod integrity_tests {
         let mut m = sample_manifest();
         m.strategies[0].contract_address = format!("0x{}", "00".repeat(20));
         let result = strategy_entries_from_manifest(&m, 0);
-        assert!(matches!(result, Err(SecurityError::InvalidDeploymentEntry { .. })));
+        assert!(matches!(
+            result,
+            Err(SecurityError::InvalidDeploymentEntry { .. })
+        ));
     }
 
     #[test]
@@ -683,7 +712,10 @@ mod integrity_tests {
         let mut m = sample_manifest();
         m.strategies[0].bytecode_hash = "not-hex-at-all".into();
         let result = strategy_entries_from_manifest(&m, 0);
-        assert!(matches!(result, Err(SecurityError::InvalidDeploymentEntry { .. })));
+        assert!(matches!(
+            result,
+            Err(SecurityError::InvalidDeploymentEntry { .. })
+        ));
     }
 
     #[test]
@@ -691,7 +723,10 @@ mod integrity_tests {
         let mut m = sample_manifest();
         m.strategies[0].bytecode_hash = format!("0x{}", "11".repeat(16)); // 16 bytes, not 32
         let result = strategy_entries_from_manifest(&m, 0);
-        assert!(matches!(result, Err(SecurityError::InvalidDeploymentEntry { .. })));
+        assert!(matches!(
+            result,
+            Err(SecurityError::InvalidDeploymentEntry { .. })
+        ));
     }
 
     #[test]
@@ -699,7 +734,10 @@ mod integrity_tests {
         let mut m = sample_manifest();
         m.strategies[0].contract_address = format!("0x{}", "21".repeat(10)); // 10 bytes, not 20
         let result = strategy_entries_from_manifest(&m, 0);
-        assert!(matches!(result, Err(SecurityError::InvalidDeploymentEntry { .. })));
+        assert!(matches!(
+            result,
+            Err(SecurityError::InvalidDeploymentEntry { .. })
+        ));
     }
 
     #[test]

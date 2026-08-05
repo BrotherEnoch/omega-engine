@@ -30,8 +30,8 @@
 //   In production the secret key bytes are loaded from HSM / env var; this
 //   module stores them in memory only for the signing operation lifetime.
 
-use parking_lot::RwLock;
 use chrono::{DateTime, Utc};
+use parking_lot::RwLock;
 use secp256k1::SecretKey;
 use serde::{Deserialize, Serialize};
 
@@ -53,10 +53,10 @@ pub enum KeyRotationState {
     },
     /// Rotation in progress: both keys accepted until `window_end_block`.
     Rotating {
-        active_address:  String,
+        active_address: String,
         pending_address: String,
         window_end_block: u64,
-        initiated_at:    DateTime<Utc>,
+        initiated_at: DateTime<Utc>,
     },
 }
 
@@ -68,11 +68,11 @@ impl KeyRotationState {
 
 /// Internal key state (holds actual secret key bytes).
 struct KeyState {
-    active_key:   SecretKey,
-    active_addr:  [u8; 20],
-    pending_key:  Option<SecretKey>,
+    active_key: SecretKey,
+    active_addr: [u8; 20],
+    pending_key: Option<SecretKey>,
     pending_addr: Option<[u8; 20]>,
-    window_end:   Option<u64>,
+    window_end: Option<u64>,
     initiated_at: Option<DateTime<Utc>>,
 }
 
@@ -81,8 +81,8 @@ struct KeyState {
 /// `Arc<KeyManager>` is shared between `BlueprintSigner` and the governance
 /// control-plane handler.
 pub struct KeyManager {
-    state:       RwLock<KeyState>,
-    secp:        secp256k1::Secp256k1<secp256k1::All>,
+    state: RwLock<KeyState>,
+    secp: secp256k1::Secp256k1<secp256k1::All>,
 }
 
 impl KeyManager {
@@ -91,11 +91,11 @@ impl KeyManager {
         let secp = secp256k1::Secp256k1::new();
         let addr = secret_key_to_address(&secp, &sk);
         let state = KeyState {
-            active_key:   sk,
-            active_addr:  addr,
-            pending_key:  None,
+            active_key: sk,
+            active_addr: addr,
+            pending_key: None,
             pending_addr: None,
-            window_end:   None,
+            window_end: None,
             initiated_at: None,
         };
         Self {
@@ -106,15 +106,19 @@ impl KeyManager {
 
     /// Create from hex-encoded secret key bytes (32 bytes, 64 hex chars, no 0x prefix).
     pub fn from_hex(hex_key: &str, chain_id: u64) -> Result<Self, SecurityError> {
-        let bytes = hex::decode(hex_key.trim_start_matches("0x"))
-            .map_err(|e| SecurityError::SigningFailed { detail: e.to_string() })?;
+        let bytes = hex::decode(hex_key.trim_start_matches("0x")).map_err(|e| {
+            SecurityError::SigningFailed {
+                detail: e.to_string(),
+            }
+        })?;
         if bytes.len() != 32 {
             return Err(SecurityError::SigningFailed {
                 detail: format!("expected 32 key bytes, got {}", bytes.len()),
             });
         }
-        let sk = SecretKey::from_slice(&bytes)
-            .map_err(|e| SecurityError::SigningFailed { detail: e.to_string() })?;
+        let sk = SecretKey::from_slice(&bytes).map_err(|e| SecurityError::SigningFailed {
+            detail: e.to_string(),
+        })?;
         let secp = secp256k1::Secp256k1::new();
         let addr = secret_key_to_address(&secp, &sk);
 
@@ -125,11 +129,11 @@ impl KeyManager {
         );
 
         let state = KeyState {
-            active_key:   sk,
-            active_addr:  addr,
-            pending_key:  None,
+            active_key: sk,
+            active_addr: addr,
+            pending_key: None,
             pending_addr: None,
-            window_end:   None,
+            window_end: None,
             initiated_at: None,
         };
         Ok(Self {
@@ -180,7 +184,7 @@ impl KeyManager {
     /// Returns `Err(RotationAlreadyPending)` if a rotation is already in progress.
     pub fn initiate_rotation(
         &self,
-        new_key:       SecretKey,
+        new_key: SecretKey,
         current_block: u64,
     ) -> Result<KeyRotationState, SecurityError> {
         let mut s = self.state.write();
@@ -188,17 +192,17 @@ impl KeyManager {
             return Err(SecurityError::RotationAlreadyPending);
         }
 
-        let new_addr      = secret_key_to_address(&self.secp, &new_key);
-        let window_end    = current_block + ROTATION_WINDOW_BLOCKS;
-        let initiated_at  = Utc::now();
+        let new_addr = secret_key_to_address(&self.secp, &new_key);
+        let window_end = current_block + ROTATION_WINDOW_BLOCKS;
+        let initiated_at = Utc::now();
 
-        s.pending_key  = Some(new_key);
+        s.pending_key = Some(new_key);
         s.pending_addr = Some(new_addr);
-        s.window_end   = Some(window_end);
+        s.window_end = Some(window_end);
         s.initiated_at = Some(initiated_at);
 
         tracing::warn!(
-            active  = hex::encode(s.active_addr),
+            active = hex::encode(s.active_addr),
             pending = hex::encode(new_addr),
             window_end,
             "key rotation initiated — dual-key window open"
@@ -207,8 +211,8 @@ impl KeyManager {
         metrics::KEY_ROTATIONS.inc();
 
         Ok(KeyRotationState::Rotating {
-            active_address:   hex::encode(s.active_addr),
-            pending_address:  hex::encode(new_addr),
+            active_address: hex::encode(s.active_addr),
+            pending_address: hex::encode(new_addr),
             window_end_block: window_end,
             initiated_at,
         })
@@ -226,11 +230,13 @@ impl KeyManager {
 
         if needs_complete {
             let mut s = self.state.write();
-            if let (Some(pk), Some(pa), Some(_we)) =
-                (s.pending_key.take(), s.pending_addr.take(), s.window_end.take())
-            {
+            if let (Some(pk), Some(pa), Some(_we)) = (
+                s.pending_key.take(),
+                s.pending_addr.take(),
+                s.window_end.take(),
+            ) {
                 let old_addr = s.active_addr;
-                s.active_key  = pk;
+                s.active_key = pk;
                 s.active_addr = pa;
                 s.initiated_at = None;
 
@@ -249,10 +255,10 @@ impl KeyManager {
         let s = self.state.read();
         match (s.pending_addr, s.window_end, s.initiated_at) {
             (Some(pa), Some(we), Some(ia)) => KeyRotationState::Rotating {
-                active_address:   hex::encode(s.active_addr),
-                pending_address:  hex::encode(pa),
+                active_address: hex::encode(s.active_addr),
+                pending_address: hex::encode(pa),
                 window_end_block: we,
-                initiated_at:     ia,
+                initiated_at: ia,
             },
             _ => KeyRotationState::Active {
                 address: hex::encode(s.active_addr),
@@ -264,8 +270,8 @@ impl KeyManager {
     pub fn cancel_rotation(&self) {
         let mut s = self.state.write();
         if let Some(pa) = s.pending_addr.take() {
-            s.pending_key  = None;
-            s.window_end   = None;
+            s.pending_key = None;
+            s.window_end = None;
             s.initiated_at = None;
             tracing::warn!(
                 pending = hex::encode(pa),
@@ -280,8 +286,12 @@ mod key_manager_tests {
     use super::*;
     use secp256k1::SecretKey;
 
-    fn sk(byte: u8) -> SecretKey { SecretKey::from_slice(&[byte; 32]).unwrap() }
-    fn km(byte: u8) -> KeyManager { KeyManager::from_secret_key(sk(byte)) }
+    fn sk(byte: u8) -> SecretKey {
+        SecretKey::from_slice(&[byte; 32]).unwrap()
+    }
+    fn km(byte: u8) -> KeyManager {
+        KeyManager::from_secret_key(sk(byte))
+    }
 
     #[test]
     fn initial_state_is_active() {
@@ -315,15 +325,15 @@ mod key_manager_tests {
     #[test]
     fn both_keys_accepted_during_window() {
         let secp = secp256k1::Secp256k1::new();
-        let m    = km(0x01);
+        let m = km(0x01);
         let addr_active = m.active_address();
         let new_sk = sk(0x02);
         let addr_pending = secret_key_to_address(&secp, &new_sk);
         m.initiate_rotation(new_sk, 1000).unwrap();
 
-        assert!(m.accepts_address(&addr_active,  1010)); // old key still valid
+        assert!(m.accepts_address(&addr_active, 1010)); // old key still valid
         assert!(m.accepts_address(&addr_pending, 1010)); // new key valid in window
-        assert!(!m.accepts_address(&[0xff; 20],  1010)); // random key rejected
+        assert!(!m.accepts_address(&[0xff; 20], 1010)); // random key rejected
     }
 
     #[test]

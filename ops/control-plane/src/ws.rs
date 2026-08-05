@@ -79,7 +79,7 @@ const PING_INTERVAL: Duration = Duration::from_secs(30);
 ///
 /// Mounted at `GET /ws/events` in `main.rs`'s `build_router()`.
 pub async fn events_handler(
-    ws:           WebSocketUpgrade,
+    ws: WebSocketUpgrade,
     State(state): State<Arc<AppState>>,
 ) -> impl IntoResponse {
     ws.on_upgrade(move |socket| handle_ws(socket, state))
@@ -92,7 +92,11 @@ pub async fn events_handler(
 async fn handle_ws(mut socket: WebSocket, state: Arc<AppState>) {
     // ── Auth handshake ────────────────────────────────────────────────────
     let is_authenticated = negotiate_auth(&mut socket, &state.api_token).await;
-    let msg_limit        = if is_authenticated { AUTHED_LIMIT } else { ANON_LIMIT };
+    let msg_limit = if is_authenticated {
+        AUTHED_LIMIT
+    } else {
+        ANON_LIMIT
+    };
 
     tracing::debug!(
         authenticated = is_authenticated,
@@ -106,15 +110,15 @@ async fn handle_ws(mut socket: WebSocket, state: Arc<AppState>) {
     let mut rx = state.ws_tx.subscribe();
 
     // ── Rate-limit state ──────────────────────────────────────────────────
-    let mut msg_count    = 0u32;
+    let mut msg_count = 0u32;
     let mut window_start = Instant::now();
-    let mut ping_timer   = tokio::time::interval(PING_INTERVAL);
+    let mut ping_timer = tokio::time::interval(PING_INTERVAL);
     ping_timer.tick().await; // consume first tick (fires immediately)
 
     loop {
         // Reset rate-limit window
         if window_start.elapsed() >= RATE_WINDOW {
-            msg_count    = 0;
+            msg_count = 0;
             window_start = Instant::now();
         }
 
@@ -224,25 +228,31 @@ async fn negotiate_auth(socket: &mut WebSocket, api_token: &str) -> bool {
                     let token = v.get("token").and_then(|t| t.as_str()).unwrap_or("");
                     if token == api_token {
                         // Acknowledge authentication
-                        let _ = socket.send(Message::Text(
-                            serde_json::to_string(&serde_json::json!({
-                                "type": "auth_ok",
-                                "rate_limit": AUTHED_LIMIT,
-                                "window_secs": RATE_WINDOW.as_secs(),
-                            })).unwrap_or_default(),
-                        )).await;
+                        let _ = socket
+                            .send(Message::Text(
+                                serde_json::to_string(&serde_json::json!({
+                                    "type": "auth_ok",
+                                    "rate_limit": AUTHED_LIMIT,
+                                    "window_secs": RATE_WINDOW.as_secs(),
+                                }))
+                                .unwrap_or_default(),
+                            ))
+                            .await;
                         return true;
                     }
                 }
             }
             // Invalid auth frame — respond with anonymous rate limits
-            let _ = socket.send(Message::Text(
-                serde_json::to_string(&serde_json::json!({
-                    "type": "auth_failed",
-                    "rate_limit": ANON_LIMIT,
-                    "window_secs": RATE_WINDOW.as_secs(),
-                })).unwrap_or_default(),
-            )).await;
+            let _ = socket
+                .send(Message::Text(
+                    serde_json::to_string(&serde_json::json!({
+                        "type": "auth_failed",
+                        "rate_limit": ANON_LIMIT,
+                        "window_secs": RATE_WINDOW.as_secs(),
+                    }))
+                    .unwrap_or_default(),
+                ))
+                .await;
             false
         }
         // Timeout or non-text frame — treat as anonymous
@@ -267,8 +277,8 @@ mod tests {
     fn rate_limits_match_spec() {
         // §17.1 fix M4: authenticated 300/min, anonymous 100/min
         assert_eq!(AUTHED_LIMIT, 300);
-        assert_eq!(ANON_LIMIT,   100);
-        assert_eq!(RATE_WINDOW,  Duration::from_secs(60));
+        assert_eq!(ANON_LIMIT, 100);
+        assert_eq!(RATE_WINDOW, Duration::from_secs(60));
     }
 
     // ── Wire format correctness ───────────────────────────────────────────────
@@ -278,104 +288,154 @@ mod tests {
 
     #[test]
     fn config_reloaded_serialises_with_type_and_payload() {
-        let event = WsEvent::ConfigReloaded { timestamp: chrono::Utc::now() };
-        let json  = serde_json::to_string(&event).unwrap();
-        assert!(json.contains("\"type\":\"config_reloaded\""),
-            "wrong type tag: {json}");
-        assert!(json.contains("\"payload\":{"),
-            "missing payload wrapper: {json}");
+        let event = WsEvent::ConfigReloaded {
+            timestamp: chrono::Utc::now(),
+        };
+        let json = serde_json::to_string(&event).unwrap();
+        assert!(
+            json.contains("\"type\":\"config_reloaded\""),
+            "wrong type tag: {json}"
+        );
+        assert!(
+            json.contains("\"payload\":{"),
+            "missing payload wrapper: {json}"
+        );
     }
 
     #[test]
     fn model_pause_changed_serialises_with_type_and_payload() {
-        let event = WsEvent::ModelPauseChanged { paused: true, timestamp: chrono::Utc::now() };
-        let json  = serde_json::to_string(&event).unwrap();
-        assert!(json.contains("\"type\":\"model_pause_changed\""),
-            "wrong type tag: {json}");
-        assert!(json.contains("\"payload\":{"),
-            "missing payload wrapper: {json}");
-        assert!(json.contains("\"paused\":true"),
-            "paused field missing from payload: {json}");
+        let event = WsEvent::ModelPauseChanged {
+            paused: true,
+            timestamp: chrono::Utc::now(),
+        };
+        let json = serde_json::to_string(&event).unwrap();
+        assert!(
+            json.contains("\"type\":\"model_pause_changed\""),
+            "wrong type tag: {json}"
+        );
+        assert!(
+            json.contains("\"payload\":{"),
+            "missing payload wrapper: {json}"
+        );
+        assert!(
+            json.contains("\"paused\":true"),
+            "paused field missing from payload: {json}"
+        );
     }
 
     #[test]
     fn blacklist_reloaded_serialises_with_type_and_payload() {
-        let event = WsEvent::BlacklistReloaded { entry_count: 42, timestamp: chrono::Utc::now() };
-        let json  = serde_json::to_string(&event).unwrap();
-        assert!(json.contains("\"type\":\"blacklist_reloaded\""),
-            "wrong type tag: {json}");
-        assert!(json.contains("\"payload\":{"),
-            "missing payload wrapper: {json}");
-        assert!(json.contains("\"entry_count\":42"),
-            "entry_count missing from payload: {json}");
+        let event = WsEvent::BlacklistReloaded {
+            entry_count: 42,
+            timestamp: chrono::Utc::now(),
+        };
+        let json = serde_json::to_string(&event).unwrap();
+        assert!(
+            json.contains("\"type\":\"blacklist_reloaded\""),
+            "wrong type tag: {json}"
+        );
+        assert!(
+            json.contains("\"payload\":{"),
+            "missing payload wrapper: {json}"
+        );
+        assert!(
+            json.contains("\"entry_count\":42"),
+            "entry_count missing from payload: {json}"
+        );
     }
 
     #[test]
     fn health_transition_serialises_with_type_and_payload() {
         let event = WsEvent::HealthTransition {
-            layer:     "relay".into(),
-            from:      "HEALTHY".into(),
-            to:        "DEGRADED".into(),
-            reason:    "test".into(),
+            layer: "relay".into(),
+            from: "HEALTHY".into(),
+            to: "DEGRADED".into(),
+            reason: "test".into(),
             timestamp: chrono::Utc::now(),
         };
         let json = serde_json::to_string(&event).unwrap();
-        assert!(json.contains("\"type\":\"health_transition\""),
-            "wrong type tag: {json}");
-        assert!(json.contains("\"payload\":{"),
-            "missing payload wrapper: {json}");
-        assert!(json.contains("\"layer\":\"relay\""),
-            "layer field missing from payload: {json}");
+        assert!(
+            json.contains("\"type\":\"health_transition\""),
+            "wrong type tag: {json}"
+        );
+        assert!(
+            json.contains("\"payload\":{"),
+            "missing payload wrapper: {json}"
+        );
+        assert!(
+            json.contains("\"layer\":\"relay\""),
+            "layer field missing from payload: {json}"
+        );
     }
 
     #[test]
     fn profit_split_serialises_with_type_and_payload() {
         let event = WsEvent::ProfitSplit {
             blueprint_hash: "0xabc".into(),
-            pil_share_wei:  "1000000000000000000".into(),
-            dao_fee_wei:    "50000000000000000".into(),
-            timestamp:      chrono::Utc::now(),
+            pil_share_wei: "1000000000000000000".into(),
+            dao_fee_wei: "50000000000000000".into(),
+            timestamp: chrono::Utc::now(),
         };
         let json = serde_json::to_string(&event).unwrap();
-        assert!(json.contains("\"type\":\"profit_split\""),
-            "wrong type tag: {json}");
-        assert!(json.contains("\"payload\":{"),
-            "missing payload wrapper: {json}");
-        assert!(json.contains("\"blueprint_hash\":\"0xabc\""),
-            "blueprint_hash missing from payload: {json}");
+        assert!(
+            json.contains("\"type\":\"profit_split\""),
+            "wrong type tag: {json}"
+        );
+        assert!(
+            json.contains("\"payload\":{"),
+            "missing payload wrapper: {json}"
+        );
+        assert!(
+            json.contains("\"blueprint_hash\":\"0xabc\""),
+            "blueprint_hash missing from payload: {json}"
+        );
     }
 
     #[test]
     fn gas_model_reverted_serialises_with_type_and_payload() {
         let event = WsEvent::GasModelReverted {
             checkpoint_version: 7,
-            win_rate:           0.72,
-            sample_count:       7000,
-            timestamp:          chrono::Utc::now(),
+            win_rate: 0.72,
+            sample_count: 7000,
+            timestamp: chrono::Utc::now(),
         };
         let json = serde_json::to_string(&event).unwrap();
-        assert!(json.contains("\"type\":\"gas_model_reverted\""),
-            "wrong type tag: {json}");
-        assert!(json.contains("\"payload\":{"),
-            "missing payload wrapper: {json}");
-        assert!(json.contains("\"checkpoint_version\":7"),
-            "checkpoint_version missing: {json}");
+        assert!(
+            json.contains("\"type\":\"gas_model_reverted\""),
+            "wrong type tag: {json}"
+        );
+        assert!(
+            json.contains("\"payload\":{"),
+            "missing payload wrapper: {json}"
+        );
+        assert!(
+            json.contains("\"checkpoint_version\":7"),
+            "checkpoint_version missing: {json}"
+        );
     }
 
     #[tokio::test]
     async fn broadcast_channel_capacity() {
         let (tx, mut rx) = broadcast::channel::<WsEvent>(WS_CHANNEL_CAPACITY);
         for _ in 0..WS_CHANNEL_CAPACITY {
-            tx.send(WsEvent::ConfigReloaded { timestamp: chrono::Utc::now() }).unwrap();
+            tx.send(WsEvent::ConfigReloaded {
+                timestamp: chrono::Utc::now(),
+            })
+            .unwrap();
         }
         // One more should succeed (replaces oldest for receivers that lagged)
-        let _ = tx.send(WsEvent::ConfigReloaded { timestamp: chrono::Utc::now() });
+        let _ = tx.send(WsEvent::ConfigReloaded {
+            timestamp: chrono::Utc::now(),
+        });
         // Receiver should get RecvError::Lagged if it was behind
         let result = rx.try_recv();
-        assert!(result.is_ok() || matches!(
-            result.unwrap_err(),
-            tokio::sync::broadcast::error::TryRecvError::Lagged(_)
-        ));
+        assert!(
+            result.is_ok()
+                || matches!(
+                    result.unwrap_err(),
+                    tokio::sync::broadcast::error::TryRecvError::Lagged(_)
+                )
+        );
     }
 
     #[tokio::test]
@@ -383,10 +443,11 @@ mod tests {
         let (tx, mut rx) = broadcast::channel::<WsEvent>(16);
         tx.send(WsEvent::ProfitSplit {
             blueprint_hash: "0x1".into(),
-            pil_share_wei:  "1000".into(),
-            dao_fee_wei:    "50".into(),
-            timestamp:      chrono::Utc::now(),
-        }).unwrap();
+            pil_share_wei: "1000".into(),
+            dao_fee_wei: "50".into(),
+            timestamp: chrono::Utc::now(),
+        })
+        .unwrap();
         let received = rx.try_recv();
         assert!(received.is_ok(), "subscriber must receive published event");
         match received.unwrap() {

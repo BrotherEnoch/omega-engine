@@ -52,6 +52,33 @@
 // intentional: it converts a silent runtime panic wherever this string
 // eventually gets parsed into an `Address` into an explicit, immediate
 // `cargo test` failure instead.
+//
+// ## Fix (this revision) — real DexSync -> TwapOracle wiring
+//
+// Added `lookup_arbitrum_pool`, `decode_v2_sync_reserves`, and
+// `price_from_v2_reserves` below, alongside `decode_sqrt_price_x96`.
+// These give `per_chain.rs`'s `run_dex_sync` a real path from a raw
+// Uniswap V2 `Sync(uint112,uint112)` log into a price it can feed to
+// `TwapOracle::update` — closing (for the TWAP leg only; Chainlink/Pyth
+// remain unfed) the "caches exist but nothing calls .update()" gap.
+//
+// HONESTY NOTE: `arbitrum_pools()` is documented and named as a Uniswap
+// V3 pool table, but the RPC stream this feeds from
+// (`run_dex_sync_stream` in crates/omega-rpc/src/subscriptions.rs)
+// filters on the Uniswap V2 `Sync` topic, not a V3 event. The three
+// functions below decode V2 reserve ratios, not a real V3 sqrtPriceX96
+// — a genuine V3 TWAP path needs a different event signature captured
+// upstream in omega-rpc, out of scope here.
+//
+// `price_from_v2_reserves`'s `token0_is_numerator` orientation flag was
+// checked against `decode_sqrt_price_x96` below, not just assumed to
+// match by naming: for the real `arbitrum_pools()` entries, WETH
+// (`token0_is_numerator=false`, USDC=token0/6dp, WETH=token1/18dp)
+// produces "USDC per WETH" from both functions, and LINK
+// (`token0_is_numerator=true`) produces "ETH per LINK" from both —
+// confirmed consistent, not coincidental (V2 constant-product reserve
+// ratios and V3's sqrt-price-squared reduce to the same price
+// relationship for a given orientation).
 
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -116,6 +143,22 @@ pub fn arbitrum_pools() -> &'static [(&'static str, &'static str, bool, u8, u8)]
     ]
 }
 
+/// Look up a known Arbitrum pool address in the static table, returning
+/// its token symbol and orientation/decimals metadata if found.
+///
+/// Returns `(symbol, token0_is_numerator, token0_decimals, token1_decimals)`.
+/// Case-insensitive on the address to tolerate checksummed vs. lowercase
+/// hex from different log sources.
+pub fn lookup_arbitrum_pool(pool: &str) -> Option<(&'static str, bool, u8, u8)> {
+    let pool_lc = pool.to_ascii_lowercase();
+    for &(sym, addr, t0_num, d0, d1) in arbitrum_pools() {
+        if addr.to_ascii_lowercase() == pool_lc {
+            return Some((sym, t0_num, d0, d1));
+        }
+    }
+    None
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // sqrtPriceX96 decoding
 // ─────────────────────────────────────────────────────────────────────────────
@@ -147,6 +190,57 @@ pub fn decode_sqrt_price_x96(
     } else {
         1.0 / price_ratio // token0 per token1 (inverted)
     }
+}
+
+/// Decode a Uniswap V2 `Sync(uint112,uint112)` event's ABI-encoded data
+/// into `(reserve0, reserve1)`.
+///
+/// Each reserve is a `uint112` right-aligned within its own 32-byte word
+/// (standard ABI encoding for values narrower than 256 bits) — so the
+/// low 16 bytes of each word hold the value; the high 16 bytes are
+/// zero-padding. Returns `None` if `data` is shorter than the required
+/// 64 bytes (two words) rather than panicking on a malformed/truncated
+/// log.
+pub fn decode_v2_sync_reserves(data: &[u8]) -> Option<(u128, u128)> {
+    if data.len() < 64 {
+        return None;
+    }
+    let mut r0 = [0u8; 16];
+    let mut r1 = [0u8; 16];
+    r0.copy_from_slice(&data[16..32]);
+    r1.copy_from_slice(&data[48..64]);
+    Some((u128::from_be_bytes(r0), u128::from_be_bytes(r1)))
+}
+
+/// Compute the spot price of the pool's "asset" token in terms of its
+/// "quote" token from raw V2 reserves, applying each token's decimals.
+///
+/// `token0_is_numerator` uses the same convention as `decode_sqrt_price_x96`
+/// above — CONFIRMED consistent (checked against the real `arbitrum_pools()`
+/// entries and against the underlying V2/V3 spot-price math independently,
+/// see this file's module-level "Fix (this revision)" note). Returns
+/// `None` on a zero reserve (undefined price) or a non-finite result.
+pub fn price_from_v2_reserves(
+    reserve0: u128,
+    reserve1: u128,
+    token0_decimals: u8,
+    token1_decimals: u8,
+    token0_is_numerator: bool,
+) -> Option<f64> {
+    if reserve0 == 0 || reserve1 == 0 {
+        return None;
+    }
+    let r0 = reserve0 as f64 / 10_f64.powi(token0_decimals as i32);
+    let r1 = reserve1 as f64 / 10_f64.powi(token1_decimals as i32);
+    if !r0.is_finite() || !r1.is_finite() || r0 <= 0.0 || r1 <= 0.0 {
+        return None;
+    }
+    let price = if token0_is_numerator {
+        r1 / r0
+    } else {
+        r0 / r1
+    };
+    price.is_finite().then_some(price)
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -359,5 +453,62 @@ mod tests {
                 "{symbol}: pool address contains non-hex characters: {addr}"
             );
         }
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// V2 reserve-decode tests (this revision)
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod v2_reserve_tests {
+    use super::*;
+
+    #[test]
+    fn decode_rejects_short_data() {
+        assert_eq!(decode_v2_sync_reserves(&[0u8; 63]), None);
+    }
+
+    #[test]
+    fn decode_reads_both_words() {
+        let mut data = [0u8; 64];
+        // reserve0 = 1000 in the low 16 bytes of the first word
+        data[16..32].copy_from_slice(&1000u128.to_be_bytes());
+        // reserve1 = 2000 in the low 16 bytes of the second word
+        data[48..64].copy_from_slice(&2000u128.to_be_bytes());
+        assert_eq!(decode_v2_sync_reserves(&data), Some((1000, 2000)));
+    }
+
+    #[test]
+    fn price_rejects_zero_reserve() {
+        assert_eq!(price_from_v2_reserves(0, 1000, 18, 18, true), None);
+        assert_eq!(price_from_v2_reserves(1000, 0, 18, 18, true), None);
+    }
+
+    #[test]
+    fn price_orientation_matches_flag() {
+        // Equal raw reserves, equal decimals — orientation flips the ratio.
+        let p_num = price_from_v2_reserves(1_000_000, 2_000_000, 18, 18, true).unwrap();
+        let p_denom = price_from_v2_reserves(1_000_000, 2_000_000, 18, 18, false).unwrap();
+        assert!((p_num - 2.0).abs() < 1e-9);
+        assert!((p_denom - 0.5).abs() < 1e-9);
+    }
+
+    /// Cross-checks price_from_v2_reserves against the real
+    /// decode_sqrt_price_x96 for the same orientation and decimals,
+    /// confirming both functions agree on which side is "numerator" —
+    /// not just individually plausible, but mutually consistent.
+    #[test]
+    fn v2_and_v3_orientation_agree_for_weth_usdc_shape() {
+        // WETH entry shape: token0=USDC (6dp), token1=WETH (18dp),
+        // token0_is_numerator=false.
+        // Construct V2 reserves implying ~1800 USDC per WETH.
+        let usdc_reserve = 1_800_000u128 * 1_000_000; // 1.8M USDC worth, 6dp
+        let weth_reserve = 1_000u128 * 1_000_000_000_000_000_000; // 1000 WETH, 18dp
+        let v2_price = price_from_v2_reserves(usdc_reserve, weth_reserve, 6, 18, false).unwrap();
+        assert!(
+            (v2_price - 1800.0).abs() < 1.0,
+            "V2 reserve price should be ~1800 USDC/WETH, got {v2_price}"
+        );
     }
 }

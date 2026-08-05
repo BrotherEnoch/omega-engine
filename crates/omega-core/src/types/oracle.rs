@@ -277,16 +277,28 @@ mod tests {
     fn la_tier_boundaries() {
         const E18: u128 = 1_000_000_000_000_000_000;
         assert_eq!(LaTier::from_hf_e18(U256::from(E18)), LaTier::Hot); // 1.0 exactly -> Hot
-        assert_eq!(LaTier::from_hf_e18(U256::from(E18 + E18 / 100)), LaTier::Warm); // 1.01 -> Warm (boundary inclusive)
-        assert_eq!(LaTier::from_hf_e18(U256::from(E18 + 5 * E18 / 100)), LaTier::Cold); // 1.05 -> Cold
-        assert_eq!(LaTier::from_hf_e18(U256::from(E18 + 20 * E18 / 100)), LaTier::Archived); // 1.20 -> Archived
+        assert_eq!(
+            LaTier::from_hf_e18(U256::from(E18 + E18 / 100)),
+            LaTier::Warm
+        ); // 1.01 -> Warm (boundary inclusive)
+        assert_eq!(
+            LaTier::from_hf_e18(U256::from(E18 + 5 * E18 / 100)),
+            LaTier::Cold
+        ); // 1.05 -> Cold
+        assert_eq!(
+            LaTier::from_hf_e18(U256::from(E18 + 20 * E18 / 100)),
+            LaTier::Archived
+        ); // 1.20 -> Archived
     }
 
     #[test]
     fn is_liquidatable_boundary() {
         const E18: u128 = 1_000_000_000_000_000_000;
         assert!(sample_position(E18 - 1).is_liquidatable());
-        assert!(!sample_position(E18).is_liquidatable(), "HF == 1.0 exactly is not liquidatable");
+        assert!(
+            !sample_position(E18).is_liquidatable(),
+            "HF == 1.0 exactly is not liquidatable"
+        );
         assert!(!sample_position(E18 + 1).is_liquidatable());
     }
 

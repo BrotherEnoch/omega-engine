@@ -34,16 +34,30 @@
 //   The EIL double-buffer (`ArcSwap<EilSnapshot>`) holds the latest
 //   consistent snapshot.  Strategies read it lock-free on every oracle tick.
 //
+// ## Fix (this revision): real Chainlink ingestion
+//
+// Added `chainlink_poll` — the polling loop that calls
+// `OmegaRpcClient::fetch_chainlink_round` (omega-rpc) and feeds
+// `ChainlinkOracle::update`, closing the Chainlink half of the
+// previously-empty-cache gap (TWAP was closed separately via
+// `per_chain.rs`'s `run_dex_sync`; Pyth remains unfed). Lives here, not
+// in omega-rpc, because it needs `ChainlinkOracle` — omega-rpc has no
+// dependency back on omega-oracle (confirmed one-way edge), so only a
+// crate that already depends on omega-rpc (this one) can hold both
+// halves of this wiring without creating a cycle.
+//
 // ## Module map
 //
-//   chainlink.rs   — Chainlink on-chain price feed cache and reader
-//   pyth.rs        — Pyth off-chain price feed cache
-//   twap.rs        — Uniswap v3 TWAP on-chain reader
-//   resolution.rs  — Tri-oracle resolution logic (§7)
-//   la_bonus.rs    — Per-asset, per-protocol liquidation bonus oracle (§11, §12)
-//   per_chain.rs   — `PerChainOracle`: wires RPC streams → OracleSignal EIL
+//   chainlink.rs      — Chainlink on-chain price feed cache and reader
+//   chainlink_poll.rs — Chainlink AggregatorV3 polling loop (this revision)
+//   pyth.rs           — Pyth off-chain price feed cache
+//   twap.rs           — Uniswap v3 TWAP on-chain reader
+//   resolution.rs     — Tri-oracle resolution logic (§7)
+//   la_bonus.rs       — Per-asset, per-protocol liquidation bonus oracle (§11, §12)
+//   per_chain.rs      — `PerChainOracle`: wires RPC streams → OracleSignal EIL
 
 pub mod chainlink;
+pub mod chainlink_poll;
 pub mod la_bonus;
 pub mod per_chain;
 pub mod pyth;
@@ -61,3 +75,10 @@ pub use resolution::{
     TWAP_STALE_SECS,
 };
 pub use twap::TwapOracle;
+
+// `chainlink_poll` intentionally has no re-export line here: its two
+// public functions (`parse_arbitrum_chainlink_feeds`,
+// `run_chainlink_poll_loop`) are called via their fully-qualified path
+// (`omega_oracle::chainlink_poll::...`) from main.rs, matching how this
+// crate's own callers already reach `resolution::resolve_price` etc.
+// when they want the qualified form rather than the root re-export.

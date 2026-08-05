@@ -532,7 +532,10 @@ mod tests {
         // must report headroom relative to ITS OWN capacity, not a
         // hardcoded 400.
         let rl = RpcRateLimiter::with_config(
-            BucketConfig { capacity: 800, refill_per_second: 800 }, // custom, NOT 400
+            BucketConfig {
+                capacity: 800,
+                refill_per_second: 800,
+            }, // custom, NOT 400
             BucketConfig::write_default(),
             BucketConfig::subscribe_default(),
         );
@@ -566,7 +569,10 @@ mod tests {
     #[tokio::test]
     async fn rpc_headroom_zero_capacity_does_not_divide_by_zero() {
         let rl = RpcRateLimiter::with_config(
-            BucketConfig { capacity: 0, refill_per_second: 0 },
+            BucketConfig {
+                capacity: 0,
+                refill_per_second: 0,
+            },
             BucketConfig::write_default(),
             BucketConfig::subscribe_default(),
         );

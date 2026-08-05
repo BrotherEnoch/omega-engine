@@ -84,6 +84,18 @@
 //   or query string. Every log site that previously included the raw
 //   `ws_url` now uses `net::redact_ws_url`, which keeps only the scheme
 //   and host.
+//
+// ## Fix (this revision): fetch_chainlink_round
+//
+// Chainlink AggregatorV3 polling support (see
+// crates/omega-oracle/src/chainlink_poll.rs for the poll loop that calls
+// it) is defined in chainlink_agg.rs, NOT in this file — that file's own
+// `impl OmegaRpcClient` block owns `fetch_chainlink_round` exclusively.
+// An earlier revision of this file also defined the method here, which
+// is a duplicate inherent method (E0592); fixed by removing it from
+// this file rather than from chainlink_agg.rs, since keeping the sol!
+// binding, ChainlinkRound, and the one method that uses them together
+// in one file is the cleaner split.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -97,7 +109,9 @@ use tokio::sync::{broadcast, Mutex};
 
 use omega_core::{FeeSnapshot, HealthState, LayerHealth};
 
-use crate::net::{redact_ws_url, validate_ws_scheme, verify_chain_id, wei_to_gwei_saturating, RpcClientError};
+use crate::net::{
+    redact_ws_url, validate_ws_scheme, verify_chain_id, wei_to_gwei_saturating, RpcClientError,
+};
 use crate::rate_limiter::{RpcRateLimiter, RpcRequestKind};
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -105,8 +119,8 @@ use crate::rate_limiter::{RpcRateLimiter, RpcRequestKind};
 // ─────────────────────────────────────────────────────────────────────────────
 
 const RECONNECT_DELAY_INITIAL_MS: u64 = 1_000;
-const RECONNECT_DELAY_MAX_MS:     u64 = 30_000;
-const BLOCK_CHANNEL_CAPACITY:  usize  = 64;
+const RECONNECT_DELAY_MAX_MS: u64 = 30_000;
+const BLOCK_CHANNEL_CAPACITY: usize = 64;
 
 /// How long a submitted transaction hash is remembered for duplicate
 /// detection. 30s comfortably covers a typical caller-side retry loop's
@@ -129,12 +143,12 @@ const SUBMISSION_TRACKER_MAX_ENTRIES: usize = 10_000;
 /// this via a `broadcast::Receiver<BlockEvent>`.
 #[derive(Debug, Clone)]
 pub struct BlockEvent {
-    pub number:        u64,
-    pub hash:          B256,
+    pub number: u64,
+    pub hash: B256,
     /// EIP-1559 base fee in gwei.  `None` for pre-London blocks.
     pub base_fee_gwei: Option<u64>,
     /// Unix timestamp in seconds.
-    pub timestamp:     u64,
+    pub timestamp: u64,
     /// True when `number` did not strictly increase relative to the
     /// highest block number previously observed on this subscription —
     /// signals a possible reorg, stale replay, or duplicate delivery
@@ -171,18 +185,22 @@ impl BlockEvent {
 #[derive(Debug, Clone)]
 pub struct RpcClientConfig {
     /// WebSocket endpoint URL (wss:// or ws://).
-    pub ws_url:    String,
+    pub ws_url: String,
     /// Requests per second budget (controls rate limiter config).
     pub rps_limit: u32,
     /// EIP-155 chain ID — used to stamp outbound signals AND verified
     /// against the connected endpoint's actual `eth_chainId` at every
     /// connection establishment (see module doc comment).
-    pub chain_id:  u64,
+    pub chain_id: u64,
 }
 
 impl RpcClientConfig {
     pub fn new(ws_url: impl Into<String>, rps_limit: u32, chain_id: u64) -> Self {
-        Self { ws_url: ws_url.into(), rps_limit, chain_id }
+        Self {
+            ws_url: ws_url.into(),
+            rps_limit,
+            chain_id,
+        }
     }
 }
 
@@ -203,7 +221,11 @@ struct SubmissionTracker {
 
 impl SubmissionTracker {
     fn new(dedup_window: Duration, max_tracked: usize) -> Self {
-        Self { recent: HashMap::new(), dedup_window, max_tracked }
+        Self {
+            recent: HashMap::new(),
+            dedup_window,
+            max_tracked,
+        }
     }
 
     /// Returns `true` if `hash` was already submitted within the dedup
@@ -270,11 +292,11 @@ struct ConnectionState {
 /// Cloning is cheap — all fields are `Arc`-wrapped.
 #[derive(Clone)]
 pub struct OmegaRpcClient {
-    config:             RpcClientConfig,
-    rate_limiter:       RpcRateLimiter,
-    block_tx:           broadcast::Sender<BlockEvent>,
-    health:             Option<Arc<dyn LayerHealth>>,
-    connection:         Arc<Mutex<ConnectionState>>,
+    config: RpcClientConfig,
+    rate_limiter: RpcRateLimiter,
+    block_tx: broadcast::Sender<BlockEvent>,
+    health: Option<Arc<dyn LayerHealth>>,
+    connection: Arc<Mutex<ConnectionState>>,
     submission_tracker: Arc<Mutex<SubmissionTracker>>,
 }
 
@@ -293,7 +315,6 @@ impl OmegaRpcClient {
     /// stop immediately on a fatal one.
     pub async fn connect(config: RpcClientConfig) -> Result<Self, RpcClientError> {
         validate_ws_scheme(&config.ws_url)?;
-
         let provider = open_provider(&config.ws_url).await?;
         verify_chain_id(provider.as_ref(), config.chain_id).await?;
 
@@ -302,11 +323,20 @@ impl OmegaRpcClient {
         let limiter = if config.rps_limit > 0 {
             let read_cap = (config.rps_limit as f64 * 0.80) as u32;
             let writ_cap = (config.rps_limit as f64 * 0.10) as u32;
-            let sub_cap  = (config.rps_limit as f64 * 0.04) as u32;
+            let sub_cap = (config.rps_limit as f64 * 0.04) as u32;
             RpcRateLimiter::with_config(
-                crate::rate_limiter::BucketConfig { capacity: read_cap, refill_per_second: read_cap },
-                crate::rate_limiter::BucketConfig { capacity: writ_cap, refill_per_second: writ_cap },
-                crate::rate_limiter::BucketConfig { capacity: sub_cap,  refill_per_second: sub_cap  },
+                crate::rate_limiter::BucketConfig {
+                    capacity: read_cap,
+                    refill_per_second: read_cap,
+                },
+                crate::rate_limiter::BucketConfig {
+                    capacity: writ_cap,
+                    refill_per_second: writ_cap,
+                },
+                crate::rate_limiter::BucketConfig {
+                    capacity: sub_cap,
+                    refill_per_second: sub_cap,
+                },
             )
         } else {
             RpcRateLimiter::new()
@@ -324,7 +354,9 @@ impl OmegaRpcClient {
             rate_limiter: limiter,
             block_tx,
             health: None,
-            connection: Arc::new(Mutex::new(ConnectionState { provider: Some(provider) })),
+            connection: Arc::new(Mutex::new(ConnectionState {
+                provider: Some(provider),
+            })),
             submission_tracker: Arc::new(Mutex::new(SubmissionTracker::new(
                 SUBMISSION_DEDUP_WINDOW,
                 SUBMISSION_TRACKER_MAX_ENTRIES,
@@ -387,7 +419,9 @@ impl OmegaRpcClient {
     /// subscription loop all share whatever connection is cached here,
     /// rather than each independently opening its own.
     pub async fn get_or_connect(&self) -> anyhow::Result<Arc<dyn Provider>> {
-        self.get_or_connect_typed().await.map_err(anyhow::Error::from)
+        self.get_or_connect_typed()
+            .await
+            .map_err(anyhow::Error::from)
     }
 
     async fn get_or_connect_typed(&self) -> Result<Arc<dyn Provider>, RpcClientError> {
@@ -558,7 +592,8 @@ impl OmegaRpcClient {
         F: FnOnce() -> Fut,
         Fut: std::future::Future<Output = anyhow::Result<T>>,
     {
-        self.wait_for_token(RpcRequestKind::Read, wait_timeout).await?;
+        self.wait_for_token(RpcRequestKind::Read, wait_timeout)
+            .await?;
         f().await
     }
 
@@ -577,7 +612,8 @@ impl OmegaRpcClient {
         F: FnOnce() -> Fut,
         Fut: std::future::Future<Output = anyhow::Result<T>>,
     {
-        self.wait_for_token(RpcRequestKind::Write, wait_timeout).await?;
+        self.wait_for_token(RpcRequestKind::Write, wait_timeout)
+            .await?;
         f().await
     }
 
@@ -618,7 +654,8 @@ impl OmegaRpcClient {
             }
         }
 
-        self.wait_for_token(RpcRequestKind::Write, wait_timeout).await?;
+        self.wait_for_token(RpcRequestKind::Write, wait_timeout)
+            .await?;
         send().await
     }
 
@@ -645,9 +682,9 @@ impl OmegaRpcClient {
 
             Ok(FeeSnapshot {
                 base_fee_gwei,
-                l1_data_fee_gwei:  0,
+                l1_data_fee_gwei: 0,
                 priority_fee_gwei: 0,
-                block_number:      block.header.number,
+                block_number: block.header.number,
             })
         })
         .await
@@ -665,6 +702,13 @@ impl OmegaRpcClient {
         })
         .await
     }
+
+    // fetch_chainlink_round intentionally NOT defined here — it lives in
+    // chainlink_agg.rs's own `impl OmegaRpcClient` block instead, to keep
+    // the sol! binding, ChainlinkRound, and the one method that uses them
+    // together in one file. Defining it in both places is a duplicate
+    // inherent method (E0592) — an earlier revision of this file did
+    // exactly that; fixed by removing it here, not there.
 
     // ── Telemetry ─────────────────────────────────────────────────────────────
 
@@ -692,10 +736,14 @@ async fn open_provider(ws_url: &str) -> Result<Arc<dyn Provider>, RpcClientError
 }
 
 fn block_to_event(block: &Block, last_block_number: Option<u64>) -> BlockEvent {
-    let base_fee_gwei = block
-        .header
-        .base_fee_per_gas
-        .map(|fee| wei_to_gwei_saturating(fee as u128));
+    // `base_fee_per_gas` is already `Option<u128>` here — no cast
+    // needed. The earlier `.map(|fee| wei_to_gwei_saturating(fee as
+    // u128))` cast u128 to u128, which clippy's unnecessary_cast lint
+    // (denied via -D warnings in this workspace's clippy invocation)
+    // correctly flagged as dead weight. Passing the function directly
+    // also sidesteps a would-be redundant_closure warning under the
+    // same -D warnings build.
+    let base_fee_gwei = block.header.base_fee_per_gas.map(wei_to_gwei_saturating);
 
     let is_reorg_or_stale = match last_block_number {
         Some(last) => block.header.number <= last,
@@ -729,10 +777,16 @@ mod tests {
     #[test]
     fn block_to_event_flags_non_increasing_block_number() {
         let event = block_to_event(&sample_block(100), Some(100));
-        assert!(event.is_reorg_or_stale, "same block number again must be flagged");
+        assert!(
+            event.is_reorg_or_stale,
+            "same block number again must be flagged"
+        );
 
         let event2 = block_to_event(&sample_block(99), Some(100));
-        assert!(event2.is_reorg_or_stale, "a lower block number must be flagged");
+        assert!(
+            event2.is_reorg_or_stale,
+            "a lower block number must be flagged"
+        );
     }
 
     #[test]
@@ -744,7 +798,10 @@ mod tests {
     #[test]
     fn block_to_event_first_block_is_never_flagged() {
         let event = block_to_event(&sample_block(1), None);
-        assert!(!event.is_reorg_or_stale, "no prior block to compare against");
+        assert!(
+            !event.is_reorg_or_stale,
+            "no prior block to compare against"
+        );
     }
 
     #[test]
@@ -757,7 +814,10 @@ mod tests {
             is_reorg_or_stale: false,
         };
         assert!(event.is_timestamp_plausible(9_990, 30), "within tolerance");
-        assert!(!event.is_timestamp_plausible(9_000, 30), "1000s in the future, tolerance 30s");
+        assert!(
+            !event.is_timestamp_plausible(9_000, 30),
+            "1000s in the future, tolerance 30s"
+        );
     }
 
     #[test]
@@ -769,7 +829,10 @@ mod tests {
             timestamp: 100,
             is_reorg_or_stale: false,
         };
-        assert!(event.is_timestamp_plausible(1_000_000, 30), "old timestamps are always plausible");
+        assert!(
+            event.is_timestamp_plausible(1_000_000, 30),
+            "old timestamps are always plausible"
+        );
     }
 
     #[test]
@@ -778,8 +841,14 @@ mod tests {
         let hash = B256::from([0x11u8; 32]);
         let t0 = Instant::now();
 
-        assert!(!tracker.check_and_record(hash, t0), "first submission is not a duplicate");
-        assert!(tracker.check_and_record(hash, t0), "second submission within window IS a duplicate");
+        assert!(
+            !tracker.check_and_record(hash, t0),
+            "first submission is not a duplicate"
+        );
+        assert!(
+            tracker.check_and_record(hash, t0),
+            "second submission within window IS a duplicate"
+        );
     }
 
     #[test]
@@ -804,7 +873,10 @@ mod tests {
         let hash_b = B256::from([0xBBu8; 32]);
 
         assert!(!tracker.check_and_record(hash_a, t0));
-        assert!(!tracker.check_and_record(hash_b, t0), "a different hash is never a duplicate");
+        assert!(
+            !tracker.check_and_record(hash_b, t0),
+            "a different hash is never a duplicate"
+        );
     }
 
     #[test]

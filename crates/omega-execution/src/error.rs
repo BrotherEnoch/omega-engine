@@ -10,6 +10,26 @@
 // and shouldn't be forced into one just to fit an existing enum — see the
 // spec's §9 table for which failures DO map onto an existing DropCode
 // (and use it directly, via `RiskCheckFailed`) versus which don't.
+//
+// ## Fix (this revision): BlueprintFieldOverflow
+//
+// `pipeline.rs::blueprint_to_check_fields` previously mapped
+// `bp.expected_profit_net.try_into().unwrap_or(u128::MAX)` — coercing a
+// U256-to-u128 overflow to `u128::MAX` rather than rejecting it. That
+// direction fails OPEN in `omega_risk::checks::check_dynamic_profit`
+// (`MAX < dynamic_min_profit_wei` is false for any realistic threshold),
+// meaning an overflowed profit figure would silently pass the exact
+// check meant to catch an unprofitable blueprint. Confirmed against the
+// real check body, not inferred — `MAX < x` is false whenever `x <
+// u128::MAX`, which is every realistic `dynamic_min_profit_wei`.
+//
+// `dynamic_min_profit` and `flashloan_amount` are NOT changed here: an
+// overflow on either of those maps to `u128::MAX` and fails CLOSED
+// (checks 5, 10, and 14 all reject when the compared-against value is
+// astronomically large), confirmed the same way against
+// `check_dynamic_profit`, `check_flashloan_liquidity`, and
+// `check_account_exposure`'s real bodies. Only `expected_profit_net`
+// needed this new error variant.
 
 use omega_core::errors::DropCode;
 use thiserror::Error;
@@ -55,4 +75,21 @@ pub enum ExecutionError {
 
     #[error("relay submission failed: {0}")]
     RelaySubmissionFailed(#[from] omega_relay::RelayError),
+
+    /// `expected_profit_net` (U256, on `ExecutionBlueprint`) does not fit
+    /// in `u128` (the type `omega_risk::checks::BlueprintFields` uses).
+    ///
+    /// Mapping this overflow to `u128::MAX` would fail OPEN in
+    /// `check_dynamic_profit` — see this file's module-level "Fix (this
+    /// revision)" note for the confirmed reasoning. Stage 1
+    /// (`verify_hash`/`verify_idempotency_key`) only checks that the
+    /// blueprint is internally self-consistent with its own claimed
+    /// hash, not that its economic fields are sane — so an overflowed
+    /// profit value is not caught anywhere before this mapping step
+    /// unless this variant exists and is used.
+    #[error(
+        "blueprint field `{field}` does not fit in u128 — failing closed rather than \
+         coercing to u128::MAX, which would fail open in check_dynamic_profit"
+    )]
+    BlueprintFieldOverflow { field: &'static str },
 }

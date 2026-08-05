@@ -1,0 +1,8 @@
+{
+    "importFilesToOrigRelpaths": {},
+    "primary_contract": "OmegaVault",
+    "specfile": "C:/Users/silve/Documents/omega-engine/certora/specs/OmegaVaultRescueAndPending.spec",
+    "specfileOrigRelpath": "certora/specs/OmegaVaultRescueAndPending.spec",
+    "specfilesToImportDecls": {},
+    "type": "spec"
+}

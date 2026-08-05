@@ -51,7 +51,9 @@ pub async fn build_bundle_payload(
     // ExecutionBlueprint's own doc comment on why the two must not be
     // conflated).
     let tx_bytes = hex::decode(raw_tx_hex.trim_start_matches("0x")).map_err(|e| {
-        ExecutionError::SigningFailed { detail: format!("signed tx is not valid hex: {e}") }
+        ExecutionError::SigningFailed {
+            detail: format!("signed tx is not valid hex: {e}"),
+        }
     })?;
     let bundle_hash_bytes = omega_security::keccak256(&tx_bytes);
     let bundle_hash = format!("0x{}", hex::encode(bundle_hash_bytes));

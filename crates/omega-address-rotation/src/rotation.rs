@@ -18,19 +18,19 @@ use crate::reputation::{seed_relay_metrics, CarryoverParams};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RotationConfig {
-    pub schedule_days:     u32,
-    pub base_carryover:    f64,
+    pub schedule_days: u32,
+    pub base_carryover: f64,
     pub decay_rate_months: f64,
-    pub pattern:           PatternDetectorConfig,
+    pub pattern: PatternDetectorConfig,
 }
 
 impl Default for RotationConfig {
     fn default() -> Self {
         Self {
-            schedule_days:     30,
-            base_carryover:    0.50,
+            schedule_days: 30,
+            base_carryover: 0.50,
             decay_rate_months: 3.0,
-            pattern:           PatternDetectorConfig::default(),
+            pattern: PatternDetectorConfig::default(),
         }
     }
 }
@@ -49,7 +49,7 @@ pub enum RotationTrigger {
 impl std::fmt::Display for RotationTrigger {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            RotationTrigger::Schedule            => f.write_str("SCHEDULE"),
+            RotationTrigger::Schedule => f.write_str("SCHEDULE"),
             RotationTrigger::FingerprintDetected => f.write_str("FINGERPRINT_DETECTED"),
         }
     }
@@ -61,12 +61,12 @@ impl std::fmt::Display for RotationTrigger {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RotationRecord {
-    pub rotated_at:        DateTime<Utc>,
-    pub trigger:           RotationTrigger,
-    pub old_rates:         std::collections::HashMap<String, f64>,
-    pub carryover_pct:     f64,
+    pub rotated_at: DateTime<Utc>,
+    pub trigger: RotationTrigger,
+    pub old_rates: std::collections::HashMap<String, f64>,
+    pub carryover_pct: f64,
     pub months_since_prev: f64,
-    pub same_fee_rate:     f64,
+    pub same_fee_rate: f64,
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -74,11 +74,11 @@ pub struct RotationRecord {
 // ─────────────────────────────────────────────────────────────────────────────
 
 pub struct AddressRotationManager {
-    config:          RotationConfig,
-    relay_metrics:   Arc<LaRelayMetrics>,
-    detector:        PatternDetector,
+    config: RotationConfig,
+    relay_metrics: Arc<LaRelayMetrics>,
+    detector: PatternDetector,
     last_rotated_at: DateTime<Utc>,
-    history:         Vec<RotationRecord>,
+    history: Vec<RotationRecord>,
 }
 
 impl AddressRotationManager {
@@ -97,7 +97,7 @@ impl AddressRotationManager {
         if self.detector.record(code) {
             tracing::warn!(
                 same_fee_rate = self.detector.same_fee_rate(),
-                threshold     = self.config.pattern.trigger_threshold,
+                threshold = self.config.pattern.trigger_threshold,
                 "Fingerprinting pattern detected — triggering address rotation",
             );
             Some(RotationTrigger::FingerprintDetected)
@@ -107,11 +107,11 @@ impl AddressRotationManager {
     }
 
     pub fn check_schedule(&self) -> Option<RotationTrigger> {
-        let elapsed   = Utc::now() - self.last_rotated_at;
+        let elapsed = Utc::now() - self.last_rotated_at;
         let threshold = Duration::days(self.config.schedule_days as i64);
         if elapsed >= threshold {
             tracing::info!(
-                days_elapsed  = elapsed.num_days(),
+                days_elapsed = elapsed.num_days(),
                 schedule_days = self.config.schedule_days,
                 "Scheduled address rotation due",
             );
@@ -123,21 +123,21 @@ impl AddressRotationManager {
 
     pub fn execute_rotation(
         &mut self,
-        trigger:           RotationTrigger,
+        trigger: RotationTrigger,
         new_relay_metrics: Arc<LaRelayMetrics>,
-        rng:               &mut impl rand::Rng,
+        rng: &mut impl rand::Rng,
     ) -> RotationRecord {
-        let now     = Utc::now();
+        let now = Utc::now();
         let elapsed = now - self.last_rotated_at;
-        let months  = elapsed.num_seconds() as f64 / (30.0 * 24.0 * 3600.0);
+        let months = elapsed.num_seconds() as f64 / (30.0 * 24.0 * 3600.0);
 
         let params = CarryoverParams {
-            base_carryover:        self.config.base_carryover,
-            decay_rate_months:     self.config.decay_rate_months,
+            base_carryover: self.config.base_carryover,
+            decay_rate_months: self.config.decay_rate_months,
             months_since_rotation: months,
         };
 
-        let old_rates     = snapshot_relay_rates(&self.relay_metrics, rng);
+        let old_rates = snapshot_relay_rates(&self.relay_metrics, rng);
         let carryover_pct = crate::reputation::compute_carryover_pct_params(&params);
         let seed_samples: usize = 20;
 
@@ -150,15 +150,15 @@ impl AddressRotationManager {
         );
 
         let record = RotationRecord {
-            rotated_at:        now,
+            rotated_at: now,
             trigger,
             old_rates,
             carryover_pct,
             months_since_prev: months,
-            same_fee_rate:     self.detector.same_fee_rate(),
+            same_fee_rate: self.detector.same_fee_rate(),
         };
 
-        self.relay_metrics   = new_relay_metrics;
+        self.relay_metrics = new_relay_metrics;
         self.last_rotated_at = now;
         self.detector.reset();
 
@@ -184,7 +184,7 @@ impl AddressRotationManager {
 
     pub fn days_until_scheduled(&self) -> i64 {
         let threshold = Duration::days(self.config.schedule_days as i64);
-        let elapsed   = Utc::now() - self.last_rotated_at;
+        let elapsed = Utc::now() - self.last_rotated_at;
         let remaining = threshold - elapsed;
         if remaining <= Duration::zero() {
             return 0;
@@ -201,7 +201,7 @@ impl AddressRotationManager {
 
 fn snapshot_relay_rates(
     metrics: &Arc<LaRelayMetrics>,
-    rng:     &mut impl rand::Rng,
+    rng: &mut impl rand::Rng,
 ) -> std::collections::HashMap<String, f64> {
     metrics
         .ranked_relays(1.0, rng)
@@ -253,12 +253,18 @@ mod tests {
 
     #[test]
     fn pattern_trigger_on_high_same_fee() {
-        let mut mgr     = make_manager();
+        let mut mgr = make_manager();
         let mut triggered = None;
         for i in 0..200 {
-            let code = if i % 4 == 0 { LossCode::LostRaceSameFee } else { LossCode::LostGasLow };
+            let code = if i % 4 == 0 {
+                LossCode::LostRaceSameFee
+            } else {
+                LossCode::LostGasLow
+            };
             triggered = mgr.on_loss(code);
-            if triggered.is_some() { break; }
+            if triggered.is_some() {
+                break;
+            }
         }
         assert_eq!(triggered, Some(RotationTrigger::FingerprintDetected));
     }
@@ -267,13 +273,20 @@ mod tests {
     fn execute_rotation_resets_detector() {
         let mut mgr = make_manager();
         for i in 0..200 {
-            let code = if i % 4 == 0 { LossCode::LostRaceSameFee } else { LossCode::LostGasLow };
-            if mgr.on_loss(code).is_some() { break; }
+            let code = if i % 4 == 0 {
+                LossCode::LostRaceSameFee
+            } else {
+                LossCode::LostGasLow
+            };
+            if mgr.on_loss(code).is_some() {
+                break;
+            }
         }
         // LaRelayMetrics::new() returns Arc<LaRelayMetrics> — no extra Arc::new()
         let new_metrics = LaRelayMetrics::new(DEFAULT_WINDOW);
-        let mut rng     = seeded_rng();
-        let record = mgr.execute_rotation(RotationTrigger::FingerprintDetected, new_metrics, &mut rng);
+        let mut rng = seeded_rng();
+        let record =
+            mgr.execute_rotation(RotationTrigger::FingerprintDetected, new_metrics, &mut rng);
         assert_eq!(record.trigger, RotationTrigger::FingerprintDetected);
         assert!(mgr.on_loss(LossCode::LostGasLow).is_none());
     }
@@ -281,7 +294,7 @@ mod tests {
     #[test]
     fn execute_rotation_populates_history() {
         let mut mgr = make_manager();
-        let new     = LaRelayMetrics::new(DEFAULT_WINDOW); // already Arc
+        let new = LaRelayMetrics::new(DEFAULT_WINDOW); // already Arc
         let mut rng = seeded_rng();
         mgr.execute_rotation(RotationTrigger::Schedule, new, &mut rng);
         assert_eq!(mgr.history().len(), 1);
@@ -291,9 +304,9 @@ mod tests {
     #[test]
     fn carryover_pct_between_0_and_1() {
         let mut mgr = make_manager();
-        let new     = LaRelayMetrics::new(DEFAULT_WINDOW); // already Arc
+        let new = LaRelayMetrics::new(DEFAULT_WINDOW); // already Arc
         let mut rng = seeded_rng();
-        let record  = mgr.execute_rotation(RotationTrigger::Schedule, new, &mut rng);
+        let record = mgr.execute_rotation(RotationTrigger::Schedule, new, &mut rng);
         assert!(record.carryover_pct >= 0.0 && record.carryover_pct <= 1.0);
     }
 }

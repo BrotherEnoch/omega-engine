@@ -88,7 +88,11 @@ impl std::fmt::Display for FaultKind {
             Self::OracleStale { feed, stale_secs } => {
                 write!(f, "OracleStale(feed={feed}, stale={stale_secs}s)")
             }
-            Self::OracleDiverge { feed_a, feed_b, diverge_bps } => {
+            Self::OracleDiverge {
+                feed_a,
+                feed_b,
+                diverge_bps,
+            } => {
                 write!(f, "OracleDiverge({feed_a}/{feed_b} {diverge_bps}bps)")
             }
             Self::SequencerDown => f.write_str("SequencerDown"),
@@ -132,10 +136,18 @@ pub struct Observation {
 
 impl Observation {
     pub fn expected(elapsed: std::time::Duration, message: impl Into<String>) -> Self {
-        Self { elapsed, message: message.into(), expected: true }
+        Self {
+            elapsed,
+            message: message.into(),
+            expected: true,
+        }
     }
     pub fn unexpected(elapsed: std::time::Duration, message: impl Into<String>) -> Self {
-        Self { elapsed, message: message.into(), expected: false }
+        Self {
+            elapsed,
+            message: message.into(),
+            expected: false,
+        }
     }
 }
 
@@ -190,10 +202,10 @@ impl ChaosTarget {
 
         Arc::new(Self {
             health_layers,
-            halt_flag:     HaltFlag::new(),
+            halt_flag: HaltFlag::new(),
             active_faults: RwLock::new(Vec::new()),
-            observations:  RwLock::new(Vec::new()),
-            start_time:    Instant::now(),
+            observations: RwLock::new(Vec::new()),
+            start_time: Instant::now(),
         })
     }
 
@@ -308,7 +320,8 @@ impl ChaosTarget {
             }
         }
         if self.halt_flag.is_halted() {
-            self.halt_flag.clear(LayerId::SystemHealth, "chaos recovery");
+            self.halt_flag
+                .clear(LayerId::SystemHealth, "chaos recovery");
         }
     }
 

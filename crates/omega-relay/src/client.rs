@@ -67,15 +67,15 @@ pub trait RelayClient: Send + Sync + 'static {
 #[derive(Serialize)]
 struct JsonRpcRequest<'a> {
     jsonrpc: &'static str,
-    id:      u64,
-    method:  &'static str,
-    params:  &'a [serde_json::Value],
+    id: u64,
+    method: &'static str,
+    params: &'a [serde_json::Value],
 }
 
 #[derive(Deserialize)]
 struct JsonRpcResponse {
     result: Option<BundleResult>,
-    error:  Option<JsonRpcError>,
+    error: Option<JsonRpcError>,
 }
 
 #[derive(Deserialize)]
@@ -91,10 +91,10 @@ struct JsonRpcError {
 
 /// Production HTTP relay client.
 pub struct HttpRelayClient {
-    name:     String,
+    name: String,
     endpoint: String,
-    client:   Client,
-    auth:     RelayAuth,
+    client: Client,
+    auth: RelayAuth,
 }
 
 impl HttpRelayClient {
@@ -110,7 +110,7 @@ impl HttpRelayClient {
         auth: RelayAuth,
     ) -> Arc<Self> {
         Arc::new(Self {
-            name:     name.into(),
+            name: name.into(),
             endpoint: endpoint.into(),
             client,
             auth,
@@ -139,9 +139,9 @@ impl RelayClient for HttpRelayClient {
 
         let body = JsonRpcRequest {
             jsonrpc: "2.0",
-            id:      1,
-            method:  "eth_sendBundle",
-            params:  std::slice::from_ref(&params),
+            id: 1,
+            method: "eth_sendBundle",
+            params: std::slice::from_ref(&params),
         };
 
         // Serialize to the EXACT bytes we're about to send, once — auth signing (for
@@ -160,7 +160,7 @@ impl RelayClient for HttpRelayClient {
         }
 
         let resp = req.send().await.map_err(|e| RelayError::RequestFailed {
-            relay:  self.name.clone(),
+            relay: self.name.clone(),
             source: e,
         })?;
 
@@ -168,29 +168,31 @@ impl RelayClient for HttpRelayClient {
 
         if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
             warn!(relay = %self.name, "relay returned 429 — rate limited");
-            return Err(RelayError::RateLimited { relay: self.name.clone() });
+            return Err(RelayError::RateLimited {
+                relay: self.name.clone(),
+            });
         }
 
         if !status.is_success() {
             let body_text = resp.text().await.unwrap_or_default();
             return Err(RelayError::HttpError {
-                relay:  self.name.clone(),
+                relay: self.name.clone(),
                 status: status.as_u16(),
-                body:   body_text,
+                body: body_text,
             });
         }
 
         let rpc_resp: JsonRpcResponse =
             resp.json().await.map_err(|e| RelayError::RequestFailed {
-                relay:  self.name.clone(),
+                relay: self.name.clone(),
                 source: e,
             })?;
 
         if let Some(err) = rpc_resp.error {
             return Err(RelayError::HttpError {
-                relay:  self.name.clone(),
+                relay: self.name.clone(),
                 status: 200,
-                body:   err.message,
+                body: err.message,
             });
         }
 
@@ -202,10 +204,15 @@ impl RelayClient for HttpRelayClient {
             "bundle submission accepted by relay (not yet confirmed on-chain)"
         );
 
-        Ok(SubmissionOutcome { accepted: true, relay_bundle_id })
+        Ok(SubmissionOutcome {
+            accepted: true,
+            relay_bundle_id,
+        })
     }
 
-    fn name(&self) -> &str { &self.name }
+    fn name(&self) -> &str {
+        &self.name
+    }
 }
 
 // ── Mock (tests only) ─────────────────────────────────────────────────────────
@@ -225,7 +232,12 @@ impl MockRelayClient {
     /// Create a mock relay that either accepts or rejects every bundle.
     pub fn new(accepts: bool) -> Self {
         Self {
-            name: if accepts { "mock-accept" } else { "mock-reject" }.into(),
+            name: if accepts {
+                "mock-accept"
+            } else {
+                "mock-reject"
+            }
+            .into(),
             accepts,
             received: std::sync::atomic::AtomicUsize::new(0),
         }
@@ -234,7 +246,7 @@ impl MockRelayClient {
     /// Create a mock relay with a specific name.
     pub fn with_name(name: impl Into<String>, accepts: bool) -> Self {
         Self {
-            name:     name.into(),
+            name: name.into(),
             accepts,
             received: std::sync::atomic::AtomicUsize::new(0),
         }
@@ -250,14 +262,17 @@ impl MockRelayClient {
 #[async_trait]
 impl RelayClient for MockRelayClient {
     async fn submit_bundle(&self, bundle: BundlePayload) -> RelayResult<SubmissionOutcome> {
-        self.received.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.received
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         Ok(SubmissionOutcome {
-            accepted:        self.accepts,
+            accepted: self.accepts,
             relay_bundle_id: Some(format!("mock-{}", bundle.bundle_hash)),
         })
     }
 
-    fn name(&self) -> &str { &self.name }
+    fn name(&self) -> &str {
+        &self.name
+    }
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -269,9 +284,12 @@ mod tests {
 
     #[tokio::test]
     async fn mock_accept_reports_accepted() {
-        let client  = MockRelayClient::new(true);
+        let client = MockRelayClient::new(true);
         let outcome = client
-            .submit_bundle(BundlePayload { bundle_hash: "0xtest".into(), ..Default::default() })
+            .submit_bundle(BundlePayload {
+                bundle_hash: "0xtest".into(),
+                ..Default::default()
+            })
             .await
             .unwrap();
         assert!(outcome.accepted);
@@ -280,9 +298,12 @@ mod tests {
 
     #[tokio::test]
     async fn mock_reject_reports_not_accepted() {
-        let client  = MockRelayClient::new(false);
+        let client = MockRelayClient::new(false);
         let outcome = client
-            .submit_bundle(BundlePayload { bundle_hash: "0xtest".into(), ..Default::default() })
+            .submit_bundle(BundlePayload {
+                bundle_hash: "0xtest".into(),
+                ..Default::default()
+            })
             .await
             .unwrap();
         assert!(!outcome.accepted);

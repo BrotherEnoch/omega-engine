@@ -295,7 +295,11 @@ impl LiquidityRegistry {
             contract,
         };
         let snap = self.snapshots.get(&key)?.clone();
-        if snap.is_fresh() { Some(snap) } else { None }
+        if snap.is_fresh() {
+            Some(snap)
+        } else {
+            None
+        }
     }
 
     /// All registered contracts for a given (chain_id, provider), with fresh

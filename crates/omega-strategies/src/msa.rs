@@ -38,6 +38,21 @@
 // blueprint. Fixed to build with a placeholder and call the canonical
 // `bp.compute_hash()`. Also adds `signal_id`, `client_order_id`,
 // `idempotency_key`.
+//
+// ## Capital-path marker (this revision)
+//
+// `flashloan_provider`/`flashloan_amount` below are `Address::ZERO`/
+// `U256::ZERO` — see the inline TODO(capital-path) comment in
+// `build_blueprint` for the full status. Short version: this is not
+// dead code being cleaned up, it's a known, currently-unexecutable
+// state being called out explicitly rather than left silent.
+//
+// ## `max_base_fee_gwei` (this revision)
+//
+// `ExecutionBlueprint` gained a `max_base_fee_gwei` field (compile
+// error otherwise: E0063 missing field). PLACEHOLDER VALUE, same
+// caveat as sa.rs/la.rs/mev.rs — set as `base_fee_at_creation * 3`
+// pending confirmation of the field's real intended semantics.
 
 use std::sync::{
     atomic::{AtomicU64, Ordering},
@@ -64,6 +79,10 @@ const MSA_MIN_HOPS: u8 = 3;
 const MSA_MAX_HOPS: u8 = 4;
 const MSA_BASE_NOTIONAL_WEI: u128 = 220_000_000_000_000_000; // 0.22 ETH
 const MSA_STEP_NOTIONAL_WEI: u128 = 20_000_000_000_000_000; // 0.02 ETH
+
+/// Placeholder multiplier for `max_base_fee_gwei` — see module-level
+/// comment on this revision's `max_base_fee_gwei` addition.
+const MAX_BASE_FEE_HEADROOM_MULTIPLIER: u64 = 3;
 
 #[derive(Debug, Clone, Copy)]
 struct RouteProfile {
@@ -267,8 +286,12 @@ impl StrategyTrait for MsaStrategy {
         );
 
         let signal_id = Uuid::new_v4();
-        let client_order_id =
-            ExecutionBlueprint::derive_client_order_id(StrategyId::Msa, self.chain_id, nonce, signal_id);
+        let client_order_id = ExecutionBlueprint::derive_client_order_id(
+            StrategyId::Msa,
+            self.chain_id,
+            nonce,
+            signal_id,
+        );
 
         let dynamic_min = U256::from(signal.base_fee_gwei)
             .saturating_mul(U256::from(MSA_GAS_BUDGET))
@@ -283,9 +306,24 @@ impl StrategyTrait for MsaStrategy {
             signal_state_hash: signal.state_hash,
             state_version: signal.state_version,
             signal_id,
+            // TODO(capital-path): flashloan_provider == Address::ZERO is documented on
+            // ExecutionBlueprint as "no flashloan — capital sourced from PIL (§7)", and
+            // omega-execution maps zero → Ok("none") in resolve_flashloan_provider_id.
+            // There is no Orchestrator branch and no strategy→PIL inventory path that
+            // makes this executable on-chain (execute() reverts ZeroAddress on
+            // flashloanToken == address(0); PilTreasury has deposit/redeem only, no
+            // strategy loan/allocate). Either wire omega_flashloan::select_provider
+            // (treat MSA as incomplete flashloan strategy — Option B default) or
+            // implement a real no-flashloan path as a product feature. Do not encode
+            // or submit until one of those exists.
             flashloan_provider: Address::ZERO,
             flashloan_amount: U256::ZERO,
             flashloan_available: U256::MAX,
+            // PLACEHOLDER — see module-level comment on this revision's
+            // max_base_fee_gwei addition.
+            max_base_fee_gwei: signal
+                .base_fee_gwei
+                .saturating_mul(MAX_BASE_FEE_HEADROOM_MULTIPLIER),
             calldata,
             strategy_bytecode_hash: self.bytecode_hash,
             l2_exec_gas_estimate: MSA_GAS_BUDGET,
@@ -400,7 +438,10 @@ mod tests {
     #[tokio::test]
     async fn build_blueprint_passes_verify_hash() {
         let bp = make().build_blueprint(&sig(0x21, 5)).await.unwrap();
-        assert!(bp.verify_hash(), "MSA blueprint must pass the canonical integrity check");
+        assert!(
+            bp.verify_hash(),
+            "MSA blueprint must pass the canonical integrity check"
+        );
     }
 
     #[tokio::test]

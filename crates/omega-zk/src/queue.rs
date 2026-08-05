@@ -44,15 +44,15 @@ fn next_request_id() -> u64 {
 
 /// A proof generation request placed on the queue by strategy tasks.
 pub struct ProofRequest {
-    pub id:             u64,
+    pub id: u64,
     pub blueprint_hash: [u8; 32],
     pub net_profit_wei: u128,
-    pub chain_id:       u64,
-    pub strategy_id:    String,
+    pub chain_id: u64,
+    pub strategy_id: String,
     /// True for Microtx lane (SLA: 1200 ms); false for Normal lane (4000 ms).
-    pub is_microtx:     bool,
+    pub is_microtx: bool,
     /// Response channel — the strategy task awaits this after submit().
-    pub response_tx:    oneshot::Sender<ProofResponse>,
+    pub response_tx: oneshot::Sender<ProofResponse>,
 }
 
 impl std::fmt::Debug for ProofRequest {
@@ -74,10 +74,10 @@ pub type ProofResponse = Result<ZkProof, ZkError>;
 /// Queue pressure state (spec thresholds: 128 / 256 / 512).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum QueuePressure {
-    Normal   = 0,
+    Normal = 0,
     Throttle = 1,
-    Suspend  = 2,
-    Halt     = 3,
+    Suspend = 2,
+    Halt = 3,
 }
 
 impl QueuePressure {
@@ -93,7 +93,9 @@ impl QueuePressure {
         }
     }
 
-    fn as_u8(self) -> u8 { self as u8 }
+    fn as_u8(self) -> u8 {
+        self as u8
+    }
 
     fn from_u8(v: u8) -> Self {
         match v {
@@ -104,17 +106,21 @@ impl QueuePressure {
         }
     }
 
-    pub fn is_halt_worthy(self)     -> bool { self == QueuePressure::Halt }
-    pub fn is_degraded_worthy(self) -> bool { self == QueuePressure::Suspend }
+    pub fn is_halt_worthy(self) -> bool {
+        self == QueuePressure::Halt
+    }
+    pub fn is_degraded_worthy(self) -> bool {
+        self == QueuePressure::Suspend
+    }
 }
 
 impl std::fmt::Display for QueuePressure {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            QueuePressure::Normal   => write!(f, "NORMAL"),
+            QueuePressure::Normal => write!(f, "NORMAL"),
             QueuePressure::Throttle => write!(f, "THROTTLE"),
-            QueuePressure::Suspend  => write!(f, "SUSPEND"),
-            QueuePressure::Halt     => write!(f, "HALT"),
+            QueuePressure::Suspend => write!(f, "SUSPEND"),
+            QueuePressure::Halt => write!(f, "HALT"),
         }
     }
 }
@@ -122,10 +128,10 @@ impl std::fmt::Display for QueuePressure {
 // ─── Proof queue ──────────────────────────────────────────────────────────────
 
 struct ProofQueueInner {
-    sender:   Sender<ProofRequest>,
-    depth:    AtomicUsize,
+    sender: Sender<ProofRequest>,
+    depth: AtomicUsize,
     pressure: AtomicU8,
-    cfg:      ZkConfig,
+    cfg: ZkConfig,
 }
 
 /// MPMC proof request queue.
@@ -139,13 +145,13 @@ pub struct ProofQueue {
 
 impl ProofQueue {
     pub fn new(cfg: ZkConfig) -> Self {
-        let capacity         = cfg.proof_queue_halt;
+        let capacity = cfg.proof_queue_halt;
         let (sender, receiver) = bounded(capacity);
         Self {
             receiver,
             inner: Arc::new(ProofQueueInner {
                 sender,
-                depth:    AtomicUsize::new(0),
+                depth: AtomicUsize::new(0),
                 pressure: AtomicU8::new(QueuePressure::Normal.as_u8()),
                 cfg,
             }),
@@ -167,12 +173,12 @@ impl ProofQueue {
         &self,
         blueprint_hash: [u8; 32],
         net_profit_wei: u128,
-        chain_id:       u64,
-        strategy_id:    String,
-        is_microtx:     bool,
+        chain_id: u64,
+        strategy_id: String,
+        is_microtx: bool,
     ) -> Result<oneshot::Receiver<ProofResponse>, ZkError> {
         let pressure = self.pressure();
-        let depth    = self.depth();
+        let depth = self.depth();
 
         match pressure {
             QueuePressure::Halt => {
@@ -194,7 +200,7 @@ impl ProofQueue {
         }
 
         let (response_tx, response_rx) = oneshot::channel();
-        let id                          = next_request_id();
+        let id = next_request_id();
 
         let req = ProofRequest {
             id,
@@ -216,8 +222,13 @@ impl ProofQueue {
                     .with_label_values(&[lane, &strategy_id])
                     .inc();
                 metrics::QUEUE_DEPTH.set(new_depth as f64);
-                tracing::debug!(id, strategy = strategy_id, is_microtx, depth = new_depth,
-                    "proof request enqueued");
+                tracing::debug!(
+                    id,
+                    strategy = strategy_id,
+                    is_microtx,
+                    depth = new_depth,
+                    "proof request enqueued"
+                );
                 Ok(response_rx)
             }
             Err(TrySendError::Full(_)) => {
@@ -229,9 +240,7 @@ impl ProofQueue {
                     halt_threshold: self.inner.cfg.proof_queue_halt,
                 })
             }
-            Err(TrySendError::Disconnected(_)) => {
-                Err(ZkError::PoolShutdown)
-            }
+            Err(TrySendError::Disconnected(_)) => Err(ZkError::PoolShutdown),
         }
     }
 
@@ -268,7 +277,10 @@ impl ProofQueue {
 
     fn update_pressure(&self, depth: usize) {
         let new_pressure = QueuePressure::from_depth_cfg(depth, &self.inner.cfg);
-        let old_u8 = self.inner.pressure.swap(new_pressure.as_u8(), Ordering::AcqRel);
+        let old_u8 = self
+            .inner
+            .pressure
+            .swap(new_pressure.as_u8(), Ordering::AcqRel);
         let old_pressure = QueuePressure::from_u8(old_u8);
 
         if old_pressure != new_pressure {
@@ -292,7 +304,10 @@ mod queue_tests {
         ProofQueue::new(ZkConfig::default())
     }
 
-    fn submit(q: &ProofQueue, is_microtx: bool) -> Result<oneshot::Receiver<ProofResponse>, ZkError> {
+    fn submit(
+        q: &ProofQueue,
+        is_microtx: bool,
+    ) -> Result<oneshot::Receiver<ProofResponse>, ZkError> {
         q.submit([0x01; 32], 1_000, 42161, "LA".into(), is_microtx)
     }
 
@@ -305,14 +320,14 @@ mod queue_tests {
 
     #[test]
     fn submit_increases_depth() {
-        let q  = make_queue();
+        let q = make_queue();
         let _rx = submit(&q, false).unwrap();
         assert_eq!(q.depth(), 1);
     }
 
     #[test]
     fn complete_decreases_depth() {
-        let q   = make_queue();
+        let q = make_queue();
         let _rx = submit(&q, false).unwrap();
         assert_eq!(q.depth(), 1);
         q.complete();
@@ -323,13 +338,15 @@ mod queue_tests {
     fn pressure_transitions_at_thresholds() {
         let cfg = ZkConfig {
             proof_queue_throttle: 4,
-            proof_queue_suspend:  6,
-            proof_queue_halt:     8,
+            proof_queue_suspend: 6,
+            proof_queue_halt: 8,
             ..Default::default()
         };
         let q = ProofQueue::new(cfg);
 
-        for _ in 0..4 { submit(&q, false).unwrap(); }
+        for _ in 0..4 {
+            submit(&q, false).unwrap();
+        }
         assert_eq!(q.pressure(), QueuePressure::Throttle);
 
         submit(&q, true).unwrap();
@@ -359,8 +376,8 @@ mod queue_tests {
     fn suspend_pressure_rejects_normal_but_accepts_microtx() {
         let cfg = ZkConfig {
             proof_queue_throttle: 2,
-            proof_queue_suspend:  2,
-            proof_queue_halt:     100,
+            proof_queue_suspend: 2,
+            proof_queue_halt: 100,
             ..Default::default()
         };
         let q = ProofQueue::new(cfg);
@@ -369,7 +386,10 @@ mod queue_tests {
         assert_eq!(q.pressure(), QueuePressure::Suspend);
 
         // Normal lane rejected
-        assert!(matches!(submit(&q, false), Err(ZkError::QueueSuspended { .. })));
+        assert!(matches!(
+            submit(&q, false),
+            Err(ZkError::QueueSuspended { .. })
+        ));
         // Microtx still accepted
         assert!(submit(&q, true).is_ok());
     }
@@ -384,13 +404,37 @@ mod queue_tests {
     #[test]
     fn pressure_from_depth_boundaries() {
         let cfg = ZkConfig::default();
-        assert_eq!(QueuePressure::from_depth_cfg(0, &cfg), QueuePressure::Normal);
-        assert_eq!(QueuePressure::from_depth_cfg(127, &cfg), QueuePressure::Normal);
-        assert_eq!(QueuePressure::from_depth_cfg(128, &cfg), QueuePressure::Throttle);
-        assert_eq!(QueuePressure::from_depth_cfg(255, &cfg), QueuePressure::Throttle);
-        assert_eq!(QueuePressure::from_depth_cfg(256, &cfg), QueuePressure::Suspend);
-        assert_eq!(QueuePressure::from_depth_cfg(511, &cfg), QueuePressure::Suspend);
-        assert_eq!(QueuePressure::from_depth_cfg(512, &cfg), QueuePressure::Halt);
-        assert_eq!(QueuePressure::from_depth_cfg(9999, &cfg), QueuePressure::Halt);
+        assert_eq!(
+            QueuePressure::from_depth_cfg(0, &cfg),
+            QueuePressure::Normal
+        );
+        assert_eq!(
+            QueuePressure::from_depth_cfg(127, &cfg),
+            QueuePressure::Normal
+        );
+        assert_eq!(
+            QueuePressure::from_depth_cfg(128, &cfg),
+            QueuePressure::Throttle
+        );
+        assert_eq!(
+            QueuePressure::from_depth_cfg(255, &cfg),
+            QueuePressure::Throttle
+        );
+        assert_eq!(
+            QueuePressure::from_depth_cfg(256, &cfg),
+            QueuePressure::Suspend
+        );
+        assert_eq!(
+            QueuePressure::from_depth_cfg(511, &cfg),
+            QueuePressure::Suspend
+        );
+        assert_eq!(
+            QueuePressure::from_depth_cfg(512, &cfg),
+            QueuePressure::Halt
+        );
+        assert_eq!(
+            QueuePressure::from_depth_cfg(9999, &cfg),
+            QueuePressure::Halt
+        );
     }
 }

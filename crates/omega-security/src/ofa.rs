@@ -52,29 +52,23 @@ pub enum OfaRule {
     },
 
     /// Omega's excess extraction from the user tx must be within `max_excess_bps`.
-    EnforceUserSlippage {
-        max_excess_bps: u16,
-    },
+    EnforceUserSlippage { max_excess_bps: u16 },
 
     /// User transaction must precede omega transaction in the bundle.
-    EnforceBundleOrder {
-        user_tx_before_omega: bool,
-    },
+    EnforceBundleOrder { user_tx_before_omega: bool },
 
     /// Bundle must only be submitted to listed private relays.
-    PrivateRelayOnly {
-        allowed_relays: Vec<String>,
-    },
+    PrivateRelayOnly { allowed_relays: Vec<String> },
 }
 
 impl OfaRule {
     /// Human-readable rule name for metrics labels.
     pub fn label(&self) -> &'static str {
         match self {
-            OfaRule::RequireConsentSig { .. }   => "require_consent_sig",
+            OfaRule::RequireConsentSig { .. } => "require_consent_sig",
             OfaRule::EnforceUserSlippage { .. } => "enforce_user_slippage",
-            OfaRule::EnforceBundleOrder { .. }  => "enforce_bundle_order",
-            OfaRule::PrivateRelayOnly { .. }    => "private_relay_only",
+            OfaRule::EnforceBundleOrder { .. } => "enforce_bundle_order",
+            OfaRule::PrivateRelayOnly { .. } => "private_relay_only",
         }
     }
 }
@@ -84,17 +78,19 @@ impl OfaRule {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OfaRuleSet {
     /// Monotonically increasing version number. Starts at 1.
-    pub version:        u32,
+    pub version: u32,
     /// ISO-8601 effective date string (informational, not enforced in code).
     pub effective_date: String,
     /// Ordered list of rules — all rules are checked; first failure is returned.
-    pub rules:          Vec<OfaRule>,
+    pub rules: Vec<OfaRule>,
 }
 
 impl OfaRuleSet {
     /// True if this rule set contains a `PrivateRelayOnly` rule.
     pub fn has_relay_restriction(&self) -> bool {
-        self.rules.iter().any(|r| matches!(r, OfaRule::PrivateRelayOnly { .. }))
+        self.rules
+            .iter()
+            .any(|r| matches!(r, OfaRule::PrivateRelayOnly { .. }))
     }
 
     /// Collect the set of allowed relay names (union across all PrivateRelayOnly rules).
@@ -154,7 +150,7 @@ impl OfaComplianceResult {
     /// Convert to Result for use in early-return chains.
     pub fn into_result(self) -> Result<(), SecurityError> {
         match self {
-            OfaComplianceResult::Compliant      => Ok(()),
+            OfaComplianceResult::Compliant => Ok(()),
             OfaComplianceResult::Violation(err) => Err(err),
         }
     }
@@ -230,11 +226,11 @@ impl OfaRuleRegistry {
         for rule in &rule_set.rules {
             if let Some(err) = evaluate_rule(rule, input) {
                 let label = match &err {
-                    SecurityError::MissingConsentSig { .. }  => "missing_consent",
-                    SecurityError::SlippageExceeded { .. }   => "slippage",
-                    SecurityError::BundleOrderViolation      => "order",
-                    SecurityError::NonPrivateRelay { .. }    => "relay",
-                    _                                        => "other",
+                    SecurityError::MissingConsentSig { .. } => "missing_consent",
+                    SecurityError::SlippageExceeded { .. } => "slippage",
+                    SecurityError::BundleOrderViolation => "order",
+                    SecurityError::NonPrivateRelay { .. } => "relay",
+                    _ => "other",
                 };
                 metrics::OFA_CHECKS
                     .with_label_values(&[&input.strategy_id, label])
@@ -258,7 +254,9 @@ impl OfaRuleRegistry {
 
 impl Default for OfaRuleRegistry {
     fn default() -> Self {
-        Self { current: ArcSwap::new(Arc::new(None)) }
+        Self {
+            current: ArcSwap::new(Arc::new(None)),
+        }
     }
 }
 
@@ -276,7 +274,7 @@ fn evaluate_rule(rule: &OfaRule, input: &OfaComplianceInput) -> Option<SecurityE
             if input.consent_schema_version != *schema_version {
                 return Some(SecurityError::RuleVersionMismatch {
                     expected: *schema_version,
-                    got:      input.consent_schema_version,
+                    got: input.consent_schema_version,
                 });
             }
             None
@@ -286,13 +284,15 @@ fn evaluate_rule(rule: &OfaRule, input: &OfaComplianceInput) -> Option<SecurityE
             if input.excess_slippage_bps > *max_excess_bps {
                 return Some(SecurityError::SlippageExceeded {
                     excess_bps: input.excess_slippage_bps,
-                    max_bps:    *max_excess_bps,
+                    max_bps: *max_excess_bps,
                 });
             }
             None
         }
 
-        OfaRule::EnforceBundleOrder { user_tx_before_omega } => {
+        OfaRule::EnforceBundleOrder {
+            user_tx_before_omega,
+        } => {
             if *user_tx_before_omega && !input.user_tx_is_first {
                 return Some(SecurityError::BundleOrderViolation);
             }
@@ -315,12 +315,14 @@ fn evaluate_rule(rule: &OfaRule, input: &OfaComplianceInput) -> Option<SecurityE
 /// Default OFA rule set matching config/ofa_rules.toml version 1.
 pub fn default_rule_set() -> OfaRuleSet {
     OfaRuleSet {
-        version:        1,
+        version: 1,
         effective_date: "2026-04-19".into(),
         rules: vec![
             OfaRule::RequireConsentSig { schema_version: 1 },
             OfaRule::EnforceUserSlippage { max_excess_bps: 50 },
-            OfaRule::EnforceBundleOrder { user_tx_before_omega: true },
+            OfaRule::EnforceBundleOrder {
+                user_tx_before_omega: true,
+            },
             OfaRule::PrivateRelayOnly {
                 allowed_relays: vec![
                     "flashbots".into(),
@@ -339,13 +341,13 @@ impl OfaComplianceInput {
     /// Build a fully-compliant input for testing or non-MEV blueprints.
     pub fn compliant(blueprint_hash: &str, strategy_id: &str) -> Self {
         Self {
-            blueprint_hash:         blueprint_hash.to_string(),
-            strategy_id:            strategy_id.to_string(),
-            has_consent_sig:        true,
+            blueprint_hash: blueprint_hash.to_string(),
+            strategy_id: strategy_id.to_string(),
+            has_consent_sig: true,
             consent_schema_version: 1,
-            excess_slippage_bps:    0,
-            user_tx_is_first:       true,
-            target_relay:           "flashbots".into(),
+            excess_slippage_bps: 0,
+            user_tx_is_first: true,
+            target_relay: "flashbots".into(),
         }
     }
 }
@@ -448,7 +450,11 @@ mod ofa_tests {
         for relay in ["flashbots", "bloxroute", "titan", "eden"] {
             let mut input = compliant_input();
             input.target_relay = relay.into();
-            assert!(reg.check(&input).is_compliant(), "relay {} should be allowed", relay);
+            assert!(
+                reg.check(&input).is_compliant(),
+                "relay {} should be allowed",
+                relay
+            );
         }
     }
 
@@ -479,9 +485,9 @@ mod ofa_tests {
     fn empty_rule_set_always_passes() {
         let reg = OfaRuleRegistry::new();
         reg.load_rules(OfaRuleSet {
-            version:        99,
+            version: 99,
             effective_date: "2099-01-01".into(),
-            rules:          vec![],
+            rules: vec![],
         });
         // No rules → always compliant
         let mut bad_input = compliant_input();
@@ -513,7 +519,7 @@ mod ofa_tests {
         // Rule 1 (consent) should be returned since it comes first.
         let reg = registry_with_defaults();
         let mut input = compliant_input();
-        input.has_consent_sig    = false;
+        input.has_consent_sig = false;
         input.excess_slippage_bps = 9999;
         assert!(matches!(
             reg.check(&input),
@@ -527,9 +533,9 @@ mod ofa_tests {
     fn custom_slippage_threshold_respected() {
         let reg = OfaRuleRegistry::new();
         reg.load_rules(OfaRuleSet {
-            version:        5,
+            version: 5,
             effective_date: "2026-01-01".into(),
-            rules:          vec![OfaRule::EnforceUserSlippage { max_excess_bps: 10 }],
+            rules: vec![OfaRule::EnforceUserSlippage { max_excess_bps: 10 }],
         });
         let mut input = compliant_input();
         input.excess_slippage_bps = 11;

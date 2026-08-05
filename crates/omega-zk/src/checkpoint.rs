@@ -51,14 +51,14 @@ use crate::metrics;
 /// Serialisable state needed to re-issue a proof request after restart.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProofCheckpointEntry {
-    pub request_id:     u64,
+    pub request_id: u64,
     pub blueprint_hash: [u8; 32],
     pub net_profit_wei: u128,
-    pub chain_id:       u64,
-    pub strategy_id:    String,
-    pub is_microtx:     bool,
+    pub chain_id: u64,
+    pub strategy_id: String,
+    pub is_microtx: bool,
     /// ISO-8601 timestamp when this checkpoint was written.
-    pub recorded_at:    String,
+    pub recorded_at: String,
 }
 
 // ─── Manager ─────────────────────────────────────────────────────────────────
@@ -67,7 +67,7 @@ pub struct ProofCheckpointEntry {
 ///
 /// `Arc<ProofCheckpointManager>` shared between worker tasks.
 pub struct ProofCheckpointManager {
-    in_flight:      DashMap<u64, ProofCheckpointEntry>,
+    in_flight: DashMap<u64, ProofCheckpointEntry>,
     checkpoint_dir: PathBuf,
     max_checkpoints: usize,
 }
@@ -86,8 +86,8 @@ impl ProofCheckpointManager {
             }
         }
         Arc::new(Self {
-            in_flight:       DashMap::new(),
-            checkpoint_dir:  dir,
+            in_flight: DashMap::new(),
+            checkpoint_dir: dir,
             max_checkpoints: cfg.max_checkpoints,
         })
     }
@@ -100,12 +100,12 @@ impl ProofCheckpointManager {
     /// Called by the worker task when proof generation begins.
     pub fn record(
         &self,
-        request_id:     u64,
+        request_id: u64,
         blueprint_hash: [u8; 32],
         net_profit_wei: u128,
-        chain_id:       u64,
-        strategy_id:    String,
-        is_microtx:     bool,
+        chain_id: u64,
+        strategy_id: String,
+        is_microtx: bool,
     ) {
         let entry = ProofCheckpointEntry {
             request_id,
@@ -167,8 +167,10 @@ impl ProofCheckpointManager {
             return Ok(Vec::new());
         }
 
-        let entries = fs::read_dir(&self.checkpoint_dir)
-            .map_err(|e| ZkError::CheckpointReadFailed { detail: e.to_string() })?;
+        let entries =
+            fs::read_dir(&self.checkpoint_dir).map_err(|e| ZkError::CheckpointReadFailed {
+                detail: e.to_string(),
+            })?;
 
         let mut recovered = Vec::new();
 
@@ -179,26 +181,24 @@ impl ProofCheckpointManager {
             }
 
             match fs::read_to_string(&path) {
-                Ok(contents) => {
-                    match serde_json::from_str::<ProofCheckpointEntry>(&contents) {
-                        Ok(cp) => {
-                            tracing::info!(
-                                request_id = cp.request_id,
-                                strategy   = %cp.strategy_id,
-                                "recovered proof checkpoint"
-                            );
-                            metrics::CHECKPOINTS_RECOVERED.inc();
-                            recovered.push(cp);
-                        }
-                        Err(e) => {
-                            tracing::warn!(
-                                path = %path.display(),
-                                error = %e,
-                                "malformed checkpoint file — skipping"
-                            );
-                        }
+                Ok(contents) => match serde_json::from_str::<ProofCheckpointEntry>(&contents) {
+                    Ok(cp) => {
+                        tracing::info!(
+                            request_id = cp.request_id,
+                            strategy   = %cp.strategy_id,
+                            "recovered proof checkpoint"
+                        );
+                        metrics::CHECKPOINTS_RECOVERED.inc();
+                        recovered.push(cp);
                     }
-                }
+                    Err(e) => {
+                        tracing::warn!(
+                            path = %path.display(),
+                            error = %e,
+                            "malformed checkpoint file — skipping"
+                        );
+                    }
+                },
                 Err(e) => {
                     tracing::warn!(
                         path = %path.display(),
@@ -232,15 +232,15 @@ impl ProofCheckpointManager {
     }
 
     fn write_to_disk(&self, entry: &ProofCheckpointEntry) -> Result<(), ZkError> {
-        let path     = self.entry_path(entry.request_id);
-        let contents = serde_json::to_string_pretty(entry)
-            .map_err(|e| ZkError::CheckpointWriteFailed {
+        let path = self.entry_path(entry.request_id);
+        let contents =
+            serde_json::to_string_pretty(entry).map_err(|e| ZkError::CheckpointWriteFailed {
                 request_id: entry.request_id,
-                detail:     e.to_string(),
+                detail: e.to_string(),
             })?;
         fs::write(&path, contents).map_err(|e| ZkError::CheckpointWriteFailed {
             request_id: entry.request_id,
-            detail:     e.to_string(),
+            detail: e.to_string(),
         })?;
         Ok(())
     }
@@ -315,7 +315,7 @@ mod checkpoint_tests {
     #[test]
     fn recover_returns_written_entries() {
         let cfg = temp_cfg();
-        let m   = ProofCheckpointManager::new(&cfg);
+        let m = ProofCheckpointManager::new(&cfg);
 
         for i in 1u64..=3 {
             let (id, hash, profit, chain, strat, microtx) = sample_entry(i);
@@ -337,7 +337,7 @@ mod checkpoint_tests {
     #[test]
     fn complete_before_recover_removes_file() {
         let cfg = temp_cfg();
-        let m   = ProofCheckpointManager::new(&cfg);
+        let m = ProofCheckpointManager::new(&cfg);
 
         let (id, hash, profit, chain, strat, microtx) = sample_entry(10);
         m.record(id, hash, profit, chain, strat, microtx);
@@ -346,7 +346,10 @@ mod checkpoint_tests {
         drop(m);
         let m2 = ProofCheckpointManager::new(&cfg);
         let recovered = m2.recover().unwrap();
-        assert!(recovered.is_empty(), "completed proof should not be recovered");
+        assert!(
+            recovered.is_empty(),
+            "completed proof should not be recovered"
+        );
     }
 
     #[test]
@@ -370,26 +373,29 @@ mod checkpoint_tests {
         }
 
         // After 5 records with max=3, in-memory count should be ≤ 3.
-        assert!(m.in_flight_count() <= 3,
-            "expected ≤3 in-flight, got {}", m.in_flight_count());
+        assert!(
+            m.in_flight_count() <= 3,
+            "expected ≤3 in-flight, got {}",
+            m.in_flight_count()
+        );
     }
 
     #[test]
     fn checkpoint_entry_fields_preserved() {
         let cfg = temp_cfg();
-        let m   = ProofCheckpointManager::new(&cfg);
+        let m = ProofCheckpointManager::new(&cfg);
         m.record(77, [0xab; 32], 9_999_999, 42161, "MEV".into(), true);
 
         drop(m);
-        let m2       = ProofCheckpointManager::new(&cfg);
+        let m2 = ProofCheckpointManager::new(&cfg);
         let recovered = m2.recover().unwrap();
         assert_eq!(recovered.len(), 1);
         let e = &recovered[0];
-        assert_eq!(e.request_id,     77);
+        assert_eq!(e.request_id, 77);
         assert_eq!(e.blueprint_hash, [0xab; 32]);
         assert_eq!(e.net_profit_wei, 9_999_999);
-        assert_eq!(e.chain_id,       42161);
-        assert_eq!(e.strategy_id,    "MEV");
+        assert_eq!(e.chain_id, 42161);
+        assert_eq!(e.strategy_id, "MEV");
         assert!(e.is_microtx);
     }
 }

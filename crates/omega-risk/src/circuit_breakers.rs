@@ -50,13 +50,13 @@
 // Spec: "< 0.70 for 72 blocks → AUTO-PAUSED (L2 fast-approve to resume)"
 //       "< 0.50 → circuit-break (L3 governance required)"
 
+use chrono::{DateTime, Utc};
 use dashmap::DashMap;
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::Arc;
-use chrono::{DateTime, Utc};
 
 use crate::metrics;
 
@@ -97,10 +97,10 @@ impl CircuitState {
 
     fn to_u8(self) -> u8 {
         match self {
-            CircuitState::Healthy    => 0,
-            CircuitState::Investigate=> 1,
+            CircuitState::Healthy => 0,
+            CircuitState::Investigate => 1,
             CircuitState::AutoPaused => 2,
-            CircuitState::Halted     => 3,
+            CircuitState::Halted => 3,
         }
     }
 
@@ -117,10 +117,10 @@ impl CircuitState {
 impl std::fmt::Display for CircuitState {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            CircuitState::Healthy     => write!(f, "HEALTHY"),
+            CircuitState::Healthy => write!(f, "HEALTHY"),
             CircuitState::Investigate => write!(f, "INVESTIGATE"),
-            CircuitState::AutoPaused  => write!(f, "AUTO_PAUSED"),
-            CircuitState::Halted      => write!(f, "HALTED"),
+            CircuitState::AutoPaused => write!(f, "AUTO_PAUSED"),
+            CircuitState::Halted => write!(f, "HALTED"),
         }
     }
 }
@@ -128,13 +128,16 @@ impl std::fmt::Display for CircuitState {
 // ─── Per-strategy breaker ─────────────────────────────────────────────────────
 
 struct BreakerWindow {
-    deque:       VecDeque<(f64, f64)>,  // (observed_profit, expected_profit)
+    deque: VecDeque<(f64, f64)>, // (observed_profit, expected_profit)
     window_size: usize,
 }
 
 impl BreakerWindow {
     fn new(size: usize) -> Self {
-        Self { deque: VecDeque::with_capacity(size), window_size: size }
+        Self {
+            deque: VecDeque::with_capacity(size),
+            window_size: size,
+        }
     }
 
     fn push(&mut self, observed: f64, expected: f64) {
@@ -146,14 +149,20 @@ impl BreakerWindow {
 
     /// EV ratio over the current window. Returns 1.0 if no data.
     fn ev_ratio(&self) -> f64 {
-        if self.deque.is_empty() { return 1.0; }
+        if self.deque.is_empty() {
+            return 1.0;
+        }
         let obs: f64 = self.deque.iter().map(|(o, _)| o).sum();
         let exp: f64 = self.deque.iter().map(|(_, e)| e).sum();
-        if exp <= 0.0 { return 1.0; }
+        if exp <= 0.0 {
+            return 1.0;
+        }
         obs / exp
     }
 
-    fn len(&self) -> usize { self.deque.len() }
+    fn len(&self) -> usize {
+        self.deque.len()
+    }
 
     /// Copy of the raw (observed, expected) pairs currently in the
     /// window, oldest first. Used by `diagnostics()` — deliberately not
@@ -199,9 +208,9 @@ pub struct BreakerDiagnostics {
 
 /// Circuit breaker for one strategy.
 pub struct StrategyCircuitBreaker {
-    strategy_id:     String,
-    state:           Arc<AtomicU8>,
-    window:          Mutex<BreakerWindow>,
+    strategy_id: String,
+    state: Arc<AtomicU8>,
+    window: Mutex<BreakerWindow>,
     last_transition: Mutex<DateTime<Utc>>,
 }
 
@@ -216,12 +225,14 @@ impl StrategyCircuitBreaker {
         metrics::CIRCUIT_BREAKER_STATE
             .with_label_values(&[strategy_id.as_str()])
             .set(CircuitState::Healthy.to_u8() as f64);
-        metrics::EV_RATIO.with_label_values(&[strategy_id.as_str()]).set(1.0);
+        metrics::EV_RATIO
+            .with_label_values(&[strategy_id.as_str()])
+            .set(1.0);
 
         Self {
             strategy_id,
-            state:           Arc::new(AtomicU8::new(CircuitState::Healthy.to_u8())),
-            window:          Mutex::new(BreakerWindow::new(EV_WINDOW_BLOCKS)),
+            state: Arc::new(AtomicU8::new(CircuitState::Healthy.to_u8())),
+            window: Mutex::new(BreakerWindow::new(EV_WINDOW_BLOCKS)),
             last_transition: Mutex::new(Utc::now()),
         }
     }
@@ -241,7 +252,9 @@ impl StrategyCircuitBreaker {
         // EV_RATIO is pushed on every call, independent of whether the
         // state transitions — the gauge should track the live ratio, not
         // just snapshot it at transition boundaries.
-        metrics::EV_RATIO.with_label_values(&[self.strategy_id.as_str()]).set(ev_ratio);
+        metrics::EV_RATIO
+            .with_label_values(&[self.strategy_id.as_str()])
+            .set(ev_ratio);
 
         // Determine new state from EV ratio.
         let new_state = if ev_ratio < EV_HALT_THRESHOLD {
@@ -334,7 +347,8 @@ impl StrategyCircuitBreaker {
             return false;
         }
 
-        self.state.store(CircuitState::Investigate.to_u8(), Ordering::Release);
+        self.state
+            .store(CircuitState::Investigate.to_u8(), Ordering::Release);
         *self.last_transition.lock() = Utc::now();
         metrics::CIRCUIT_BREAKER_STATE
             .with_label_values(&[self.strategy_id.as_str()])
@@ -380,7 +394,8 @@ impl StrategyCircuitBreaker {
             let mut win = self.window.lock();
             win.deque.clear();
         }
-        self.state.store(CircuitState::Investigate.to_u8(), Ordering::Release);
+        self.state
+            .store(CircuitState::Investigate.to_u8(), Ordering::Release);
         *self.last_transition.lock() = Utc::now();
         metrics::CIRCUIT_BREAKER_STATE
             .with_label_values(&[self.strategy_id.as_str()])
@@ -388,7 +403,9 @@ impl StrategyCircuitBreaker {
         // Window was just cleared, so ev_ratio() returns to the "no
         // data" default of 1.0 — reflect that on the gauge immediately
         // rather than leaving it at whatever the pre-clear value was.
-        metrics::EV_RATIO.with_label_values(&[self.strategy_id.as_str()]).set(1.0);
+        metrics::EV_RATIO
+            .with_label_values(&[self.strategy_id.as_str()])
+            .set(1.0);
 
         metrics::CIRCUIT_BREAKER_L3_CLEAR_TOTAL
             .with_label_values(&[self.strategy_id.as_str()])
@@ -420,7 +437,9 @@ pub struct CircuitBreakerRegistry {
 
 impl CircuitBreakerRegistry {
     pub fn new() -> Self {
-        Self { breakers: Arc::new(DashMap::new()) }
+        Self {
+            breakers: Arc::new(DashMap::new()),
+        }
     }
 
     /// Ensure a breaker exists for `strategy_id` (idempotent).
@@ -433,7 +452,8 @@ impl CircuitBreakerRegistry {
     /// Record an outcome for `strategy_id`.
     /// Auto-registers the strategy if not yet present.
     pub fn record(&self, strategy_id: &str, observed: f64, expected: f64) {
-        let breaker = self.breakers
+        let breaker = self
+            .breakers
             .entry(strategy_id.to_string())
             .or_insert_with(|| Arc::new(StrategyCircuitBreaker::new(strategy_id)));
         breaker.record(observed, expected);
@@ -443,7 +463,7 @@ impl CircuitBreakerRegistry {
     pub fn is_operational(&self, strategy_id: &str) -> bool {
         match self.breakers.get(strategy_id) {
             Some(b) => b.is_operational(),
-            None    => true, // unknown strategy: default allow (register on first outcome)
+            None => true, // unknown strategy: default allow (register on first outcome)
         }
     }
 
@@ -451,7 +471,7 @@ impl CircuitBreakerRegistry {
     pub fn state(&self, strategy_id: &str) -> CircuitState {
         match self.breakers.get(strategy_id) {
             Some(b) => b.state(),
-            None    => CircuitState::Healthy,
+            None => CircuitState::Healthy,
         }
     }
 
@@ -459,7 +479,7 @@ impl CircuitBreakerRegistry {
     pub fn ev_ratio(&self, strategy_id: &str) -> f64 {
         match self.breakers.get(strategy_id) {
             Some(b) => b.ev_ratio(),
-            None    => 1.0,
+            None => 1.0,
         }
     }
 
@@ -480,7 +500,10 @@ impl CircuitBreakerRegistry {
     /// control-plane dashboard or a bulk incident-response check across
     /// all strategies at once.
     pub fn all_diagnostics(&self) -> Vec<BreakerDiagnostics> {
-        self.breakers.iter().map(|e| e.value().diagnostics()).collect()
+        self.breakers
+            .iter()
+            .map(|e| e.value().diagnostics())
+            .collect()
     }
 
     /// Resume an AutoPaused strategy via L2 governance. `operator` and
@@ -515,7 +538,9 @@ impl CircuitBreakerRegistry {
 }
 
 impl Default for CircuitBreakerRegistry {
-    fn default() -> Self { Self::new() }
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 #[cfg(test)]
@@ -549,7 +574,8 @@ mod cb_tests {
         let s = reg.state("LA");
         assert!(
             s == CircuitState::AutoPaused || s == CircuitState::Halted,
-            "expected paused or halted, got {:?}", s
+            "expected paused or halted, got {:?}",
+            s
         );
     }
 
@@ -601,7 +627,10 @@ mod cb_tests {
         }
         assert_eq!(reg.state("SA"), CircuitState::AutoPaused);
         reg.resume_l2("SA", "alice", "test");
-        assert!((reg.ev_ratio("SA") - 0.65).abs() < 1e-6, "window should survive L2 resume");
+        assert!(
+            (reg.ev_ratio("SA") - 0.65).abs() < 1e-6,
+            "window should survive L2 resume"
+        );
     }
 
     #[test]
@@ -777,7 +806,11 @@ mod cb_tests {
             .iter()
             .filter(|(obs, exp)| obs / exp < 0.0)
             .collect();
-        assert_eq!(outliers.len(), 1, "exactly one catastrophic pair should be identifiable");
+        assert_eq!(
+            outliers.len(),
+            1,
+            "exactly one catastrophic pair should be identifiable"
+        );
     }
 
     #[test]
@@ -835,15 +868,15 @@ mod cb_tests {
         // gauge values.
         let reg = CircuitBreakerRegistry::new();
         reg.register("METRICS_TEST");
-        reg.record("METRICS_TEST", 1.0, 1.0);       // Healthy, no transition
+        reg.record("METRICS_TEST", 1.0, 1.0); // Healthy, no transition
         for _ in 0..EV_WINDOW_BLOCKS {
-            reg.record("METRICS_TEST", 0.65, 1.0);  // drives to AutoPaused
+            reg.record("METRICS_TEST", 0.65, 1.0); // drives to AutoPaused
         }
         assert_eq!(reg.state("METRICS_TEST"), CircuitState::AutoPaused);
         assert!(reg.resume_l2("METRICS_TEST", "alice", "lifecycle test resume"));
         assert_eq!(reg.state("METRICS_TEST"), CircuitState::Investigate);
         for _ in 0..EV_WINDOW_BLOCKS {
-            reg.record("METRICS_TEST", 0.3, 1.0);   // drives to Halted
+            reg.record("METRICS_TEST", 0.3, 1.0); // drives to Halted
         }
         assert_eq!(reg.state("METRICS_TEST"), CircuitState::Halted);
         assert!(reg.clear_halt_l3("METRICS_TEST", "alice", "lifecycle test clear"));

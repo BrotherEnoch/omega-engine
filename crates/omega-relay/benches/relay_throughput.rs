@@ -20,7 +20,8 @@ use omega_relay::{
     config::{RelayConfig, RelayName},
     confirmation::InclusionTracker,
     metrics::{ExecutionAddress, LaRelayMetrics},
-    reputation::submission_order, PositionKey,
+    reputation::submission_order,
+    PositionKey,
 };
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
@@ -89,8 +90,12 @@ fn bench_cascade_throughput(c: &mut Criterion) {
                 // Dummy tracker — these benchmarks measure submission throughput, not
                 // confirmation behavior, so a real RPC endpoint isn't needed here.
                 let tracker = InclusionTracker::new("http://localhost:1");
-                let submitter =
-                    CascadeSubmitter::new(Arc::clone(&clients), Arc::clone(&metrics), &cfg, tracker);
+                let submitter = CascadeSubmitter::new(
+                    Arc::clone(&clients),
+                    Arc::clone(&metrics),
+                    &cfg,
+                    tracker,
+                );
 
                 b.to_async(&rt).iter_batched(
                     || (0..count).map(bundle).collect::<Vec<_>>(),

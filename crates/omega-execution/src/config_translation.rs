@@ -102,7 +102,10 @@ pub fn translate_relay_config(
         });
     }
 
-    TranslatedRelayConfig { config, unmapped_fields }
+    TranslatedRelayConfig {
+        config,
+        unmapped_fields,
+    }
 }
 
 #[cfg(test)]

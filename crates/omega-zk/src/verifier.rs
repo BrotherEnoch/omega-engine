@@ -13,7 +13,7 @@
 
 use crate::error::ZkError;
 use crate::metrics;
-use crate::prover::{ZkProof, ProverTier};
+use crate::prover::{ProverTier, ZkProof};
 /// Stateless STARK proof verifier.
 #[derive(Debug, Default)]
 pub struct ZkVerifier {
@@ -22,7 +22,9 @@ pub struct ZkVerifier {
 
 impl ZkVerifier {
     pub fn new(chain_id: u64) -> Self {
-        Self { expected_chain_id: chain_id }
+        Self {
+            expected_chain_id: chain_id,
+        }
     }
 
     /// Verify a ZkProof produced by T1SoftwareProver.
@@ -61,12 +63,12 @@ impl ZkVerifier {
     }
 
     fn verify_winterfell(&self, proof: &ZkProof) -> Result<(), ZkError> {
+        use crate::prover::{BlueprintAir, BlueprintPublicInputs};
         use winterfell::{
             crypto::{hashers::Blake3_256, DefaultRandomCoin},
             math::fields::f128::BaseElement,
             verify, AcceptableOptions,
         };
-        use crate::prover::{BlueprintAir, BlueprintPublicInputs};
 
         // Deserialise the proof bytes.
         let stark_proof: winterfell::StarkProof =
@@ -78,26 +80,29 @@ impl ZkVerifier {
             })?;
 
         // Reconstruct public inputs (must match what was proved).
-        let pub_inputs = BlueprintPublicInputs::new(
-            &proof.blueprint_hash,
-            proof.net_profit_wei,
-            proof.chain_id,
-        );
+        let pub_inputs =
+            BlueprintPublicInputs::new(&proof.blueprint_hash, proof.net_profit_wei, proof.chain_id);
 
-        let acceptable = AcceptableOptions::OptionSet(vec![
-            winterfell::ProofOptions::new(28, 8, 0,
-                winterfell::FieldExtension::None, 8, 127),
-        ]);
+        let acceptable = AcceptableOptions::OptionSet(vec![winterfell::ProofOptions::new(
+            28,
+            8,
+            0,
+            winterfell::FieldExtension::None,
+            8,
+            127,
+        )]);
 
         type HashFn = Blake3_256<BaseElement>;
         type RandCoin = DefaultRandomCoin<HashFn>;
 
-        verify::<BlueprintAir, HashFn, RandCoin>(stark_proof, pub_inputs, &acceptable).map_err(|_| {
-            metrics::VERIFICATION_FAILURES.inc();
-            ZkError::VerificationFailed {
-                blueprint_hash: hex::encode(proof.blueprint_hash),
-            }
-        })?;
+        verify::<BlueprintAir, HashFn, RandCoin>(stark_proof, pub_inputs, &acceptable).map_err(
+            |_| {
+                metrics::VERIFICATION_FAILURES.inc();
+                ZkError::VerificationFailed {
+                    blueprint_hash: hex::encode(proof.blueprint_hash),
+                }
+            },
+        )?;
 
         metrics::PROOFS_VERIFIED.inc();
         tracing::debug!(

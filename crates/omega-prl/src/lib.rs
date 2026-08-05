@@ -29,17 +29,37 @@
 //! `is_halted()`. Fixed below: the ingestion path now discards (rather
 //! than scores) events while halted. See that method's comment.
 //!
-//! `PrlEngine` (below) is flagged `#[deprecated]` — it references
-//! `crate::pattern::PatternMatcher` (singular module) and
-//! `omega_core::types::signal::Signal`, neither of which match the
-//! production pipeline (`PatternRecognitionLayer`,
-//! `crate::patterns::matcher::PatternMatcher`) or this crate's actual
-//! `omega_core` dependency (which exports `OracleSignal`, not `Signal`).
-//! It calls `self.matcher.match_pattern(signal)`, a method that does not
-//! exist on the real `PatternMatcher`. This looks like orphaned scaffold
-//! code that bypasses `PrlHealth`, the WAL, confidence decay, and
-//! threshold governance entirely via a separate, unaudited
-//! `PrlSafetyGate`. See the warning on the struct itself.
+//! ## Audit fix (this revision): removed non-compiling orphaned scaffold
+//!
+//! This crate previously also declared `pub mod pattern;`,
+//! `pub mod inference;`, `pub mod safety;`, and a deprecated `PrlEngine`
+//! struct built on top of them, plus `use
+//! omega_core::types::signal::Signal;`. None of it compiled:
+//!   - `pattern.rs` / `inference.rs` / `safety.rs` did not exist
+//!     anywhere in the crate (`E0583: file not found for module`) —
+//!     unlike every other module in the §23 structure above, which is a
+//!     real nested `pub mod` block with real files.
+//!   - `omega_core::types::signal` exports `OracleSignal`, not `Signal`
+//!     (`E0432: unresolved import`) — this crate's actual dependency on
+//!     `omega_core` never defined the type this import named.
+//!   - `PrlEngine::process_signal` called
+//!     `self.matcher.match_pattern(signal)`, a method that does not
+//!     exist on the real `crate::patterns::matcher::PatternMatcher`
+//!     used by `PatternRecognitionLayer` below — `PrlEngine` was built
+//!     against `crate::pattern::PatternMatcher` (singular module, never
+//!     existed) and a `PrlSafetyGate` type that likewise never existed
+//!     anywhere in this crate.
+//!   - `PrlEngine` was already `#[deprecated]` with a doc comment
+//!     explicitly warning it "bypasses `PrlHealth`, the WAL, confidence
+//!     decay, and threshold governance" and instructing readers not to
+//!     treat it as a safe entry point.
+//!
+//! Given all of that, reconciling `PrlEngine` with the real pipeline
+//! would mean inventing an entire second pattern-matching/safety-gate
+//! implementation this audit has no visibility into — worse than simply
+//! removing dead code that never compiled and was already flagged as
+//! unsafe to use. `PatternRecognitionLayer` (below) is, and remains,
+//! the only real entry point into this crate.
 
 #![deny(unsafe_op_in_unsafe_fn)]
 
@@ -101,56 +121,6 @@ pub mod health {
 pub mod metrics {
     pub mod events;
     pub mod prometheus;
-}
-
-pub mod pattern;
-pub mod inference;
-pub mod safety;
-
-use omega_core::types::signal::Signal;
-use tracing;
-
-/// AUDIT WARNING (see module doc comment above): this struct uses
-/// `crate::pattern::PatternMatcher` (singular module) and
-/// `omega_core::types::signal::Signal` — NEITHER of which match the
-/// production pipeline (`crate::patterns::matcher::PatternMatcher`,
-/// `PatternRecognitionLayer`) or the `omega_core::types::signal::OracleSignal`
-/// type this crate's own dependency actually exports.
-/// `process_signal` calls `self.matcher.match_pattern(signal)`, a method
-/// that does not exist on the real `PatternMatcher` reviewed in this
-/// audit. This looks like orphaned scaffold code that either fails to
-/// compile against the rest of this crate, or — if `pattern.rs` /
-/// `inference.rs` / `safety.rs` define a fully separate type universe —
-/// completely bypasses `PrlHealth`, the WAL, confidence decay, and
-/// threshold governance via a separate, unaudited `PrlSafetyGate`.
-/// DO NOT treat this as a safe alternative entry point until it is
-/// reconciled with — or removed in favor of — `PatternRecognitionLayer`.
-#[deprecated(
-    note = "unreconciled with PatternRecognitionLayer's health/WAL/confidence \
-            pipeline — see the audit warning on this struct's doc comment"
-)]
-pub struct PrlEngine {
-    matcher: pattern::PatternMatcher,
-    safety: safety::PrlSafetyGate,
-}
-
-#[allow(deprecated)]
-impl PrlEngine {
-    pub fn new() -> Self {
-        Self {
-            matcher: pattern::PatternMatcher::new(),
-            safety: safety::PrlSafetyGate::new(),
-        }
-    }
-
-    pub fn process_signal(&self, signal: Signal) -> Option<Signal> {
-        if !self.safety.is_safe_to_process() {
-            tracing::warn!("PRL blocked by safety gate (kill switch or budget exceeded)");
-            return None;
-        }
-
-        self.matcher.match_pattern(signal)
-    }
 }
 
 pub mod integration;

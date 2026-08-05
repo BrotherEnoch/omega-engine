@@ -44,7 +44,12 @@ pub enum SecurityError {
     ReplayDetected { hash: String, chain_id: u64 },
 
     #[error("Nonce mismatch for strategy {strategy_id} on chain {chain_id}: expected {expected}, got {got}")]
-    NonceMismatch { strategy_id: String, chain_id: u64, expected: u64, got: u64 },
+    NonceMismatch {
+        strategy_id: String,
+        chain_id: u64,
+        expected: u64,
+        got: u64,
+    },
 
     #[error("Nonce overflow for strategy {strategy_id}: cannot exceed u64::MAX")]
     NonceOverflow { strategy_id: String },

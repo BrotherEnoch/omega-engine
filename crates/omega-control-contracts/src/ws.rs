@@ -102,14 +102,8 @@ pub enum WsClientFrame {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum WsAuthFrame {
-    AuthOk {
-        rate_limit: u32,
-        window_secs: u64,
-    },
-    AuthFailed {
-        rate_limit: u32,
-        window_secs: u64,
-    },
+    AuthOk { rate_limit: u32, window_secs: u64 },
+    AuthFailed { rate_limit: u32, window_secs: u64 },
 }
 
 #[cfg(test)]

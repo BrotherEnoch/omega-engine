@@ -342,4 +342,3 @@ mod tests {
         assert!(matches!(err.drop_code(), Some(DropCode::MissWhitelist)));
     }
 }
-

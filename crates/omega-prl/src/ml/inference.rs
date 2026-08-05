@@ -171,8 +171,7 @@ impl OnnxInferenceEngine {
         #[cfg(feature = "onnx-runtime")]
         let mut sessions_map = std::collections::HashMap::new();
         #[cfg(not(feature = "onnx-runtime"))]
-        let sessions_map: std::collections::HashMap<String, ()> =
-            std::collections::HashMap::new();
+        let sessions_map: std::collections::HashMap<String, ()> = std::collections::HashMap::new();
 
         #[cfg(feature = "onnx-runtime")]
         for name in [
@@ -308,7 +307,9 @@ impl OnnxInferenceEngine {
         {
             self.ml_active.store(false, Ordering::SeqCst);
             self.timeout_streak.store(0, Ordering::Relaxed);
-            tracing::warn!("PRL rollback applied to checkpoint metadata only; ONNX runtime disabled");
+            tracing::warn!(
+                "PRL rollback applied to checkpoint metadata only; ONNX runtime disabled"
+            );
             Ok(())
         }
 

@@ -15,7 +15,8 @@ pub static CHECKS_PASSED: Lazy<CounterVec> = Lazy::new(|| {
         "omega_risk_checks_passed_total",
         "Blueprints that passed all 13 pre-trade checks",
         &["strategy"]
-    ).expect("register omega_risk_checks_passed_total")
+    )
+    .expect("register omega_risk_checks_passed_total")
 });
 
 /// Count of blueprints dropped at a pre-trade check, per strategy × drop_code.
@@ -24,7 +25,8 @@ pub static CHECKS_FAILED: Lazy<CounterVec> = Lazy::new(|| {
         "omega_risk_checks_failed_total",
         "Blueprints dropped at pre-trade check",
         &["strategy", "drop_code"]
-    ).expect("register omega_risk_checks_failed_total")
+    )
+    .expect("register omega_risk_checks_failed_total")
 });
 
 // ─── Gas model ────────────────────────────────────────────────────────────────
@@ -35,7 +37,8 @@ pub static L1_ADAPTIVE_BUFFER: Lazy<GaugeVec> = Lazy::new(|| {
         "omega_risk_l1_adaptive_buffer",
         "Current L1 adaptive gas buffer (1.30–2.00)",
         &["chain_id"]
-    ).expect("register omega_risk_l1_adaptive_buffer")
+    )
+    .expect("register omega_risk_l1_adaptive_buffer")
 });
 
 /// Current dynamic minimum profit threshold per strategy.
@@ -44,7 +47,8 @@ pub static DYNAMIC_MIN_PROFIT: Lazy<GaugeVec> = Lazy::new(|| {
         "omega_risk_dynamic_min_profit_gwei",
         "Current dynamic minimum profit threshold in gwei",
         &["strategy", "chain_id"]
-    ).expect("register omega_risk_dynamic_min_profit_gwei")
+    )
+    .expect("register omega_risk_dynamic_min_profit_gwei")
 });
 
 // ─── Circuit breakers (EV-ratio based, per circuit_breakers.rs) ──────────────
@@ -55,7 +59,8 @@ pub static CIRCUIT_BREAKER_STATE: Lazy<GaugeVec> = Lazy::new(|| {
         "omega_risk_circuit_breaker_state",
         "Circuit breaker state (0=Healthy 1=Investigate 2=AutoPaused 3=Halted)",
         &["strategy"]
-    ).expect("register omega_risk_circuit_breaker_state")
+    )
+    .expect("register omega_risk_circuit_breaker_state")
 });
 
 /// Rolling EV ratio per strategy.
@@ -64,7 +69,8 @@ pub static EV_RATIO: Lazy<GaugeVec> = Lazy::new(|| {
         "omega_risk_ev_ratio",
         "Rolling EV ratio (observed/expected) over 72-block window",
         &["strategy"]
-    ).expect("register omega_risk_ev_ratio")
+    )
+    .expect("register omega_risk_ev_ratio")
 });
 
 /// Count of times a strategy's circuit breaker was resumed via L2
@@ -77,7 +83,8 @@ pub static CIRCUIT_BREAKER_L2_RESUME_TOTAL: Lazy<CounterVec> = Lazy::new(|| {
         "omega_risk_circuit_breaker_l2_resume_total",
         "Count of L2 fast-approve resumes (resume_l2) per strategy",
         &["strategy"]
-    ).expect("register omega_risk_circuit_breaker_l2_resume_total")
+    )
+    .expect("register omega_risk_circuit_breaker_l2_resume_total")
 });
 
 /// Info-style metric carrying the operator and reason of the most recent
@@ -102,7 +109,8 @@ pub static CIRCUIT_BREAKER_L3_CLEAR_TOTAL: Lazy<CounterVec> = Lazy::new(|| {
         "omega_risk_circuit_breaker_l3_clear_total",
         "Count of L3 governance clears (clear_halt_l3) per strategy",
         &["strategy"]
-    ).expect("register omega_risk_circuit_breaker_l3_clear_total")
+    )
+    .expect("register omega_risk_circuit_breaker_l3_clear_total")
 });
 
 /// Info-style metric carrying the operator and reason of the most recent
@@ -131,7 +139,8 @@ pub static KILL_SWITCH_TRIPPED: Lazy<GaugeVec> = Lazy::new(|| {
         "omega_risk_kill_switch_tripped",
         "1 if the kill switch is tripped for this scope, 0 otherwise",
         &["scope"]
-    ).expect("register omega_risk_kill_switch_tripped")
+    )
+    .expect("register omega_risk_kill_switch_tripped")
 });
 
 /// Cumulative realized loss tracked by the kill switch, per scope, in wei.
@@ -140,7 +149,8 @@ pub static KILL_SWITCH_CUMULATIVE_LOSS_WEI: Lazy<GaugeVec> = Lazy::new(|| {
         "omega_risk_kill_switch_cumulative_loss_wei",
         "Cumulative realized loss tracked by the kill switch, in wei",
         &["scope"]
-    ).expect("register omega_risk_kill_switch_cumulative_loss_wei")
+    )
+    .expect("register omega_risk_kill_switch_cumulative_loss_wei")
 });
 
 /// Configured cumulative-loss trip threshold per scope, in wei. Published
@@ -153,7 +163,8 @@ pub static KILL_SWITCH_MAX_CUMULATIVE_LOSS_WEI: Lazy<GaugeVec> = Lazy::new(|| {
         "omega_risk_kill_switch_max_cumulative_loss_wei",
         "Configured cumulative-loss trip threshold for this scope, in wei",
         &["scope"]
-    ).expect("register omega_risk_kill_switch_max_cumulative_loss_wei")
+    )
+    .expect("register omega_risk_kill_switch_max_cumulative_loss_wei")
 });
 
 /// Count of times the kill switch was reset for a given scope. A Counter,
@@ -166,7 +177,8 @@ pub static KILL_SWITCH_RESET_TOTAL: Lazy<CounterVec> = Lazy::new(|| {
         "omega_risk_kill_switch_reset_total",
         "Count of kill switch resets per scope",
         &["scope"]
-    ).expect("register omega_risk_kill_switch_reset_total")
+    )
+    .expect("register omega_risk_kill_switch_reset_total")
 });
 
 /// Info-style metric carrying the operator and reason of the most recent
@@ -192,7 +204,8 @@ pub static HEARTBEAT_LAST_BEAT_TIMESTAMP: Lazy<GaugeVec> = Lazy::new(|| {
         "omega_risk_heartbeat_last_beat_timestamp",
         "Unix timestamp (seconds) of the last liveness beat for this component",
         &["component"]
-    ).expect("register omega_risk_heartbeat_last_beat_timestamp")
+    )
+    .expect("register omega_risk_heartbeat_last_beat_timestamp")
 });
 
 // ─── Flash crash ────────────────────────────────────────────────────────────
@@ -203,7 +216,8 @@ pub static FLASH_CRASH_ACTIVE: Lazy<GaugeVec> = Lazy::new(|| {
         "omega_risk_flash_crash_active",
         "1 when graduated flash-crash response is active",
         &["asset"]
-    ).expect("register omega_risk_flash_crash_active")
+    )
+    .expect("register omega_risk_flash_crash_active")
 });
 
 // ─── Initialisation ───────────────────────────────────────────────────────────

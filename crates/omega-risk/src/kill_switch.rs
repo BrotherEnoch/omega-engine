@@ -63,6 +63,19 @@
 // delegates. This mirrors how `trip_manual`/`reset` already take
 // `operator`/`reason` as caller-supplied parameters rather than storing
 // them.
+//
+// ## Audit fix (this revision): deprecated chrono API
+//
+// All four call sites in this crate (three here, one in heartbeat.rs)
+// that fell back to `chrono::Duration::max_value()` when converting a
+// `std::time::Duration` that overflows `chrono::Duration`'s internal
+// range now use `chrono::Duration::MAX` instead. `chrono::Duration` is a
+// type alias for `TimeDelta`; `max_value()` is chrono's deprecated
+// pre-associated-const spelling of the same value now exposed as the
+// `MAX` const. Purely a deprecation-warning fix — the fallback value
+// itself (used only when a configured window/silence duration is larger
+// than chrono can represent, which no realistic config here approaches)
+// is unchanged.
 
 use chrono::{DateTime, Utc};
 use dashmap::mapref::entry::Entry;
@@ -127,7 +140,9 @@ impl KillSwitchConfig {
             ));
         }
         if self.loss_window.is_zero() {
-            return Err(KillSwitchError::InvalidConfig("loss_window must be > 0".into()));
+            return Err(KillSwitchError::InvalidConfig(
+                "loss_window must be > 0".into(),
+            ));
         }
         if self.max_consecutive_failures == 0 {
             return Err(KillSwitchError::InvalidConfig(
@@ -164,10 +179,22 @@ pub struct WindowLossEntry {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum TripReason {
-    CumulativeLoss { threshold_wei: u128, realized_loss_wei: u128 },
-    WindowLoss { threshold_wei: u128, realized_loss_wei: u128, window_secs: u64 },
-    ConsecutiveFailures { threshold: u32, observed: u32 },
-    Manual { reason: String },
+    CumulativeLoss {
+        threshold_wei: u128,
+        realized_loss_wei: u128,
+    },
+    WindowLoss {
+        threshold_wei: u128,
+        realized_loss_wei: u128,
+        window_secs: u64,
+    },
+    ConsecutiveFailures {
+        threshold: u32,
+        observed: u32,
+    },
+    Manual {
+        reason: String,
+    },
 }
 
 impl std::fmt::Display for TripReason {
@@ -315,13 +342,16 @@ impl KillSwitch {
     pub fn diagnostics_at(&self, scope: &str, now: DateTime<Utc>) -> KillSwitchDiagnostics {
         let state = self.state.lock();
 
-        let window = chrono::Duration::from_std(self.config.loss_window)
-            .unwrap_or(chrono::Duration::max_value());
+        let window =
+            chrono::Duration::from_std(self.config.loss_window).unwrap_or(chrono::Duration::MAX);
         let window_losses: Vec<WindowLossEntry> = state
             .window_history
             .iter()
             .filter(|t| now - t.at <= window)
-            .map(|t| WindowLossEntry { at: t.at, loss_wei: t.loss_wei })
+            .map(|t| WindowLossEntry {
+                at: t.at,
+                loss_wei: t.loss_wei,
+            })
             .collect();
 
         let status = match &state.trip {
@@ -344,7 +374,11 @@ impl KillSwitch {
     /// matching the convention used elsewhere in this crate (e.g.
     /// `omega-simulation::Receipt::realized_profit_wei`). Returns
     /// `Some(TripReason)` only if this call caused the trip just now.
-    pub fn record_outcome(&self, realized_profit_wei: Option<i128>, success: bool) -> Option<TripReason> {
+    pub fn record_outcome(
+        &self,
+        realized_profit_wei: Option<i128>,
+        success: bool,
+    ) -> Option<TripReason> {
         self.record_outcome_at(realized_profit_wei, success, Utc::now())
     }
 
@@ -376,7 +410,9 @@ impl KillSwitch {
             .unwrap_or(0);
 
         state.cumulative_loss_wei = state.cumulative_loss_wei.saturating_add(loss_wei);
-        state.window_history.push_back(TimedLoss { at: now, loss_wei });
+        state
+            .window_history
+            .push_back(TimedLoss { at: now, loss_wei });
         Self::evict_expired(&mut state.window_history, now, self.config.loss_window);
 
         if state.trip.is_some() {
@@ -399,7 +435,7 @@ impl KillSwitch {
     }
 
     fn evict_expired(history: &mut VecDeque<TimedLoss>, now: DateTime<Utc>, window: Duration) {
-        let window = chrono::Duration::from_std(window).unwrap_or(chrono::Duration::max_value());
+        let window = chrono::Duration::from_std(window).unwrap_or(chrono::Duration::MAX);
         while let Some(front) = history.front() {
             if now - front.at > window {
                 history.pop_front();
@@ -421,7 +457,8 @@ impl KillSwitch {
     }
 
     fn check_window_loss(&self, state: &State, now: DateTime<Utc>) -> Option<TripReason> {
-        let window = chrono::Duration::from_std(self.config.loss_window).unwrap_or(chrono::Duration::max_value());
+        let window =
+            chrono::Duration::from_std(self.config.loss_window).unwrap_or(chrono::Duration::MAX);
         let window_loss: u128 = state
             .window_history
             .iter()
@@ -451,7 +488,10 @@ impl KillSwitch {
     }
 
     fn apply_trip(&self, state: &mut State, reason: TripReason, now: DateTime<Utc>) -> TripReason {
-        let event = TripEvent { reason: reason.clone(), tripped_at: now };
+        let event = TripEvent {
+            reason: reason.clone(),
+            tripped_at: now,
+        };
         tracing::error!(reason = %event.reason, "kill switch tripped");
         state.trip = Some(event);
         reason
@@ -463,7 +503,9 @@ impl KillSwitch {
     pub fn trip_manual(&self, operator: &str, reason: &str) {
         let mut state = self.state.lock();
         let event = TripEvent {
-            reason: TripReason::Manual { reason: format!("{reason} (operator: {operator})") },
+            reason: TripReason::Manual {
+                reason: format!("{reason} (operator: {operator})"),
+            },
             tripped_at: Utc::now(),
         };
         tracing::error!(reason = %event.reason, "kill switch manually tripped");
@@ -521,7 +563,10 @@ pub struct KillSwitchRegistry {
 impl KillSwitchRegistry {
     pub fn new(default_config: KillSwitchConfig) -> Result<Self> {
         default_config.validate()?;
-        Ok(Self { switches: Arc::new(DashMap::new()), default_config })
+        Ok(Self {
+            switches: Arc::new(DashMap::new()),
+            default_config,
+        })
     }
 
     /// Bug fix: this previously read `!self.switches.contains_key(scope)`
@@ -558,8 +603,12 @@ impl KillSwitchRegistry {
                 metrics::KILL_SWITCH_MAX_CUMULATIVE_LOSS_WEI
                     .with_label_values(&[scope])
                     .set(switch.config().max_cumulative_loss_wei as f64);
-                metrics::KILL_SWITCH_TRIPPED.with_label_values(&[scope]).set(0.0);
-                metrics::KILL_SWITCH_CUMULATIVE_LOSS_WEI.with_label_values(&[scope]).set(0.0);
+                metrics::KILL_SWITCH_TRIPPED
+                    .with_label_values(&[scope])
+                    .set(0.0);
+                metrics::KILL_SWITCH_CUMULATIVE_LOSS_WEI
+                    .with_label_values(&[scope])
+                    .set(0.0);
 
                 switch
             }
@@ -589,7 +638,9 @@ impl KillSwitchRegistry {
             .set(switch.cumulative_loss_wei() as f64);
 
         if result.is_some() {
-            metrics::KILL_SWITCH_TRIPPED.with_label_values(&[scope]).set(1.0);
+            metrics::KILL_SWITCH_TRIPPED
+                .with_label_values(&[scope])
+                .set(1.0);
         }
 
         result
@@ -617,7 +668,9 @@ impl KillSwitchRegistry {
     /// Same as `diagnostics`, but with an explicit timestamp — see
     /// `KillSwitch::diagnostics_at`.
     pub fn diagnostics_at(&self, scope: &str, now: DateTime<Utc>) -> Option<KillSwitchDiagnostics> {
-        self.switches.get(scope).map(|s| s.diagnostics_at(scope, now))
+        self.switches
+            .get(scope)
+            .map(|s| s.diagnostics_at(scope, now))
     }
 
     /// Diagnostic snapshots for every registered scope, for a
@@ -631,7 +684,9 @@ impl KillSwitchRegistry {
 
     pub fn trip_manual(&self, scope: &str, operator: &str, reason: &str) {
         self.get_or_create(scope).trip_manual(operator, reason);
-        metrics::KILL_SWITCH_TRIPPED.with_label_values(&[scope]).set(1.0);
+        metrics::KILL_SWITCH_TRIPPED
+            .with_label_values(&[scope])
+            .set(1.0);
     }
 
     /// Clears a trip for `scope`. On success:
@@ -654,8 +709,12 @@ impl KillSwitchRegistry {
     pub fn reset(&self, scope: &str, operator: &str, reason: &str) -> Result<()> {
         self.get_or_create(scope).reset(operator, reason)?;
 
-        metrics::KILL_SWITCH_TRIPPED.with_label_values(&[scope]).set(0.0);
-        metrics::KILL_SWITCH_RESET_TOTAL.with_label_values(&[scope]).inc();
+        metrics::KILL_SWITCH_TRIPPED
+            .with_label_values(&[scope])
+            .set(0.0);
+        metrics::KILL_SWITCH_RESET_TOTAL
+            .with_label_values(&[scope])
+            .inc();
         // Info-metric pattern: this is a new distinct label combination on
         // every reset with a different operator/reason (Prometheus has no
         // native "overwrite the previous series" primitive), so old
@@ -681,7 +740,9 @@ impl KillSwitchRegistry {
         for entry in self.switches.iter() {
             let scope = entry.key().clone();
             entry.value().trip_manual(operator, reason);
-            metrics::KILL_SWITCH_TRIPPED.with_label_values(&[scope.as_str()]).set(1.0);
+            metrics::KILL_SWITCH_TRIPPED
+                .with_label_values(&[scope.as_str()])
+                .set(1.0);
         }
         tracing::error!(operator, reason, "kill switch: ALL scopes manually tripped");
     }
@@ -730,8 +791,12 @@ mod tests {
         let mut c = cfg();
         c.max_loss_per_window_wei = 10_000_000_000_000_000_000; // 10 ETH
         let k = KillSwitch::new(c).unwrap();
-        assert!(k.record_outcome(Some(-400_000_000_000_000_000), true).is_none());
-        assert!(k.record_outcome(Some(-400_000_000_000_000_000), true).is_none());
+        assert!(k
+            .record_outcome(Some(-400_000_000_000_000_000), true)
+            .is_none());
+        assert!(k
+            .record_outcome(Some(-400_000_000_000_000_000), true)
+            .is_none());
         let tripped = k.record_outcome(Some(-400_000_000_000_000_000), true);
         assert!(matches!(tripped, Some(TripReason::CumulativeLoss { .. })));
         assert!(k.guard().is_err());
@@ -743,14 +808,20 @@ mod tests {
         // sudden fast bleed that hasn't yet reached the all-time cap.
         let mut c = cfg();
         c.max_cumulative_loss_wei = 100_000_000_000_000_000_000; // 100 ETH
-        c.max_loss_per_window_wei = 300_000_000_000_000_000;     // 0.3 ETH
-        c.loss_window = Duration::from_secs(600);                 // 10 min
+        c.max_loss_per_window_wei = 300_000_000_000_000_000; // 0.3 ETH
+        c.loss_window = Duration::from_secs(600); // 10 min
         let k = KillSwitch::new(c).unwrap();
 
         let t0 = Utc::now();
-        assert!(k.record_outcome_at(Some(-100_000_000_000_000_000), true, t0).is_none());
         assert!(k
-            .record_outcome_at(Some(-100_000_000_000_000_000), true, t0 + chrono::Duration::seconds(60))
+            .record_outcome_at(Some(-100_000_000_000_000_000), true, t0)
+            .is_none());
+        assert!(k
+            .record_outcome_at(
+                Some(-100_000_000_000_000_000),
+                true,
+                t0 + chrono::Duration::seconds(60)
+            )
             .is_none());
         let tripped = k.record_outcome_at(
             Some(-100_000_000_000_000_000),
@@ -764,13 +835,17 @@ mod tests {
     fn old_losses_outside_window_are_evicted_and_dont_count() {
         let mut c = cfg();
         c.max_cumulative_loss_wei = 100_000_000_000_000_000_000; // disabled
-        c.max_loss_per_window_wei = 300_000_000_000_000_000;     // 0.3 ETH
-        c.loss_window = Duration::from_secs(600);                 // 10 min
+        c.max_loss_per_window_wei = 300_000_000_000_000_000; // 0.3 ETH
+        c.loss_window = Duration::from_secs(600); // 10 min
         let k = KillSwitch::new(c).unwrap();
 
         let t0 = Utc::now();
         k.record_outcome_at(Some(-200_000_000_000_000_000), true, t0);
-        k.record_outcome_at(Some(-200_000_000_000_000_000), true, t0 + chrono::Duration::seconds(60));
+        k.record_outcome_at(
+            Some(-200_000_000_000_000_000),
+            true,
+            t0 + chrono::Duration::seconds(60),
+        );
         let later = t0 + chrono::Duration::seconds(1200);
         let tripped = k.record_outcome_at(Some(-100_000_000_000_000_000), true, later);
         assert!(tripped.is_none());
@@ -784,7 +859,10 @@ mod tests {
             assert!(k.record_outcome(None, false).is_none());
         }
         let tripped = k.record_outcome(None, false);
-        assert!(matches!(tripped, Some(TripReason::ConsecutiveFailures { .. })));
+        assert!(matches!(
+            tripped,
+            Some(TripReason::ConsecutiveFailures { .. })
+        ));
         assert!(k.guard().is_err());
     }
 
@@ -833,7 +911,9 @@ mod tests {
     fn trip_is_sticky_across_further_outcomes() {
         let k = KillSwitch::new(cfg()).unwrap();
         k.trip_manual("alice", "testing");
-        assert!(k.record_outcome(Some(1_000_000_000_000_000_000), true).is_none());
+        assert!(k
+            .record_outcome(Some(1_000_000_000_000_000_000), true)
+            .is_none());
         assert!(k.guard().is_err());
     }
 
@@ -857,7 +937,9 @@ mod tests {
         k.trip_manual("alice", "suspected bug");
         let diag = k.diagnostics("TEST_SCOPE");
         match diag.status {
-            KillSwitchStatus::Tripped(event) => assert!(matches!(event.reason, TripReason::Manual { .. })),
+            KillSwitchStatus::Tripped(event) => {
+                assert!(matches!(event.reason, TripReason::Manual { .. }))
+            }
             KillSwitchStatus::Armed => panic!("expected tripped"),
         }
     }
@@ -894,8 +976,14 @@ mod tests {
         let c = cfg();
         let k = KillSwitch::new(c.clone()).unwrap();
         let diag = k.diagnostics("TEST_SCOPE");
-        assert_eq!(diag.config.max_cumulative_loss_wei, c.max_cumulative_loss_wei);
-        assert_eq!(diag.config.max_consecutive_failures, c.max_consecutive_failures);
+        assert_eq!(
+            diag.config.max_cumulative_loss_wei,
+            c.max_cumulative_loss_wei
+        );
+        assert_eq!(
+            diag.config.max_consecutive_failures,
+            c.max_consecutive_failures
+        );
     }
 
     #[test]
@@ -949,7 +1037,9 @@ mod tests {
     fn registry_diagnostics_matches_scope_after_trip() {
         let reg = KillSwitchRegistry::new(cfg()).unwrap();
         reg.trip_manual("MEV", "alice", "test trip for diagnostics");
-        let diag = reg.diagnostics("MEV").expect("scope should be registered after trip_manual");
+        let diag = reg
+            .diagnostics("MEV")
+            .expect("scope should be registered after trip_manual");
         assert_eq!(diag.scope, "MEV");
         assert!(diag.status.is_tripped());
     }
@@ -1018,7 +1108,9 @@ mod tests {
         let reg = KillSwitchRegistry::new(cfg()).unwrap();
         let scope = "SCOPE_RESET_ERROR_TEST";
         reg.get_or_create(scope); // register without tripping
-        assert!(reg.reset(scope, "alice", "premature reset attempt").is_err());
+        assert!(reg
+            .reset(scope, "alice", "premature reset attempt")
+            .is_err());
 
         let count = metrics::KILL_SWITCH_RESET_TOTAL
             .with_label_values(&[scope])

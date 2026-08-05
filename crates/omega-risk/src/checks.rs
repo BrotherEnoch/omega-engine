@@ -1,6 +1,6 @@
 // crates/omega-risk/src/checks.rs
 //
-// 15 pre-trade checks in FAST-FAIL order (spec Section 5 / S7 / S11 / S12).
+// 16 pre-trade checks in FAST-FAIL order (spec Section 5 / S7 / S11 / S12).
 //
 // Order is mandatory and maps directly to the spec:
 //   1.  ChainID          — chain_id mismatch → WrongChain
@@ -18,6 +18,7 @@
 //   13. PriceImpact      — LA only: price_impact_bps > 50 → MissPriceImpact
 //   14. AccountExposure  — current_exposure + flashloan_amount > max_exposure → MissExposureLimit
 //   15. NonceReplay      — bp.nonce ≤ latest_blueprint_nonce → StaleBlueprint
+//   16. PriceSanity      — non-sane active price, or spot/TWAP divergence > threshold → MissFlashCrash
 //
 // Fast-fail principle: cheapest checks (no memory allocation, no division) run first.
 // The first failing check returns its DropCode immediately; subsequent checks are skipped.
@@ -114,21 +115,57 @@
 // debug-only detail. `tracing`'s key-value fields already serialize to
 // structured JSON under a JSON-formatted subscriber, so no separate
 // hand-rolled JSON logger is introduced.
+//
+// ## Audit fix (this revision): check 16, oracle price sanity / flash-crash
+// guard, and shared check functions for cross-crate reuse
+//
+// `DropCode::MissFlashCrash` already existed as a match arm in
+// `drop_code_label` below, but no check function ever produced it —
+// nothing in this file, before this revision, ever returned
+// `Some(DropCode::MissFlashCrash)`. Added `check_price_sanity` (check 16)
+// to actually implement it. This closes a real, distinct gap from check 8
+// (`MissOracleDiverge`, Chainlink-vs-Pyth divergence): check 8 does
+// nothing if a relied-upon price is simply non-sane on its own (zero,
+// negative, NaN, infinite — e.g. a malformed or compromised feed), or if
+// Chainlink and Pyth agree with each other but have moved together far
+// from the TWAP reference (which is deliberately harder to manipulate
+// within a single block, being time-weighted). See `OracleSnapshot::
+// spot_twap_divergence`/`has_sane_prices` in context.rs for the underlying
+// logic and `FLASH_CRASH_SPOT_TWAP_DIVERGENCE_THRESHOLD`'s doc comment for
+// why its threshold is deliberately looser than check 8's.
+//
+// Also as of this revision, `check_oracle_freshness`, `check_oracle_
+// hierarchy`, `check_slippage`, and the new `check_price_sanity` are thin
+// wrappers around new `pub` free functions (`oracle_freshness_check`,
+// `oracle_hierarchy_check`, `oracle_price_sanity_check`, `slippage_check`)
+// rather than containing their logic directly. This is so that
+// omega-hot-path — which runs its own <1ms simulation lane entirely
+// outside this 16-check pipeline and previously had NO oracle-freshness,
+// price-sanity, or slippage protection of its own at all — can call the
+// EXACT SAME logic directly, given only an `OracleSnapshot` and/or a
+// slippage figure, without needing to build a full `BlueprintFields` +
+// `CheckContext` (which would require it to resolve
+// `flashloan_provider_id`, `strategy_bytecode_hash` whitelist lookups,
+// etc. — concerns entirely outside the oracle/price/slippage area this
+// change is scoped to). Two divergent implementations of "is this oracle
+// data fresh enough" would be strictly worse than one shared one: any
+// future tuning of a threshold would need to happen in two places and
+// could silently drift out of sync exactly the way the gas-spike/
+// flashloan-safety constants were fixed to prevent above.
 
 use omega_core::errors::DropCode;
 
 use crate::context::{
-    CheckContext, MAX_PRICE_IMPACT_BPS,
-    CHAINLINK_STALENESS_SECS, PYTH_STALENESS_SECS, TWAP_STALENESS_SECS,
-    ORACLE_DIVERGE_THRESHOLD,
-    GAS_SPIKE_THRESHOLD_NUM, GAS_SPIKE_THRESHOLD_DEN,
-    FLASHLOAN_SAFETY_NUM, FLASHLOAN_SAFETY_DEN,
+    CheckContext, OracleSnapshot, CHAINLINK_STALENESS_SECS, FLASHLOAN_SAFETY_DEN,
+    FLASHLOAN_SAFETY_NUM, FLASH_CRASH_SPOT_TWAP_DIVERGENCE_THRESHOLD, GAS_SPIKE_THRESHOLD_DEN,
+    GAS_SPIKE_THRESHOLD_NUM, MAX_PRICE_IMPACT_BPS, ORACLE_DIVERGE_THRESHOLD, PYTH_STALENESS_SECS,
+    TWAP_STALENESS_SECS,
 };
 use crate::metrics;
 
 // ─── Public result type ───────────────────────────────────────────────────────
 
-/// Outcome of running all 15 pre-trade checks.
+/// Outcome of running all 16 pre-trade checks.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CheckResult {
     Pass,
@@ -136,11 +173,86 @@ pub enum CheckResult {
 }
 
 impl CheckResult {
-    pub fn is_pass(&self) -> bool { matches!(self, CheckResult::Pass) }
-    pub fn is_fail(&self) -> bool { matches!(self, CheckResult::Fail(_)) }
-    pub fn drop_code(&self) -> Option<&DropCode> {
-        match self { CheckResult::Fail(c) => Some(c), _ => None }
+    pub fn is_pass(&self) -> bool {
+        matches!(self, CheckResult::Pass)
     }
+    pub fn is_fail(&self) -> bool {
+        matches!(self, CheckResult::Fail(_))
+    }
+    pub fn drop_code(&self) -> Option<&DropCode> {
+        match self {
+            CheckResult::Fail(c) => Some(c),
+            _ => None,
+        }
+    }
+}
+
+// ─── Shared standalone check functions ────────────────────────────────────────
+//
+// See this file's module doc comment, "check 16 ... and shared check
+// functions for cross-crate reuse", for why these are `pub` free
+// functions rather than logic inlined into the `BlueprintFields`/
+// `CheckContext`-shaped private checks below, which now delegate to them.
+
+/// Standalone oracle freshness check (spec S5: MissOracle) — rejects only
+/// when Chainlink, Pyth, AND TWAP are all simultaneously stale.
+///
+/// Callable directly (e.g. from omega-hot-path) without a full
+/// `BlueprintFields`/`CheckContext` — this check never reads blueprint
+/// fields at all, only the oracle snapshot.
+pub fn oracle_freshness_check(oracle: &OracleSnapshot) -> Option<DropCode> {
+    if !oracle.chainlink_fresh() && !oracle.pyth_fresh() && !oracle.twap_fresh() {
+        return Some(DropCode::MissOracle);
+    }
+    None
+}
+
+/// Standalone oracle hierarchy check (spec S5: MissOracleDiverge) —
+/// rejects when Chainlink AND Pyth are both fresh but diverge beyond
+/// `ORACLE_DIVERGE_THRESHOLD`. Skipped (returns `None`) when fewer than
+/// two fresh spot feeds are available to compare.
+pub fn oracle_hierarchy_check(oracle: &OracleSnapshot) -> Option<DropCode> {
+    if oracle.chainlink_fresh() && oracle.pyth_fresh() {
+        if oracle.chainlink_pyth_divergence() > ORACLE_DIVERGE_THRESHOLD {
+            return Some(DropCode::MissOracleDiverge);
+        }
+    }
+    None
+}
+
+/// Standalone oracle price sanity / flash-crash check (check 16,
+/// `DropCode::MissFlashCrash`). Rejects when either:
+///   - any currently-fresh price feed is non-finite or non-positive, or
+///   - a fresh spot price (Chainlink, falling back to Pyth) diverges from
+///     a fresh TWAP by more than
+///     `FLASH_CRASH_SPOT_TWAP_DIVERGENCE_THRESHOLD`.
+///
+/// See this file's module doc comment and `OracleSnapshot::
+/// has_sane_prices`/`spot_twap_divergence` in context.rs for the full
+/// reasoning, including why this is distinct from check 8.
+pub fn oracle_price_sanity_check(oracle: &OracleSnapshot) -> Option<DropCode> {
+    if !oracle.has_sane_prices() {
+        return Some(DropCode::MissFlashCrash);
+    }
+    if let Some(divergence) = oracle.spot_twap_divergence() {
+        if divergence > FLASH_CRASH_SPOT_TWAP_DIVERGENCE_THRESHOLD {
+            return Some(DropCode::MissFlashCrash);
+        }
+    }
+    None
+}
+
+/// Standalone slippage check (spec: MissSlippage) — rejects when
+/// `slippage_bps` exceeds `max_slippage_bps`. Takes plain `u16`s rather
+/// than a `BlueprintFields`/`CheckContext` pair so a caller with only
+/// these two numbers (e.g. omega-hot-path, which selects
+/// `max_slippage_bps` itself from the blueprint's `strategy_id`) can call
+/// this directly.
+pub fn slippage_check(slippage_bps: u16, max_slippage_bps: u16) -> Option<DropCode> {
+    if slippage_bps > max_slippage_bps {
+        return Some(DropCode::MissSlippage);
+    }
+    None
 }
 
 // ─── Blueprint-like trait-object-compatible input ────────────────────────────
@@ -149,35 +261,35 @@ impl CheckResult {
 // omega-risk independent of alloy primitives and allow unit-testing without building
 // a full blueprint.  omega-strategies calls `BlueprintFields::from_blueprint(&bp)`.
 
-/// Minimal blueprint fields required by the 15 pre-trade checks.
+/// Minimal blueprint fields required by the 16 pre-trade checks.
 /// Extracted from ExecutionBlueprint by the caller.
 #[derive(Debug, Clone)]
 pub struct BlueprintFields {
-    pub chain_id:                u64,
-    pub expiry_block:            u64,
-    pub l2_exec_gas_estimate:    u64,
-    pub l1_data_gas_estimate:    u64,
-    pub extraction_gas:          u64,
-    pub expected_profit_net_wei: u128,  // in wei for U256-free comparison
-    pub dynamic_min_profit_wei:  u128,
-    pub l1_data_fee_at_creation: u64,   // gwei
-    pub slippage_bps:            u16,
-    pub flashloan_amount:        u128,
-    pub flashloan_provider_id:   &'static str,
-    pub strategy_id:             &'static str,
-    pub strategy_bytecode_hash:  [u8; 32],
+    pub chain_id: u64,
+    pub expiry_block: u64,
+    pub l2_exec_gas_estimate: u64,
+    pub l1_data_gas_estimate: u64,
+    pub extraction_gas: u64,
+    pub expected_profit_net_wei: u128, // in wei for U256-free comparison
+    pub dynamic_min_profit_wei: u128,
+    pub l1_data_fee_at_creation: u64, // gwei
+    pub slippage_bps: u16,
+    pub flashloan_amount: u128,
+    pub flashloan_provider_id: &'static str,
+    pub strategy_id: &'static str,
+    pub strategy_bytecode_hash: [u8; 32],
     /// Present for LA blueprints only (spec check 13).
-    pub price_impact_bps:        Option<u16>,
-    pub ofa_compliant:           bool,
+    pub price_impact_bps: Option<u16>,
+    pub ofa_compliant: bool,
     /// Monotonically-increasing nonce assigned at blueprint creation.
     /// Used by check 15 to reject stale/replayed blueprints; compared
     /// against `CheckContext::latest_blueprint_nonce`.
-    pub nonce:                   u64,
+    pub nonce: u64,
 }
 
 // ─── Main entry point ─────────────────────────────────────────────────────────
 
-/// Execute all 15 pre-trade checks in fast-fail order.
+/// Execute all 16 pre-trade checks in fast-fail order.
 ///
 /// Returns `CheckResult::Pass` only when every check passes.
 /// The first failing check short-circuits and returns its `DropCode`.
@@ -189,7 +301,9 @@ pub fn run_all_checks(bp: &BlueprintFields, ctx: &CheckContext) -> CheckResult {
     let result = run_checks_inner(bp, ctx);
     match &result {
         CheckResult::Pass => {
-            metrics::CHECKS_PASSED.with_label_values(&[bp.strategy_id]).inc();
+            metrics::CHECKS_PASSED
+                .with_label_values(&[bp.strategy_id])
+                .inc();
         }
         CheckResult::Fail(code) => {
             metrics::CHECKS_FAILED
@@ -215,56 +329,95 @@ pub fn run_all_checks(bp: &BlueprintFields, ctx: &CheckContext) -> CheckResult {
 #[inline]
 fn run_checks_inner(bp: &BlueprintFields, ctx: &CheckContext) -> CheckResult {
     // 1. Chain ID — cheapest possible check; bitwise comparison.
-    if let Some(c) = check_chain_id(bp, ctx) { return CheckResult::Fail(c); }
+    if let Some(c) = check_chain_id(bp, ctx) {
+        return CheckResult::Fail(c);
+    }
 
     // 2. Expiry — integer comparison.
-    if let Some(c) = check_expiry(bp, ctx) { return CheckResult::Fail(c); }
+    if let Some(c) = check_expiry(bp, ctx) {
+        return CheckResult::Fail(c);
+    }
 
     // 3. Gas budget — integer addition + comparison.
-    if let Some(c) = check_gas_budget(bp, ctx) { return CheckResult::Fail(c); }
+    if let Some(c) = check_gas_budget(bp, ctx) {
+        return CheckResult::Fail(c);
+    }
 
     // 4. Whitelist — hash comparison (O(1) hashmap lookup in caller).
-    if let Some(c) = check_whitelist(bp, ctx) { return CheckResult::Fail(c); }
+    if let Some(c) = check_whitelist(bp, ctx) {
+        return CheckResult::Fail(c);
+    }
 
     // 5. Dynamic profit — U128 comparison.
-    if let Some(c) = check_dynamic_profit(bp, ctx) { return CheckResult::Fail(c); }
+    if let Some(c) = check_dynamic_profit(bp, ctx) {
+        return CheckResult::Fail(c);
+    }
 
     // 6. Gas spike — exact integer ratio comparison, no division.
-    if let Some(c) = check_gas_spike(bp, ctx) { return CheckResult::Fail(c); }
+    if let Some(c) = check_gas_spike(bp, ctx) {
+        return CheckResult::Fail(c);
+    }
 
     // 7. Oracle freshness — integer comparisons against age thresholds.
-    if let Some(c) = check_oracle_freshness(bp, ctx) { return CheckResult::Fail(c); }
+    if let Some(c) = check_oracle_freshness(bp, ctx) {
+        return CheckResult::Fail(c);
+    }
 
     // 8. Oracle hierarchy — one float division (only when both feeds fresh).
-    if let Some(c) = check_oracle_hierarchy(bp, ctx) { return CheckResult::Fail(c); }
+    if let Some(c) = check_oracle_hierarchy(bp, ctx) {
+        return CheckResult::Fail(c);
+    }
 
     // 9. Slippage — integer comparison.
-    if let Some(c) = check_slippage(bp, ctx) { return CheckResult::Fail(c); }
+    if let Some(c) = check_slippage(bp, ctx) {
+        return CheckResult::Fail(c);
+    }
 
     // 10. Flashloan liquidity — exact integer ceiling-division comparison.
-    if let Some(c) = check_flashloan_liquidity(bp, ctx) { return CheckResult::Fail(c); }
+    if let Some(c) = check_flashloan_liquidity(bp, ctx) {
+        return CheckResult::Fail(c);
+    }
 
     // 11. Competition — float comparison.
-    if let Some(c) = check_competition(bp, ctx) { return CheckResult::Fail(c); }
+    if let Some(c) = check_competition(bp, ctx) {
+        return CheckResult::Fail(c);
+    }
 
     // 12. Risk score — float comparison.
-    if let Some(c) = check_risk_score(bp, ctx) { return CheckResult::Fail(c); }
+    if let Some(c) = check_risk_score(bp, ctx) {
+        return CheckResult::Fail(c);
+    }
 
     // 13. Price impact — LA only; only evaluated when field is present.
     if bp.price_impact_bps.is_some() {
-        if let Some(c) = check_price_impact(bp, ctx) { return CheckResult::Fail(c); }
+        if let Some(c) = check_price_impact(bp, ctx) {
+            return CheckResult::Fail(c);
+        }
     }
 
     // 14. Account exposure — integer addition + comparison, cheap; placed
     // last only because it was added last, not because it needs 13
     // checks' worth of prior state. Would be equally valid immediately
     // after check 3 (gas budget) in the fast-fail ordering.
-    if let Some(c) = check_account_exposure(bp, ctx) { return CheckResult::Fail(c); }
+    if let Some(c) = check_account_exposure(bp, ctx) {
+        return CheckResult::Fail(c);
+    }
 
     // 15. Nonce replay — single integer comparison, cheapest of all;
     // placed last only because it was added last. Would be equally
     // valid as check 0, ahead of check_chain_id.
-    if let Some(c) = check_nonce_replay(bp, ctx) { return CheckResult::Fail(c); }
+    if let Some(c) = check_nonce_replay(bp, ctx) {
+        return CheckResult::Fail(c);
+    }
+
+    // 16. Price sanity / flash-crash guard — one or two float comparisons
+    // plus finiteness checks, no allocation. Placed last for the same
+    // reason as 14/15 (added last, not because it needs everything
+    // above it); it would be equally valid immediately after check 8,
+    // which it complements.
+    if let Some(c) = check_price_sanity(bp, ctx) {
+        return CheckResult::Fail(c);
+    }
 
     CheckResult::Pass
 }
@@ -294,7 +447,8 @@ fn check_expiry(bp: &BlueprintFields, ctx: &CheckContext) -> Option<DropCode> {
 /// Total gas = l2_exec + l1_data + extraction.
 #[inline]
 fn check_gas_budget(bp: &BlueprintFields, ctx: &CheckContext) -> Option<DropCode> {
-    let total_gas = bp.l2_exec_gas_estimate
+    let total_gas = bp
+        .l2_exec_gas_estimate
         .saturating_add(bp.l1_data_gas_estimate)
         .saturating_add(bp.extraction_gas);
     if ctx.strategy_max_gas > 0 && total_gas > ctx.strategy_max_gas {
@@ -346,8 +500,8 @@ fn check_dynamic_profit(bp: &BlueprintFields, _ctx: &CheckContext) -> Option<Dro
 #[inline]
 fn check_gas_spike(bp: &BlueprintFields, ctx: &CheckContext) -> Option<DropCode> {
     let at_creation = bp.l1_data_fee_at_creation.max(1);
-    let current     = ctx.current_l1_gas_price_gwei;
-    let diff        = current.abs_diff(at_creation);
+    let current = ctx.current_l1_gas_price_gwei;
+    let diff = current.abs_diff(at_creation);
 
     if diff.saturating_mul(GAS_SPIKE_THRESHOLD_DEN)
         > at_creation.saturating_mul(GAS_SPIKE_THRESHOLD_NUM)
@@ -357,26 +511,17 @@ fn check_gas_spike(bp: &BlueprintFields, ctx: &CheckContext) -> Option<DropCode>
     None
 }
 
-/// Check 7: at least one oracle must be within its staleness threshold (spec S5: MissOracle).
-///
-/// Tri-oracle hierarchy: Chainlink primary, Pyth secondary, TWAP tertiary.
-/// Blueprint is rejected only when ALL three feeds are stale simultaneously.
+/// Check 7: at least one oracle must be within its staleness threshold
+/// (spec S5: MissOracle). Delegates to the standalone
+/// `oracle_freshness_check` — see this file's module doc comment for why.
 #[inline]
 fn check_oracle_freshness(_bp: &BlueprintFields, ctx: &CheckContext) -> Option<DropCode> {
-    let cl_ok = ctx.oracle.chainlink_age_s < CHAINLINK_STALENESS_SECS;
-    let py_ok = ctx.oracle.pyth_age_s     < PYTH_STALENESS_SECS;
-    let tw_ok = ctx.oracle.twap_age_s     < TWAP_STALENESS_SECS;
-
-    if !cl_ok && !py_ok && !tw_ok {
-        return Some(DropCode::MissOracle);
-    }
-    None
+    oracle_freshness_check(&ctx.oracle)
 }
 
-/// Check 8: when Chainlink AND Pyth are both fresh, they must agree within 0.4 % (spec S5).
-///
-/// Divergence above threshold = oracle manipulation signal → drop with MissOracleDiverge.
-/// If only one feed is fresh, skip divergence check (handled by hierarchy resolution).
+/// Check 8: when Chainlink AND Pyth are both fresh, they must agree
+/// within 0.4 % (spec S5). Delegates to the standalone
+/// `oracle_hierarchy_check` — see this file's module doc comment for why.
 ///
 /// NOTE: retained as float here (unlike checks 6/10) because the divergence
 /// itself is computed from `f64` oracle prices upstream in
@@ -387,25 +532,15 @@ fn check_oracle_freshness(_bp: &BlueprintFields, ctx: &CheckContext) -> Option<D
 /// the same way checks 6 and 10 were.
 #[inline]
 fn check_oracle_hierarchy(_bp: &BlueprintFields, ctx: &CheckContext) -> Option<DropCode> {
-    let cl_ok = ctx.oracle.chainlink_age_s < CHAINLINK_STALENESS_SECS;
-    let py_ok = ctx.oracle.pyth_age_s     < PYTH_STALENESS_SECS;
-
-    if cl_ok && py_ok {
-        let divergence = ctx.oracle.chainlink_pyth_divergence();
-        if divergence > ORACLE_DIVERGE_THRESHOLD {
-            return Some(DropCode::MissOracleDiverge);
-        }
-    }
-    None
+    oracle_hierarchy_check(&ctx.oracle)
 }
 
-/// Check 9: slippage_bps must not exceed the per-strategy maximum (spec: MissSlippage).
+/// Check 9: slippage_bps must not exceed the per-strategy maximum (spec:
+/// MissSlippage). Delegates to the standalone `slippage_check` — see this
+/// file's module doc comment for why.
 #[inline]
 fn check_slippage(bp: &BlueprintFields, ctx: &CheckContext) -> Option<DropCode> {
-    if bp.slippage_bps > ctx.max_slippage_bps {
-        return Some(DropCode::MissSlippage);
-    }
-    None
+    slippage_check(bp.slippage_bps, ctx.max_slippage_bps)
 }
 
 /// Check 10: flashloan provider must have enough liquidity (spec S11: MissLiquidity).
@@ -425,15 +560,14 @@ fn check_slippage(bp: &BlueprintFields, ctx: &CheckContext) -> Option<DropCode> 
 #[inline]
 fn check_flashloan_liquidity(bp: &BlueprintFields, ctx: &CheckContext) -> Option<DropCode> {
     // No-self-flash rule (spec: "encoded exclusion_list per protocol").
-    if ctx.flashloan.protocol_id.as_str() == bp.flashloan_provider_id
-        && bp.strategy_id == "LA"
-    {
+    if ctx.flashloan.protocol_id.as_str() == bp.flashloan_provider_id && bp.strategy_id == "LA" {
         // Flashloan provider is the same protocol being liquidated — forbidden.
         return Some(DropCode::MissLiquidity);
     }
 
     // Safety margin check — exact integer ceiling division.
-    let required = bp.flashloan_amount
+    let required = bp
+        .flashloan_amount
         .saturating_mul(FLASHLOAN_SAFETY_NUM)
         .div_ceil(FLASHLOAN_SAFETY_DEN);
 
@@ -516,90 +650,101 @@ fn check_nonce_replay(bp: &BlueprintFields, ctx: &CheckContext) -> Option<DropCo
     None
 }
 
+/// Check 16: active oracle prices must be sane, and the fresh spot price
+/// must not have diverged too far from a fresh TWAP (flash-crash /
+/// oracle-manipulation guard, `DropCode::MissFlashCrash`). Delegates to
+/// the standalone `oracle_price_sanity_check` — see this file's module
+/// doc comment for the full reasoning and why this is distinct from
+/// check 8.
+#[inline]
+fn check_price_sanity(_bp: &BlueprintFields, ctx: &CheckContext) -> Option<DropCode> {
+    oracle_price_sanity_check(&ctx.oracle)
+}
+
 // ─── Prometheus label helper ──────────────────────────────────────────────────
 
 fn drop_code_label(code: &DropCode) -> &'static str {
     match code {
-        DropCode::WrongChain          => "wrong_chain",
-        DropCode::MissExpiry          => "miss_expiry",
-        DropCode::MissGas             => "miss_gas",
-        DropCode::MissWhitelist       => "miss_whitelist",
-        DropCode::MissProfit          => "miss_profit",
-        DropCode::MissGasSpike        => "miss_gas_spike",
-        DropCode::MissOracle          => "miss_oracle",
-        DropCode::MissOracleDiverge   => "miss_oracle_diverge",
-        DropCode::MissSlippage        => "miss_slippage",
-        DropCode::MissLiquidity       => "miss_liquidity",
-        DropCode::MissCompetition     => "miss_competition",
-        DropCode::MissRisk            => "miss_risk",
-        DropCode::MissPriceImpact     => "miss_price_impact",
-        DropCode::MissExposureLimit   => "miss_exposure_limit",
-        DropCode::MissDexLiquidity    => "miss_dex_liquidity",
+        DropCode::WrongChain => "wrong_chain",
+        DropCode::MissExpiry => "miss_expiry",
+        DropCode::MissGas => "miss_gas",
+        DropCode::MissWhitelist => "miss_whitelist",
+        DropCode::MissProfit => "miss_profit",
+        DropCode::MissGasSpike => "miss_gas_spike",
+        DropCode::MissOracle => "miss_oracle",
+        DropCode::MissOracleDiverge => "miss_oracle_diverge",
+        DropCode::MissSlippage => "miss_slippage",
+        DropCode::MissLiquidity => "miss_liquidity",
+        DropCode::MissCompetition => "miss_competition",
+        DropCode::MissRisk => "miss_risk",
+        DropCode::MissPriceImpact => "miss_price_impact",
+        DropCode::MissExposureLimit => "miss_exposure_limit",
+        DropCode::MissDexLiquidity => "miss_dex_liquidity",
         DropCode::MissHfNotLiquidatable => "miss_hf_not_liquidatable",
-        DropCode::MissFlashCrash      => "miss_flash_crash",
-        DropCode::StaleBlueprint      => "stale_blueprint",
-        _                             => "other",
+        DropCode::MissFlashCrash => "miss_flash_crash",
+        DropCode::StaleBlueprint => "stale_blueprint",
+        _ => "other",
     }
 }
 
 #[cfg(test)]
 mod checks_tests {
     use super::*;
-    use crate::context::{CheckContext, OracleSnapshot, FlashloanSnapshot};
+    use crate::context::{CheckContext, FlashloanSnapshot, OracleSnapshot};
 
     // ── Test harness ──────────────────────────────────────────────────────────
 
     fn passing_bp() -> BlueprintFields {
         BlueprintFields {
-            chain_id:                42161,
-            expiry_block:            1000,
-            l2_exec_gas_estimate:    100_000,
-            l1_data_gas_estimate:    5_000,
-            extraction_gas:          45_000,
+            chain_id: 42161,
+            expiry_block: 1000,
+            l2_exec_gas_estimate: 100_000,
+            l1_data_gas_estimate: 5_000,
+            extraction_gas: 45_000,
             expected_profit_net_wei: 1_000_000_000_000_000_000, // 1 ETH
-            dynamic_min_profit_wei:  100_000_000_000_000_000,   // 0.1 ETH
+            dynamic_min_profit_wei: 100_000_000_000_000_000,    // 0.1 ETH
             l1_data_fee_at_creation: 50,
-            slippage_bps:            20,
-            flashloan_amount:        1_000_000,
-            flashloan_provider_id:   "balancer",
-            strategy_id:             "SA",
-            strategy_bytecode_hash:  [0xaa; 32],
-            price_impact_bps:        None,
-            ofa_compliant:           true,
-            nonce:                   501, // > passing_ctx's latest_blueprint_nonce (500)
+            slippage_bps: 20,
+            flashloan_amount: 1_000_000,
+            flashloan_provider_id: "balancer",
+            strategy_id: "SA",
+            strategy_bytecode_hash: [0xaa; 32],
+            price_impact_bps: None,
+            ofa_compliant: true,
+            nonce: 501, // > passing_ctx's latest_blueprint_nonce (500)
         }
     }
 
     fn passing_ctx() -> CheckContext {
         CheckContext {
-            expected_chain_id:       42161,
-            current_block:           500,
+            expected_chain_id: 42161,
+            current_block: 500,
             current_l1_gas_price_gwei: 50,
-            current_l2_base_fee_gwei:  1,
-            l1_adaptive_buffer:      1.30,
+            current_l2_base_fee_gwei: 1,
+            l1_adaptive_buffer: 1.30,
             oracle: OracleSnapshot {
                 chainlink_price: 2000.0,
-                pyth_price:      2001.0,  // 0.05 % divergence — within 0.4 %
-                twap_price:      1999.0,
+                pyth_price: 2001.0, // 0.05 % divergence — within 0.4 %
+                twap_price: 1999.0, // ~0.05% from chainlink — well within flash-crash threshold
                 chainlink_age_s: 10,
-                pyth_age_s:      10,
-                twap_age_s:      60,
+                pyth_age_s: 10,
+                twap_age_s: 60,
             },
             flashloan: FlashloanSnapshot {
-                available:   2_000_000,  // 2× the flashloan_amount
+                available: 2_000_000, // 2× the flashloan_amount
                 protocol_id: String::from("balancer"),
             },
-            competition_probability:     0.50,
+            competition_probability: 0.50,
             max_competition_probability: 0.90,
-            strategy_max_gas:            500_000,
-            max_slippage_bps:            30,
-            rollout_tier:                1.0,
-            strategy_bytecode_hash:      [0xaa; 32],
-            risk_score:                  0.30,
-            max_risk_score:              0.80,
+            strategy_max_gas: 500_000,
+            max_slippage_bps: 30,
+            rollout_tier: 1.0,
+            strategy_bytecode_hash: [0xaa; 32],
+            risk_score: 0.30,
+            max_risk_score: 0.80,
             current_account_exposure_wei: 0,
-            max_account_exposure_wei:     10_000_000_000_000_000_000, // 10 ETH headroom
-            latest_blueprint_nonce:       500,
+            max_account_exposure_wei: 10_000_000_000_000_000_000, // 10 ETH headroom
+            latest_blueprint_nonce: 500,
         }
     }
 
@@ -607,7 +752,7 @@ mod checks_tests {
 
     #[test]
     fn all_passing_returns_pass() {
-        let bp  = passing_bp();
+        let bp = passing_bp();
         let ctx = passing_ctx();
         assert_eq!(run_all_checks(&bp, &ctx), CheckResult::Pass);
     }
@@ -619,41 +764,53 @@ mod checks_tests {
         let mut bp = passing_bp();
         bp.chain_id = 1; // Ethereum mainnet
         let ctx = passing_ctx();
-        assert_eq!(run_all_checks(&bp, &ctx), CheckResult::Fail(DropCode::WrongChain));
+        assert_eq!(
+            run_all_checks(&bp, &ctx),
+            CheckResult::Fail(DropCode::WrongChain)
+        );
     }
 
     // ── Check 2: expiry ───────────────────────────────────────────────────────
 
     #[test]
     fn expired_block_fails_at_check_2() {
-        let bp  = passing_bp();
+        let bp = passing_bp();
         let mut ctx = passing_ctx();
         ctx.current_block = 1001; // > expiry_block 1000
-        assert_eq!(run_all_checks(&bp, &ctx), CheckResult::Fail(DropCode::MissExpiry));
+        assert_eq!(
+            run_all_checks(&bp, &ctx),
+            CheckResult::Fail(DropCode::MissExpiry)
+        );
     }
 
     #[test]
     fn block_equal_to_expiry_fails() {
-        let bp  = passing_bp();
+        let bp = passing_bp();
         let mut ctx = passing_ctx();
         ctx.current_block = 1000; // == expiry_block
-        assert_eq!(run_all_checks(&bp, &ctx), CheckResult::Fail(DropCode::MissExpiry));
+        assert_eq!(
+            run_all_checks(&bp, &ctx),
+            CheckResult::Fail(DropCode::MissExpiry)
+        );
     }
 
     // ── Check 3: gas budget ───────────────────────────────────────────────────
 
     #[test]
     fn over_gas_budget_fails_at_check_3() {
-        let bp  = passing_bp();
+        let bp = passing_bp();
         let mut ctx = passing_ctx();
         // total_gas = 100_000 + 5_000 + 45_000 = 150_000; set budget to 100_000
         ctx.strategy_max_gas = 100_000;
-        assert_eq!(run_all_checks(&bp, &ctx), CheckResult::Fail(DropCode::MissGas));
+        assert_eq!(
+            run_all_checks(&bp, &ctx),
+            CheckResult::Fail(DropCode::MissGas)
+        );
     }
 
     #[test]
     fn zero_gas_budget_skips_check() {
-        let bp  = passing_bp();
+        let bp = passing_bp();
         let mut ctx = passing_ctx();
         ctx.strategy_max_gas = 0; // 0 = unlimited
         assert_eq!(run_all_checks(&bp, &ctx), CheckResult::Pass);
@@ -663,10 +820,13 @@ mod checks_tests {
 
     #[test]
     fn wrong_bytecode_hash_fails_at_check_4() {
-        let bp  = passing_bp();
+        let bp = passing_bp();
         let mut ctx = passing_ctx();
         ctx.strategy_bytecode_hash = [0xbb; 32]; // different from bp's 0xaa
-        assert_eq!(run_all_checks(&bp, &ctx), CheckResult::Fail(DropCode::MissWhitelist));
+        assert_eq!(
+            run_all_checks(&bp, &ctx),
+            CheckResult::Fail(DropCode::MissWhitelist)
+        );
     }
 
     // ── Check 5: dynamic profit ───────────────────────────────────────────────
@@ -676,22 +836,28 @@ mod checks_tests {
         let mut bp = passing_bp();
         bp.expected_profit_net_wei = 50_000_000_000_000_000; // 0.05 ETH < min 0.1 ETH
         let ctx = passing_ctx();
-        assert_eq!(run_all_checks(&bp, &ctx), CheckResult::Fail(DropCode::MissProfit));
+        assert_eq!(
+            run_all_checks(&bp, &ctx),
+            CheckResult::Fail(DropCode::MissProfit)
+        );
     }
 
     // ── Check 6: gas spike ────────────────────────────────────────────────────
 
     #[test]
     fn gas_spike_above_30pct_fails_at_check_6() {
-        let bp  = passing_bp(); // l1_at_creation = 50
+        let bp = passing_bp(); // l1_at_creation = 50
         let mut ctx = passing_ctx();
         ctx.current_l1_gas_price_gwei = 75; // 50 % increase > 30 %
-        assert_eq!(run_all_checks(&bp, &ctx), CheckResult::Fail(DropCode::MissGasSpike));
+        assert_eq!(
+            run_all_checks(&bp, &ctx),
+            CheckResult::Fail(DropCode::MissGasSpike)
+        );
     }
 
     #[test]
     fn gas_spike_exactly_30pct_passes() {
-        let bp  = passing_bp(); // l1_at_creation = 50
+        let bp = passing_bp(); // l1_at_creation = 50
         let mut ctx = passing_ctx();
         ctx.current_l1_gas_price_gwei = 65; // 30 % = threshold, not strictly >
         assert_eq!(run_all_checks(&bp, &ctx), CheckResult::Pass);
@@ -701,10 +867,13 @@ mod checks_tests {
     fn gas_spike_decrease_also_triggers() {
         // abs_diff must catch a large DECREASE too, not just an increase —
         // the old float code used .abs() for the same reason.
-        let bp  = passing_bp(); // l1_at_creation = 50
+        let bp = passing_bp(); // l1_at_creation = 50
         let mut ctx = passing_ctx();
         ctx.current_l1_gas_price_gwei = 30; // 40% decrease > 30%
-        assert_eq!(run_all_checks(&bp, &ctx), CheckResult::Fail(DropCode::MissGasSpike));
+        assert_eq!(
+            run_all_checks(&bp, &ctx),
+            CheckResult::Fail(DropCode::MissGasSpike)
+        );
     }
 
     #[test]
@@ -716,10 +885,12 @@ mod checks_tests {
         // rather than a separately-maintained magic number.
         let bp = passing_bp(); // l1_at_creation = 50
         let mut ctx = passing_ctx();
-        let threshold_price =
-            50 + (50 * GAS_SPIKE_THRESHOLD_NUM) / GAS_SPIKE_THRESHOLD_DEN;
+        let threshold_price = 50 + (50 * GAS_SPIKE_THRESHOLD_NUM) / GAS_SPIKE_THRESHOLD_DEN;
         ctx.current_l1_gas_price_gwei = threshold_price + 1;
-        assert_eq!(run_all_checks(&bp, &ctx), CheckResult::Fail(DropCode::MissGasSpike));
+        assert_eq!(
+            run_all_checks(&bp, &ctx),
+            CheckResult::Fail(DropCode::MissGasSpike)
+        );
     }
 
     // ── Check 7: oracle freshness ─────────────────────────────────────────────
@@ -729,9 +900,12 @@ mod checks_tests {
         let bp = passing_bp();
         let mut ctx = passing_ctx();
         ctx.oracle.chainlink_age_s = 100; // > 45s
-        ctx.oracle.pyth_age_s      = 100;
-        ctx.oracle.twap_age_s      = 200; // > 120s
-        assert_eq!(run_all_checks(&bp, &ctx), CheckResult::Fail(DropCode::MissOracle));
+        ctx.oracle.pyth_age_s = 100;
+        ctx.oracle.twap_age_s = 200; // > 120s
+        assert_eq!(
+            run_all_checks(&bp, &ctx),
+            CheckResult::Fail(DropCode::MissOracle)
+        );
     }
 
     #[test]
@@ -739,9 +913,10 @@ mod checks_tests {
         let bp = passing_bp();
         let mut ctx = passing_ctx();
         ctx.oracle.chainlink_age_s = 100;
-        ctx.oracle.pyth_age_s      = 100;
-        ctx.oracle.twap_age_s      = 60; // TWAP fresh
-        // No divergence check when only TWAP is fresh → pass check 8 too.
+        ctx.oracle.pyth_age_s = 100;
+        ctx.oracle.twap_age_s = 60; // TWAP fresh
+                                    // No divergence/hierarchy check when only TWAP is fresh, and no
+                                    // spot price to compare against TWAP for check 16 either → pass.
         assert_eq!(run_all_checks(&bp, &ctx), CheckResult::Pass);
     }
 
@@ -753,10 +928,13 @@ mod checks_tests {
         let mut ctx = passing_ctx();
         // Chainlink 2000, Pyth 2010 → divergence 0.5 % > 0.4 %
         ctx.oracle.chainlink_price = 2000.0;
-        ctx.oracle.pyth_price      = 2010.0;
+        ctx.oracle.pyth_price = 2010.0;
         ctx.oracle.chainlink_age_s = 10;
-        ctx.oracle.pyth_age_s      = 10;
-        assert_eq!(run_all_checks(&bp, &ctx), CheckResult::Fail(DropCode::MissOracleDiverge));
+        ctx.oracle.pyth_age_s = 10;
+        assert_eq!(
+            run_all_checks(&bp, &ctx),
+            CheckResult::Fail(DropCode::MissOracleDiverge)
+        );
     }
 
     #[test]
@@ -764,7 +942,9 @@ mod checks_tests {
         let bp = passing_bp();
         let mut ctx = passing_ctx();
         ctx.oracle.pyth_age_s = 100; // Pyth stale → only Chainlink fresh
-        // Divergence check skipped; check 8 passes.
+        ctx.oracle.twap_age_s = 100; // also make TWAP stale so check 16 has nothing to compare either
+                                     // Divergence check (8) skipped; sanity check (16) has no fresh
+                                     // TWAP to compare the lone fresh spot price against either.
         assert_eq!(run_all_checks(&bp, &ctx), CheckResult::Pass);
     }
 
@@ -775,7 +955,21 @@ mod checks_tests {
         let mut bp = passing_bp();
         bp.slippage_bps = 50; // > max_slippage_bps 30
         let ctx = passing_ctx();
-        assert_eq!(run_all_checks(&bp, &ctx), CheckResult::Fail(DropCode::MissSlippage));
+        assert_eq!(
+            run_all_checks(&bp, &ctx),
+            CheckResult::Fail(DropCode::MissSlippage)
+        );
+    }
+
+    #[test]
+    fn slippage_check_standalone_matches_pipeline_result() {
+        // Regression guard for the refactor: the standalone function and
+        // the full pipeline must agree, since check_slippage now merely
+        // delegates to slippage_check rather than containing its own copy
+        // of the comparison.
+        assert_eq!(slippage_check(50, 30), Some(DropCode::MissSlippage));
+        assert_eq!(slippage_check(30, 30), None, "exactly at max must pass");
+        assert_eq!(slippage_check(20, 30), None);
     }
 
     // ── Check 10: liquidity ───────────────────────────────────────────────────
@@ -785,19 +979,25 @@ mod checks_tests {
         let bp = passing_bp(); // flashloan_amount = 1_000_000
         let mut ctx = passing_ctx();
         ctx.flashloan.available = 1_100_000; // < 1_000_000 × 1.20 = 1_200_000
-        assert_eq!(run_all_checks(&bp, &ctx), CheckResult::Fail(DropCode::MissLiquidity));
+        assert_eq!(
+            run_all_checks(&bp, &ctx),
+            CheckResult::Fail(DropCode::MissLiquidity)
+        );
     }
 
     #[test]
     fn self_flash_la_fails_at_check_10() {
         let mut bp = passing_bp();
-        bp.strategy_id           = "LA";
+        bp.strategy_id = "LA";
         bp.flashloan_provider_id = "aave";
         let mut ctx = passing_ctx();
         ctx.flashloan.protocol_id = String::from("aave"); // same as flashloan provider
-        // Ensure other fields pass so we reach check 10.
+                                                          // Ensure other fields pass so we reach check 10.
         ctx.strategy_max_gas = 1_000_000;
-        assert_eq!(run_all_checks(&bp, &ctx), CheckResult::Fail(DropCode::MissLiquidity));
+        assert_eq!(
+            run_all_checks(&bp, &ctx),
+            CheckResult::Fail(DropCode::MissLiquidity)
+        );
     }
 
     #[test]
@@ -813,7 +1013,10 @@ mod checks_tests {
         // True requirement: 1_000_001 * 1.20 = 1_200_001.2
         // Floor would require only 1_200_001; ceiling requires 1_200_002.
         ctx.flashloan.available = 1_200_001;
-        assert_eq!(run_all_checks(&bp, &ctx), CheckResult::Fail(DropCode::MissLiquidity));
+        assert_eq!(
+            run_all_checks(&bp, &ctx),
+            CheckResult::Fail(DropCode::MissLiquidity)
+        );
     }
 
     #[test]
@@ -835,7 +1038,10 @@ mod checks_tests {
         assert_eq!(run_all_checks(&bp, &ctx), CheckResult::Pass);
 
         ctx.flashloan.available = 1_199_999;
-        assert_eq!(run_all_checks(&bp, &ctx), CheckResult::Fail(DropCode::MissLiquidity));
+        assert_eq!(
+            run_all_checks(&bp, &ctx),
+            CheckResult::Fail(DropCode::MissLiquidity)
+        );
     }
 
     // ── Check 11: competition ─────────────────────────────────────────────────
@@ -844,9 +1050,12 @@ mod checks_tests {
     fn high_competition_fails_at_check_11() {
         let bp = passing_bp();
         let mut ctx = passing_ctx();
-        ctx.competition_probability     = 0.95;
+        ctx.competition_probability = 0.95;
         ctx.max_competition_probability = 0.90;
-        assert_eq!(run_all_checks(&bp, &ctx), CheckResult::Fail(DropCode::MissCompetition));
+        assert_eq!(
+            run_all_checks(&bp, &ctx),
+            CheckResult::Fail(DropCode::MissCompetition)
+        );
     }
 
     // ── Check 12: risk score ──────────────────────────────────────────────────
@@ -855,9 +1064,12 @@ mod checks_tests {
     fn high_risk_score_fails_at_check_12() {
         let bp = passing_bp();
         let mut ctx = passing_ctx();
-        ctx.risk_score    = 0.95;
+        ctx.risk_score = 0.95;
         ctx.max_risk_score = 0.80;
-        assert_eq!(run_all_checks(&bp, &ctx), CheckResult::Fail(DropCode::MissRisk));
+        assert_eq!(
+            run_all_checks(&bp, &ctx),
+            CheckResult::Fail(DropCode::MissRisk)
+        );
     }
 
     // ── Check 13: price impact (LA only) ─────────────────────────────────────
@@ -867,7 +1079,10 @@ mod checks_tests {
         let mut bp = passing_bp();
         bp.price_impact_bps = Some(51);
         let ctx = passing_ctx();
-        assert_eq!(run_all_checks(&bp, &ctx), CheckResult::Fail(DropCode::MissPriceImpact));
+        assert_eq!(
+            run_all_checks(&bp, &ctx),
+            CheckResult::Fail(DropCode::MissPriceImpact)
+        );
     }
 
     #[test]
@@ -893,7 +1108,7 @@ mod checks_tests {
         let bp = passing_bp(); // flashloan_amount = 1_000_000
         let mut ctx = passing_ctx();
         ctx.current_account_exposure_wei = 0;
-        ctx.max_account_exposure_wei     = 2_000_000;
+        ctx.max_account_exposure_wei = 2_000_000;
         assert_eq!(run_all_checks(&bp, &ctx), CheckResult::Pass);
     }
 
@@ -902,8 +1117,11 @@ mod checks_tests {
         let bp = passing_bp(); // flashloan_amount = 1_000_000
         let mut ctx = passing_ctx();
         ctx.current_account_exposure_wei = 900_000;
-        ctx.max_account_exposure_wei     = 1_000_000; // 900_000 + 1_000_000 > 1_000_000
-        assert_eq!(run_all_checks(&bp, &ctx), CheckResult::Fail(DropCode::MissExposureLimit));
+        ctx.max_account_exposure_wei = 1_000_000; // 900_000 + 1_000_000 > 1_000_000
+        assert_eq!(
+            run_all_checks(&bp, &ctx),
+            CheckResult::Fail(DropCode::MissExposureLimit)
+        );
     }
 
     #[test]
@@ -911,7 +1129,7 @@ mod checks_tests {
         let bp = passing_bp(); // flashloan_amount = 1_000_000
         let mut ctx = passing_ctx();
         ctx.current_account_exposure_wei = 0;
-        ctx.max_account_exposure_wei     = 1_000_000; // exactly equal, not strictly over
+        ctx.max_account_exposure_wei = 1_000_000; // exactly equal, not strictly over
         assert_eq!(run_all_checks(&bp, &ctx), CheckResult::Pass);
     }
 
@@ -927,10 +1145,10 @@ mod checks_tests {
         // flashloan_amount used here.
         let mut bp = passing_bp();
         bp.flashloan_amount = 10; // tiny real exposure
-        // expected_profit_net_wei is 1_000_000_000_000_000_000 (1 ETH) from passing_bp
+                                  // expected_profit_net_wei is 1_000_000_000_000_000_000 (1 ETH) from passing_bp
         let mut ctx = passing_ctx();
         ctx.current_account_exposure_wei = 0;
-        ctx.max_account_exposure_wei     = 1_000; // far smaller than expected_profit_net_wei
+        ctx.max_account_exposure_wei = 1_000; // far smaller than expected_profit_net_wei
         assert_eq!(
             run_all_checks(&bp, &ctx),
             CheckResult::Pass,
@@ -944,14 +1162,17 @@ mod checks_tests {
         let bp = passing_bp(); // flashloan_amount = 1_000_000
         let mut ctx = passing_ctx();
         ctx.current_account_exposure_wei = u128::MAX - 10; // near overflow
-        ctx.max_account_exposure_wei     = u128::MAX;
+        ctx.max_account_exposure_wei = u128::MAX;
         // saturating_add caps at u128::MAX, which is > nothing except
         // itself — with max_account_exposure_wei also at u128::MAX this
         // specific case is right at the boundary (equal, not over), so
         // assert it does NOT panic and resolves deterministically rather
         // than asserting a specific pass/fail here.
         let result = run_all_checks(&bp, &ctx);
-        assert!(result.is_pass() || result.is_fail(), "must resolve without panicking on overflow");
+        assert!(
+            result.is_pass() || result.is_fail(),
+            "must resolve without panicking on overflow"
+        );
     }
 
     // ── Check 15: nonce replay ────────────────────────────────────────────────
@@ -971,7 +1192,10 @@ mod checks_tests {
         bp.nonce = 500;
         let mut ctx = passing_ctx();
         ctx.latest_blueprint_nonce = 500;
-        assert_eq!(run_all_checks(&bp, &ctx), CheckResult::Fail(DropCode::StaleBlueprint));
+        assert_eq!(
+            run_all_checks(&bp, &ctx),
+            CheckResult::Fail(DropCode::StaleBlueprint)
+        );
     }
 
     #[test]
@@ -980,7 +1204,10 @@ mod checks_tests {
         bp.nonce = 499;
         let mut ctx = passing_ctx();
         ctx.latest_blueprint_nonce = 500;
-        assert_eq!(run_all_checks(&bp, &ctx), CheckResult::Fail(DropCode::StaleBlueprint));
+        assert_eq!(
+            run_all_checks(&bp, &ctx),
+            CheckResult::Fail(DropCode::StaleBlueprint)
+        );
     }
 
     #[test]
@@ -992,28 +1219,169 @@ mod checks_tests {
         bp.nonce = 0;
         let mut ctx = passing_ctx();
         ctx.latest_blueprint_nonce = 0;
-        assert_eq!(run_all_checks(&bp, &ctx), CheckResult::Fail(DropCode::StaleBlueprint));
+        assert_eq!(
+            run_all_checks(&bp, &ctx),
+            CheckResult::Fail(DropCode::StaleBlueprint)
+        );
+    }
+
+    // ── Check 16: price sanity / flash-crash guard ───────────────────────────
+
+    #[test]
+    fn zero_price_on_fresh_oracle_fails_at_check_16() {
+        let bp = passing_bp();
+        let mut ctx = passing_ctx();
+        ctx.oracle.chainlink_price = 0.0; // chainlink is fresh (age 10s) but price is garbage
+        assert_eq!(
+            run_all_checks(&bp, &ctx),
+            CheckResult::Fail(DropCode::MissFlashCrash)
+        );
+    }
+
+    #[test]
+    fn negative_price_on_fresh_oracle_fails_at_check_16() {
+        let bp = passing_bp();
+        let mut ctx = passing_ctx();
+        ctx.oracle.pyth_price = -100.0;
+        assert_eq!(
+            run_all_checks(&bp, &ctx),
+            CheckResult::Fail(DropCode::MissFlashCrash)
+        );
+    }
+
+    #[test]
+    fn nan_price_on_fresh_oracle_fails_at_check_16() {
+        let bp = passing_bp();
+        let mut ctx = passing_ctx();
+        ctx.oracle.twap_price = f64::NAN;
+        assert_eq!(
+            run_all_checks(&bp, &ctx),
+            CheckResult::Fail(DropCode::MissFlashCrash)
+        );
+    }
+
+    #[test]
+    fn infinite_price_on_fresh_oracle_fails_at_check_16() {
+        let bp = passing_bp();
+        let mut ctx = passing_ctx();
+        ctx.oracle.chainlink_price = f64::INFINITY;
+        assert_eq!(
+            run_all_checks(&bp, &ctx),
+            CheckResult::Fail(DropCode::MissFlashCrash)
+        );
+    }
+
+    #[test]
+    fn non_sane_price_on_stale_oracle_does_not_fail_check_16() {
+        // A garbage price on a feed that's already stale (and therefore
+        // not relied upon) must not trip the sanity guard — only fresh,
+        // actively-relied-upon feeds are checked.
+        let bp = passing_bp();
+        let mut ctx = passing_ctx();
+        ctx.oracle.pyth_age_s = 100; // pyth now stale
+        ctx.oracle.pyth_price = -999.0; // garbage, but irrelevant since stale
+        assert_eq!(run_all_checks(&bp, &ctx), CheckResult::Pass);
+    }
+
+    #[test]
+    fn spot_twap_divergence_within_threshold_passes() {
+        let bp = passing_bp();
+        let mut ctx = passing_ctx();
+        ctx.oracle.chainlink_price = 2000.0;
+        ctx.oracle.twap_price = 1900.0; // ~5.3% divergence, well under 15% threshold
+        ctx.oracle.pyth_price = 2000.0; // keep check 8 happy (0% CL/Pyth divergence)
+        assert_eq!(run_all_checks(&bp, &ctx), CheckResult::Pass);
+    }
+
+    #[test]
+    fn spot_twap_divergence_above_threshold_fails_at_check_16() {
+        let bp = passing_bp();
+        let mut ctx = passing_ctx();
+        ctx.oracle.chainlink_price = 2000.0;
+        ctx.oracle.pyth_price = 2000.0; // CL/Pyth agree — check 8 passes
+        ctx.oracle.twap_price = 1000.0; // 100% divergence from spot — flash crash
+        assert_eq!(
+            run_all_checks(&bp, &ctx),
+            CheckResult::Fail(DropCode::MissFlashCrash)
+        );
+    }
+
+    #[test]
+    fn spot_twap_divergence_skipped_when_twap_stale() {
+        let bp = passing_bp();
+        let mut ctx = passing_ctx();
+        ctx.oracle.twap_age_s = 200; // stale (> 120s)
+        ctx.oracle.twap_price = 1.0; // would otherwise diverge wildly from spot ~2000
+        assert_eq!(run_all_checks(&bp, &ctx), CheckResult::Pass);
+    }
+
+    #[test]
+    fn oracle_price_sanity_check_standalone_matches_pipeline_result() {
+        // Regression guard for the refactor: the standalone function used
+        // directly by omega-hot-path must agree with what the full
+        // pipeline produces for the identical oracle snapshot.
+        let mut ctx = passing_ctx();
+        assert_eq!(oracle_price_sanity_check(&ctx.oracle), None);
+
+        ctx.oracle.chainlink_price = -1.0;
+        assert_eq!(
+            oracle_price_sanity_check(&ctx.oracle),
+            Some(DropCode::MissFlashCrash)
+        );
+    }
+
+    #[test]
+    fn oracle_freshness_check_standalone_matches_pipeline_result() {
+        let mut ctx = passing_ctx();
+        assert_eq!(oracle_freshness_check(&ctx.oracle), None);
+
+        ctx.oracle.chainlink_age_s = 100;
+        ctx.oracle.pyth_age_s = 100;
+        ctx.oracle.twap_age_s = 200;
+        assert_eq!(
+            oracle_freshness_check(&ctx.oracle),
+            Some(DropCode::MissOracle)
+        );
+    }
+
+    #[test]
+    fn oracle_hierarchy_check_standalone_matches_pipeline_result() {
+        let mut ctx = passing_ctx();
+        assert_eq!(oracle_hierarchy_check(&ctx.oracle), None);
+
+        ctx.oracle.chainlink_price = 2000.0;
+        ctx.oracle.pyth_price = 2010.0; // 0.5% > 0.4% threshold
+        assert_eq!(
+            oracle_hierarchy_check(&ctx.oracle),
+            Some(DropCode::MissOracleDiverge)
+        );
     }
 
     // ── Fast-fail ordering ────────────────────────────────────────────────────
 
     #[test]
     fn chain_id_fails_before_expiry() {
-        let mut bp  = passing_bp();
+        let mut bp = passing_bp();
         bp.chain_id = 1; // check 1 fails
         let mut ctx = passing_ctx();
         ctx.current_block = 9999; // check 2 would also fail
-        // Should return WrongChain, not MissExpiry.
-        assert_eq!(run_all_checks(&bp, &ctx), CheckResult::Fail(DropCode::WrongChain));
+                                  // Should return WrongChain, not MissExpiry.
+        assert_eq!(
+            run_all_checks(&bp, &ctx),
+            CheckResult::Fail(DropCode::WrongChain)
+        );
     }
 
     #[test]
     fn expiry_fails_before_gas_budget() {
-        let bp  = passing_bp();
+        let bp = passing_bp();
         let mut ctx = passing_ctx();
-        ctx.current_block    = 9999; // check 2 fails
-        ctx.strategy_max_gas = 1;    // check 3 would also fail
-        assert_eq!(run_all_checks(&bp, &ctx), CheckResult::Fail(DropCode::MissExpiry));
+        ctx.current_block = 9999; // check 2 fails
+        ctx.strategy_max_gas = 1; // check 3 would also fail
+        assert_eq!(
+            run_all_checks(&bp, &ctx),
+            CheckResult::Fail(DropCode::MissExpiry)
+        );
     }
 
     #[test]
@@ -1022,11 +1390,14 @@ mod checks_tests {
         // but as implemented it runs last — confirm the code's actual
         // order (chain_id first) is what governs, not check cost alone.
         let mut bp = passing_bp();
-        bp.chain_id = 1;   // check 1 fails
-        bp.nonce    = 0;   // check 15 would also fail
+        bp.chain_id = 1; // check 1 fails
+        bp.nonce = 0; // check 15 would also fail
         let mut ctx = passing_ctx();
         ctx.latest_blueprint_nonce = 0;
-        assert_eq!(run_all_checks(&bp, &ctx), CheckResult::Fail(DropCode::WrongChain));
+        assert_eq!(
+            run_all_checks(&bp, &ctx),
+            CheckResult::Fail(DropCode::WrongChain)
+        );
     }
 
     #[test]
@@ -1034,8 +1405,26 @@ mod checks_tests {
         let bp = passing_bp(); // nonce = 501
         let mut ctx = passing_ctx();
         ctx.current_account_exposure_wei = 900_000;
-        ctx.max_account_exposure_wei     = 1_000_000; // check 14 fails
-        ctx.latest_blueprint_nonce       = 999;        // check 15 would also fail (501 <= 999)
-        assert_eq!(run_all_checks(&bp, &ctx), CheckResult::Fail(DropCode::MissExposureLimit));
+        ctx.max_account_exposure_wei = 1_000_000; // check 14 fails
+        ctx.latest_blueprint_nonce = 999; // check 15 would also fail (501 <= 999)
+        assert_eq!(
+            run_all_checks(&bp, &ctx),
+            CheckResult::Fail(DropCode::MissExposureLimit)
+        );
+    }
+
+    #[test]
+    fn nonce_replay_fails_before_price_sanity() {
+        // check 16 runs last — confirm check 15 (nonce) still wins when
+        // both would fail, since code order (not cost) governs.
+        let mut bp = passing_bp();
+        bp.nonce = 0;
+        let mut ctx = passing_ctx();
+        ctx.latest_blueprint_nonce = 0; // check 15 fails
+        ctx.oracle.chainlink_price = -1.0; // check 16 would also fail
+        assert_eq!(
+            run_all_checks(&bp, &ctx),
+            CheckResult::Fail(DropCode::StaleBlueprint)
+        );
     }
 }

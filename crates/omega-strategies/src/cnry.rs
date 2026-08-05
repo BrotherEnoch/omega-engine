@@ -15,11 +15,11 @@
 // construction site.
 
 use std::sync::{
-    Arc,
     atomic::{AtomicU64, Ordering},
+    Arc,
 };
 
-use alloy_primitives::{B256, Bytes, U256};
+use alloy_primitives::{Bytes, B256, U256};
 use anyhow::Result;
 use async_trait::async_trait;
 
@@ -33,18 +33,18 @@ use omega_core::{GasConfig, OmegaConfig};
 // Constants
 // ─────────────────────────────────────────────────────────────────────────────
 
-const CNRY_GAS_BUDGET:    u64  = 0;
+const CNRY_GAS_BUDGET: u64 = 0;
 const CNRY_BYTECODE_HASH: B256 = B256::ZERO;
-const CNRY_SPREAD_WEI:    u128 = 200_000_000_000_000_000; // 0.2 ETH
+const CNRY_SPREAD_WEI: u128 = 200_000_000_000_000_000; // 0.2 ETH
 
 // ─────────────────────────────────────────────────────────────────────────────
 // CnryStrategy
 // ─────────────────────────────────────────────────────────────────────────────
 
 pub struct CnryStrategy {
-    chain_id:     u64,
+    chain_id: u64,
     scored_count: AtomicU64,
-    gas:          GasConfig,
+    gas: GasConfig,
 }
 
 impl CnryStrategy {
@@ -70,7 +70,7 @@ impl CnryStrategy {
             };
         }
 
-        let spread_wei  = U256::from(CNRY_SPREAD_WEI);
+        let spread_wei = U256::from(CNRY_SPREAD_WEI);
         let l2_cost_gwei = (200_000_f64
             * self.gas.l2_buffer_factor
             * (signal.base_fee_gwei as f64
@@ -86,10 +86,9 @@ impl CnryStrategy {
             };
         }
 
-        let net              = spread_wei.saturating_sub(cost_wei);
+        let net = spread_wei.saturating_sub(cost_wei);
         let competition_prob = 0.35_f64;
-        let score = (1.0 - competition_prob)
-            * (net.saturating_to::<u128>() as f64 / 1e15).min(1.0);
+        let score = (1.0 - competition_prob) * (net.saturating_to::<u128>() as f64 / 1e15).min(1.0);
 
         OpScore {
             score: score.clamp(0.0, 1.0),
@@ -101,36 +100,56 @@ impl CnryStrategy {
 
 #[async_trait]
 impl StrategyTrait for CnryStrategy {
-    fn strategy_id(&self)           -> StrategyId { StrategyId::Cnry }
-    fn lane(&self)                  -> Lane        { Lane::Microtx }
-    fn hot_path_eligible(&self)     -> bool        { false }
-    fn gas_budget(&self)            -> u64         { CNRY_GAS_BUDGET }
-    fn expected_bytecode_hash(&self)-> B256        { CNRY_BYTECODE_HASH }
-    fn is_canary(&self)             -> bool        { true }
+    fn strategy_id(&self) -> StrategyId {
+        StrategyId::Cnry
+    }
+    fn lane(&self) -> Lane {
+        Lane::Microtx
+    }
+    fn hot_path_eligible(&self) -> bool {
+        false
+    }
+    fn gas_budget(&self) -> u64 {
+        CNRY_GAS_BUDGET
+    }
+    fn expected_bytecode_hash(&self) -> B256 {
+        CNRY_BYTECODE_HASH
+    }
+    fn is_canary(&self) -> bool {
+        true
+    }
 
-    fn base_min_profit_wei(&self) -> U256 { U256::ZERO }
+    fn base_min_profit_wei(&self) -> U256 {
+        U256::ZERO
+    }
 
     async fn score(&self, signal: &SignalState) -> Result<OpScore> {
         let op = self.compute_score(signal);
         self.scored_count.fetch_add(1, Ordering::Relaxed);
         tracing::debug!(
-            chain_id     = self.chain_id,
+            chain_id = self.chain_id,
             block_number = signal.block_number,
-            score        = op.score,
+            score = op.score,
             "CNRY scored opportunity",
         );
         Ok(op)
     }
 
     async fn build_blueprint(&self, _signal: &SignalState) -> Result<ExecutionBlueprint> {
-        Err(anyhow::anyhow!(OmegaError::dropped(DropCode::MissWhitelist)))
+        Err(anyhow::anyhow!(OmegaError::dropped(
+            DropCode::MissWhitelist
+        )))
     }
 
     async fn simulate(&self, _bp: &ExecutionBlueprint) -> Result<SimResult> {
-        Err(anyhow::anyhow!(OmegaError::dropped(DropCode::MissWhitelist)))
+        Err(anyhow::anyhow!(OmegaError::dropped(
+            DropCode::MissWhitelist
+        )))
     }
 
-    fn encode_calldata(&self, _bp: &ExecutionBlueprint) -> Bytes { Bytes::new() }
+    fn encode_calldata(&self, _bp: &ExecutionBlueprint) -> Bytes {
+        Bytes::new()
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -152,11 +171,11 @@ mod tests {
     fn signal(base_fee: u64) -> SignalState {
         SignalState {
             state_version: 1,
-            chain_id:      42161,
-            block_number:  1_000_000,
+            chain_id: 42161,
+            block_number: 1_000_000,
             base_fee_gwei: base_fee,
             l1_data_fee_gwei: 2,
-            state_hash:    B256::from([0x01; 32]),
+            state_hash: B256::from([0x01; 32]),
         }
     }
 
@@ -171,39 +190,39 @@ mod tests {
         let client_order_id =
             ExecutionBlueprint::derive_client_order_id(StrategyId::Cnry, 42161, 0, signal_id);
         ExecutionBlueprint {
-            blueprint_hash:          B256::ZERO,
-            chain_id:                42161,
-            strategy_id:             StrategyId::Cnry,
-            lane:                    Lane::Microtx,
-            simulator:               omega_core::types::lane::Simulator::Revm,
-            signal_state_hash:       B256::ZERO,
-            state_version:           0,
+            blueprint_hash: B256::ZERO,
+            chain_id: 42161,
+            strategy_id: StrategyId::Cnry,
+            lane: Lane::Microtx,
+            simulator: omega_core::types::lane::Simulator::Revm,
+            signal_state_hash: B256::ZERO,
+            state_version: 0,
             signal_id,
-            flashloan_provider:      Address::ZERO,
-            flashloan_amount:        U256::ZERO,
-            flashloan_available:     U256::ZERO,
-            calldata:                Bytes::new(),
-            strategy_bytecode_hash:  B256::ZERO,
-            l2_exec_gas_estimate:    0,
-            l1_data_gas_estimate:    0,
-            extraction_gas:          0,
-            expected_profit_net:     U256::ZERO,
-            dynamic_min_profit:      U256::ZERO,
-            l2_buffer_factor:        1.0,
-            l1_data_buffer_factor:   1.0,
-            slippage_bps:            0,
-            base_fee_at_creation:    0,
+            flashloan_provider: Address::ZERO,
+            flashloan_amount: U256::ZERO,
+            flashloan_available: U256::ZERO,
+            calldata: Bytes::new(),
+            strategy_bytecode_hash: B256::ZERO,
+            l2_exec_gas_estimate: 0,
+            l1_data_gas_estimate: 0,
+            extraction_gas: 0,
+            expected_profit_net: U256::ZERO,
+            dynamic_min_profit: U256::ZERO,
+            l2_buffer_factor: 1.0,
+            l1_data_buffer_factor: 1.0,
+            slippage_bps: 0,
+            base_fee_at_creation: 0,
             l1_data_fee_at_creation: 0,
-            priority_fee_gwei:       0,
-            price_impact_bps:        None,
-            ofa_compliant:           false,
-            expiry_block:            0,
-            nonce:                   0,
-            confirmation_depth:      12,
+            priority_fee_gwei: 0,
+            price_impact_bps: None,
+            ofa_compliant: false,
+            expiry_block: 0,
+            nonce: 0,
+            confirmation_depth: 12,
             client_order_id,
-            idempotency_key:         B256::ZERO,
-            relay_targets:           vec![],
-            zk_proof_commitment:     None,
+            idempotency_key: B256::ZERO,
+            relay_targets: vec![],
+            zk_proof_commitment: None,
         }
     }
 
@@ -218,7 +237,7 @@ mod tests {
 
     #[tokio::test]
     async fn score_low_fee_positive() {
-        let s  = make_strategy();
+        let s = make_strategy();
         let op = s.score(&signal(5)).await.unwrap();
         assert!(op.score > 0.0);
         assert_eq!(s.scored_count(), 1);
@@ -226,28 +245,28 @@ mod tests {
 
     #[tokio::test]
     async fn score_high_fee_zero() {
-        let s  = make_strategy();
+        let s = make_strategy();
         let op = s.score(&signal(100)).await.unwrap();
         assert_eq!(op.score, 0.0);
     }
 
     #[tokio::test]
     async fn build_blueprint_blocked() {
-        let s   = make_strategy();
+        let s = make_strategy();
         let err = s.build_blueprint(&signal(5)).await;
         assert!(err.is_err(), "CNRY must never build blueprints");
     }
 
     #[tokio::test]
     async fn simulate_blocked() {
-        let s  = make_strategy();
+        let s = make_strategy();
         let bp = test_blueprint();
         assert!(s.simulate(&bp).await.is_err(), "CNRY must never simulate");
     }
 
     #[test]
     fn encode_calldata_empty() {
-        let s  = make_strategy();
+        let s = make_strategy();
         let bp = test_blueprint();
         assert!(s.encode_calldata(&bp).is_empty());
     }

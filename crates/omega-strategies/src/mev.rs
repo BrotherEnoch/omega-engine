@@ -61,6 +61,21 @@
 // Removed `compute_blueprint_hash` entirely and switched to the
 // canonical `bp.compute_hash()`. Also adds `signal_id`,
 // `client_order_id`, `idempotency_key`.
+//
+// ## Capital-path marker (this revision)
+//
+// `flashloan_provider`/`flashloan_amount`/`flashloan_available` below
+// are all zero, matching this file's own long-standing claim that MEV
+// does not use flashloans — see the inline TODO(capital-path) comment
+// in `build_blueprint` for what that claim does and doesn't cover if
+// this strategy ever needs borrowable capital in the future.
+//
+// ## `max_base_fee_gwei` (this revision)
+//
+// `ExecutionBlueprint` gained a `max_base_fee_gwei` field (compile
+// error otherwise: E0063 missing field). PLACEHOLDER VALUE, same
+// caveat as sa.rs/msa.rs/la.rs — set as `base_fee_at_creation * 3`
+// pending confirmation of the field's real intended semantics.
 
 use std::sync::{
     atomic::{AtomicU64, Ordering},
@@ -100,6 +115,10 @@ const ADVERSE_SELECTION_THRESHOLD: f64 = 0.5;
 ///
 /// The remaining 70% is competition buffer and slippage headroom.
 const IMPACT_CAPTURE_FRACTION: f64 = 0.30;
+
+/// Placeholder multiplier for `max_base_fee_gwei` — see module-level
+/// comment on this revision's `max_base_fee_gwei` addition.
+const MAX_BASE_FEE_HEADROOM_MULTIPLIER: u64 = 3;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // MevStrategy
@@ -312,8 +331,12 @@ impl StrategyTrait for MevStrategy {
         let l1_buf = self.gas.l1_data_buffer_factor;
 
         let signal_id = Uuid::new_v4();
-        let client_order_id =
-            ExecutionBlueprint::derive_client_order_id(StrategyId::Mev, self.chain_id, nonce, signal_id);
+        let client_order_id = ExecutionBlueprint::derive_client_order_id(
+            StrategyId::Mev,
+            self.chain_id,
+            nonce,
+            signal_id,
+        );
 
         // Partially-built blueprint for hash computation
         let mut bp = ExecutionBlueprint {
@@ -325,9 +348,21 @@ impl StrategyTrait for MevStrategy {
             signal_state_hash: signal.state_hash,
             state_version: signal.state_version,
             signal_id,
+            // TODO(capital-path): Strategy comment claims "MEV does not use flashloans."
+            // Zero provider/amount matches that claim and resolve_flashloan_provider_id's
+            // Ok("none") path. There is still no on-chain no-flashloan / PIL-inventory
+            // execution path if this strategy ever needs borrowable capital. Do not
+            // populate a non-zero flashloan_token without either select_provider wiring
+            // or an explicit product decision that MEV remains self/externally funded
+            // outside the Orchestrator flashloan flow.
             flashloan_provider: Address::ZERO, // MEV does not use flashloans
             flashloan_amount: U256::ZERO,
             flashloan_available: U256::ZERO,
+            // PLACEHOLDER — see module-level comment on this revision's
+            // max_base_fee_gwei addition.
+            max_base_fee_gwei: signal
+                .base_fee_gwei
+                .saturating_mul(MAX_BASE_FEE_HEADROOM_MULTIPLIER),
             calldata,
             strategy_bytecode_hash: self.bytecode_hash,
             l2_exec_gas_estimate: MEV_GAS_BUDGET,
@@ -576,7 +611,10 @@ mod tests {
             return;
         }
         let bp = strategy.build_blueprint(&signal).await.unwrap();
-        assert!(bp.verify_hash(), "MEV blueprint must pass the canonical integrity check");
+        assert!(
+            bp.verify_hash(),
+            "MEV blueprint must pass the canonical integrity check"
+        );
     }
 
     #[tokio::test]

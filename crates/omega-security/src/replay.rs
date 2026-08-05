@@ -66,7 +66,7 @@ use crate::metrics;
 /// Chain-scoped key: (blueprint_hash[32], chain_id[8]) → 40 bytes, used as DashSet key.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct ReplayKey {
-    hash:     [u8; 32],
+    hash: [u8; 32],
     chain_id: u64,
 }
 
@@ -80,7 +80,9 @@ pub struct ReplayGuard {
 
 impl ReplayGuard {
     pub fn new() -> Self {
-        Self { executed: Arc::new(DashSet::new()) }
+        Self {
+            executed: Arc::new(DashSet::new()),
+        }
     }
 
     /// Check whether `blueprint_hash` has already been executed on `chain_id`.
@@ -89,16 +91,19 @@ impl ReplayGuard {
     /// Returns `Ok(())` otherwise (does NOT insert — call `mark_executed` after
     /// on-chain confirmation).
     pub fn check(&self, blueprint_hash: &[u8; 32], chain_id: u64) -> Result<(), SecurityError> {
-        let key = ReplayKey { hash: *blueprint_hash, chain_id };
+        let key = ReplayKey {
+            hash: *blueprint_hash,
+            chain_id,
+        };
         if self.executed.contains(&key) {
             metrics::REPLAY_ATTEMPTS.inc();
             tracing::error!(
-                hash     = hex::encode(blueprint_hash),
+                hash = hex::encode(blueprint_hash),
                 chain_id,
                 "REPLAY DETECTED — blueprint already executed"
             );
             return Err(SecurityError::ReplayDetected {
-                hash:     hex::encode(blueprint_hash),
+                hash: hex::encode(blueprint_hash),
                 chain_id,
             });
         }
@@ -109,10 +114,13 @@ impl ReplayGuard {
     ///
     /// Idempotent: inserting a duplicate is silently ignored (DashSet semantics).
     pub fn mark_executed(&self, blueprint_hash: &[u8; 32], chain_id: u64) {
-        let key = ReplayKey { hash: *blueprint_hash, chain_id };
+        let key = ReplayKey {
+            hash: *blueprint_hash,
+            chain_id,
+        };
         self.executed.insert(key);
         tracing::debug!(
-            hash     = hex::encode(blueprint_hash),
+            hash = hex::encode(blueprint_hash),
             chain_id,
             "blueprint marked executed in replay guard"
         );
@@ -128,12 +136,15 @@ impl ReplayGuard {
         blueprint_hash: &[u8; 32],
         chain_id: u64,
     ) -> Result<(), SecurityError> {
-        let key = ReplayKey { hash: *blueprint_hash, chain_id };
+        let key = ReplayKey {
+            hash: *blueprint_hash,
+            chain_id,
+        };
         // DashSet::insert returns true if the value was newly inserted.
         if !self.executed.insert(key) {
             metrics::REPLAY_ATTEMPTS.inc();
             return Err(SecurityError::ReplayDetected {
-                hash:     hex::encode(blueprint_hash),
+                hash: hex::encode(blueprint_hash),
                 chain_id,
             });
         }
@@ -162,7 +173,9 @@ impl ReplayGuard {
 }
 
 impl Default for ReplayGuard {
-    fn default() -> Self { Self::new() }
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 // ─── Nonce registry ───────────────────────────────────────────────────────────
@@ -188,9 +201,9 @@ fn nonce_map_key(strategy_id: &str, chain_id: u64) -> [u8; 32] {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NonceState {
     /// Next expected nonce (matches on-chain `next_nonce[key]`).
-    pub next_nonce:  u64,
+    pub next_nonce: u64,
     /// Chain ID this nonce is scoped to.
-    pub chain_id:    u64,
+    pub chain_id: u64,
     /// Strategy ID string.
     pub strategy_id: String,
 }
@@ -207,7 +220,9 @@ pub struct NonceRegistry {
 
 impl NonceRegistry {
     pub fn new() -> Self {
-        Self { nonces: Arc::new(DashMap::new()) }
+        Self {
+            nonces: Arc::new(DashMap::new()),
+        }
     }
 
     /// Validate that `blueprint_nonce` matches the expected next nonce for
@@ -216,8 +231,8 @@ impl NonceRegistry {
     /// Does NOT advance the nonce — call `advance()` after successful on-chain inclusion.
     pub fn validate(
         &self,
-        strategy_id:     &str,
-        chain_id:        u64,
+        strategy_id: &str,
+        chain_id: u64,
         blueprint_nonce: u64,
     ) -> Result<(), SecurityError> {
         let key = nonce_map_key(strategy_id, chain_id);
@@ -227,8 +242,8 @@ impl NonceRegistry {
                     return Err(SecurityError::NonceMismatch {
                         strategy_id: strategy_id.to_string(),
                         chain_id,
-                        expected:    state.next_nonce,
-                        got:         blueprint_nonce,
+                        expected: state.next_nonce,
+                        got: blueprint_nonce,
                     });
                 }
             }
@@ -239,7 +254,7 @@ impl NonceRegistry {
                         strategy_id: strategy_id.to_string(),
                         chain_id,
                         expected: 0,
-                        got:      blueprint_nonce,
+                        got: blueprint_nonce,
                     });
                 }
             }
@@ -251,15 +266,17 @@ impl NonceRegistry {
     pub fn advance(&self, strategy_id: &str, chain_id: u64) -> Result<u64, SecurityError> {
         let key = nonce_map_key(strategy_id, chain_id);
         let mut entry = self.nonces.entry(key).or_insert_with(|| NonceState {
-            next_nonce:  0,
+            next_nonce: 0,
             chain_id,
             strategy_id: strategy_id.to_string(),
         });
 
         let current = entry.next_nonce;
-        let next = current.checked_add(1).ok_or_else(|| SecurityError::NonceOverflow {
-            strategy_id: strategy_id.to_string(),
-        })?;
+        let next = current
+            .checked_add(1)
+            .ok_or_else(|| SecurityError::NonceOverflow {
+                strategy_id: strategy_id.to_string(),
+            })?;
         entry.next_nonce = next;
         Ok(next)
     }
@@ -268,11 +285,14 @@ impl NonceRegistry {
     /// after sequencer restart).
     pub fn on_chain_nonce_sync(&self, strategy_id: &str, chain_id: u64, chain_nonce: u64) {
         let key = nonce_map_key(strategy_id, chain_id);
-        self.nonces.insert(key, NonceState {
-            next_nonce:  chain_nonce,
-            chain_id,
-            strategy_id: strategy_id.to_string(),
-        });
+        self.nonces.insert(
+            key,
+            NonceState {
+                next_nonce: chain_nonce,
+                chain_id,
+                strategy_id: strategy_id.to_string(),
+            },
+        );
         tracing::debug!(
             strategy = strategy_id,
             chain_id,
@@ -294,7 +314,9 @@ impl NonceRegistry {
 }
 
 impl Default for NonceRegistry {
-    fn default() -> Self { Self::new() }
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 #[cfg(test)]
@@ -351,21 +373,25 @@ mod replay_tests {
         use std::sync::{Arc, Mutex};
         use std::thread;
 
-        let g      = Arc::new(ReplayGuard::new());
-        let wins   = Arc::new(Mutex::new(0u32));
-        let hash   = [0xfe; 32];
+        let g = Arc::new(ReplayGuard::new());
+        let wins = Arc::new(Mutex::new(0u32));
+        let hash = [0xfe; 32];
 
-        let handles: Vec<_> = (0..16).map(|_| {
-            let g2 = Arc::clone(&g);
-            let w2 = Arc::clone(&wins);
-            thread::spawn(move || {
-                if g2.check_and_mark(&hash, 42161).is_ok() {
-                    *w2.lock().unwrap() += 1;
-                }
+        let handles: Vec<_> = (0..16)
+            .map(|_| {
+                let g2 = Arc::clone(&g);
+                let w2 = Arc::clone(&wins);
+                thread::spawn(move || {
+                    if g2.check_and_mark(&hash, 42161).is_ok() {
+                        *w2.lock().unwrap() += 1;
+                    }
+                })
             })
-        }).collect();
+            .collect();
 
-        for h in handles { h.join().unwrap(); }
+        for h in handles {
+            h.join().unwrap();
+        }
         assert_eq!(*wins.lock().unwrap(), 1, "exactly one thread must win");
     }
 
@@ -394,7 +420,7 @@ mod replay_tests {
         r.advance("SA", 42161).unwrap();
         // Arbitrum at nonce 2, but Ethereum still at 0.
         assert_eq!(r.next_nonce("SA", 42161), 2);
-        assert_eq!(r.next_nonce("SA", 1),     0);
+        assert_eq!(r.next_nonce("SA", 1), 0);
     }
 
     #[test]
@@ -429,17 +455,16 @@ mod replay_tests {
         use omega_core::types::blueprint::{ExecutionBlueprint, StrategyId};
 
         let cases = [
-            (StrategyId::Sa,   "SA"),
+            (StrategyId::Sa, "SA"),
             (StrategyId::Cnry, "CNRY"),
-            (StrategyId::Msa,  "MSA"),
-            (StrategyId::La,   "LA"),
-            (StrategyId::Mev,  "MEV"),
+            (StrategyId::Msa, "MSA"),
+            (StrategyId::La, "LA"),
+            (StrategyId::Mev, "MEV"),
         ];
 
         for (strategy_id, label) in cases {
             for chain_id in [1u64, 42161u64] {
-                let expected: [u8; 32] =
-                    ExecutionBlueprint::nonce_key(strategy_id, chain_id).0;
+                let expected: [u8; 32] = ExecutionBlueprint::nonce_key(strategy_id, chain_id).0;
                 let actual = nonce_map_key(label, chain_id);
                 assert_eq!(
                     actual, expected,
@@ -460,7 +485,7 @@ mod replay_tests {
         use sha3::{Digest, Keccak256};
 
         let strategy_id = "SA";
-        let chain_id     = 42161u64;
+        let chain_id = 42161u64;
 
         let mut naive = Keccak256::new();
         naive.update(strategy_id.as_bytes());

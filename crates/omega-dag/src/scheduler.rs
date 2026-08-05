@@ -62,9 +62,9 @@ use std::collections::{HashMap, VecDeque};
 
 use alloy_primitives::B256;
 use chrono::Utc;
-use petgraph::Direction;
 use petgraph::algo::is_cyclic_directed;
 use petgraph::stable_graph::{NodeIndex, StableDiGraph};
+use petgraph::Direction;
 
 use omega_core::errors::{DropCode, OmegaError};
 use omega_core::types::blueprint::ExecutionBlueprint;

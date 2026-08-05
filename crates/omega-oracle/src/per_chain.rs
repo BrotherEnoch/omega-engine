@@ -45,11 +45,13 @@
 //    race (writing through a raw pointer while another thread reads
 //    the same field through its own `Arc` clone, with zero
 //    synchronization) — undefined behavior, not merely a style issue.
-//    Fixed by changing `health: Option<Arc<dyn LayerHealth>>` to
-//    `arc_swap::ArcSwapOption<dyn LayerHealth>`, the same pattern this
-//    struct already uses for `eil: ArcSwap<EilSnapshot>`. `with_health`
-//    is now fully safe — no `unsafe` block, no raw pointers, correct
-//    regardless of how many `Arc` clones exist.
+//    Fixed by changing `health: Option<Arc<dyn LayerHealth>>` to an
+//    arc-swap-backed field, the same pattern this struct already uses
+//    for `eil: ArcSwap<EilSnapshot>`. `with_health` is now fully safe —
+//    no `unsafe` block, no raw pointers, correct regardless of how many
+//    `Arc` clones exist. See finding 3 below for the exact field type
+//    this ended up as, after an intermediate attempt that didn't
+//    compile.
 //
 // 2. UNBOUNDED MEMORY GROWTH: `publish`/`publish_with_fee` cloned
 //    `snap.signals` (the ENTIRE historical signal list since process
@@ -64,14 +66,51 @@
 //    point, not a derived value — tune it against actual downstream
 //    consumption of `EilSnapshot.signals` (which this crate cannot see
 //    from here).
+//
+// 3. ARC-SWAP + TRAIT OBJECT DID NOT ACTUALLY COMPILE (this revision,
+//    correcting an earlier mistake): the previous revision declared
+//    `health: ArcSwapOption<dyn LayerHealth>`, intending the same
+//    lock-free pattern as `eil`. That does not compile against the
+//    pinned `arc-swap` dependency in this workspace: its `RefCnt` trait
+//    is implemented as `impl<T> RefCnt for Arc<T>` — WITHOUT a
+//    `T: ?Sized` bound — so it only applies when the `Arc`'s pointee is
+//    `Sized`. `dyn LayerHealth` is not `Sized`, so `Arc<dyn LayerHealth>`
+//    (and therefore `ArcSwapOption<dyn LayerHealth>`, which wraps
+//    exactly that) never satisfies `RefCnt`, and every call site touching
+//    `self: Arc<Self>` or the `health` field failed with "the size for
+//    values of type `(dyn LayerHealth + 'static)` cannot be known at
+//    compilation time." Fixed by introducing `HealthHandle`, a plain
+//    `Sized` newtype wrapping the real `Arc<dyn LayerHealth>`, and
+//    storing `ArcSwapOption<HealthHandle>` instead. `ArcSwapOption`'s
+//    own pointee is now the `Sized` `HealthHandle` struct, satisfying
+//    the installed crate's `RefCnt` impl, while `HealthHandle` still
+//    holds the actual trait object underneath — so `with_health`'s and
+//    `health()`'s public signatures (`Arc<dyn LayerHealth>` in and out)
+//    are unchanged. If this workspace's `arc-swap` is ever upgraded to
+//    a version whose `RefCnt` impl is `?Sized`-generic, `HealthHandle`
+//    could be removed and `health` could go back to
+//    `ArcSwapOption<dyn LayerHealth>` directly — this wrapper is a
+//    workaround for the installed version's limitation, not a design
+//    preference.
+//
+// 4. TEST FAKE OUT OF SYNC WITH `LayerHealth` (this revision): the
+//    `FakeHealth` test type in `with_health_sets_and_reads_back_without_unsafe`
+//    only implemented `set_state`, but `LayerHealth` has since grown
+//    `state()` and `layer_id()` (E0046: not all trait items
+//    implemented). Added both per rustc's own suggested stubs — this
+//    test only exercises `with_health`/`health()` round-tripping the
+//    handle, it never calls `state()`/`layer_id()` on the fake, so
+//    `todo!()` bodies are safe here; they're placeholders, not
+//    behavior this test depends on. If a future test needs a fake that
+//    actually reports state, give it real bodies instead.
 
 use std::sync::{
-    Arc,
     atomic::{AtomicU64, Ordering},
+    Arc,
 };
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use alloy_primitives::{B256, keccak256};
+use alloy_primitives::{keccak256, B256};
 use arc_swap::{ArcSwap, ArcSwapOption};
 use dashmap::DashMap;
 use tokio::sync::broadcast;
@@ -118,6 +157,20 @@ pub struct EilSnapshot {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// HealthHandle — Sized wrapper working around the pinned arc-swap version
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Plain `Sized` newtype wrapping the real health handle.
+///
+/// See finding 3 in this file's module-level audit note for why this
+/// exists: the pinned `arc-swap` version's `RefCnt` impl for `Arc<T>`
+/// requires `T: Sized`, so `dyn LayerHealth` cannot be `ArcSwapOption`'s
+/// direct pointee. Wrapping it in this struct gives `ArcSwapOption` a
+/// `Sized` pointee to work with, while this struct's single field is
+/// still the actual `Arc<dyn LayerHealth>` the public API deals in.
+struct HealthHandle(Arc<dyn LayerHealth>);
+
+// ─────────────────────────────────────────────────────────────────────────────
 // PerChainOracle
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -140,12 +193,14 @@ pub struct PerChainOracle {
     pub pyth_handle: Arc<OracleFeedHandle>,
     /// Health layer for ExternalData transitions.
     ///
-    /// `ArcSwapOption` rather than a plain `Option<Arc<dyn LayerHealth>>`
-    /// — see this file's module-level audit note on why the previous
-    /// unsafe raw-pointer mutation was unsound, and why this is the
-    /// correct replacement rather than a `Mutex`/`RwLock` (lock-free
-    /// reads, consistent with `eil`'s existing pattern in this struct).
-    health: ArcSwapOption<dyn LayerHealth>,
+    /// `ArcSwapOption<HealthHandle>` rather than a plain
+    /// `Option<Arc<dyn LayerHealth>>` — see this file's module-level
+    /// audit note (finding 3) for why the direct `ArcSwapOption<dyn
+    /// LayerHealth>` this crate briefly tried does not compile against
+    /// the pinned `arc-swap` version, and why `HealthHandle` is the
+    /// workaround rather than a `Mutex`/`RwLock` (lock-free reads,
+    /// consistent with `eil`'s existing pattern in this struct).
+    health: ArcSwapOption<HealthHandle>,
 }
 
 impl PerChainOracle {
@@ -183,17 +238,17 @@ impl PerChainOracle {
     ///
     /// Fully safe — no `unsafe`, no raw pointers. Correct regardless of
     /// how many `Arc<PerChainOracle>` clones exist at call time, unlike
-    /// the previous raw-pointer-mutation implementation (see this
-    /// file's module-level audit note).
+    /// the original raw-pointer-mutation implementation (see this
+    /// file's module-level audit note, finding 1).
     pub fn with_health(self: Arc<Self>, health: Arc<dyn LayerHealth>) -> Arc<Self> {
-        self.health.store(Some(health));
+        self.health.store(Some(Arc::new(HealthHandle(health))));
         self
     }
 
     /// Current health layer handle, if one has been wired in via
     /// `with_health`. Lock-free read.
     pub fn health(&self) -> Option<Arc<dyn LayerHealth>> {
-        self.health.load_full()
+        self.health.load_full().map(|handle| handle.0.clone())
     }
 
     /// Subscribe to outbound OracleSignal events.
@@ -546,9 +601,25 @@ mod tests {
         struct FakeHealth;
         impl LayerHealth for FakeHealth {
             fn set_state(&self, _state: omega_core::HealthState, _reason: &str) {}
+            // Neither method below is exercised by this test — it only
+            // round-trips the handle through with_health()/health() — so
+            // todo!() bodies are fine here. See finding 4 in this file's
+            // module-level audit note. If your actual HealthState/LayerId
+            // variant names differ from what rustc's own suggested stub
+            // implies, this compiles regardless since the bodies are
+            // never called.
+            fn state(&self) -> omega_core::HealthStatus {
+                todo!()
+            }
+            fn layer_id(&self) -> omega_core::LayerId {
+                todo!()
+            }
         }
         let oracle = PerChainOracle::new(42161).with_health(Arc::new(FakeHealth));
-        assert!(oracle.health().is_some(), "health handle must be readable after with_health");
+        assert!(
+            oracle.health().is_some(),
+            "health handle must be readable after with_health"
+        );
     }
 
     #[test]
@@ -596,9 +667,23 @@ mod tests {
         let snap = oracle.snapshot();
         // The oldest 10 block_numbers (0..10) must have been evicted;
         // the newest entry's block_number must be total-1.
+        //
+        // RECONSTRUCTED TAIL: the source pasted into this conversation
+        // was truncated exactly at this point (no closing assertions or
+        // braces). The two lines below follow directly from the
+        // eviction math this test itself sets up — excess = total -
+        // MAX_SIGNAL_HISTORY = 10 entries drained from the front — but
+        // verify this against whatever the real file actually asserted.
         let oldest_retained = snap.signals.first().unwrap().block_number;
         let newest_retained = snap.signals.last().unwrap().block_number;
-        assert_eq!(oldest_retained, 10, "the oldest 10 entries must have been evicted");
-        assert_eq!(newest_retained, (total - 1) as u64);
+        assert_eq!(
+            oldest_retained, 10,
+            "the oldest 10 entries (block_number 0..10) must have been evicted"
+        );
+        assert_eq!(
+            newest_retained,
+            (total - 1) as u64,
+            "the newest entry must still be present after eviction"
+        );
     }
 }

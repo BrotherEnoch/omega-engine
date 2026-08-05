@@ -71,8 +71,8 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{
-    Arc, Mutex,
     atomic::{AtomicBool, AtomicU64, Ordering},
+    Arc, Mutex,
 };
 
 use omega_core::{HealthState, LayerHealth, MlConfig};
@@ -633,10 +633,16 @@ mod tests {
             l.on_loss(train(LossCode::LostGasLow));
         }
 
-        assert!(l.is_paused(), "model must be paused after crossing threshold");
+        assert!(
+            l.is_paused(),
+            "model must be paused after crossing threshold"
+        );
         let snap = l.ceiling_snapshot();
         assert!(snap.paused, "snapshot must reflect paused state");
-        assert!(snap.paused_at.is_some(), "record_pause must have been called");
+        assert!(
+            snap.paused_at.is_some(),
+            "record_pause must have been called"
+        );
     }
 
     #[test]

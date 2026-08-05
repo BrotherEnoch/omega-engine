@@ -37,6 +37,16 @@
 //! literals encoding the same spec constant (§11.2, §14.2), with no single source of
 //! truth. Added `LA_TIE_BAND_FRACTION` here as that source; all three call sites now
 //! derive their threshold from it instead of a bare `0.95`.
+//!
+//! ## Audit fix (this revision): `tests` module had no `#[allow]` at all
+//!
+//! Every other test module in this crate carries `#[allow(clippy::unwrap_used)]` (this
+//! crate denies it at the crate level — see `lib.rs`) but this one didn't, so every
+//! `.unwrap()` in the tests below — there are several, including in tests that predate
+//! this revision — was a hard compile error under `-D warnings`. Added the same
+//! `#[allow]` used everywhere else in this crate, rather than rewriting each assertion
+//! through `.expect(...)` (also denied) or manual match arms, which would add noise
+//! without changing what these tests actually verify.
 
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
@@ -181,6 +191,7 @@ impl Default for GasWarRelayConfig {
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
 
@@ -238,7 +249,10 @@ mod tests {
 
     #[test]
     fn relay_name_serializes_as_plain_string() {
-        assert_eq!(serde_json::to_string(&RelayName::Flashbots).unwrap(), "\"flashbots\"");
+        assert_eq!(
+            serde_json::to_string(&RelayName::Flashbots).unwrap(),
+            "\"flashbots\""
+        );
         assert_eq!(
             serde_json::to_string(&RelayName::Other("xyz".into())).unwrap(),
             "\"xyz\""
@@ -274,7 +288,10 @@ mod tests {
             confirmation_rpc_url = "http://localhost:8545"
         "#;
         let cfg: RelayConfig = toml::from_str(toml_str).unwrap();
-        assert_eq!(cfg.phase_1_relays, vec![RelayName::Flashbots, RelayName::Bloxroute]);
+        assert_eq!(
+            cfg.phase_1_relays,
+            vec![RelayName::Flashbots, RelayName::Bloxroute]
+        );
     }
 
     #[test]

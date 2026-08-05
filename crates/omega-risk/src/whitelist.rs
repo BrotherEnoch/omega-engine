@@ -35,7 +35,9 @@ pub struct BytecodeWhitelist {
 
 impl BytecodeWhitelist {
     pub fn new(initial: BytecodeMap) -> Self {
-        Self { inner: Arc::new(ArcSwap::new(Arc::new(initial))) }
+        Self {
+            inner: Arc::new(ArcSwap::new(Arc::new(initial))),
+        }
     }
 
     /// Check whether `hash` is the expected bytecode for `strategy_id`.
@@ -51,7 +53,10 @@ impl BytecodeWhitelist {
     /// Hot-update the whitelist (called after L3 governance clears a new deployment).
     pub fn update(&self, new_map: BytecodeMap) {
         self.inner.store(Arc::new(new_map));
-        tracing::info!("bytecode whitelist updated ({} strategies)", self.inner.load().len());
+        tracing::info!(
+            "bytecode whitelist updated ({} strategies)",
+            self.inner.load().len()
+        );
     }
 
     /// Register a single new strategy hash without replacing the whole map.
@@ -60,7 +65,10 @@ impl BytecodeWhitelist {
         let mut new_map: BytecodeMap = (**current).clone();
         new_map.insert(strategy_id.clone(), hash);
         self.inner.store(Arc::new(new_map));
-        tracing::info!(strategy = strategy_id, "bytecode whitelist: strategy registered");
+        tracing::info!(
+            strategy = strategy_id,
+            "bytecode whitelist: strategy registered"
+        );
     }
 }
 
@@ -72,7 +80,9 @@ pub struct AddressWhitelist {
 
 impl AddressWhitelist {
     pub fn new(initial: AddressSet) -> Self {
-        Self { inner: Arc::new(ArcSwap::new(Arc::new(initial))) }
+        Self {
+            inner: Arc::new(ArcSwap::new(Arc::new(initial))),
+        }
     }
 
     /// True if `addr` is in the approved set.
@@ -95,7 +105,10 @@ impl AddressWhitelist {
         let mut new_set: AddressSet = (**current).clone();
         new_set.remove(addr);
         self.inner.store(Arc::new(new_set));
-        tracing::info!(addr = hex::encode(*addr), "address whitelist: address removed");
+        tracing::info!(
+            addr = hex::encode(*addr),
+            "address whitelist: address removed"
+        );
     }
 }
 

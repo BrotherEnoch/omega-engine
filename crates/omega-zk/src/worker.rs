@@ -38,8 +38,8 @@ use crate::queue::{ProofQueue, ProofRequest};
 
 /// Manages the pool of async proof worker tasks.
 pub struct ProofWorkerPool {
-    handles:     Vec<JoinHandle<()>>,
-    queue:       ProofQueue,
+    handles: Vec<JoinHandle<()>>,
+    queue: ProofQueue,
     worker_count: usize,
 }
 
@@ -49,14 +49,14 @@ impl ProofWorkerPool {
         metrics::register_all();
 
         let worker_count = cfg.worker_count;
-        let chain_id     = 42161u64; // passed through cfg in production; hardcoded for now
+        let chain_id = 42161u64; // passed through cfg in production; hardcoded for now
 
         tracing::info!(worker_count, "proof worker pool starting");
 
         let mut handles = Vec::with_capacity(worker_count);
 
         for worker_id in 0..worker_count {
-            let q   = queue.clone();
+            let q = queue.clone();
             let cfg = cfg.clone();
 
             let handle = tokio::spawn(async move {
@@ -70,7 +70,11 @@ impl ProofWorkerPool {
             .with_label_values(&["idle"])
             .set(worker_count as f64);
 
-        Self { handles, queue, worker_count }
+        Self {
+            handles,
+            queue,
+            worker_count,
+        }
     }
 
     /// Graceful shutdown: abort all worker tasks.
@@ -111,8 +115,8 @@ async fn run_worker(worker_id: usize, queue: ProofQueue, cfg: ZkConfig, chain_id
         let req = {
             let receiver = queue.receiver.clone();
             match tokio::task::spawn_blocking(move || receiver.recv()).await {
-                Ok(Ok(req))  => req,
-                Ok(Err(_))   => {
+                Ok(Ok(req)) => req,
+                Ok(Err(_)) => {
                     // Channel disconnected — shutdown.
                     tracing::info!(worker_id, "proof worker channel closed, exiting");
                     break;
@@ -134,18 +138,18 @@ async fn run_worker(worker_id: usize, queue: ProofQueue, cfg: ZkConfig, chain_id
 
 async fn process_request(
     worker_id: usize,
-    req:       ProofRequest,
-    prover:    &Arc<T1SoftwareProver>,
-    queue:     &ProofQueue,
-    cfg:       &ZkConfig,
+    req: ProofRequest,
+    prover: &Arc<T1SoftwareProver>,
+    queue: &ProofQueue,
+    cfg: &ZkConfig,
 ) {
-    let request_id     = req.id;
-    let is_microtx     = req.is_microtx;
-    let strategy_id    = req.strategy_id.clone();
+    let request_id = req.id;
+    let is_microtx = req.is_microtx;
+    let strategy_id = req.strategy_id.clone();
     let blueprint_hash = req.blueprint_hash;
     let net_profit_wei = req.net_profit_wei;
-    let sla_ms         = cfg.sla_ms(is_microtx);
-    let lane           = if is_microtx { "microtx" } else { "normal" };
+    let sla_ms = cfg.sla_ms(is_microtx);
+    let lane = if is_microtx { "microtx" } else { "normal" };
 
     metrics::WORKER_COUNT.with_label_values(&["proving"]).inc();
     metrics::WORKER_COUNT.with_label_values(&["idle"]).dec();
@@ -153,16 +157,13 @@ async fn process_request(
     tracing::debug!(worker_id, request_id, strategy = %strategy_id, is_microtx,
         "starting proof generation");
 
-    let prover2         = Arc::clone(prover);
-    let strategy_id2    = strategy_id.clone();
-    let prove_future    = tokio::task::spawn_blocking(move || {
+    let prover2 = Arc::clone(prover);
+    let strategy_id2 = strategy_id.clone();
+    let prove_future = tokio::task::spawn_blocking(move || {
         prover2.prove(blueprint_hash, net_profit_wei, &strategy_id2)
     });
 
-    let result = tokio::time::timeout(
-        Duration::from_millis(sla_ms),
-        prove_future,
-    ).await;
+    let result = tokio::time::timeout(Duration::from_millis(sla_ms), prove_future).await;
 
     let proof_result = match result {
         // Within SLA, no panic.
@@ -180,7 +181,10 @@ async fn process_request(
                     .with_label_values(&[lane])
                     .inc();
                 tracing::warn!(
-                    worker_id, request_id, gen_ms, sla_ms,
+                    worker_id,
+                    request_id,
+                    gen_ms,
+                    sla_ms,
                     "proof completed but exceeded SLA"
                 );
             }
@@ -203,7 +207,10 @@ async fn process_request(
                 .with_label_values(&["prover_error"])
                 .inc();
             tracing::error!(worker_id, request_id, %join_err, "proof worker panicked");
-            Err(ZkError::WorkerPanic { worker_id, request_id })
+            Err(ZkError::WorkerPanic {
+                worker_id,
+                request_id,
+            })
         }
 
         // Timeout.
@@ -233,7 +240,9 @@ async fn process_request(
     let _ = req.response_tx.send(proof_result);
 }
 
-fn prover2_tier(_: &[u8; 32]) -> &'static str { "t1_software" }
+fn prover2_tier(_: &[u8; 32]) -> &'static str {
+    "t1_software"
+}
 
 #[cfg(test)]
 mod worker_tests {
@@ -244,26 +253,21 @@ mod worker_tests {
     #[tokio::test]
     async fn worker_pool_generates_proof_end_to_end() {
         let cfg = ZkConfig {
-            worker_count:   2,
+            worker_count: 2,
             microtx_sla_ms: 30_000,
-            normal_sla_ms:  30_000,
+            normal_sla_ms: 30_000,
             ..Default::default()
         };
 
-        let queue  = ProofQueue::new(cfg.clone());
-        let pool   = ProofWorkerPool::start(cfg, queue.clone());
+        let queue = ProofQueue::new(cfg.clone());
+        let pool = ProofWorkerPool::start(cfg, queue.clone());
 
-        let rx = queue.submit(
-            [0xde; 32],
-            500_000_000,
-            42161,
-            "LA".into(),
-            false,
-        ).unwrap();
+        let rx = queue
+            .submit([0xde; 32], 500_000_000, 42161, "LA".into(), false)
+            .unwrap();
 
-        let result = tokio::time::timeout(
-            Duration::from_secs(60), rx
-        ).await
+        let result = tokio::time::timeout(Duration::from_secs(60), rx)
+            .await
             .expect("timed out waiting for proof")
             .expect("oneshot closed");
 
@@ -278,20 +282,20 @@ mod worker_tests {
     #[tokio::test]
     async fn worker_pool_drains_multiple_requests() {
         let cfg = ZkConfig {
-            worker_count:   4,
-            normal_sla_ms:  30_000,
+            worker_count: 4,
+            normal_sla_ms: 30_000,
             microtx_sla_ms: 30_000,
             ..Default::default()
         };
 
         let queue = ProofQueue::new(cfg.clone());
-        let pool  = ProofWorkerPool::start(cfg, queue.clone());
+        let pool = ProofWorkerPool::start(cfg, queue.clone());
 
         let mut rxs = Vec::new();
         for i in 0u8..4 {
-            let rx = queue.submit(
-                [i; 32], 100 + i as u128, 42161, "SA".into(), false,
-            ).unwrap();
+            let rx = queue
+                .submit([i; 32], 100 + i as u128, 42161, "SA".into(), false)
+                .unwrap();
             rxs.push(rx);
         }
 
@@ -303,7 +307,11 @@ mod worker_tests {
             assert!(result.is_ok());
         }
 
-        assert_eq!(queue.depth(), 0, "queue should be empty after all proofs complete");
+        assert_eq!(
+            queue.depth(),
+            0,
+            "queue should be empty after all proofs complete"
+        );
         pool.shutdown();
     }
 }

@@ -53,7 +53,10 @@ pub trait RelayClientFactory: Send + Sync {
 pub struct UnconfiguredRelayClientFactory;
 
 impl RelayClientFactory for UnconfiguredRelayClientFactory {
-    fn build(&self, _config: &RelayConfig) -> anyhow::Result<HashMap<String, Arc<dyn RelayClient>>> {
+    fn build(
+        &self,
+        _config: &RelayConfig,
+    ) -> anyhow::Result<HashMap<String, Arc<dyn RelayClient>>> {
         anyhow::bail!(
             "no RelayClientFactory configured — HttpRelayClient::new has zero production \
              call sites anywhere in the omega-engine workspace as of this writing. Building \
@@ -87,7 +90,11 @@ impl RelayClientFactory for MockRelayClientFactory {
         // since tests care about dispatch/aggregation logic, not
         // per-relay distinctness.
         let mut map: HashMap<String, Arc<dyn RelayClient>> = HashMap::new();
-        for name in config.phase_1_relays.iter().chain(config.phase_2plus_relays.iter()) {
+        for name in config
+            .phase_1_relays
+            .iter()
+            .chain(config.phase_2plus_relays.iter())
+        {
             map.insert(name.to_string(), Arc::clone(&self.client));
         }
         Ok(map)
@@ -101,12 +108,23 @@ mod tests {
 
     #[test]
     fn unconfigured_factory_fails_with_named_gaps() {
+        // Fix (this revision): `.unwrap_err()` requires the Result's Ok
+        // type — HashMap<String, Arc<dyn RelayClient>> — to implement
+        // Debug, which it can't: `dyn RelayClient` has no Debug impl (see
+        // the E0277 build error this produced). Mapping the Ok type to
+        // `()` before calling `unwrap_err()` sidesteps that: `unwrap_err`
+        // only needs Debug on whatever the Ok type currently is, not on
+        // the original one, and this test only cares about the Err value
+        // (checked via `err.to_string()` below), never the Ok value.
         let factory = UnconfiguredRelayClientFactory;
         let cfg = RelayConfig::default();
-        let err = factory.build(&cfg).unwrap_err();
+        let err = factory.build(&cfg).map(|_| ()).unwrap_err();
         let msg = err.to_string();
         assert!(msg.contains("Gap 3"), "error must name the secrets gap");
-        assert!(msg.contains("Gap 4"), "error must name the config-translation gap");
+        assert!(
+            msg.contains("Gap 4"),
+            "error must name the config-translation gap"
+        );
     }
 
     #[test]
@@ -132,10 +150,14 @@ mod tests {
                     relay_bundle_id: Some(bundle.bundle_hash),
                 })
             }
-            fn name(&self) -> &str { "dummy" }
+            fn name(&self) -> &str {
+                "dummy"
+            }
         }
 
-        let factory = MockRelayClientFactory { client: Arc::new(Dummy) };
+        let factory = MockRelayClientFactory {
+            client: Arc::new(Dummy),
+        };
         let cfg = RelayConfig {
             phase_1_relays: vec![RelayName::Flashbots],
             phase_2plus_relays: vec![RelayName::Flashbots, RelayName::Bloxroute],
