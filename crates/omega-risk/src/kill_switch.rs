@@ -76,6 +76,75 @@
 // itself (used only when a configured window/silence duration is larger
 // than chrono can represent, which no realistic config here approaches)
 // is unchanged.
+//
+// ## Audit fix (this revision): clippy::expect_used in get_or_create
+//
+// `KillSwitchRegistry::get_or_create`'s `Entry::Vacant` branch calls
+// `KillSwitch::new(self.default_config.clone()).expect(...)`. This is
+// provably infallible: `default_config` is validated once in
+// `KillSwitchRegistry::new` (which itself returns an error if invalid),
+// and `KillSwitchConfig` is immutable after that — there is no code path
+// that could make an already-validated config invalid later. The
+// `#[allow(clippy::expect_used)]` below documents that this specific
+// `.expect()` is a deliberate "this cannot happen, and if it somehow
+// does, panicking is correct" assertion, not an unchecked-error-handling
+// oversight — matching how `metrics.rs` treats registration failures.
+//
+// ## Audit fix (this revision): clippy in test module
+//
+// Same reasoning as flash_crash.rs/heartbeat.rs/circuit_breakers.rs: the
+// crate-wide `[lints.clippy]` unwrap_used/expect_used/float_cmp settings
+// apply even inside `#[cfg(test)]` under `cargo clippy --all-targets --
+// -D warnings`, despite lib.rs's `#![cfg_attr(not(test), deny(...))]`
+// intending the deny half to be non-test-only. Added a module-level
+// allow to `tests` covering all three lints actually triggered here.
+//
+// ## Audit fix (this revision, 2): shared test cfg()'s window-loss cap
+// was unrealistically tight, causing two test failures
+//
+// `diagnostics_reflects_cumulative_loss_and_failures` records a single
+// realistic-looking 0.5 ETH loss and then asserts the switch is NOT
+// tripped (it's testing that diagnostics correctly reports an untripped
+// switch's state). But the shared `cfg()` helper's
+// `max_loss_per_window_wei` was 0.2 ETH — smaller than the very loss the
+// test records — so that single call tripped the WindowLoss condition
+// immediately, and the test's `assert!(!diag.status.is_tripped())`
+// failed. This wasn't a production bug: `KillSwitch`'s window-loss logic
+// itself is correct (see `trips_on_window_loss_even_when_cumulative_
+// still_low` below, which deliberately sets a tight window cap and
+// confirms it trips). The test helper's default was just too tight for
+// a test that wasn't trying to exercise tripping at all.
+//
+// Fixed by raising `cfg()`'s `max_loss_per_window_wei` from 0.2 ETH to
+// 2 ETH, comfortably above the losses any test using the bare `cfg()`
+// helper (rather than a locally-overridden config) records. Every other
+// test in this module either overrides `max_loss_per_window_wei` itself,
+// records no loss at all (manual trips, consecutive-failure-only
+// outcomes, or positive/profitable outcomes), or records losses well
+// under both the old and new cap — so this change is scoped to fixing
+// exactly the one under-specified test, not a behavior change to the
+// production window-loss check itself.
+//
+// `old_losses_outside_window_are_evicted_and_dont_count` had a second,
+// independent bug in its own timing, not in `cfg()`: it recorded two 0.2
+// ETH losses only 60 seconds apart against a 0.3 ETH window cap and a
+// 600-second window. Both losses were still inside the window at the
+// moment the *second* one was recorded (60s < 600s), so their sum (0.4
+// ETH) already exceeded the 0.3 ETH cap and tripped the switch right
+// there — before the test's third, later call (meant to demonstrate that
+// the first two losses had aged out) ever ran. By the time that third
+// call executed, the switch was already (and correctly) tripped, so
+// `k.guard().is_ok()` failed.
+//
+// Fixed by spacing the loss recordings so each individual window-loss
+// evaluation stays under the cap at the time it's evaluated (the first
+// two losses, recorded within the window of each other, sum to under
+// the cap and don't trip), while confirming that once ALL of those
+// entries have genuinely aged out of the window, a later loss that would
+// otherwise have pushed the running total over the cap does not, because
+// the earlier entries are no longer counted. This is what the test's own
+// name and intent describe; only the numbers needed to actually match
+// that description.
 
 use chrono::{DateTime, Utc};
 use dashmap::mapref::entry::Entry;
@@ -589,6 +658,11 @@ impl KillSwitchRegistry {
         match self.switches.entry(scope.to_string()) {
             Entry::Occupied(e) => e.get().clone(),
             Entry::Vacant(e) => {
+                // See this file's module doc comment ("Audit fix: clippy::
+                // expect_used in get_or_create") for why this specific
+                // .expect() is provably infallible and therefore a
+                // deliberate assertion, not unchecked error handling.
+                #[allow(clippy::expect_used)]
                 let switch = Arc::new(
                     KillSwitch::new(self.default_config.clone())
                         .expect("default_config already validated in KillSwitchRegistry::new"),
@@ -758,12 +832,29 @@ impl KillSwitchRegistry {
 
 #[cfg(test)]
 mod tests {
+    #![allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::float_cmp
+    )]
+
     use super::*;
 
     fn cfg() -> KillSwitchConfig {
         KillSwitchConfig {
             max_cumulative_loss_wei: 1_000_000_000_000_000_000, // 1 ETH all-time
-            max_loss_per_window_wei: 200_000_000_000_000_000,   // 0.2 ETH per window
+            // Raised from 0.2 ETH (see this file's module-level "Audit fix
+            // (this revision, 2)" note): 0.2 ETH was smaller than a single
+            // realistic loss some tests using this shared default record,
+            // causing an unintended premature trip in a test that wasn't
+            // trying to exercise tripping at all. 2 ETH is comfortably
+            // above every loss recorded by a test that doesn't override
+            // this field itself; tests that specifically want a tight
+            // window cap (e.g. trips_on_window_loss_even_when_cumulative_
+            // still_low) already construct their own local config rather
+            // than relying on this default.
+            max_loss_per_window_wei: 2_000_000_000_000_000_000, // 2 ETH per window
             loss_window: Duration::from_secs(3600),             // 1 hour
             max_consecutive_failures: 5,
         }
@@ -786,8 +877,9 @@ mod tests {
     #[test]
     fn trips_on_cumulative_loss() {
         // Window cap set effectively-disabled so cumulative is what trips
-        // (each individual 0.4 ETH loss would otherwise blow the 0.2 ETH
-        // window cap first).
+        // (each individual 0.4 ETH loss would otherwise blow even the
+        // raised 2 ETH window cap after three of them — set it far higher
+        // still so only the 1 ETH cumulative cap can be the one to fire).
         let mut c = cfg();
         c.max_loss_per_window_wei = 10_000_000_000_000_000_000; // 10 ETH
         let k = KillSwitch::new(c).unwrap();
@@ -833,6 +925,23 @@ mod tests {
 
     #[test]
     fn old_losses_outside_window_are_evicted_and_dont_count() {
+        // See this file's module-level "Audit fix (this revision, 2)"
+        // note for why the original timing here was self-defeating: two
+        // losses recorded only 60s apart, against a 600s window, are
+        // BOTH still inside the window at the moment the second one is
+        // evaluated — so if their sum exceeds the cap, the switch trips
+        // right then, before the test ever gets to its "did the old
+        // entries age out" call.
+        //
+        // Fixed timing: the first two losses are spaced close enough
+        // together that their sum stays UNDER the cap at each of their
+        // own evaluation times (so neither trips prematurely), and the
+        // third loss is recorded only after BOTH earlier entries have
+        // fully aged out of the window. The full historical sum of all
+        // three losses (0.1 + 0.1 + 0.25 = 0.45 ETH) exceeds the 0.3 ETH
+        // cap — proving that if eviction weren't working, the third call
+        // would trip — but because the first two have aged out by then,
+        // only the third loss (0.25 ETH, under the cap alone) counts.
         let mut c = cfg();
         c.max_cumulative_loss_wei = 100_000_000_000_000_000_000; // disabled
         c.max_loss_per_window_wei = 300_000_000_000_000_000; // 0.3 ETH
@@ -840,15 +949,29 @@ mod tests {
         let k = KillSwitch::new(c).unwrap();
 
         let t0 = Utc::now();
-        k.record_outcome_at(Some(-200_000_000_000_000_000), true, t0);
-        k.record_outcome_at(
-            Some(-200_000_000_000_000_000),
-            true,
-            t0 + chrono::Duration::seconds(60),
+        // Both within the window of each other; sum = 0.2 ETH < 0.3 ETH
+        // cap at each evaluation, so neither trips.
+        assert!(k
+            .record_outcome_at(Some(-100_000_000_000_000_000), true, t0)
+            .is_none());
+        assert!(k
+            .record_outcome_at(
+                Some(-100_000_000_000_000_000),
+                true,
+                t0 + chrono::Duration::seconds(60)
+            )
+            .is_none());
+
+        // 700s after t0 (>600s window past both prior entries: 700s past
+        // the first, 640s past the second) — both have aged out. If they
+        // hadn't, 0.1 + 0.1 + 0.25 = 0.45 ETH would exceed the 0.3 ETH
+        // cap and this call would trip.
+        let later = t0 + chrono::Duration::seconds(700);
+        let tripped = k.record_outcome_at(Some(-250_000_000_000_000_000), true, later);
+        assert!(
+            tripped.is_none(),
+            "aged-out entries must not count toward the window sum"
         );
-        let later = t0 + chrono::Duration::seconds(1200);
-        let tripped = k.record_outcome_at(Some(-100_000_000_000_000_000), true, later);
-        assert!(tripped.is_none());
         assert!(k.guard().is_ok());
     }
 

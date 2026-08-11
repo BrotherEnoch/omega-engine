@@ -42,13 +42,15 @@
 //      produces a bytes32 from `strategy_id`, but folds in `chain_id` too
 //      and is documented as being for nonce-namespacing specifically — not
 //      confirmed to be the same value used at `registerStrategy()` time.
-//   3. `ExecutionBlueprint` does not carry `providerType`
-//      (Balancer/AaveV3/UniswapV3) or a `flashloanToken` distinct from
-//      `providerContract` — the contract's blueprint layout needs three
-//      logically separate pieces of information; `ExecutionBlueprint`
-//      currently exposes one `flashloan_provider: Address` field. This
-//      looks like a genuine schema gap upstream of this crate, not
-//      something a signer implementation can resolve on its own.
+//   3. `ExecutionBlueprint` now carries `flashloan_provider_type` /
+//      `provider_contract` / `flashloan_token` as of a later revision (see
+//      omega-core::types::blueprint's own doc comment) — this closes part
+//      of what was previously flagged here as a genuine schema gap
+//      (`providerType`/`flashloanToken` distinct from `providerContract`).
+//      What remains unconfirmed is whether the Orchestrator's on-chain
+//      `execute()` ABI expects exactly these three values in exactly this
+//      shape; that confirmation, not the schema gap itself, is still
+//      outstanding.
 //   4. `minNetProfit`'s exact source (`dynamic_min_profit` verbatim, or
 //      something else) was not confirmed against any file read.
 //
@@ -79,6 +81,36 @@
 // so the rest of the pipeline (integrity check, kill switch, 15 pre-trade
 // checks, idempotency dedup, DAG bookkeeping) is fully implemented and
 // fully testable today, independent of this gap.
+//
+// ## Audit fix (this revision): test helper missing flashloan/token fields
+//
+// `tests::sample_bp` predates `ExecutionBlueprint` gaining
+// `flashloan_provider_type`, `provider_contract`, and `flashloan_token`
+// (it already included `max_base_fee_gwei` — see that field's own line
+// below, unchanged). Nothing in `KeyManagerTransactionSigner::
+// sign_transaction`'s current, real code path reads any of the three
+// (see `build_execute_calldata`'s doc comment: it fails loudly before
+// touching blueprint fields beyond what's already read), so
+// `Balancer`/`Address::ZERO`/`Address::ZERO` are inert placeholders
+// consistent with this helper's existing
+// `flashloan_provider: Address::ZERO` "no flashloan" convention.
+//
+// ## Audit fix (this revision, 2): clippy::too_many_arguments
+//
+// `encode_eip1559_unsigned` takes 8 positional arguments — one over
+// clippy's default `too-many-arguments` threshold of 7 — and
+// `cargo clippy --workspace --all-targets -- -D warnings` failed on it.
+// Its sibling `encode_eip1559_signed` (11 arguments — the same 8 plus
+// `y_parity`/`r`/`s`) already carries
+// `#[allow(clippy::too_many_arguments)]` for the identical reason: both
+// functions' argument lists are mandated by EIP-1559's own field order
+// (see this file's "EIP-1559 RLP encoding helpers" section doc comment
+// — chain_id, nonce, max_priority_fee_per_gas, max_fee_per_gas,
+// gas_limit, destination, amount, data, [access_list]), so splitting
+// them into a struct would obscure the 1:1 correspondence to the spec
+// this code is deliberately preserving, not simplify anything. Same
+// justification, same fix, applied to the sibling function that was
+// missing it.
 
 use std::sync::Arc;
 
@@ -86,7 +118,7 @@ use alloy_primitives::{Address, Bytes, U256};
 use async_trait::async_trait;
 use omega_core::types::blueprint::ExecutionBlueprint;
 use omega_security::key_manager::KeyManager;
-use secp256k1::{Message, Secp256k1, SecretKey};
+use secp256k1::{Message, Secp256k1};
 
 use crate::error::ExecutionError;
 
@@ -189,17 +221,20 @@ impl KeyManagerTransactionSigner {
     /// NOT IMPLEMENTED — see this module's top doc comment, items 1-4. This
     /// is factored out as its own method (rather than inlined into
     /// `sign_transaction`) so that once an ABI encoder, the strategyId
-    /// mapping, and the missing `ExecutionBlueprint` fields are confirmed,
-    /// only this method needs a real body — the RLP/envelope-signing logic
-    /// in `sign_transaction` below does not need to change.
+    /// mapping, and confirmation of the Orchestrator's exact expected ABI
+    /// shape for the flashloan-identity fields are in hand, only this
+    /// method needs a real body — the RLP/envelope-signing logic in
+    /// `sign_transaction` below does not need to change.
     fn build_execute_calldata(&self, _bp: &ExecutionBlueprint) -> Result<Bytes, ExecutionError> {
         Err(ExecutionError::SigningFailed {
             detail: "KeyManagerTransactionSigner::build_execute_calldata is not implemented: \
                 requires (1) an ABI encoder for blueprintCalldata / execute()'s outer calldata, \
                 not present anywhere in this workspace's dependency graph as of this revision, \
                 (2) confirmation of the on-chain strategy_registry's bytes32 strategyId derivation, \
-                (3) ExecutionBlueprint fields for providerType/flashloanToken distinct from \
-                providerContract, which do not currently exist on that struct, and \
+                (3) confirmation of the Orchestrator's exact expected on-chain ABI shape for \
+                ExecutionBlueprint's flashloan_provider_type/provider_contract/flashloan_token \
+                fields (the schema itself now exists on ExecutionBlueprint, but the ABI \
+                encoding contract for it has not been confirmed against any file read), and \
                 (4) confirmation of minNetProfit's source field. See signer.rs's module doc \
                 comment for the full list. Fabricating any of these for a contract that moves \
                 real flashloaned funds is refused by design — same policy as \
@@ -313,7 +348,14 @@ impl TransactionSigner for KeyManagerTransactionSigner {
 // set, since that dependency question was itself unresolved (see top doc
 // comment, item 1) and this encoder does not need the full ABI/consensus
 // surface, only RLP.
+//
+// Both `encode_eip1559_unsigned` and `encode_eip1559_signed` carry
+// `#[allow(clippy::too_many_arguments)]` — see this file's module-level
+// "Audit fix (this revision, 2)" note for why: their argument lists are
+// dictated 1:1 by EIP-1559's own field order, not an accident of API
+// design that a struct would clean up.
 
+#[allow(clippy::too_many_arguments)]
 fn encode_eip1559_unsigned(
     chain_id: u64,
     nonce: u64,
@@ -469,6 +511,7 @@ impl TransactionSigner for MockTransactionSigner {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use omega_core::types::flashloan_provider::FlashloanProviderType;
     use omega_security::key_manager::KeyManager;
     use secp256k1::SecretKey;
 
@@ -632,6 +675,16 @@ mod tests {
             flashloan_provider: Address::ZERO,
             flashloan_amount: U256::ZERO,
             flashloan_available: U256::ZERO,
+            // See this file's module-level "Audit fix: test helper
+            // missing flashloan/token fields" note: sign_transaction's
+            // current real code path (everything up to and including
+            // build_execute_calldata's loud failure) never reads these
+            // three, so they mirror this helper's existing
+            // flashloan_provider: Address::ZERO "no flashloan"
+            // convention.
+            flashloan_provider_type: FlashloanProviderType::Balancer,
+            provider_contract: Address::ZERO,
+            flashloan_token: Address::ZERO,
             calldata: Bytes::new(),
             strategy_bytecode_hash: B256::ZERO,
             l2_exec_gas_estimate: 100_000,

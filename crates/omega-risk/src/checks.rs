@@ -1,5 +1,4 @@
 // crates/omega-risk/src/checks.rs
-//
 // 16 pre-trade checks in FAST-FAIL order (spec Section 5 / S7 / S11 / S12).
 //
 // Order is mandatory and maps directly to the spec:
@@ -152,14 +151,75 @@
 // future tuning of a threshold would need to happen in two places and
 // could silently drift out of sync exactly the way the gas-spike/
 // flashloan-safety constants were fixed to prevent above.
+//
+// ## Fix (this revision): unused staleness-constant imports
+//
+// `CHAINLINK_STALENESS_SECS`, `PYTH_STALENESS_SECS`, `TWAP_STALENESS_SECS`
+// were imported here but never referenced — the actual per-feed
+// staleness comparisons (`chainlink_fresh()`, `pyth_fresh()`,
+// `twap_fresh()`) live as methods on `OracleSnapshot` in context.rs,
+// which already has its own access to these constants; this file only
+// ever calls those methods, never compares an age against the threshold
+// directly. Removed from the import list rather than
+// `#[allow(unused_imports)]`-ing them, since the actual fix is simply
+// not importing what this file doesn't use.
+//
+// ## Audit fix (this revision): clippy::collapsible_if in oracle_hierarchy_check
+//
+// `oracle_hierarchy_check` previously nested `if oracle.chainlink_fresh()
+// && oracle.pyth_fresh() { if oracle.chainlink_pyth_divergence() > ... {
+// ... } }`. Merged into a single `if` with a combined `&&` condition —
+// behaviorally identical (both conditions must hold for the check to
+// fire; the divergence computation still only runs once both feeds are
+// confirmed fresh, since `&&` short-circuits left-to-right), just
+// expressed as one boolean expression instead of two nested guards,
+// which is what `clippy::collapsible_if` (denied under `-D warnings`)
+// requires.
+//
+// ## Audit fix (this revision, 2): check 8 must skip non-sane prices,
+// not treat them as "divergence"
+//
+// Root cause of three test failures (`zero_price_on_fresh_oracle_
+// fails_at_check_16`, `negative_price_on_fresh_oracle_fails_at_check_16`,
+// `nonce_replay_fails_before_price_sanity`): `OracleSnapshot::
+// chainlink_pyth_divergence()` in context.rs returns `f64::INFINITY` when
+// `chainlink_price <= 0.0`. Since `INFINITY > ORACLE_DIVERGE_THRESHOLD`
+// is trivially true, `oracle_hierarchy_check` (check 8) was firing
+// `MissOracleDiverge` for a zero/negative/non-sane price BEFORE check 15
+// (nonce replay) or check 16 (`oracle_price_sanity_check` /
+// `MissFlashCrash`) ever got a chance to run — both of which are the
+// correct, more specific drop code for those situations. A non-sane
+// single price is not "divergence between two feeds"; it's the
+// responsibility of check 16 (or, further upstream, check 7's freshness
+// gate).
+//
+// Fixed by having `oracle_hierarchy_check` early-return `None` (skip,
+// don't fail) whenever the two fresh feeds it's about to compare aren't
+// both sane, via the existing `OracleSnapshot::has_sane_prices()` helper
+// — the same helper `oracle_price_sanity_check` (check 16) already uses.
+// This does not reintroduce `clippy::collapsible_if`: the function is
+// now three sequential single-condition `if`s with early returns rather
+// than one nested pair, which clippy does not flag.
+//
+// A deliberately NOT-taken alternative: making
+// `chainlink_pyth_divergence()` itself return `0.0` (or some other
+// non-triggering sentinel) for non-sane inputs instead of `INFINITY`.
+// That would fix check 8 too, but it would also make
+// `chainlink_pyth_divergence()` itself lie about what it's reporting —
+// callers of that method directly (if any exist beyond this file) would
+// see "0% divergence" for what is actually "one of these two feeds is
+// garbage," which is a worse foot-gun than a function that keeps
+// reporting `INFINITY` (an honest "this doesn't make sense to compare")
+// while the caller — the code with checks 15/16 explicitly ordered
+// nearby, sharing the same `has_sane_prices()` helper — is what decides
+// to skip the comparison instead of trusting it.
 
 use omega_core::errors::DropCode;
 
 use crate::context::{
-    CheckContext, OracleSnapshot, CHAINLINK_STALENESS_SECS, FLASHLOAN_SAFETY_DEN,
-    FLASHLOAN_SAFETY_NUM, FLASH_CRASH_SPOT_TWAP_DIVERGENCE_THRESHOLD, GAS_SPIKE_THRESHOLD_DEN,
-    GAS_SPIKE_THRESHOLD_NUM, MAX_PRICE_IMPACT_BPS, ORACLE_DIVERGE_THRESHOLD, PYTH_STALENESS_SECS,
-    TWAP_STALENESS_SECS,
+    CheckContext, OracleSnapshot, FLASHLOAN_SAFETY_DEN, FLASHLOAN_SAFETY_NUM,
+    FLASH_CRASH_SPOT_TWAP_DIVERGENCE_THRESHOLD, GAS_SPIKE_THRESHOLD_DEN, GAS_SPIKE_THRESHOLD_NUM,
+    MAX_PRICE_IMPACT_BPS, ORACLE_DIVERGE_THRESHOLD,
 };
 use crate::metrics;
 
@@ -210,12 +270,25 @@ pub fn oracle_freshness_check(oracle: &OracleSnapshot) -> Option<DropCode> {
 /// Standalone oracle hierarchy check (spec S5: MissOracleDiverge) —
 /// rejects when Chainlink AND Pyth are both fresh but diverge beyond
 /// `ORACLE_DIVERGE_THRESHOLD`. Skipped (returns `None`) when fewer than
-/// two fresh spot feeds are available to compare.
+/// two fresh spot feeds are available to compare, **or when either fresh
+/// price is non-sane** (zero, negative, NaN, or infinite) — see this
+/// file's module-level "Audit fix (this revision, 2)" note. A non-sane
+/// price is not "divergence"; that case is check 16's
+/// (`oracle_price_sanity_check` / `MissFlashCrash`) responsibility, and
+/// letting `chainlink_pyth_divergence()`'s `f64::INFINITY` sentinel leak
+/// through here as a false "diverged" result would mask check 16 (and
+/// check 15, which sits between them) from ever running.
 pub fn oracle_hierarchy_check(oracle: &OracleSnapshot) -> Option<DropCode> {
-    if oracle.chainlink_fresh() && oracle.pyth_fresh() {
-        if oracle.chainlink_pyth_divergence() > ORACLE_DIVERGE_THRESHOLD {
-            return Some(DropCode::MissOracleDiverge);
-        }
+    if !oracle.chainlink_fresh() || !oracle.pyth_fresh() {
+        return None;
+    }
+    if !oracle.has_sane_prices() {
+        // Non-sane prices are check 16's responsibility, not a
+        // "divergence" between two otherwise-comparable feeds.
+        return None;
+    }
+    if oracle.chainlink_pyth_divergence() > ORACLE_DIVERGE_THRESHOLD {
+        return Some(DropCode::MissOracleDiverge);
     }
     None
 }
@@ -363,7 +436,9 @@ fn run_checks_inner(bp: &BlueprintFields, ctx: &CheckContext) -> CheckResult {
         return CheckResult::Fail(c);
     }
 
-    // 8. Oracle hierarchy — one float division (only when both feeds fresh).
+    // 8. Oracle hierarchy — one float division (only when both feeds fresh
+    // AND sane; see this file's module doc comment, "Audit fix (this
+    // revision, 2)").
     if let Some(c) = check_oracle_hierarchy(bp, ctx) {
         return CheckResult::Fail(c);
     }
@@ -1357,6 +1432,26 @@ mod checks_tests {
         );
     }
 
+    #[test]
+    fn oracle_hierarchy_check_skips_non_sane_prices_instead_of_diverging() {
+        // Regression guard for this revision's fix: a non-sane price must
+        // not leak through chainlink_pyth_divergence()'s f64::INFINITY
+        // sentinel as a false MissOracleDiverge — it must be skipped
+        // (None) so check 16 (or check 15, whichever is reached first in
+        // the full pipeline) is what actually reports it.
+        let mut ctx = passing_ctx();
+        ctx.oracle.chainlink_price = 0.0;
+        assert_eq!(
+            oracle_hierarchy_check(&ctx.oracle),
+            None,
+            "non-sane price must be skipped by check 8, not reported as divergence"
+        );
+
+        ctx.oracle.chainlink_price = 2000.0;
+        ctx.oracle.pyth_price = -1.0;
+        assert_eq!(oracle_hierarchy_check(&ctx.oracle), None);
+    }
+
     // ── Fast-fail ordering ────────────────────────────────────────────────────
 
     #[test]
@@ -1416,7 +1511,10 @@ mod checks_tests {
     #[test]
     fn nonce_replay_fails_before_price_sanity() {
         // check 16 runs last — confirm check 15 (nonce) still wins when
-        // both would fail, since code order (not cost) governs.
+        // both would fail, since code order (not cost) governs. Also
+        // exercises this revision's check-8 fix: a non-sane chainlink
+        // price must not short-circuit into MissOracleDiverge before
+        // check 15 is even reached.
         let mut bp = passing_bp();
         bp.nonce = 0;
         let mut ctx = passing_ctx();

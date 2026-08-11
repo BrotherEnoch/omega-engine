@@ -17,6 +17,20 @@
 //   - txs / bundle_hash: require a signed transaction, which requires a
 //     TransactionSigner (see signer.rs) — genuinely not available yet;
 //     this module depends on the trait, not a fabricated implementation.
+//
+// ## Audit fix (this revision): test helper missing flashloan/fee fields
+//
+// `tests::sample_bp` predates `ExecutionBlueprint` gaining
+// `flashloan_provider_type`, `provider_contract`, `flashloan_token`, and
+// `max_base_fee_gwei`. Nothing in `build_bundle_payload` reads any of
+// the three flashloan-identity fields (this stage only touches
+// `priority_fee_gwei`, `expiry_block`, and hands the whole blueprint to
+// the signer), so `Balancer`/`Address::ZERO`/`Address::ZERO` are inert
+// placeholders consistent with this helper's existing
+// `flashloan_provider: Address::ZERO` "no flashloan" convention;
+// `max_base_fee_gwei` is derived via the real
+// `ExecutionBlueprint::derive_max_base_fee_gwei` helper rather than a
+// hand-picked literal.
 
 use omega_core::types::blueprint::ExecutionBlueprint;
 use omega_relay::BundlePayload;
@@ -78,6 +92,7 @@ mod tests {
     use crate::signer::{MockTransactionSigner, UnconfiguredSigner};
     use alloy_primitives::{Address, Bytes, B256, U256};
     use omega_core::types::blueprint::StrategyId;
+    use omega_core::types::flashloan_provider::FlashloanProviderType;
     use omega_core::types::lane::{Lane, Simulator};
     use uuid::Uuid;
 
@@ -85,6 +100,7 @@ mod tests {
         let signal_id = Uuid::from_bytes([0x07u8; 16]);
         let client_order_id =
             ExecutionBlueprint::derive_client_order_id(StrategyId::Sa, 42161, 0, signal_id);
+        let base_fee_at_creation = 10;
         let mut bp = ExecutionBlueprint {
             blueprint_hash: B256::from([0x07u8; 32]),
             chain_id: 42161,
@@ -97,6 +113,14 @@ mod tests {
             flashloan_provider: Address::ZERO,
             flashloan_amount: U256::ZERO,
             flashloan_available: U256::ZERO,
+            // See this file's module-level "Audit fix: test helper
+            // missing flashloan/fee fields" note: build_bundle_payload
+            // never reads these three, so they mirror this helper's
+            // existing flashloan_provider: Address::ZERO "no flashloan"
+            // convention.
+            flashloan_provider_type: FlashloanProviderType::Balancer,
+            provider_contract: Address::ZERO,
+            flashloan_token: Address::ZERO,
             calldata: Bytes::new(),
             strategy_bytecode_hash: B256::ZERO,
             l2_exec_gas_estimate: 100_000,
@@ -107,9 +131,15 @@ mod tests {
             l2_buffer_factor: 1.15,
             l1_data_buffer_factor: 1.10,
             slippage_bps: 50,
-            base_fee_at_creation: 10,
+            base_fee_at_creation,
             l1_data_fee_at_creation: 2,
             priority_fee_gwei: 42,
+            // Derived via the real ExecutionBlueprint helper — see this
+            // file's module-level audit note.
+            max_base_fee_gwei: ExecutionBlueprint::derive_max_base_fee_gwei(
+                base_fee_at_creation,
+                3.0,
+            ),
             price_impact_bps: None,
             ofa_compliant: false,
             expiry_block: 1_100,

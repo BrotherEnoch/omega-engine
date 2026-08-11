@@ -29,10 +29,27 @@
 //
 // ## Audit fix (this revision): export individual oracle checks
 //
-// omega-hot-path invokes check_oracle_freshness / check_oracle_hierarchy /
-// check_slippage directly (it does not run the full 15-check pipeline).
-// Those three functions are therefore re-exported here alongside the
-// existing run_all_checks surface.
+// omega-hot-path invokes the individual oracle/slippage checks directly
+// (it does not run the full 16-check pipeline).
+//
+// ## Fix (this revision, 2): re-exported the WRONG function names
+//
+// This file previously did
+//   `pub use checks::{check_oracle_freshness, check_oracle_hierarchy, check_slippage, ...}`
+// — but those three identifiers name the PRIVATE thin-wrapper functions
+// inside checks.rs (`fn check_oracle_freshness(bp: &BlueprintFields, ctx:
+// &CheckContext) -> ...`), not the `pub` standalone functions checks.rs
+// actually defines for exactly this cross-crate use case (E0603: function
+// is private). The real public functions — the ones that take only an
+// `&OracleSnapshot` or bare `u16`s, with no `BlueprintFields`/
+// `CheckContext` required, which is the whole point for a caller like
+// omega-hot-path — are named `oracle_freshness_check`,
+// `oracle_hierarchy_check`, `oracle_price_sanity_check`, and
+// `slippage_check`. Corrected the re-export list to name those instead,
+// and added `oracle_price_sanity_check` (check 16 / MissFlashCrash),
+// which was omitted entirely from the previous list despite existing in
+// checks.rs and being just as relevant to a caller bypassing the full
+// pipeline as the other three.
 
 #![cfg_attr(not(test), deny(clippy::unwrap_used, clippy::expect_used))]
 
@@ -48,8 +65,8 @@ pub mod metrics;
 pub mod whitelist;
 
 pub use checks::{
-    check_oracle_freshness, check_oracle_hierarchy, check_slippage, run_all_checks,
-    BlueprintFields, CheckResult,
+    oracle_freshness_check, oracle_hierarchy_check, oracle_price_sanity_check, run_all_checks,
+    slippage_check, BlueprintFields, CheckResult,
 };
 pub use circuit_breakers::{BreakerDiagnostics, CircuitBreakerRegistry, CircuitState};
 pub use competition::{competition_probability, priority_fee_gwei, AssetTier};

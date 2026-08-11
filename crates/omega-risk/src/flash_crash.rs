@@ -21,6 +21,19 @@
 //   `Arc<FlashCrashGuard>` is shared across oracle-update callbacks.
 //   Uses a Mutex<VecDeque<f64>> for the price window (only written on oracle updates,
 //   not in the hot scoring path).
+//
+// ## Audit fix (this revision): clippy::unwrap_used in detect_spike/detect_drift
+//
+// `detect_spike`/`detect_drift` previously did `*prices.last().unwrap()`
+// after an explicit `prices.len() < WINDOW` guard — provably safe (the
+// length check guarantees `Some`), but `#![cfg_attr(not(test),
+// deny(clippy::unwrap_used, ...))]` in lib.rs can't see that proof and
+// denies the `.unwrap()` call outright in non-test builds. Replaced with
+// a `let Some(..) = .. else { return false }` pattern, which is
+// behaviorally identical (the `else` branch is unreachable given the
+// preceding length check, exactly as the old `.unwrap()` assumed) but
+// doesn't trip the lint, since it's expressed as an explicit fallible
+// match rather than an infallibility assertion.
 
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
@@ -146,7 +159,9 @@ impl FlashCrashGuard {
         if prices.len() < SPIKE_WINDOW_BLOCKS {
             return false;
         }
-        let current = *prices.last().unwrap();
+        let Some(&current) = prices.last() else {
+            return false;
+        };
         let baseline = prices[prices.len() - SPIKE_WINDOW_BLOCKS];
         if baseline <= 0.0 {
             return false;
@@ -161,7 +176,9 @@ impl FlashCrashGuard {
             return false;
         }
         let oldest = prices[0];
-        let current = *prices.last().unwrap();
+        let Some(&current) = prices.last() else {
+            return false;
+        };
         if oldest <= 0.0 {
             return false;
         }
@@ -183,6 +200,18 @@ impl Default for FlashCrashGuard {
 
 #[cfg(test)]
 mod flash_crash_tests {
+    // Test-only: assertion-style unwrap/expect/panic on values this
+    // module's own preceding logic already guarantees are populated is
+    // normal, idiomatic test code, not a production robustness gap. The
+    // crate-wide `clippy::unwrap_used`/`clippy::expect_used`/`clippy::panic`
+    // lints (Cargo.toml `[lints.clippy]`, escalated to hard errors under
+    // `-D warnings`) would otherwise apply even inside `#[cfg(test)]`
+    // when invoked via `cargo clippy --all-targets`, despite lib.rs's own
+    // `#![cfg_attr(not(test), deny(...))]` deliberately scoping the
+    // *deny* to non-test code only. This allow makes that scoping actually
+    // hold under `--all-targets` too.
+    #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+
     use super::*;
 
     fn make_flat_guard(price: f64, n: usize) -> FlashCrashGuard {

@@ -3,6 +3,22 @@
 // Prometheus metrics for the risk layer.
 // All metrics are labelled with strategy_id and, where applicable, drop_code.
 // Registered once at process start via register_all().
+//
+// ## Audit fix (this revision): expect_used at registration sites
+//
+// Every `register_*_vec!(...).expect(...)` call below panics if metric
+// registration fails (duplicate name collision, invalid label set). That
+// is the correct behavior for process-init code: there is no sane
+// degraded mode for "this metric didn't register" — failing fast at
+// startup is strictly better than limping along with a silently-missing
+// gauge/counter that some other part of this crate assumes exists. The
+// crate-wide `clippy::expect_used = "warn"` lint (set in Cargo.toml,
+// escalated to a hard error under `-D warnings`) would otherwise force
+// annotating all ~15 call sites individually; a single module-level allow
+// here documents that this whole file's `expect()` usage is a deliberate,
+// uniform policy rather than 15 independent judgment calls.
+
+#![allow(clippy::expect_used)]
 
 use once_cell::sync::Lazy;
 use prometheus::{register_counter_vec, register_gauge_vec, CounterVec, GaugeVec};

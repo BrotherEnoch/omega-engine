@@ -49,6 +49,21 @@
 //
 // Spec: "< 0.70 for 72 blocks → AUTO-PAUSED (L2 fast-approve to resume)"
 //       "< 0.50 → circuit-break (L3 governance required)"
+//
+// ## Audit fix (this revision): clippy in test module
+//
+// `cb_tests` compares Prometheus counter values with `assert_eq!(count,
+// 2.0)` (a deliberate exact comparison — these are integer-valued
+// counters, so no float-precision concern applies in practice) and calls
+// `.unwrap()`/`.expect()` on `Option`s that the preceding lines already
+// guarantee are `Some`. Both patterns are ordinary, idiomatic test code,
+// but the crate-wide `[lints.clippy]` unwrap_used/expect_used ("warn" in
+// Cargo.toml) and the workspace's `-D clippy::float_cmp` escalate both to
+// hard errors under `cargo clippy --all-targets -- -D warnings`, even
+// though lib.rs's `#![cfg_attr(not(test), deny(...))]` only intends the
+// unwrap/expect deny to apply to non-test code. Added a module-level
+// allow covering all three lints to `cb_tests` so that scoping actually
+// holds.
 
 use chrono::{DateTime, Utc};
 use dashmap::DashMap;
@@ -545,6 +560,13 @@ impl Default for CircuitBreakerRegistry {
 
 #[cfg(test)]
 mod cb_tests {
+    #![allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::float_cmp
+    )]
+
     use super::*;
 
     #[test]

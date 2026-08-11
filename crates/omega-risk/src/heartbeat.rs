@@ -44,6 +44,16 @@
 // `chrono::Duration::max_value()`. See the matching note in
 // `kill_switch.rs`'s module doc comment — same fix, same reasoning,
 // applied to the other three call sites in this crate.
+//
+// ## Audit fix (this revision): clippy::unwrap_used in tests
+//
+// See flash_crash.rs's test-module doc comment for the general
+// reasoning: this crate's `[lints.clippy]` unwrap_used/expect_used are
+// set to "warn" at the manifest level, which `cargo clippy --all-targets
+// -- -D warnings` escalates to a hard error even inside `#[cfg(test)]`,
+// despite lib.rs's own `#![cfg_attr(not(test), deny(...))]` intending the
+// deny to apply outside tests only. Added a module-level allow to this
+// file's `tests` module so that intent actually holds.
 
 use chrono::Utc;
 use dashmap::DashMap;
@@ -215,6 +225,8 @@ impl Default for HeartbeatRegistry {
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+
     use super::*;
     use std::thread::sleep;
 

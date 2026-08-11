@@ -65,6 +65,70 @@
 // `check_dynamic_profit`, `check_flashloan_liquidity`, and
 // `check_account_exposure`'s real bodies), so coercing to `u128::MAX`
 // there is the conservative, correct behavior already.
+//
+// ## Audit fix (this revision): test helpers missing flashloan/fee fields
+//
+// Both `tests::sample_bp` and `tests::sample_bp_wide` predate
+// `ExecutionBlueprint` gaining `flashloan_provider_type`,
+// `provider_contract`, `flashloan_token`, and `max_base_fee_gwei`.
+// Nothing in `ExecutionPipeline::execute`'s Stage 0-6 path reads any of
+// the three flashloan-identity fields directly (Stage 2c reads
+// `flashloan_amount`/`flashloan_provider_id` via
+// `blueprint_to_check_fields`, which is unaffected — those are distinct,
+// pre-existing fields, not the three new ones), so
+// `Balancer`/`Address::ZERO`/`Address::ZERO` are inert placeholders in
+// both helpers, consistent with their existing
+// `flashloan_provider: Address::ZERO` "no flashloan" convention;
+// `max_base_fee_gwei` is derived via the real
+// `ExecutionBlueprint::derive_max_base_fee_gwei` helper in both, rather
+// than a hand-picked literal.
+//
+// ## Audit fix (this revision, 2): two clippy::-D-warnings failures in tests
+//
+// `cargo clippy --workspace --all-targets -- -D warnings` failed on two
+// unrelated lints in this file's test module:
+//
+//   1. `clippy::writeln_empty_string` at `blacklist_file()`'s
+//      `writeln!(f, "").unwrap();`. `writeln!(f)` (no format string)
+//      already writes exactly one newline on its own — passing `""` as
+//      an explicit format string is redundant. Fixed by dropping the
+//      empty string argument; the file's actual content (a single
+//      blank line, i.e. an empty relay-blacklist file) is unchanged.
+//   2. `clippy::await_holding_lock` at `phase_0_suppresses_submission`,
+//      flagging `pipeline.dag.lock().unwrap()` as held across the
+//      later `pipeline.execute(...).await` even though that test
+//      already called `drop(dag_guard)` before the await point.
+//      Rather than rely on clippy correctly tracking an explicit
+//      `drop()` call, this is fixed by block-scoping the guard instead
+//      — the same pattern this file's own
+//      `duplicate_idempotency_key_second_call_blocked` test already
+//      uses successfully a few tests below (`{ let mut g =
+//      pipeline.dag.lock().unwrap(); g.admit(...).unwrap(); }`), which
+//      is unambiguous to any static analysis since the guard binding
+//      does not exist past the closing brace. Behavior is identical;
+//      only the guard's scoping construct changed.
+//
+// ## Audit fix (this revision, 3): make_relay_with never seeded LaRelayMetrics
+//
+// 15 tests that expected a successful submission (`microtx_lane_submits_single`,
+// `integrity_registry_pass_allows_submission`, every concurrent/load/property
+// test that asserts `Ok(...)`, etc.) failed with
+// `RelayError::AllRelaysFailed`, even against `AlwaysAcceptRelay`. Root
+// cause, confirmed directly against `omega-relay/src/backpressure.rs`'s
+// real source (pasted this session): `submit_single_bundle` computes
+// `let mut ranked = metrics.la_ranked_relays(); if ranked.is_empty() {
+// return Err(RelayError::AllRelaysFailed { .. }); }` BEFORE it ever
+// looks at the `relay_clients` map — ranking comes entirely from
+// `LaRelayMetrics`, which `make_relay_with` below constructed via
+// `LaRelayMetrics::new(...)` but never populated. An empty ranking
+// means every submission fails closed before any `RelayClient` impl
+// (however permissive) is ever invoked. `omega-relay`'s own
+// `backpressure.rs::tests::make_clients_and_metrics` already
+// establishes the fix pattern — seed `metrics.record(&relay_name,
+// bool)` for each relay before use — mirrored in `make_relay_with`
+// below. See that function's own comment for why `RelayName::Flashbots`
+// is constructed directly rather than via omega-relay's private
+// `parse_relay_name` helper.
 
 use std::sync::{Arc, Mutex};
 
@@ -496,17 +560,26 @@ fn blueprint_to_check_fields(bp: &ExecutionBlueprint) -> Result<BlueprintFields,
 /// no-self-flash rule compares against `CheckContext::flashloan::protocol_id`.
 ///
 /// NO ADDRESS-TO-PROTOCOL-NAME TABLE EXISTS ANYWHERE IN THE OMEGA-ENGINE
-/// WORKSPACE as read in this investigation — `ExecutionBlueprint` carries
-/// only a raw `Address`, never a protocol name string, and no other file
-/// read in this thread maps one to the other. Fabricating real Aave/
-/// Balancer/Compound/Morpho/Euler deployment addresses here would be
-/// exactly the kind of placeholder data ruled out earlier in this
-/// conversation. Fails closed (returns an error for any non-zero address)
-/// rather than filling in an unmatchable sentinel string — a check that
-/// LOOKS like it's running the no-self-flash rule but can never actually
-/// fire is more dangerous than a loud, blocking error, since it would
-/// silently defeat exactly the protection `check_flashloan_liquidity`
-/// exists to provide.
+/// WORKSPACE as read in this investigation — this function reads
+/// `bp.flashloan_provider` (the legacy address field), NOT the newer
+/// `bp.flashloan_provider_type`/`bp.provider_contract` fields added to
+/// `ExecutionBlueprint` in a later revision. Whether
+/// `flashloan_provider_type` should now be the primary source for this
+/// mapping (it's a real, structured enum — `Balancer`/`AaveV3`/
+/// `UniswapV3` — rather than a raw address needing a lookup table) is an
+/// open question this function does not resolve: `omega_risk::context`'s
+/// `FlashloanSnapshot::protocol_id` is a `String`, and confirming the
+/// exact string values that field expects for each
+/// `FlashloanProviderType` variant requires reading code not available
+/// in this investigation. Fabricating real Aave/Balancer/Compound/
+/// Morpho/Euler deployment addresses OR guessing at protocol_id string
+/// values here would be exactly the kind of placeholder data ruled out
+/// elsewhere in this crate. Fails closed (returns an error for any
+/// non-zero address) rather than filling in an unmatchable sentinel
+/// string — a check that LOOKS like it's running the no-self-flash rule
+/// but can never actually fire is more dangerous than a loud, blocking
+/// error, since it would silently defeat exactly the protection
+/// `check_flashloan_liquidity` exists to provide.
 fn resolve_flashloan_provider_id(addr: Address) -> Result<&'static str, ExecutionError> {
     if addr == Address::ZERO {
         // No flashloan used (ExecutionBlueprint's own doc comment: "Zero
@@ -537,10 +610,11 @@ mod tests {
     use crate::signer::MockTransactionSigner;
     use alloy_primitives::{Bytes, B256, U256};
     use omega_core::types::blueprint::StrategyId;
+    use omega_core::types::flashloan_provider::FlashloanProviderType;
     use omega_core::types::lane::Simulator;
     use omega_dag::{DagConfig, ExecutionDag};
     use omega_relay::{
-        BuilderBlacklist, ExecutionAddress, LaRelayMetrics, RelayClient, RelayConfig,
+        BuilderBlacklist, ExecutionAddress, LaRelayMetrics, RelayClient, RelayConfig, RelayName,
         SubmissionOutcome,
     };
     use omega_risk::context::{CheckContext, FlashloanSnapshot, OracleSnapshot};
@@ -575,7 +649,12 @@ mod tests {
 
     fn blacklist_file() -> NamedTempFile {
         let mut f = NamedTempFile::new().unwrap();
-        writeln!(f, "").unwrap(); // empty blacklist is valid
+        // Fix (this revision, 2): was `writeln!(f, "").unwrap();` —
+        // clippy::writeln_empty_string flags the redundant explicit ""
+        // format string. `writeln!(f)` alone already writes exactly one
+        // newline; the resulting file content (a single blank line, an
+        // empty relay blacklist) is identical either way.
+        writeln!(f).unwrap(); // empty blacklist is valid
         f
     }
 
@@ -594,6 +673,33 @@ mod tests {
         let f = blacklist_file();
         let blacklist = BuilderBlacklist::load(f.path()).unwrap();
         let metrics = LaRelayMetrics::new(50, ExecutionAddress("0xTEST".into()));
+
+        // Fix (this revision, 3): both `submit_single_bundle` and
+        // `CascadeSubmitter::build_submission_order` (omega-relay's
+        // backpressure.rs, confirmed directly against that file's real
+        // source) rank candidate relays via `metrics.la_ranked_relays()`
+        // — NOT from the `clients` map populated below. An unseeded
+        // `LaRelayMetrics` starts with an empty ranking, so every
+        // submission in this crate's tests failed closed with
+        // `RelayError::AllRelaysFailed` before the injected `RelayClient`
+        // (e.g. `AlwaysAcceptRelay`) was ever called, regardless of what
+        // it would have returned. `omega-relay`'s own
+        // `backpressure.rs::tests::make_clients_and_metrics` seeds
+        // exactly this way before constructing a submitter — mirrored
+        // here. `RelayName::Flashbots` is used directly (not
+        // `parse_relay_name("flashbots")`, omega-relay's own helper for
+        // this) because that function is private to omega-relay and not
+        // reachable from this crate; "flashbots" is the only relay name
+        // this helper ever inserts into `clients` below, so this matches
+        // it exactly. 18/20 accepted mirrors omega-relay's own test
+        // seeding ratio (`i < 18` out of `0..20`) — the exact ratio is
+        // immaterial here (any non-empty ranking clears the empty-list
+        // guard), reused only for consistency with the established
+        // pattern rather than picked arbitrarily.
+        for i in 0..20u32 {
+            metrics.record(&RelayName::Flashbots, i < 18);
+        }
+
         let mut clients: HashMap<String, Arc<dyn RelayClient>> = HashMap::new();
         clients.insert("flashbots".into(), client);
         let cfg = RelayConfig {
@@ -669,10 +775,33 @@ mod tests {
         }
     }
 
+    /// Fix (this revision, 4): every blueprint this helper produced
+    /// shared the same `idempotency_key`, because only `signal_id`
+    /// (via `hash_byte`) varied while `nonce` was hardcoded to `1` —
+    /// and `ExecutionBlueprint::compute_idempotency_key()` does not
+    /// hash `signal_id` (or `client_order_id`, which is itself derived
+    /// from `signal_id`) at all; per `omega-core`'s own blueprint.rs
+    /// doc comment, both are provenance metadata, not economic
+    /// identity. Confirmed empirically, not just theoretically: six
+    /// concurrency/load tests that admit N distinct `sample_bp(i)`
+    /// values into the pipeline all failed with the SAME symptom —
+    /// exactly one submission succeeding and every other one rejected
+    /// with `ExecutionError::DuplicateIdempotencyKey` — which is
+    /// exactly what happens when N blueprints collapse onto one
+    /// idempotency key. `nonce` IS hashed into the key (it's already a
+    /// real, independent parameter to
+    /// `derive_client_order_id`/`BlueprintFields`, not something this
+    /// fix introduces), so varying it by `hash_byte` gives each
+    /// generated blueprint a genuinely distinct identity. The
+    /// `derive_client_order_id` call's `nonce` argument is updated to
+    /// match for consistency, though that field itself isn't part of
+    /// the idempotency key.
     fn sample_bp(hash_byte: u8) -> ExecutionBlueprint {
         let signal_id = Uuid::from_bytes([hash_byte; 16]);
+        let nonce = hash_byte as u64;
         let client_order_id =
-            ExecutionBlueprint::derive_client_order_id(StrategyId::Sa, 42161, 1, signal_id);
+            ExecutionBlueprint::derive_client_order_id(StrategyId::Sa, 42161, nonce, signal_id);
+        let base_fee_at_creation: u64 = 50;
         let mut bp = ExecutionBlueprint {
             blueprint_hash: B256::ZERO,
             chain_id: 42161,
@@ -685,6 +814,14 @@ mod tests {
             flashloan_provider: Address::ZERO,
             flashloan_amount: U256::from(1_000_000u64),
             flashloan_available: U256::from(2_000_000u64),
+            // See this file's module-level "Audit fix: test helpers
+            // missing flashloan/fee fields" note: ExecutionPipeline's
+            // Stage 0-6 path never reads these three, so they mirror
+            // this helper's existing flashloan_provider: Address::ZERO
+            // "no flashloan" convention.
+            flashloan_provider_type: FlashloanProviderType::Balancer,
+            provider_contract: Address::ZERO,
+            flashloan_token: Address::ZERO,
             calldata: Bytes::new(),
             strategy_bytecode_hash: B256::from([0xaa; 32]),
             l2_exec_gas_estimate: 100_000,
@@ -695,13 +832,19 @@ mod tests {
             l2_buffer_factor: 1.15,
             l1_data_buffer_factor: 1.10,
             slippage_bps: 20,
-            base_fee_at_creation: 50,
+            base_fee_at_creation,
             l1_data_fee_at_creation: 40,
             priority_fee_gwei: 10,
+            // Derived via the real ExecutionBlueprint helper — see this
+            // file's module-level audit note.
+            max_base_fee_gwei: ExecutionBlueprint::derive_max_base_fee_gwei(
+                base_fee_at_creation,
+                3.0,
+            ),
             price_impact_bps: None,
             ofa_compliant: false,
             expiry_block: 1_000,
-            nonce: 1,
+            nonce,
             confirmation_depth: 12,
             client_order_id,
             idempotency_key: B256::ZERO,
@@ -765,9 +908,17 @@ mod tests {
     #[tokio::test]
     async fn phase_0_suppresses_submission() {
         let pipeline = make_pipeline();
-        let mut dag_guard = pipeline.dag.lock().unwrap();
-        dag_guard.admit(sample_bp(1), &[]).unwrap();
-        drop(dag_guard);
+        // Fix (this revision, 2): block-scoped instead of an explicit
+        // `drop(dag_guard)` after the fact — see this file's
+        // module-level "Audit fix (this revision, 2)" note for why:
+        // clippy::await_holding_lock still flagged the manual-drop
+        // version even though the drop ran before the later `.await`.
+        // Block scoping is the same pattern already used a few tests
+        // below in `duplicate_idempotency_key_second_call_blocked`.
+        {
+            let mut dag_guard = pipeline.dag.lock().unwrap();
+            dag_guard.admit(sample_bp(1), &[]).unwrap();
+        }
 
         let bp = sample_bp(1);
         let ctx = passing_ctx(bp.strategy_bytecode_hash.0);
@@ -1782,18 +1933,28 @@ mod tests {
     }
 
     /// Like `sample_bp`, but accepts a wider index so load tests can
-    /// generate hundreds/thousands of blueprints with distinct
-    /// `signal_id`s (and therefore distinct `idempotency_key`s) without
-    /// colliding — `sample_bp`'s `u8` parameter wraps at 256, which is
-    /// too narrow for the 1000-blueprint load test.
+    /// generate hundreds/thousands of blueprints without their
+    /// `client_order_id`s colliding — `sample_bp`'s `u8` parameter
+    /// wraps at 256, which is too narrow for the 1000-blueprint load
+    /// test.
+    ///
+    /// Fix (this revision, 4): this comment previously claimed varying
+    /// `signal_id` alone produced "distinct idempotency_keys" — that
+    /// was wrong, and is exactly why the load tests using this helper
+    /// failed with `DuplicateIdempotencyKey`. See `sample_bp`'s
+    /// identically-reasoned fix above: `compute_idempotency_key()`
+    /// doesn't hash `signal_id`, so `nonce` (a real, separately-hashed
+    /// field) is varied by `index` here too.
     fn sample_bp_wide(index: u16) -> ExecutionBlueprint {
         let bytes = index.to_be_bytes();
         let mut hash_seed = [0u8; 16];
         hash_seed[14] = bytes[0];
         hash_seed[15] = bytes[1];
         let signal_id = Uuid::from_bytes(hash_seed);
+        let nonce = index as u64;
         let client_order_id =
-            ExecutionBlueprint::derive_client_order_id(StrategyId::Sa, 42161, 1, signal_id);
+            ExecutionBlueprint::derive_client_order_id(StrategyId::Sa, 42161, nonce, signal_id);
+        let base_fee_at_creation: u64 = 50;
         let mut bp = ExecutionBlueprint {
             blueprint_hash: B256::ZERO,
             chain_id: 42161,
@@ -1806,6 +1967,12 @@ mod tests {
             flashloan_provider: Address::ZERO,
             flashloan_amount: U256::from(1_000_000u64),
             flashloan_available: U256::from(2_000_000u64),
+            // See this file's module-level "Audit fix: test helpers
+            // missing flashloan/fee fields" note — same reasoning as
+            // sample_bp above.
+            flashloan_provider_type: FlashloanProviderType::Balancer,
+            provider_contract: Address::ZERO,
+            flashloan_token: Address::ZERO,
             calldata: Bytes::new(),
             strategy_bytecode_hash: B256::from([0xaa; 32]),
             l2_exec_gas_estimate: 100_000,
@@ -1816,13 +1983,19 @@ mod tests {
             l2_buffer_factor: 1.15,
             l1_data_buffer_factor: 1.10,
             slippage_bps: 20,
-            base_fee_at_creation: 50,
+            base_fee_at_creation,
             l1_data_fee_at_creation: 40,
             priority_fee_gwei: 10,
+            // Derived via the real ExecutionBlueprint helper — see this
+            // file's module-level audit note.
+            max_base_fee_gwei: ExecutionBlueprint::derive_max_base_fee_gwei(
+                base_fee_at_creation,
+                3.0,
+            ),
             price_impact_bps: None,
             ofa_compliant: false,
             expiry_block: 1_000,
-            nonce: 1,
+            nonce,
             confirmation_depth: 12,
             client_order_id,
             idempotency_key: B256::ZERO,

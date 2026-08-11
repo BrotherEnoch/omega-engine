@@ -9,6 +9,24 @@
 // (a `tokio::time::interval` loop) — they're meant to be
 // `tokio::spawn`ed once at startup, the same way that function already
 // is, once `omega-execution` is wired into `main.rs` (Gap 8).
+//
+// ## Audit fix (this revision): test fixture missing flashloan/fee fields
+//
+// The inline `ExecutionBlueprint` literal in
+// `tests::eviction_loop_actually_evicts_on_schedule` predates
+// `ExecutionBlueprint` gaining `flashloan_provider_type`,
+// `provider_contract`, `flashloan_token`, and `max_base_fee_gwei`. This
+// test never runs the pipeline past Stage 0 (phase 0 suppresses
+// submission before any flashloan-identity field is read), so
+// `Balancer`/`Address::ZERO`/`Address::ZERO` are inert placeholders
+// consistent with this fixture's existing
+// `flashloan_provider: alloy_primitives::Address::ZERO` "no flashloan"
+// convention (this fixture uses fully-qualified paths throughout rather
+// than local `use` imports, since it's a one-off construction inline in
+// a single test rather than a shared helper function — the new fields
+// follow that same fully-qualified-path style); `max_base_fee_gwei` is
+// derived via the real `ExecutionBlueprint::derive_max_base_fee_gwei`
+// helper rather than a hand-picked literal.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -112,6 +130,7 @@ mod tests {
     async fn eviction_loop_actually_evicts_on_schedule() {
         use crate::signer::MockTransactionSigner;
         use omega_core::types::blueprint::{ExecutionBlueprint, StrategyId};
+        use omega_core::types::flashloan_provider::FlashloanProviderType;
         use omega_dag::{DagConfig, ExecutionDag};
         use omega_risk::kill_switch::{KillSwitchConfig, KillSwitchRegistry};
         use std::sync::Mutex;
@@ -123,6 +142,7 @@ mod tests {
         let signal_id = Uuid::from_bytes([0x99u8; 16]);
         let client_order_id =
             ExecutionBlueprint::derive_client_order_id(StrategyId::Sa, 42161, 1, signal_id);
+        let base_fee_at_creation: u64 = 50;
         let mut bp = ExecutionBlueprint {
             blueprint_hash: alloy_primitives::B256::ZERO,
             chain_id: 42161,
@@ -135,6 +155,13 @@ mod tests {
             flashloan_provider: alloy_primitives::Address::ZERO,
             flashloan_amount: alloy_primitives::U256::from(1_000_000u64),
             flashloan_available: alloy_primitives::U256::from(2_000_000u64),
+            // See this file's module-level "Audit fix: test fixture
+            // missing flashloan/fee fields" note: this test never runs
+            // the pipeline past Stage 0, so these three are inert
+            // placeholders mirroring flashloan_provider: Address::ZERO.
+            flashloan_provider_type: FlashloanProviderType::Balancer,
+            provider_contract: alloy_primitives::Address::ZERO,
+            flashloan_token: alloy_primitives::Address::ZERO,
             calldata: alloy_primitives::Bytes::new(),
             strategy_bytecode_hash: alloy_primitives::B256::from([0xaa; 32]),
             l2_exec_gas_estimate: 100_000,
@@ -145,9 +172,15 @@ mod tests {
             l2_buffer_factor: 1.15,
             l1_data_buffer_factor: 1.10,
             slippage_bps: 20,
-            base_fee_at_creation: 50,
+            base_fee_at_creation,
             l1_data_fee_at_creation: 40,
             priority_fee_gwei: 10,
+            // Derived via the real ExecutionBlueprint helper — see this
+            // file's module-level audit note.
+            max_base_fee_gwei: ExecutionBlueprint::derive_max_base_fee_gwei(
+                base_fee_at_creation,
+                3.0,
+            ),
             price_impact_bps: None,
             ofa_compliant: false,
             expiry_block: 1_000,
