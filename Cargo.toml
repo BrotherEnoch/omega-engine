@@ -23,13 +23,57 @@
 # crates/omega-execution/src/lib.rs's own module doc comment for what it
 # is and, just as importantly, what it deliberately does not implement
 # yet (raw transaction signing, flashloan-provider resolution — both
-# fail closed rather than being fabricated). NOT added to this file's
-# own `[dependencies]` list — the omega-engine binary does not construct
-# or call into ExecutionPipeline yet, since doing so would require real
-# deployment configuration (relay endpoints/auth, kill-switch thresholds,
-# a deployment manifest for omega-security's IntegrityRegistry) that
-# doesn't exist in any file read while building this crate. Wiring it
-# into src/main.rs is a follow-up once that configuration exists.
+# fail closed rather than being fabricated).
+#
+# ## Fix (this revision, 3): E0433 `omega_risk` not found in scope
+#
+# `src/main.rs` has `use omega_risk::context::OracleSnapshot;` — used to
+# type `HotPathRequest::oracle` and to build snapshots in
+# `build_oracle_snapshot()`. `omega-risk` was already listed under
+# `[workspace].members`, but the omega-engine BINARY package's own
+# `[dependencies]` table below never listed it. Fixed by adding the same
+# `{ path = "crates/omega-risk" }` pattern already used for every
+# sibling crate below.
+#
+# ## Fix (this revision, 4): E0308 duplicate `alloy_primitives::Address` types
+#
+# Fixed by raising `alloy-primitives` to `"0.8"` below, so every crate
+# that writes `alloy-primitives = { workspace = true }` resolves to the
+# same 0.8.x line `alloy-core` already forces in transitively.
+#
+# ## Cleanup (this revision, 3): removed invalid `[alias]` table
+#
+# `[alias]` is not a `Cargo.toml` table — cargo aliases belong in
+# `.cargo/config.toml`'s own `[alias]` section. Removed here; restore
+# `cargo check-modules` by adding
+#     [alias]
+#     check-modules = "run --package module-check --"
+# to `.cargo/config.toml` at the repo root instead.
+#
+# ## C1 (this revision, 5): Integration wiring foundation — add
+# omega-relay, omega-security, omega-execution as binary dependencies
+#
+# `src/main.rs` is being wired (see PROGRESS.md / ExecutionPipelineSpec)
+# to construct a fail-closed `ExecutionPipeline` at startup: a
+# `KillSwitchRegistry` (omega-risk::kill_switch — already a dependency
+# via the omega-risk fix above, no new line needed there), an empty
+# `IntegrityRegistry` (omega-security), a `MultiRelayClient` with zero
+# live relay clients (omega-relay), an `UnconfiguredSigner`, and
+# `ExecutionPipeline::new(...)` itself (omega-execution). All four
+# crates were already `[workspace].members` (per the "added
+# crates/omega-execution" note above and the pre-existing workspace
+# list) and already compile standalone, but — same class of gap as the
+# omega-risk E0433 fix above — none of them were listed in the BINARY
+# package's own `[dependencies]` table, only in `[workspace].members`.
+# `omega-security` and `omega-relay` were not previously binary
+# dependencies at all (nothing in main.rs referenced them before this
+# revision). Fixed by adding all three (omega-relay, omega-security,
+# omega-execution) below, following the exact `{ path = "crates/..." }`
+# pattern every existing sibling entry already uses. This is
+# dependency-graph wiring only — see src/main.rs's own C1 doc comment
+# for the actual object construction and for what is deliberately left
+# fail-closed / unconstructed (real signer, real relay endpoints, real
+# deployment manifest, real kill-switch thresholds).
 
 [package]
 name        = "omega-engine"
@@ -41,10 +85,16 @@ default-run = "omega-engine"
 name = "omega-engine"
 path = "src/main.rs"
 
-[alias]
-check-modules = "run --package module-check --"
-
 [dependencies]
+# C2: chrono — main.rs now calls chrono::Utc::now() directly in
+# score_and_admit (see that file's own "C2" doc comment on
+# current_block_timestamp_secs). chrono is already a
+# [workspace.dependencies] entry (used transitively via omega-risk and
+# others); this adds it as a direct binary dependency, matching the
+# same class of fix as the earlier omega-risk E0433 note above — a
+# crate main.rs actually uses by name must be listed in ITS OWN
+# [dependencies] table, not just present somewhere in the workspace.
+chrono             = { workspace = true }
 tokio              = { workspace = true }
 anyhow             = { workspace = true }
 tracing            = { workspace = true }
@@ -56,12 +106,19 @@ omega-core          = { path = "crates/omega-core" }
 omega-health        = { path = "crates/omega-health" }
 omega-rpc           = { path = "crates/omega-rpc" }
 omega-oracle        = { path = "crates/omega-oracle" }
+omega-risk          = { path = "crates/omega-risk" }
 omega-dag           = { path = "crates/omega-dag" }
 omega-zk            = { path = "crates/omega-zk" }
 omega-hot-path      = { path = "crates/omega-hot-path" }
 omega-strategies    = { path = "crates/omega-strategies" }
 omega-observability = { path = "crates/omega-observability" }
 omega-relay         = { path = "crates/omega-relay" }
+# C1: newly added binary dependencies — see this file's own "C1" doc
+# comment above. omega-relay was moved up next to its pre-existing spot
+# in this list (it was already present, used only transitively before
+# this revision — now used directly in main.rs for MultiRelayClient).
+omega-security      = { path = "crates/omega-security" }
+omega-execution     = { path = "crates/omega-execution" }
 
 [workspace]
 resolver = "2"
@@ -108,7 +165,7 @@ tokio-stream       = "0.1"
 # pubsub is listed here explicitly so it is guaranteed present for
 # ProviderBuilder::on_builtin to resolve wss:// correctly.
 alloy              = { version = "0.3", features = ["serde", "providers", "transport-ws", "pubsub", "rpc-types", "rpc-types-eth"] }
-alloy-primitives   = { version = "0.7", features = ["serde"] }
+alloy-primitives   = { version = "0.8", features = ["serde"] }
 revm               = { version = "8",   features = ["serde"] }
 serde              = { version = "1",   features = ["derive"] }
 serde_json         = "1"
