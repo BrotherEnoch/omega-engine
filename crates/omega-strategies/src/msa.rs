@@ -53,6 +53,25 @@
 // error otherwise: E0063 missing field). PLACEHOLDER VALUE, same
 // caveat as sa.rs/la.rs/mev.rs — set as `base_fee_at_creation * 3`
 // pending confirmation of the field's real intended semantics.
+//
+// ## Fix (this revision, 2): flashloan identity fields for E0063
+//
+// `ExecutionBlueprint` gained three additional fields —
+// `flashloan_provider_type`, `provider_contract`, `flashloan_token` —
+// at some point without this file being updated to match, producing
+// `error[E0063]: missing fields flashloan_provider_type, flashloan_token
+// and provider_contract in initializer of ExecutionBlueprint`. Fixed by
+// adding all three as inert placeholders (`FlashloanProviderType::
+// Balancer`, `Address::ZERO`, `Address::ZERO`) alongside the existing
+// `flashloan_provider: Address::ZERO` / no-flashloan path — the same
+// pattern `omega-execution/src/pipeline.rs`'s own test helper
+// (`tests::sample_bp`) already establishes for exactly this situation:
+// nothing in `ExecutionPipeline::execute`'s Stage 0-6 path reads any of
+// these three flashloan-identity fields when `flashloan_provider` is
+// `Address::ZERO`, so their concrete values are inert here, not a
+// product decision. See this file's own TODO(capital-path) comment
+// below for the still-open question of what MSA's real flashloan path
+// (if any) should look like.
 
 use std::sync::{
     atomic::{AtomicU64, Ordering},
@@ -65,6 +84,7 @@ use async_trait::async_trait;
 use uuid::Uuid;
 
 use omega_core::types::blueprint::{ExecutionBlueprint, StrategyId};
+use omega_core::types::flashloan_provider::FlashloanProviderType;
 use omega_core::types::lane::{Lane, Simulator};
 use omega_core::types::strategy::{OpScore, SignalState, SimResult, StrategyTrait};
 use omega_core::{GasConfig, OmegaConfig};
@@ -319,6 +339,15 @@ impl StrategyTrait for MsaStrategy {
             flashloan_provider: Address::ZERO,
             flashloan_amount: U256::ZERO,
             flashloan_available: U256::MAX,
+            // Fix (this revision, 2): inert placeholders — flashloan_provider
+            // is Address::ZERO (no flashloan), and omega-execution's pipeline
+            // never reads these three fields on that path. Same pattern
+            // pipeline.rs's own test helper (sample_bp) already uses for the
+            // identical case — see this file's module-level "Fix (this
+            // revision, 2)" note.
+            flashloan_provider_type: FlashloanProviderType::Balancer,
+            provider_contract: Address::ZERO,
+            flashloan_token: Address::ZERO,
             // PLACEHOLDER — see module-level comment on this revision's
             // max_base_fee_gwei addition.
             max_base_fee_gwei: signal
