@@ -3195,7 +3195,7 @@ dependencies = [
 name = "omega-compliance"
 version = "12.0.0"
 dependencies = [
- "alloy-primitives 0.7.7",
+ "alloy-primitives 0.8.26",
  "anyhow",
  "chrono",
  "omega-core",
@@ -3255,7 +3255,7 @@ dependencies = [
 name = "omega-core"
 version = "12.0.0"
 dependencies = [
- "alloy-primitives 0.7.7",
+ "alloy-primitives 0.8.26",
  "anyhow",
  "async-trait",
  "bincode",
@@ -3287,7 +3287,7 @@ dependencies = [
 name = "omega-dag"
 version = "12.0.0"
 dependencies = [
- "alloy-primitives 0.7.7",
+ "alloy-primitives 0.8.26",
  "anyhow",
  "chrono",
  "omega-core",
@@ -3304,14 +3304,18 @@ name = "omega-engine"
 version = "12.0.0"
 dependencies = [
  "anyhow",
+ "chrono",
  "omega-core",
  "omega-dag",
+ "omega-execution",
  "omega-health",
  "omega-hot-path",
  "omega-observability",
  "omega-oracle",
  "omega-relay",
+ "omega-risk",
  "omega-rpc",
+ "omega-security",
  "omega-strategies",
  "omega-zk",
  "reqwest",
@@ -3325,7 +3329,7 @@ dependencies = [
 name = "omega-execution"
 version = "12.0.0"
 dependencies = [
- "alloy-primitives 0.7.7",
+ "alloy-primitives 0.8.26",
  "anyhow",
  "async-trait",
  "chrono",
@@ -3349,7 +3353,7 @@ dependencies = [
 name = "omega-flashloan"
 version = "12.0.0"
 dependencies = [
- "alloy-primitives 0.7.7",
+ "alloy-primitives 0.8.26",
  "anyhow",
  "chrono",
  "dashmap 5.5.3",
@@ -3364,7 +3368,7 @@ dependencies = [
 name = "omega-gas-war"
 version = "12.0.0"
 dependencies = [
- "alloy-primitives 0.7.7",
+ "alloy-primitives 0.8.26",
  "anyhow",
  "arc-swap",
  "chrono",
@@ -3383,7 +3387,7 @@ dependencies = [
 name = "omega-health"
 version = "12.0.0"
 dependencies = [
- "alloy-primitives 0.7.7",
+ "alloy-primitives 0.8.26",
  "anyhow",
  "arc-swap",
  "chrono",
@@ -3401,7 +3405,7 @@ dependencies = [
 name = "omega-hot-path"
 version = "12.0.0"
 dependencies = [
- "alloy-primitives 0.7.7",
+ "alloy-primitives 0.8.26",
  "anyhow",
  "arc-swap",
  "chrono",
@@ -3419,7 +3423,7 @@ dependencies = [
 name = "omega-loss-attribution"
 version = "12.0.0"
 dependencies = [
- "alloy-primitives 0.7.7",
+ "alloy-primitives 0.8.26",
  "anyhow",
  "bincode",
  "chrono",
@@ -3449,7 +3453,7 @@ dependencies = [
 name = "omega-oracle"
 version = "12.0.0"
 dependencies = [
- "alloy-primitives 0.7.7",
+ "alloy-primitives 0.8.26",
  "anyhow",
  "arc-swap",
  "chrono",
@@ -3563,7 +3567,7 @@ name = "omega-rpc"
 version = "12.0.0"
 dependencies = [
  "alloy",
- "alloy-primitives 0.7.7",
+ "alloy-primitives 0.8.26",
  "anyhow",
  "chrono",
  "dashmap 5.5.3",
@@ -3625,7 +3629,7 @@ dependencies = [
 name = "omega-strategies"
 version = "12.0.0"
 dependencies = [
- "alloy-primitives 0.7.7",
+ "alloy-primitives 0.8.26",
  "anyhow",
  "arc-swap",
  "async-trait",
