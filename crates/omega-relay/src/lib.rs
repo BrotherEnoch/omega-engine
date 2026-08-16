@@ -206,8 +206,16 @@ impl MultiRelayClient {
 
 // ── Integration tests ─────────────────────────────────────────────────────────
 
+// `clippy::expect_used` is added here alongside the pre-existing
+// `unwrap_used`/`indexing_slicing` allows: this crate's `#![deny(...)]` above
+// is workspace-wide (including tests, unlike e.g. omega-hot-path's
+// `#![cfg_attr(not(test), deny(...))]` split), and `new_returns_a_live_reorg_event_receiver`
+// below legitimately needs `.expect("must not time out")` /
+// `.expect("channel must not be closed")` to assert on a timeout/recv result
+// with a meaningful failure message — the same idiom `unwrap_used` was
+// already allowed for in this module.
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::indexing_slicing)]
+#[allow(clippy::unwrap_used, clippy::indexing_slicing, clippy::expect_used)]
 mod integration_tests {
     use super::*;
     use crate::client::MockRelayClient;

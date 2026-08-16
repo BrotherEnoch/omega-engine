@@ -30,8 +30,14 @@ import "@openzeppelin/contracts/access/AccessControl.sol";
 ///    OZ5 post-_update path).
 /// 3. No separate Nonces base class in 4.9.6 -- nonces() is provided solely
 ///    by ERC20Permit via Counters. The dual-override nonces() is deleted.
-/// 4. clock() / CLOCK_MODE() still overridden to timestamp mode so
-///    holding_since (unix time) and getPastVotes timepoints share units.
+/// 4. clock() still overridden to timestamp mode so holding_since (unix time)
+///    and getPastVotes timepoints share units. CLOCK_MODE() is `pure`, not
+///    `view` -- it returns a fixed literal ("mode=timestamp") and, per the note
+///    below, deliberately never calls super, so nothing in its body reads
+///    contract state at all. It was originally left as `view` defensively, but
+///    the compiler correctly flags that as stricter than necessary (Warning
+///    2018), and there's no reason to keep a wider mutability annotation than
+///    the function actually needs.
 ///    CLOCK_MODE does not call super, regardless of whether 4.9.6 enforces a
 ///    hard consistency check at runtime: calling super would return the
 ///    wrong description string ("blocknumber" instead of "timestamp")
@@ -125,7 +131,7 @@ contract OpilToken is ERC20Votes, AccessControl {
     }
 
     // solhint-disable-next-line func-name-mixedcase
-    function CLOCK_MODE() public view override returns (string memory) {
+    function CLOCK_MODE() public pure override returns (string memory) {
         return "mode=timestamp";
     }
 

@@ -223,7 +223,7 @@ fn parse_hex_block(block_hex: &str) -> RelayResult<u64> {
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used)]
+#[allow(clippy::unwrap_used, clippy::indexing_slicing)]
 mod tests {
     use super::*;
 
@@ -295,7 +295,11 @@ mod tests {
         // must resolve as not-included rather than staying pending forever.
         let results = tracker.reconcile(100 + CONFIRMATION_GRACE_BLOCKS).await;
         assert_eq!(results.len(), 1);
-        assert!(!results[0].included);
+        // `results[0]` would trip this crate's `clippy::indexing_slicing` deny
+        // (see lib.rs) even inside tests, since the test module only allows
+        // `unwrap_used`/`indexing_slicing` itself, not raw `[]` panics implicitly —
+        // use `.first().unwrap()` to stay within what's actually allowed here.
+        assert!(!results.first().unwrap().included);
         assert_eq!(tracker.pending_count(), 0, "must not stay pending forever");
     }
 }

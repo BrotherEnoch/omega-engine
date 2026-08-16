@@ -1,6 +1,6 @@
-// crates/omega-compliance/src/ofa.rs
+﻿// crates/omega-compliance/src/ofa.rs
 //
-// Order Flow Agreement (OFA) compliance validation (spec §8).
+// Order Flow Agreement (OFA) compliance validation (spec Â§8).
 //
 // ## What OFA is
 //
@@ -12,25 +12,51 @@
 //     - Slippage: the backrun must not worsen the user's slippage
 //     - Order validity: the order must not be expired or malformed
 //
-// ## Compliance obligations (spec §8)
+// ## Compliance obligations (spec Â§8)
 //
 //   Every blueprint with `ofa_compliant = true` MUST pass all three
 //   checks before relay submission:
 //
-//     1. ConsentCheck   — user has a valid, unexpired OFA consent record
-//     2. SlippageCheck  — `price_impact_bps ≤ consent.max_slippage_bps`
-//     3. OrderCheck     — order is well-formed and within validity window
+//     1. ConsentCheck   â€” user has a valid, unexpired OFA consent record
+//     2. SlippageCheck  â€” `price_impact_bps â‰¤ consent.max_slippage_bps`
+//     3. OrderCheck     â€” order is well-formed and within validity window
 //
 //   A blueprint that fails any check is discarded with the corresponding
 //   DropCode and is NOT submitted to any relay.
 //
-// ## Versioned rule sets (spec §8)
+// ## Versioned rule sets (spec Â§8)
 //
 //   OFA rules are versioned.  Each `OfaRuleSet` has an activation
 //   timestamp; the compliance checker uses the most recently activated
-//   rule set that is ≤ the current time.  Rule set updates use the L2
-//   fast-approve governance path (§5).  Downgrades are blocked — the
+//   rule set that is â‰¤ the current time.  Rule set updates use the L2
+//   fast-approve governance path (Â§5).  Downgrades are blocked â€” the
 //   active version can only increase.
+//
+// ## Fix (this revision): tests::dummy_bp missing 7 ExecutionBlueprint fields
+//
+// `dummy_bp` predates the `signal_id` / `client_order_id` /
+// `idempotency_key` fields (added for submission idempotency) AND the
+// `flashloan_provider_type` / `provider_contract` / `flashloan_token`
+// fields (added for real flashloan provider/pool selection â€” see
+// `omega_core::types::blueprint`'s own module doc comment) â€” 7 fields
+// total, matching the compiler's `E0063: missing fields client_order_id,
+// flashloan_provider_type, flashloan_token and 4 other fields` exactly.
+//
+// None of these checks (`check_consent`/`check_slippage`/`check_order`)
+// read any of the 7, so â€” same reasoning already established elsewhere
+// in this codebase's test helpers â€” they're placeholder values here:
+//   - `signal_id`/`client_order_id`/`idempotency_key`: deterministic
+//     placeholders, not integrity-checked (no test here calls
+//     `verify_hash()`/`verify_idempotency_key()`).
+//   - `flashloan_provider_type`/`provider_contract`/`flashloan_token`:
+//     this blueprint doesn't source a real flashloan
+//     (`flashloan_provider: Address::ZERO`, matching the file's existing
+//     "no flashloan" convention), so these are inert placeholders too.
+//   - `max_base_fee_gwei`: set from `base_fee_at_creation * 3`, the same
+//     placeholder headroom multiplier used in `sa.rs`/`la.rs`/`msa.rs`/
+//     `mev.rs` pending confirmation of this field's real intended
+//     semantics (per those files' own comments) â€” not read by any check
+//     in this file either.
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -38,9 +64,9 @@ use serde::{Deserialize, Serialize};
 use omega_core::errors::DropCode;
 use omega_core::types::blueprint::ExecutionBlueprint;
 
-// ─────────────────────────────────────────────────────────────────────────────
+// â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 // OfaConsentRecord
-// ─────────────────────────────────────────────────────────────────────────────
+// â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 /// A user's consent record for OFA participation.
 ///
@@ -72,9 +98,9 @@ impl OfaConsentRecord {
     }
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
+// â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 // OfaOrder
-// ─────────────────────────────────────────────────────────────────────────────
+// â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 /// A parsed OFA order from the MEV-Share SSE stream.
 ///
@@ -99,7 +125,7 @@ impl OfaOrder {
     ///
     /// An order is valid when:
     ///   - It has not been filled
-    ///   - `current_block ≤ expires_at`
+    ///   - `current_block â‰¤ expires_at`
     pub fn is_valid_at_block(&self, current_block: u64) -> bool {
         !self.is_filled && current_block <= self.expires_at
     }
@@ -117,15 +143,15 @@ impl OfaOrder {
     }
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
+// â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 // OfaRuleSet
-// ─────────────────────────────────────────────────────────────────────────────
+// â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
-/// A versioned OFA compliance rule set (spec §8).
+/// A versioned OFA compliance rule set (spec Â§8).
 ///
 /// Rule set updates are applied via L2 fast-approve governance.
 /// The active rule set is the most recently activated one
-/// (activated_at ≤ Utc::now()).
+/// (activated_at â‰¤ Utc::now()).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OfaRuleSet {
     /// Monotonically increasing version number.
@@ -135,7 +161,7 @@ pub struct OfaRuleSet {
     /// Maximum age of a consent record in seconds before it is
     /// considered stale (default 86400 = 24 hours).
     pub consent_max_age_secs: u64,
-    /// Maximum order age in blocks (default 20 blocks ≈ 5s on Arbitrum).
+    /// Maximum order age in blocks (default 20 blocks â‰ˆ 5s on Arbitrum).
     pub order_max_age_blocks: u64,
     /// Maximum slippage imposed by backrun, in basis points (default 50).
     pub backrun_slippage_cap_bps: u16,
@@ -153,9 +179,9 @@ impl Default for OfaRuleSet {
     }
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
+// â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 // OfaCheckError
-// ─────────────────────────────────────────────────────────────────────────────
+// â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 /// A typed OFA compliance failure.
 ///
@@ -202,13 +228,13 @@ impl OfaCheckError {
     }
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
+// â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 // OfaChecker
-// ─────────────────────────────────────────────────────────────────────────────
+// â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
-/// Stateless OFA compliance checker (spec §8).
+/// Stateless OFA compliance checker (spec Â§8).
 ///
-/// All methods are pure functions — no I/O, no async.
+/// All methods are pure functions â€” no I/O, no async.
 pub struct OfaChecker;
 
 impl OfaChecker {
@@ -315,16 +341,18 @@ impl OfaChecker {
     }
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
+// â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 // Tests
-// ─────────────────────────────────────────────────────────────────────────────
+// â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use alloy_primitives::{Address, Bytes, B256, U256};
     use omega_core::types::blueprint::{ExecutionBlueprint, StrategyId};
+    use omega_core::types::flashloan_provider::FlashloanProviderType;
     use omega_core::types::lane::{Lane, Simulator};
+    use uuid::Uuid;
 
     fn consent(active: bool, max_slippage_bps: u16, expires_minutes: i64) -> OfaConsentRecord {
         OfaConsentRecord {
@@ -350,7 +378,15 @@ mod tests {
         OfaRuleSet::default()
     }
 
+    /// See this file's module-level "Fix (this revision)" note for why
+    /// `signal_id`/`client_order_id`/`idempotency_key`/
+    /// `flashloan_provider_type`/`provider_contract`/`flashloan_token`/
+    /// `max_base_fee_gwei` are placeholder values here â€” none of
+    /// `OfaChecker`'s checks read any of them.
     fn dummy_bp(price_impact_bps: Option<u16>) -> ExecutionBlueprint {
+        let signal_id = Uuid::from_bytes([0x00u8; 16]);
+        let client_order_id =
+            ExecutionBlueprint::derive_client_order_id(StrategyId::Mev, 42161, 1, signal_id);
         ExecutionBlueprint {
             blueprint_hash: B256::ZERO,
             chain_id: 42161,
@@ -359,9 +395,13 @@ mod tests {
             simulator: Simulator::Anvil,
             signal_state_hash: B256::ZERO,
             state_version: 1,
+            signal_id,
             flashloan_provider: Address::ZERO,
             flashloan_amount: U256::ZERO,
             flashloan_available: U256::ZERO,
+            flashloan_provider_type: FlashloanProviderType::Balancer,
+            provider_contract: Address::ZERO,
+            flashloan_token: Address::ZERO,
             calldata: Bytes::new(),
             strategy_bytecode_hash: B256::ZERO,
             l2_exec_gas_estimate: 200_000,
@@ -375,17 +415,20 @@ mod tests {
             base_fee_at_creation: 10,
             l1_data_fee_at_creation: 2,
             priority_fee_gwei: 100,
+            max_base_fee_gwei: 30, // base_fee_at_creation * 3 â€” see module note
             price_impact_bps,
             ofa_compliant: true,
             expiry_block: 1_000_001,
             nonce: 1,
             confirmation_depth: 12,
+            client_order_id,
+            idempotency_key: B256::ZERO,
             relay_targets: vec!["mev_share".into()],
             zk_proof_commitment: None,
         }
     }
 
-    // ── ConsentCheck ─────────────────────────────────────────────────────────
+    // â”€â”€ ConsentCheck â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
     #[test]
     fn consent_valid() {
@@ -409,7 +452,7 @@ mod tests {
         assert!(matches!(err, OfaCheckError::ConsentMissingOrExpired { .. }));
     }
 
-    // ── SlippageCheck ─────────────────────────────────────────────────────────
+    // â”€â”€ SlippageCheck â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
     #[test]
     fn slippage_within_limits() {
@@ -456,7 +499,7 @@ mod tests {
         assert!(OfaChecker::check_slippage(&bp, &c, &rules()).is_ok());
     }
 
-    // ── OrderCheck ───────────────────────────────────────────────────────────
+    // â”€â”€ OrderCheck â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
     #[test]
     fn order_valid() {
@@ -494,7 +537,7 @@ mod tests {
         assert!(matches!(err, OfaCheckError::OrderMalformed { .. }));
     }
 
-    // ── validate_blueprint ────────────────────────────────────────────────────
+    // â”€â”€ validate_blueprint â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
     #[test]
     fn full_validation_passes() {

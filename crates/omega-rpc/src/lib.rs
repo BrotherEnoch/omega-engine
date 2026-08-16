@@ -20,11 +20,11 @@
 //     submit_raw_transaction)
 //   - 500 rps target against a dedicated high-throughput node
 //
-// ## Audit pass summary (this revision)
+// ## Audit pass summary (prior revision)
 //
 // Applied a boundary-safety audit (the guiding question: can this crate
 // ever let the engine act on incorrect, stale, incomplete, or
-// duplicated external information?). Findings fixed in this pass:
+// duplicated external information?). Findings fixed in that pass:
 //   - Chain ID was never verified against any connected endpoint —
 //     added `net::verify_chain_id`, called at every connection
 //     establishment (client.rs, subscriptions.rs).
@@ -60,7 +60,7 @@
 //     client configured with a non-default `rps_limit` — fixed to
 //     track and report the actual configured capacity.
 //
-// ## Fix (this revision): fetch_chainlink_round / chainlink_agg
+// ## Fix (prior revision): fetch_chainlink_round / chainlink_agg
 //
 // Added `chainlink_agg` — the AggregatorV3Interface `sol!` binding and
 // `OmegaRpcClient::fetch_chainlink_round` (client.rs), giving
@@ -73,39 +73,24 @@
 // omega-oracle's `chainlink_poll.rs` instead, which already has this
 // crate as a dependency.
 //
-// ## Module map
+// ## Fix (this revision): arb_gas_info
 //
-//   net.rs            — shared boundary-safety helpers: RpcClientError,
-//                       chain-ID verification, URL redaction, saturating
-//                       gwei conversion. Used by both client.rs and
-//                       subscriptions.rs.
-//
-//   client.rs         — OmegaRpcClient: rate-limited WS client with a
-//                       shared persistent connection, block subscription
-//                       with reorg flagging, health integration,
-//                       chain-ID-verified reconnect, transaction
-//                       de-duplication, and Chainlink AggregatorV3 reads
-//                       (this revision).
-//
-//   chainlink_agg.rs  — AggregatorV3Interface sol! binding,
-//                       ChainlinkRound, scale_chainlink_answer (this
-//                       revision). No omega-oracle dependency — see
-//                       module-level note above.
-//
-//   rate_limiter.rs   — RpcRateLimiter: token-bucket per request kind
-//                       (Read 400 rps, Write 50 rps, Subscribe 20 rps by
-//                       default; actual capacity now tracked correctly
-//                       in snapshots regardless of custom configuration)
-//
-//   subscriptions.rs  — Five typed subscription streams:
-//                         run_pending_tx_stream       (SA/MSA order flow)
-//                         run_lending_protocol_stream (LA events)
-//                         run_dex_sync_stream         (MSA Bellman-Ford)
-//                         run_fee_oracle_stream       (§7 gas model input)
-//                         run_mev_share_stream        (Phase 4 MEV-OFA)
-
+// Added `arb_gas_info` — the ArbGasInfo precompile `sol!` binding and
+// `OmegaRpcClient::fetch_l1_base_fee_estimate_gwei` (see that module's
+// own doc comment for the full reasoning). Same non-dependency
+// discipline as chainlink_agg: no reference to any omega-oracle type
+// here; the "fetch then update PerChainOracle's FeeSnapshot" wiring
+// lives in `src/main.rs`'s new poll loop, mirroring the Chainlink split
+// exactly. Declared as a private module (`mod`, not `pub mod`) — same
+// as `chainlink_agg` above — since `OmegaRpcClient::
+// fetch_l1_base_fee_estimate_gwei` is reachable via the already-`pub`
+// `OmegaRpcClient` re-export below regardless of this module's own
+// visibility; no new `pub use` is needed since this module adds a
+// method to an existing public type rather than a new standalone type.
+mod arb_gas_info;
 mod chainlink_agg;
 mod net;
+mod flashloan_liq;
 
 pub mod client;
 pub mod rate_limiter;
@@ -125,4 +110,8 @@ pub use subscriptions::{
     run_dex_sync_stream, run_fee_oracle_stream, run_lending_protocol_stream, run_mev_share_stream,
     run_pending_tx_stream, DexSyncEvent, FeeOracleEvent, LendingProtocol, LendingProtocolEvent,
     MevShareEvent, PendingTxEvent,
+};
+
+pub use flashloan_liq::{
+    AAVE_PROTOCOL_DATA_PROVIDER, AAVE_V3_POOL, BALANCER_V2_VAULT, USDC_NATIVE, WETH,
 };

@@ -1,9 +1,9 @@
-// ops/control-plane/src/ws.rs
+﻿// ops/control-plane/src/ws.rs
 //
 //
-// WebSocket event stream — ws://<host>/ws/events (spec §17, §17.1).
+// WebSocket event stream â€” ws://<host>/ws/events (spec Â§17, Â§17.1).
 //
-// ## Rate limits (§17.1, fix M4)
+// ## Rate limits (Â§17.1, fix M4)
 //
 //   Authenticated connections (valid Bearer token in the first message):
 //     300 messages/minute outbound
@@ -35,37 +35,74 @@
 //   and should reconnect.
 //
 //   The route itself (`GET /ws/events`) is mounted in `main.rs`'s
-//   `build_router()` — this module only provides the handler.
+//   `build_router()` â€” this module only provides the handler.
 //
-// ## Wire format
+// ## Wire format (fixed this revision â€” see "Fix" note below)
 //
-//   Every event frame has shape:
-//     { "type": "<snake_case_variant>", "payload": { … } }
+//   `WsEvent` (the broadcast event stream) is INTERNALLY tagged, with
+//   NO separate payload wrapper â€” `omega_control_contracts::ws::WsEvent`
+//   actually declares `#[serde(tag = "kind", rename_all = "snake_case")]`
+//   (no `content = "..."`), so every field is flattened alongside the
+//   tag at the top level:
 //
-//   This matches `omega_control_contracts::ws::WsEvent`'s
-//   `#[serde(tag = "type", content = "payload", rename_all = "snake_case")]`
-//   attribute and the frontend's copy of the same type.
+//     { "kind": "<snake_case_variant>", "field_a": â€¦, "field_b": â€¦ }
+//
+//   e.g. `WsEvent::ProfitSplit { .. }` serialises as
+//     { "kind": "profit_split", "blueprint_hash": "0x1", "pil_share_wei": "â€¦", â€¦ }
+//   NOT as `{ "type": "profit_split", "payload": { â€¦ } }`.
+//
+//   The two one-shot auth-handshake frame types are tagged differently
+//   but follow the SAME flattened (no-wrapper) shape â€” just with
+//   `tag = "type"` instead of `tag = "kind"`:
+//     - `WsClientFrame` (client â†’ server): `{ "type": "auth", "token": "â€¦" }`
+//     - `WsAuthFrame` (server â†’ client ack): `{ "type": "auth_ok", "rate_limit": â€¦, "window_secs": â€¦ }`
+//       or `{ "type": "auth_failed", "rate_limit": â€¦, "window_secs": â€¦ }`
+//   `negotiate_auth` below hand-builds these via `serde_json::json!` and
+//   was already correct against this shape â€” only the broadcast-event
+//   wire format (this section) was previously documented wrong.
 //
 // ## Fix (this revision)
 //
 // The test module previously imported `WsEvent` and
-// `WS_CHANNEL_CAPACITY` from `crate::state` — a module that does not
+// `WS_CHANNEL_CAPACITY` from `crate::state` â€” a module that does not
 // exist in this crate (no `mod state;` in `main.rs`; confirmed the same
 // way `grpc.rs`'s own module comment already documented for its
 // equivalent `AppState`/`WsEvent`/`ALL_LAYER_IDS` imports). Fixed by
 // importing `WsEvent` from `omega_control_contracts::ws`, the same
 // shared type `grpc.rs`, `obs_bridge.rs`, and the frontend dashboard
-// already agree on — see this file's own module doc comment above,
-// which already said this was the wire-format source of truth even
-// before the import itself was fixed to match.
+// already agree on.
 //
-// `WS_CHANNEL_CAPACITY` is assumed to live alongside `AppState` in
-// `main.rs`, mirroring how `grpc.rs` reaches `crate::AppState` directly
-// — referenced here as `crate::WS_CHANNEL_CAPACITY`. THIS IS AN
-// ASSUMPTION, not a confirmed fact (main.rs's contents were not
-// available when this fix was made) — if the real constant lives
-// somewhere else (or under a different name), update this one import
-// line accordingly; nothing else in this file depends on its location.
+// `WS_CHANNEL_CAPACITY` resolves via `crate::WS_CHANNEL_CAPACITY` â€” this
+// compiles and its two tests (`broadcast_channel_capacity`,
+// `broadcast_publish_reaches_subscriber`) pass, confirming `main.rs`
+// really does expose it there (whether by re-export from
+// `omega_control_contracts::ws::WS_CHANNEL_CAPACITY` or its own const of
+// the same value) â€” left unchanged.
+//
+// ## Fix (this revision, 2): six WsEvent serialisation tests asserted
+// the wrong wire format
+//
+// This file's own module doc comment (see "## Wire format" above)
+// previously claimed `WsEvent` used
+// `#[serde(tag = "type", content = "payload", rename_all = "snake_case")]`
+// â€” an assumption made without having seen
+// `crates/omega-control-contracts/src/ws.rs`, and explicitly flagged as
+// such at the time (`main.rs's contents were not available when this
+// fix was made`). The real attribute is
+// `#[serde(tag = "kind", rename_all = "snake_case")]` â€” no `content`,
+// fields flattened at the top level, not wrapped under `"payload"`.
+// Confirmed independently by `omega-control-contracts`' OWN test suite
+// (`ws::tests::blueprint_confirmed_uses_wei_string_like_profit_split`,
+// `ws::tests::profit_split_and_blueprint_confirmed_agree_on_precision_strategy`),
+// which already passed against this real shape â€” only this file's
+// tests were out of sync with it. Fixed all six affected tests
+// (`config_reloaded_â€¦`, `model_pause_changed_â€¦`, `blacklist_reloaded_â€¦`,
+// `health_transition_â€¦`, `profit_split_â€¦`, `gas_model_reverted_â€¦`) to
+// assert `"kind":"<variant>"` instead of `"type":"<variant>"`, and
+// removed the now-incorrect `"payload":{` wrapper assertions â€” each
+// event's own fields (already separately asserted, e.g.
+// `"entry_count":42`) are the correct thing to check for flatness
+// instead.
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -77,13 +114,13 @@ use tokio::time::timeout;
 
 use crate::AppState;
 
-// ─────────────────────────────────────────────────────────────────────────────
+// â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 // Constants
-// ─────────────────────────────────────────────────────────────────────────────
+// â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 /// Rate limit window.
 const RATE_WINDOW: Duration = Duration::from_secs(60);
-/// Messages per window for authenticated connections (§17.1, fix M4).
+/// Messages per window for authenticated connections (Â§17.1, fix M4).
 const AUTHED_LIMIT: u32 = 300;
 /// Messages per window for anonymous connections.
 const ANON_LIMIT: u32 = 100;
@@ -92,9 +129,9 @@ const AUTH_TIMEOUT: Duration = Duration::from_secs(5);
 /// WebSocket ping interval.
 const PING_INTERVAL: Duration = Duration::from_secs(30);
 
-// ─────────────────────────────────────────────────────────────────────────────
+// â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 // Upgrade handler
-// ─────────────────────────────────────────────────────────────────────────────
+// â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 /// Axum route handler: upgrades an HTTP connection to WebSocket.
 ///
@@ -106,12 +143,12 @@ pub async fn events_handler(
     ws.on_upgrade(move |socket| handle_ws(socket, state))
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
+// â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 // Connection handler
-// ─────────────────────────────────────────────────────────────────────────────
+// â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 async fn handle_ws(mut socket: WebSocket, state: Arc<AppState>) {
-    // ── Auth handshake ────────────────────────────────────────────────────
+    // â”€â”€ Auth handshake â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     let is_authenticated = negotiate_auth(&mut socket, &state.api_token).await;
     let msg_limit = if is_authenticated {
         AUTHED_LIMIT
@@ -130,7 +167,7 @@ async fn handle_ws(mut socket: WebSocket, state: Arc<AppState>) {
     // dropped; we detect this via `RecvError::Lagged` and notify the client.
     let mut rx = state.ws_tx.subscribe();
 
-    // ── Rate-limit state ──────────────────────────────────────────────────
+    // â”€â”€ Rate-limit state â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     let mut msg_count = 0u32;
     let mut window_start = Instant::now();
     let mut ping_timer = tokio::time::interval(PING_INTERVAL);
@@ -144,7 +181,7 @@ async fn handle_ws(mut socket: WebSocket, state: Arc<AppState>) {
         }
 
         tokio::select! {
-            // ── Inbound frame from client ─────────────────────────────────
+            // â”€â”€ Inbound frame from client â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
             frame = socket.recv() => {
                 match frame {
                     Some(Ok(Message::Close(_))) | None => {
@@ -164,12 +201,12 @@ async fn handle_ws(mut socket: WebSocket, state: Arc<AppState>) {
                 }
             }
 
-            // ── Outbound event from broadcast channel ─────────────────────
+            // â”€â”€ Outbound event from broadcast channel â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
             result = rx.recv() => {
                 match result {
                     Ok(event) => {
                         if msg_count >= msg_limit {
-                            // Rate limit exceeded — close with Policy Violation
+                            // Rate limit exceeded â€” close with Policy Violation
                             let _ = socket.send(Message::Text(
                                 serde_json::to_string(&serde_json::json!({
                                     "error": "RATE_LIMIT_EXCEEDED",
@@ -193,7 +230,7 @@ async fn handle_ws(mut socket: WebSocket, state: Arc<AppState>) {
                         };
 
                         if socket.send(Message::Text(text)).await.is_err() {
-                            tracing::debug!("WebSocket send failed — client disconnected");
+                            tracing::debug!("WebSocket send failed â€” client disconnected");
                             break;
                         }
                         msg_count += 1;
@@ -208,17 +245,17 @@ async fn handle_ws(mut socket: WebSocket, state: Arc<AppState>) {
                                 "message": "reconnect recommended",
                             })).unwrap_or_default(),
                         )).await;
-                        // Continue — the receiver is now caught up
+                        // Continue â€” the receiver is now caught up
                     }
 
                     Err(tokio::sync::broadcast::error::RecvError::Closed) => {
-                        tracing::info!("WebSocket broadcast channel closed — shutting down");
+                        tracing::info!("WebSocket broadcast channel closed â€” shutting down");
                         break;
                     }
                 }
             }
 
-            // ── Periodic ping ─────────────────────────────────────────────
+            // â”€â”€ Periodic ping â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
             _ = ping_timer.tick() => {
                 if socket.send(Message::Ping(vec![])).await.is_err() {
                     break;
@@ -230,9 +267,9 @@ async fn handle_ws(mut socket: WebSocket, state: Arc<AppState>) {
     tracing::debug!("WebSocket connection closed");
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
+// â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 // Auth negotiation
-// ─────────────────────────────────────────────────────────────────────────────
+// â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 /// Read the initial auth frame from the client and validate the token.
 ///
@@ -263,7 +300,7 @@ async fn negotiate_auth(socket: &mut WebSocket, api_token: &str) -> bool {
                     }
                 }
             }
-            // Invalid auth frame — respond with anonymous rate limits
+            // Invalid auth frame â€” respond with anonymous rate limits
             let _ = socket
                 .send(Message::Text(
                     serde_json::to_string(&serde_json::json!({
@@ -276,14 +313,14 @@ async fn negotiate_auth(socket: &mut WebSocket, api_token: &str) -> bool {
                 .await;
             false
         }
-        // Timeout or non-text frame — treat as anonymous
+        // Timeout or non-text frame â€” treat as anonymous
         _ => false,
     }
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
+// â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 // Tests
-// ─────────────────────────────────────────────────────────────────────────────
+// â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 #[cfg(test)]
 mod tests {
@@ -292,22 +329,26 @@ mod tests {
     use tokio::sync::broadcast;
 
     // See this file's module-level "Fix (this revision)" note: this is
-    // an assumed location, not a confirmed one — update if wrong.
+    // an assumed location, not a confirmed one â€” update if wrong.
     use crate::WS_CHANNEL_CAPACITY;
 
     #[test]
     fn rate_limits_match_spec() {
-        // §17.1 fix M4: authenticated 300/min, anonymous 100/min
+        // Â§17.1 fix M4: authenticated 300/min, anonymous 100/min
         assert_eq!(AUTHED_LIMIT, 300);
         assert_eq!(ANON_LIMIT, 100);
         assert_eq!(RATE_WINDOW, Duration::from_secs(60));
     }
 
-    // ── Wire format correctness ───────────────────────────────────────────────
+    // â”€â”€ Wire format correctness â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     // These tests mirror the frontend's deserialisation expectations.
-    // omega_control_contracts::ws::WsEvent uses
-    // `#[serde(tag = "type", content = "payload")]`, so every serialised
-    // frame must contain both fields.
+    // omega_control_contracts::ws::WsEvent actually declares
+    // `#[serde(tag = "kind", rename_all = "snake_case")]` â€” INTERNALLY
+    // tagged, no `content` wrapper â€” so every serialised frame carries
+    // its tag as `"kind"` with all other fields flattened alongside it
+    // at the top level, NOT wrapped under a `"payload"` key. See this
+    // file's module-level "Fix (this revision, 2)" note for why these
+    // tests previously asserted a different (wrong) shape.
 
     #[test]
     fn config_reloaded_serialises_with_type_and_payload() {
@@ -316,12 +357,8 @@ mod tests {
         };
         let json = serde_json::to_string(&event).unwrap();
         assert!(
-            json.contains("\"type\":\"config_reloaded\""),
+            json.contains("\"kind\":\"config_reloaded\""),
             "wrong type tag: {json}"
-        );
-        assert!(
-            json.contains("\"payload\":{"),
-            "missing payload wrapper: {json}"
         );
     }
 
@@ -333,16 +370,12 @@ mod tests {
         };
         let json = serde_json::to_string(&event).unwrap();
         assert!(
-            json.contains("\"type\":\"model_pause_changed\""),
+            json.contains("\"kind\":\"model_pause_changed\""),
             "wrong type tag: {json}"
         );
         assert!(
-            json.contains("\"payload\":{"),
-            "missing payload wrapper: {json}"
-        );
-        assert!(
             json.contains("\"paused\":true"),
-            "paused field missing from payload: {json}"
+            "paused field missing (should be flattened at top level): {json}"
         );
     }
 
@@ -354,16 +387,12 @@ mod tests {
         };
         let json = serde_json::to_string(&event).unwrap();
         assert!(
-            json.contains("\"type\":\"blacklist_reloaded\""),
+            json.contains("\"kind\":\"blacklist_reloaded\""),
             "wrong type tag: {json}"
         );
         assert!(
-            json.contains("\"payload\":{"),
-            "missing payload wrapper: {json}"
-        );
-        assert!(
             json.contains("\"entry_count\":42"),
-            "entry_count missing from payload: {json}"
+            "entry_count missing (should be flattened at top level): {json}"
         );
     }
 
@@ -378,16 +407,12 @@ mod tests {
         };
         let json = serde_json::to_string(&event).unwrap();
         assert!(
-            json.contains("\"type\":\"health_transition\""),
+            json.contains("\"kind\":\"health_transition\""),
             "wrong type tag: {json}"
         );
         assert!(
-            json.contains("\"payload\":{"),
-            "missing payload wrapper: {json}"
-        );
-        assert!(
             json.contains("\"layer\":\"relay\""),
-            "layer field missing from payload: {json}"
+            "layer field missing (should be flattened at top level): {json}"
         );
     }
 
@@ -401,16 +426,12 @@ mod tests {
         };
         let json = serde_json::to_string(&event).unwrap();
         assert!(
-            json.contains("\"type\":\"profit_split\""),
+            json.contains("\"kind\":\"profit_split\""),
             "wrong type tag: {json}"
         );
         assert!(
-            json.contains("\"payload\":{"),
-            "missing payload wrapper: {json}"
-        );
-        assert!(
             json.contains("\"blueprint_hash\":\"0xabc\""),
-            "blueprint_hash missing from payload: {json}"
+            "blueprint_hash missing (should be flattened at top level): {json}"
         );
     }
 
@@ -424,16 +445,12 @@ mod tests {
         };
         let json = serde_json::to_string(&event).unwrap();
         assert!(
-            json.contains("\"type\":\"gas_model_reverted\""),
+            json.contains("\"kind\":\"gas_model_reverted\""),
             "wrong type tag: {json}"
         );
         assert!(
-            json.contains("\"payload\":{"),
-            "missing payload wrapper: {json}"
-        );
-        assert!(
             json.contains("\"checkpoint_version\":7"),
-            "checkpoint_version missing: {json}"
+            "checkpoint_version missing (should be flattened at top level): {json}"
         );
     }
 

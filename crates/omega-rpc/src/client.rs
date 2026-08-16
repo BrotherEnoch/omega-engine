@@ -1,8 +1,8 @@
-// crates/omega-rpc/src/client.rs
+﻿// crates/omega-rpc/src/client.rs
 //
-// OmegaRpcClient — rate-limited WebSocket RPC client.
+// OmegaRpcClient â€” rate-limited WebSocket RPC client.
 //
-// ## Architectural role (§22.1)
+// ## Architectural role (Â§22.1)
 //
 //   omega-rpc is the ONLY crate permitted to use the full alloy transport
 //   stack.  All other crates receive data through the oracle layer
@@ -12,7 +12,7 @@
 // ## Connection model
 //
 //   Single WebSocket connection to a dedicated node (500 rps target),
-//   shared across every call this client makes — `get_or_connect()`
+//   shared across every call this client makes â€” `get_or_connect()`
 //   lazily establishes it once and every subsequent call (block
 //   subscription, `fetch_fee_snapshot`, `fetch_logs`,
 //   `submit_raw_transaction`) reuses the same handle, only reconnecting
@@ -25,40 +25,40 @@
 //   below) would have needed to be repeated, or skipped, on every call
 //   rather than checked once at the actual trust boundary.
 //
-//   Reconnection is handled by `connect_with_retry` — exponential
-//   backoff from 1s to 30s, EXCEPT for fatal (configuration) errors —
-//   see `RpcClientError::is_fatal` in `net.rs` — which stop the retry
+//   Reconnection is handled by `connect_with_retry` â€” exponential
+//   backoff from 1s to 30s, EXCEPT for fatal (configuration) errors â€”
+//   see `RpcClientError::is_fatal` in `net.rs` â€” which stop the retry
 //   loop immediately instead of looping forever against something that
 //   can never succeed.
 //
-// ## Chain ID verification (audit finding — previously missing entirely)
+// ## Chain ID verification (audit finding â€” previously missing entirely)
 //
-//   Every connection establishment — the initial `connect()`, and every
-//   reconnect inside `get_or_connect()` — calls `eth_chainId` via
+//   Every connection establishment â€” the initial `connect()`, and every
+//   reconnect inside `get_or_connect()` â€” calls `eth_chainId` via
 //   `net::verify_chain_id` and compares it against `config.chain_id`.
 //   Nothing previously did this: a misconfigured or misrouted endpoint
 //   would have silently mislabeled every block, log, and fee snapshot
 //   with the wrong `chain_id` from that point forward. A mismatch is
-//   fatal (non-retryable) — see `RpcClientError`.
+//   fatal (non-retryable) â€” see `RpcClientError`.
 //
-// ## Transaction de-duplication (audit finding — previously absent entirely)
+// ## Transaction de-duplication (audit finding â€” previously absent entirely)
 //
 //   `submit_raw_transaction` is the ONLY intended path for submitting a
 //   signed transaction. It tracks recently-submitted transaction hashes
 //   in a bounded, TTL'd cache and refuses to resubmit a hash already
-//   seen within the dedup window — WITHOUT making any network call or
+//   seen within the dedup window â€” WITHOUT making any network call or
 //   consuming a write-rate-limit token for the rejected duplicate. This
 //   guards specifically against a caller-side retry bug that mistakes a
 //   slow-but-successful submission for a failure and resubmits it,
 //   which without this guard could result in the same trade being
 //   placed twice.
 //
-// ## Reorg / staleness signal (audit finding — previously absent)
+// ## Reorg / staleness signal (audit finding â€” previously absent)
 //
 //   Every `BlockEvent` now carries `is_reorg_or_stale`, computed by
 //   comparing the incoming block's number against the highest number
 //   previously observed on this subscription. Previously every block
-//   was broadcast verbatim with no such check — a reorg, a duplicate
+//   was broadcast verbatim with no such check â€” a reorg, a duplicate
 //   delivery, or a misbehaving endpoint serving stale data was
 //   indistinguishable from genuine chain progress to every downstream
 //   consumer.
@@ -67,18 +67,18 @@
 //
 //   `OmegaRpcClient` holds an optional `Arc<dyn LayerHealth>` for the
 //   ExternalData layer. On any successful (re)connection the health
-//   layer is set to Healthy UNCONDITIONALLY — previously this only
+//   layer is set to Healthy UNCONDITIONALLY â€” previously this only
 //   happened when recovering from a prior Degraded state specifically,
 //   which meant a clean first-time connect never promoted health out of
 //   its initial Unknown state (and, per the corresponding fix in
-//   omega-core, Unknown is correctly treated as NOT operational — so
+//   omega-core, Unknown is correctly treated as NOT operational â€” so
 //   this bug could leave the engine perpetually believing RPC
 //   connectivity was unavailable despite it working fine). On a fatal
-//   (non-retryable) error, health is set to Halted, not Degraded — a
+//   (non-retryable) error, health is set to Halted, not Degraded â€” a
 //   Degraded state implies "will recover on its own with retries,"
 //   which is false for a configuration error.
 //
-// ## Logging (audit finding — credentials were being logged in the clear)
+// ## Logging (audit finding â€” credentials were being logged in the clear)
 //
 //   Most RPC providers embed an API key directly in the WS URL's path
 //   or query string. Every log site that previously included the raw
@@ -89,13 +89,29 @@
 //
 // Chainlink AggregatorV3 polling support (see
 // crates/omega-oracle/src/chainlink_poll.rs for the poll loop that calls
-// it) is defined in chainlink_agg.rs, NOT in this file — that file's own
+// it) is defined in chainlink_agg.rs, NOT in this file â€” that file's own
 // `impl OmegaRpcClient` block owns `fetch_chainlink_round` exclusively.
 // An earlier revision of this file also defined the method here, which
 // is a duplicate inherent method (E0592); fixed by removing it from
 // this file rather than from chainlink_agg.rs, since keeping the sol!
 // binding, ChainlinkRound, and the one method that uses them together
 // in one file is the cleaner split.
+//
+// ## Fix (this revision): E0282 in tests::sample_block
+//
+// `Block::default()` failed to compile with "type annotations needed
+// for `Block<_, _>`": `alloy::rpc::types::Block<T, H>` declares default
+// type parameters on the struct itself, and those defaults are applied
+// automatically wherever `Block` is written out as a TYPE â€” exactly as
+// it already is, unannotated, in this file's own `block_to_event(block:
+// &Block, ...)` signature â€” but a bare `Block::default()` value
+// construction has no such type-position context to trigger them, so
+// the compiler has nothing to resolve `T`/`H` against. Fixed by giving
+// the `let` binding the identical bare `Block` annotation already used
+// successfully elsewhere in this file, which resolves to the same
+// `Block<Transaction, Header>` instantiation via the same default-
+// parameter mechanism â€” no need to name `Transaction`/`Header`
+// explicitly.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -114,9 +130,9 @@ use crate::net::{
 };
 use crate::rate_limiter::{RpcRateLimiter, RpcRequestKind};
 
-// ─────────────────────────────────────────────────────────────────────────────
+// â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 // Constants
-// ─────────────────────────────────────────────────────────────────────────────
+// â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 const RECONNECT_DELAY_INITIAL_MS: u64 = 1_000;
 const RECONNECT_DELAY_MAX_MS: u64 = 30_000;
@@ -130,12 +146,12 @@ const SUBMISSION_DEDUP_WINDOW: Duration = Duration::from_secs(30);
 
 /// Hard upper bound on how many in-flight submission hashes are
 /// tracked at once, so this cache can never grow unboundedly even
-/// under a pathological submission rate — see `SubmissionTracker`.
+/// under a pathological submission rate â€” see `SubmissionTracker`.
 const SUBMISSION_TRACKER_MAX_ENTRIES: usize = 10_000;
 
-// ─────────────────────────────────────────────────────────────────────────────
+// â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 // BlockEvent
-// ─────────────────────────────────────────────────────────────────────────────
+// â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 /// Lightweight block header event emitted on each new block.
 ///
@@ -150,7 +166,7 @@ pub struct BlockEvent {
     /// Unix timestamp in seconds.
     pub timestamp: u64,
     /// True when `number` did not strictly increase relative to the
-    /// highest block number previously observed on this subscription —
+    /// highest block number previously observed on this subscription â€”
     /// signals a possible reorg, stale replay, or duplicate delivery
     /// from the RPC endpoint. Downstream consumers (e.g. the LA reorg
     /// guard) should treat any blueprint built against state at or
@@ -161,7 +177,7 @@ pub struct BlockEvent {
 
 impl BlockEvent {
     /// True when this block's timestamp is plausible relative to
-    /// `now_unix_secs` — i.e. not further in the future than
+    /// `now_unix_secs` â€” i.e. not further in the future than
     /// `max_future_skew_secs` allows.
     ///
     /// Deliberately does not bound how far in the PAST a timestamp may
@@ -177,9 +193,9 @@ impl BlockEvent {
     }
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
+// â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 // RpcClientConfig
-// ─────────────────────────────────────────────────────────────────────────────
+// â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 /// Runtime configuration for `OmegaRpcClient`.
 #[derive(Debug, Clone)]
@@ -188,7 +204,7 @@ pub struct RpcClientConfig {
     pub ws_url: String,
     /// Requests per second budget (controls rate limiter config).
     pub rps_limit: u32,
-    /// EIP-155 chain ID — used to stamp outbound signals AND verified
+    /// EIP-155 chain ID â€” used to stamp outbound signals AND verified
     /// against the connected endpoint's actual `eth_chainId` at every
     /// connection establishment (see module doc comment).
     pub chain_id: u64,
@@ -204,12 +220,12 @@ impl RpcClientConfig {
     }
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
+// â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 // SubmissionTracker
-// ─────────────────────────────────────────────────────────────────────────────
+// â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 /// Bounded, TTL-based de-duplication cache. Prevents the same signed
-/// transaction hash from being submitted twice within `dedup_window` —
+/// transaction hash from being submitted twice within `dedup_window` â€”
 /// e.g. due to a caller-side retry loop mistakenly treating a slow-but-
 /// successful submission as a failure and resubmitting it. See
 /// `OmegaRpcClient::submit_raw_transaction`.
@@ -243,17 +259,17 @@ impl SubmissionTracker {
 
         if self.recent.len() >= self.max_tracked {
             // Fails safe by NOT falsely reporting a duplicate for a
-            // new, legitimate hash — but logs loudly, since dedup
+            // new, legitimate hash â€” but logs loudly, since dedup
             // protection is now degraded for new submissions until
             // enough entries age out. This should never happen under
-            // realistic submission rates (max 1 write/cycle, §4) —
+            // realistic submission rates (max 1 write/cycle, Â§4) â€”
             // hitting this bound indicates something upstream is
             // submitting far faster than the engine's own design
             // assumes, which is itself worth knowing about.
             tracing::error!(
                 tracked = self.recent.len(),
                 max = self.max_tracked,
-                "submission tracker at capacity — duplicate detection degraded for \
+                "submission tracker at capacity â€” duplicate detection degraded for \
                  new hashes until existing entries expire"
             );
             return false;
@@ -264,9 +280,9 @@ impl SubmissionTracker {
     }
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
+// â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 // ConnectionState
-// ─────────────────────────────────────────────────────────────────────────────
+// â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 type SharedProvider = Arc<dyn Provider>;
 
@@ -274,14 +290,14 @@ struct ConnectionState {
     provider: Option<SharedProvider>,
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
+// â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 // OmegaRpcClient
-// ─────────────────────────────────────────────────────────────────────────────
+// â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 /// Rate-limited WebSocket RPC client for the Omega Engine.
 ///
 /// Wraps a single shared alloy provider connection with:
-///   - Token-bucket rate limiting per request kind (§22 hardware spec)
+///   - Token-bucket rate limiting per request kind (Â§22 hardware spec)
 ///   - Block header broadcast channel for downstream consumers, with
 ///     reorg/staleness flagging
 ///   - Health layer integration for ExternalData transitions
@@ -289,7 +305,7 @@ struct ConnectionState {
 ///     on every (re)connection
 ///   - Transaction submission de-duplication
 ///
-/// Cloning is cheap — all fields are `Arc`-wrapped.
+/// Cloning is cheap â€” all fields are `Arc`-wrapped.
 #[derive(Clone)]
 pub struct OmegaRpcClient {
     config: RpcClientConfig,
@@ -301,13 +317,13 @@ pub struct OmegaRpcClient {
 }
 
 impl OmegaRpcClient {
-    // ── Constructors ──────────────────────────────────────────────────────────
+    // â”€â”€ Constructors â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
     /// Connect to the given WebSocket endpoint.
     ///
     /// Validates the URL scheme, establishes the connection, and
     /// verifies the endpoint's actual chain ID matches
-    /// `config.chain_id` before returning — a `RpcClientError` from
+    /// `config.chain_id` before returning â€” a `RpcClientError` from
     /// this method is `is_fatal()` for both a bad URL and a chain-ID
     /// mismatch, since retrying either with the same configuration can
     /// never succeed. Use `connect_with_retry` when the caller can
@@ -366,11 +382,11 @@ impl OmegaRpcClient {
 
     /// Connect with exponential backoff retry.
     ///
-    /// Retries on TRANSIENT failures (network blips, node restarts) —
-    /// backoff 1s → 2s → 4s → … → 30s cap. Stops IMMEDIATELY and
+    /// Retries on TRANSIENT failures (network blips, node restarts) â€”
+    /// backoff 1s â†’ 2s â†’ 4s â†’ â€¦ â†’ 30s cap. Stops IMMEDIATELY and
     /// returns `Err` on a FATAL error (bad URL scheme, chain-ID
     /// mismatch), since retrying those with the same configuration can
-    /// never succeed — looping forever against a permanent
+    /// never succeed â€” looping forever against a permanent
     /// misconfiguration previously gave an operator no signal that the
     /// problem needed their attention rather than more patience.
     pub async fn connect_with_retry(config: RpcClientConfig) -> Result<Self, RpcClientError> {
@@ -382,7 +398,7 @@ impl OmegaRpcClient {
                     tracing::error!(
                         error = %e,
                         ws_url = %redact_ws_url(&config.ws_url),
-                        "RPC connect failed with a FATAL, non-retryable error — giving up. \
+                        "RPC connect failed with a FATAL, non-retryable error â€” giving up. \
                          This requires operator intervention (check RPC URL / chain_id config).",
                     );
                     return Err(e);
@@ -392,7 +408,7 @@ impl OmegaRpcClient {
                         error    = %e,
                         delay_ms,
                         ws_url   = %redact_ws_url(&config.ws_url),
-                        "RPC connect failed — retrying",
+                        "RPC connect failed â€” retrying",
                     );
                     tokio::time::sleep(Duration::from_millis(delay_ms)).await;
                     delay_ms = (delay_ms * 2).min(RECONNECT_DELAY_MAX_MS);
@@ -407,14 +423,14 @@ impl OmegaRpcClient {
         self
     }
 
-    // ── Connection management ─────────────────────────────────────────────────
+    // â”€â”€ Connection management â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
     /// Returns the current shared provider connection, establishing
     /// (and chain-ID-verifying) a new one if none is cached or the
     /// cached one was invalidated by a previous failure.
     ///
     /// This is the single place every RPC call in this client goes
-    /// through to get a connection — `fetch_fee_snapshot`,
+    /// through to get a connection â€” `fetch_fee_snapshot`,
     /// `fetch_logs`, `submit_raw_transaction`, and the block
     /// subscription loop all share whatever connection is cached here,
     /// rather than each independently opening its own.
@@ -444,7 +460,7 @@ impl OmegaRpcClient {
         state.provider = None;
     }
 
-    // ── Subscriptions ─────────────────────────────────────────────────────────
+    // â”€â”€ Subscriptions â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
     /// Subscribe to new block headers.
     pub fn subscribe_blocks(&self) -> broadcast::Receiver<BlockEvent> {
@@ -455,7 +471,7 @@ impl OmegaRpcClient {
     ///
     /// Must be spawned as a Tokio task. Reconnects automatically with
     /// backoff on a transient error. Returns ONLY when a fatal
-    /// (non-retryable) error occurs — a configuration problem
+    /// (non-retryable) error occurs â€” a configuration problem
     /// (misconfigured URL, chain-ID mismatch) that retrying can never
     /// fix. The caller/supervisor of the spawned task should treat task
     /// completion as needing operator attention; under normal operation
@@ -465,13 +481,13 @@ impl OmegaRpcClient {
         loop {
             match self.run_block_subscription_once().await {
                 Ok(()) => {
-                    tracing::warn!("Block header stream ended — reconnecting");
+                    tracing::warn!("Block header stream ended â€” reconnecting");
                     delay_ms = RECONNECT_DELAY_INITIAL_MS;
                 }
                 Err(e) if e.is_fatal() => {
                     tracing::error!(
                         error = %e,
-                        "Block header stream: FATAL non-retryable error — stopping subscription. \
+                        "Block header stream: FATAL non-retryable error â€” stopping subscription. \
                          This requires operator intervention (check RPC URL / chain_id config).",
                     );
                     if let Some(ref health) = self.health {
@@ -480,7 +496,7 @@ impl OmegaRpcClient {
                     return;
                 }
                 Err(e) => {
-                    tracing::error!(error = %e, "Block header stream error — reconnecting");
+                    tracing::error!(error = %e, "Block header stream error â€” reconnecting");
                     if let Some(ref health) = self.health {
                         health.set_state(
                             HealthState::Degraded,
@@ -507,7 +523,7 @@ impl OmegaRpcClient {
             }
         };
 
-        // Set Healthy UNCONDITIONALLY on a successful (re)connect —
+        // Set Healthy UNCONDITIONALLY on a successful (re)connect â€”
         // previously this only fired when recovering from Degraded
         // specifically, so a clean first-time connect never promoted
         // health out of its initial Unknown state.
@@ -532,7 +548,7 @@ impl OmegaRpcClient {
                 tracing::warn!(
                     block_number = event.number,
                     last_seen    = ?last_block_number,
-                    "Block number did not strictly increase — possible reorg or \
+                    "Block number did not strictly increase â€” possible reorg or \
                      stale/duplicate data from RPC endpoint; flagged for downstream \
                      reorg handling",
                 );
@@ -552,7 +568,7 @@ impl OmegaRpcClient {
             }
         }
 
-        // Stream ended — the connection is no longer usable. Invalidate
+        // Stream ended â€” the connection is no longer usable. Invalidate
         // it so the next call (whether this same subscription loop, or
         // fetch_fee_snapshot/fetch_logs/submit_raw_transaction running
         // concurrently) reconnects rather than silently reusing a dead
@@ -562,7 +578,7 @@ impl OmegaRpcClient {
         Ok(())
     }
 
-    // ── Rate-limited calls ────────────────────────────────────────────────────
+    // â”€â”€ Rate-limited calls â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
     async fn wait_for_token(
         &self,
@@ -600,7 +616,7 @@ impl OmegaRpcClient {
     /// Execute a write after consuming a rate-limit token.
     ///
     /// For submitting a SIGNED TRANSACTION specifically, prefer
-    /// `submit_raw_transaction` instead — it additionally guards
+    /// `submit_raw_transaction` instead â€” it additionally guards
     /// against double-submission of the same transaction hash, which
     /// this generic method has no awareness of.
     pub async fn gated_write<F, Fut, T>(
@@ -622,7 +638,7 @@ impl OmegaRpcClient {
     /// transaction's own hash).
     ///
     /// If `tx_hash` was already submitted within the last 30 seconds,
-    /// this returns `Err` IMMEDIATELY — without consuming a
+    /// this returns `Err` IMMEDIATELY â€” without consuming a
     /// write-rate-limit token and without calling `send` at all. This
     /// is the guard against a caller-side retry bug that mistakes a
     /// slow-but-successful submission for a failure and resubmits the
@@ -648,7 +664,7 @@ impl OmegaRpcClient {
             if tracker.check_and_record(tx_hash, Instant::now()) {
                 anyhow::bail!(
                     "duplicate submission rejected: tx_hash {tx_hash} was already \
-                     submitted within the last {:?} — refusing to resubmit",
+                     submitted within the last {:?} â€” refusing to resubmit",
                     SUBMISSION_DEDUP_WINDOW,
                 );
             }
@@ -659,7 +675,7 @@ impl OmegaRpcClient {
         send().await
     }
 
-    // ── Fee oracle ────────────────────────────────────────────────────────────
+    // â”€â”€ Fee oracle â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
     /// Fetch the current fee snapshot from the node, using the shared
     /// connection (see `get_or_connect`).
@@ -673,7 +689,7 @@ impl OmegaRpcClient {
                 .map_err(|e| anyhow::anyhow!("eth_getBlockByNumber failed: {e}"))?
                 .ok_or_else(|| anyhow::anyhow!("latest block not found"))?;
 
-            // Saturating conversion — see net::wei_to_gwei_saturating for
+            // Saturating conversion â€” see net::wei_to_gwei_saturating for
             // why a bare `as u64` cast here is dangerous (silently
             // wraps an absurd/malformed base fee into a small, WRONG,
             // artificially-cheap-looking gas cost).
@@ -703,14 +719,14 @@ impl OmegaRpcClient {
         .await
     }
 
-    // fetch_chainlink_round intentionally NOT defined here — it lives in
+    // fetch_chainlink_round intentionally NOT defined here â€” it lives in
     // chainlink_agg.rs's own `impl OmegaRpcClient` block instead, to keep
     // the sol! binding, ChainlinkRound, and the one method that uses them
     // together in one file. Defining it in both places is a duplicate
-    // inherent method (E0592) — an earlier revision of this file did
+    // inherent method (E0592) â€” an earlier revision of this file did
     // exactly that; fixed by removing it here, not there.
 
-    // ── Telemetry ─────────────────────────────────────────────────────────────
+    // â”€â”€ Telemetry â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
     /// Rate limiter snapshot for the shadow scorecard `rpc_headroom` metric.
     pub async fn rate_limiter_snapshot(&self) -> crate::rate_limiter::RateLimiterSnapshot {
@@ -723,9 +739,9 @@ impl OmegaRpcClient {
     }
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
+// â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 // Helpers
-// ─────────────────────────────────────────────────────────────────────────────
+// â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 async fn open_provider(ws_url: &str) -> Result<Arc<dyn Provider>, RpcClientError> {
     let provider = ProviderBuilder::new()
@@ -736,7 +752,7 @@ async fn open_provider(ws_url: &str) -> Result<Arc<dyn Provider>, RpcClientError
 }
 
 fn block_to_event(block: &Block, last_block_number: Option<u64>) -> BlockEvent {
-    // `base_fee_per_gas` is already `Option<u128>` here — no cast
+    // `base_fee_per_gas` is already `Option<u128>` here â€” no cast
     // needed. The earlier `.map(|fee| wei_to_gwei_saturating(fee as
     // u128))` cast u128 to u128, which clippy's unnecessary_cast lint
     // (denied via -D warnings in this workspace's clippy invocation)
@@ -767,9 +783,22 @@ mod tests {
         // NOTE: this constructs the minimal fields these tests need via
         // whatever Default/builder path alloy's Block/Header type
         // exposes in this workspace's alloy version. Kept intentionally
-        // minimal — full Block construction details are alloy-version-
+        // minimal â€” full Block construction details are alloy-version-
         // specific and this test only needs `header.number` to vary.
-        let mut block = Block::default();
+        //
+        // `Block::default()` alone is ambiguous (E0282): `Block<T, H>`
+        // has default type parameters declared on the struct, but those
+        // defaults only apply where `Block` is written out as a TYPE â€”
+        // exactly as it already is, unannotated, in this file's
+        // `block_to_event(block: &Block, ...)` signature above â€” not
+        // for a bare `Default::default()` value construction with no
+        // type-position context. Annotating this binding with the same
+        // bare `Block` used there resolves to the identical
+        // `Block<Transaction, Header>` instantiation via the same
+        // default-parameter mechanism, with no need to name either
+        // parameter explicitly. See this file's module-level "Fix (this
+        // revision): E0282 in tests::sample_block" note.
+        let mut block: Block = Block::default();
         block.header.number = number;
         block
     }
@@ -889,7 +918,7 @@ mod tests {
 
         assert!(!tracker.check_and_record(h1, t0));
         assert!(!tracker.check_and_record(h2, t0));
-        // At capacity now (2 tracked, long TTL so nothing expires) —
+        // At capacity now (2 tracked, long TTL so nothing expires) â€”
         // a third, genuinely-new hash must NOT be falsely reported as
         // a duplicate; dedup protection is simply degraded for it.
         assert!(

@@ -1,8 +1,8 @@
-// crates/omega-hot-path/src/metrics.rs
+﻿// crates/omega-hot-path/src/metrics.rs
 //
-// HotPathMetrics — observability for the <1ms Microtx execution lane.
+// HotPathMetrics â€” observability for the <1ms Microtx execution lane.
 //
-// ## Spec §4, §16
+// ## Spec Â§4, Â§16
 //
 //   The hot-path simulation SLA is <1ms per blueprint.  HotPathMetrics
 //   tracks:
@@ -11,7 +11,7 @@
 //     - Successes and total EV captured
 //     - Slot utilisation (live vs capacity)
 //
-//   All counters use atomics — the metrics struct is `Clone + Send + Sync`
+//   All counters use atomics â€” the metrics struct is `Clone + Send + Sync`
 //   and safe to read from any thread without locking.  The shadow scorecard
 //   `sim_latency_p95_ms` metric reads directly from this struct.
 //
@@ -19,14 +19,25 @@
 //
 //   We use a fixed-width histogram over microseconds with 8 buckets:
 //     [0,100), [100,250), [250,500), [500,1000), [1000,2000),
-//     [2000,5000), [5000,10000), [10000,∞)
+//     [2000,5000), [5000,10000), [10000,âˆž)
 //
-//   The SLA target is 1000µs (<1ms).  Buckets 0–3 are within-SLA;
-//   buckets 4–7 are SLA violations.  A separate `sla_violations` counter
+//   The SLA target is 1000Âµs (<1ms).  Buckets 0â€“3 are within-SLA;
+//   buckets 4â€“7 are SLA violations.  A separate `sla_violations` counter
 //   tracks the total number of executions that exceeded 1ms.
 //
 //   p95 is estimated from the histogram by summing bucket counts until
-//   ≥ 95% of total observations are covered.
+//   â‰¥ 95% of total observations are covered.
+//
+// ## Fix (this revision): clippy::expect_used in snapshot_is_serialisable
+//
+// Same root cause as every other test-module clippy failure in this
+// crate (see gate.rs's own note): this crate's Cargo.toml `[lints]`
+// table sets `clippy::expect_used` to "warn" unconditionally (no
+// `cfg(test)` carve-out possible at the manifest level), and
+// `cargo clippy -- -D warnings` promotes that to a hard error for this
+// module's single, ordinary test-only `.expect("serialisable")` call.
+// Scoped `#[allow]` added to `mod tests` here, matching gate.rs/
+// simulator.rs/lib.rs in this same crate.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -34,9 +45,9 @@ use alloy_primitives::U256;
 use chrono::{DateTime, Utc};
 use serde::Serialize;
 
-// ─────────────────────────────────────────────────────────────────────────────
+// â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 // Histogram buckets
-// ─────────────────────────────────────────────────────────────────────────────
+// â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 /// Upper bounds (exclusive) of the latency histogram buckets in microseconds.
 ///
@@ -45,17 +56,17 @@ pub const LATENCY_BUCKETS_US: &[u64] = &[100, 250, 500, 1_000, 2_000, 5_000, 10_
 
 const NUM_BUCKETS: usize = 8;
 
-/// The hot-path latency SLA in microseconds (spec §4: <1ms).
+/// The hot-path latency SLA in microseconds (spec Â§4: <1ms).
 pub const SLA_US: u64 = 1_000;
 
-// ─────────────────────────────────────────────────────────────────────────────
+// â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 // HotPathMetrics
-// ─────────────────────────────────────────────────────────────────────────────
+// â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 /// Thread-safe observability metrics for the Microtx execution lane.
 ///
 /// Shared via `Arc<HotPathMetrics>`.  All write operations use
-/// `Relaxed` ordering — metrics are eventually-consistent diagnostics,
+/// `Relaxed` ordering â€” metrics are eventually-consistent diagnostics,
 /// not synchronisation primitives.
 pub struct HotPathMetrics {
     /// Total blueprints that entered simulation (accepted + rejected).
@@ -215,7 +226,7 @@ impl HotPathMetrics {
         }
     }
 
-    // ── Private helpers ───────────────────────────────────────────────────
+    // â”€â”€ Private helpers â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
     fn increment_histogram(&self, latency_us: u64) {
         for (i, &upper) in LATENCY_BUCKETS_US.iter().enumerate() {
@@ -246,9 +257,9 @@ impl Default for HotPathMetrics {
     }
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
+// â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 // HotPathMetricsSnapshot
-// ─────────────────────────────────────────────────────────────────────────────
+// â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 #[derive(Debug, Clone, Serialize)]
 pub struct HotPathMetricsSnapshot {
@@ -264,11 +275,17 @@ pub struct HotPathMetricsSnapshot {
     pub histogram: [u64; NUM_BUCKETS],
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
+// â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 // Tests
-// ─────────────────────────────────────────────────────────────────────────────
+// â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
+// See this file's module-level "Fix (this revision)" note: this crate's
+// Cargo.toml `[lints]` table sets clippy::expect_used to "warn"
+// unconditionally, and `cargo clippy -- -D warnings` promotes that to a
+// hard error for this module's ordinary test-only `.expect(...)` call
+// otherwise.
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
 
@@ -344,7 +361,7 @@ mod tests {
         let p95 = m.p95_latency_us();
         assert!(
             p95 <= 500,
-            "p95={p95} should be ≤500µs with 95% under 250µs"
+            "p95={p95} should be â‰¤500Âµs with 95% under 250Âµs"
         );
     }
 

@@ -78,7 +78,25 @@ const SA_GAS_BUDGET: u64 = 200_000;
 const SA_EXTRACTION_GAS: u64 = 21_000;
 const SA_L1_DATA_GAS: u64 = 1_600;
 const SA_EXPIRY_BLOCKS: u64 = 2;
-const SA_SLIPPAGE_BPS: u16 = 50;
+// Fix (this revision): was 50 — did not match omega-risk::context's
+// MAX_SLIPPAGE_BPS_SA (30), the real policy cap omega_risk::checks's
+// check 9 (MissSlippage) evaluates against
+// (`bp.slippage_bps > ctx.max_slippage_bps`). The two constants were
+// independently maintained with no structural link, so they'd silently
+// drifted apart. This was invisible in practice only because check 4
+// (bytecode whitelist) still fails closed for every SA blueprint
+// regardless, as of this revision; once a real deployment manifest makes
+// check 4 pass, every real SA blueprint would otherwise have
+// deterministically failed check 9 instead. 30 is confirmed as the
+// intended value — context.rs's MAX_SLIPPAGE_BPS_SA is the policy cap
+// and this constant must not exceed it.
+//
+// NOT YET DONE: referencing omega_risk::context::MAX_SLIPPAGE_BPS_SA
+// directly here instead of keeping a second literal — the structural fix
+// that would prevent this class of drift permanently — is deferred until
+// it's confirmed omega-strategies' Cargo.toml already depends on
+// omega-risk (this file currently imports only from omega-core).
+const SA_SLIPPAGE_BPS: u16 = 30;
 const SA_CONFIRMATION: u8 = 12;
 const SA_SPREAD_WEI: u128 = 200_000_000_000_000_000; // 0.2 ETH
 
@@ -475,6 +493,54 @@ mod tests {
         assert_ne!(
             bp1.signal_id, bp2.signal_id,
             "each build is a distinct signal generation"
+        );
+    }
+
+    // ── Cross-crate constant drift guard ─────────────────────────────────────
+
+    /// Regression guard, same pattern as
+    /// `omega_risk::checks::checks_tests::
+    /// gas_spike_threshold_matches_named_constant_not_a_duplicate_literal`:
+    /// `omega-strategies` deliberately does not depend on `omega-risk`
+    /// (Cargo.toml's own architectural note — strategies stay compilable
+    /// without the full dependency tree), so `SA_SLIPPAGE_BPS` here and
+    /// `omega_risk::context::MAX_SLIPPAGE_BPS_SA` cannot be the same
+    /// constant. They drifted apart once already (this file previously
+    /// had 50 against a real cap of 30) with nothing to catch it until a
+    /// blueprint hit check 9 in a live pipeline. This mirrors the real
+    /// cap value as a named, heavily-commented local constant and asserts
+    /// against it, so an edit to either side that isn't mirrored on the
+    /// other fails THIS test instead of failing silently in production.
+    ///
+    /// IF THIS TEST FAILS: either `SA_SLIPPAGE_BPS` above was changed
+    /// without checking `context.rs`, or `context.rs`'s
+    /// `MAX_SLIPPAGE_BPS_SA` changed and this mirror is now stale — check
+    /// crates/omega-risk/src/context.rs's real value before touching
+    /// either number.
+    ///
+    /// Both operands below are local `const`s, so clippy's
+    /// `assertions_on_constants` lint flags this as evaluable at
+    /// compile time and suggests a `const { assert!(..) }` block.
+    /// Deliberately not taking that suggestion: this is a genuine test
+    /// (see "IF THIS TEST FAILS" framing directly above) whose job is
+    /// to surface as a normal `cargo test` failure if either constant
+    /// drifts, not to become a hard compile error — that's a real
+    /// behavioral choice, not a lint nuisance.
+    #[allow(clippy::assertions_on_constants)]
+    #[test]
+    fn sa_slippage_within_known_risk_policy_cap() {
+        /// Mirrors omega_risk::context::MAX_SLIPPAGE_BPS_SA as of the
+        /// revision that fixed the 50-vs-30 drift. Not the real constant
+        /// (can't import it — see this test's doc comment) — a manually
+        /// synced copy that exists specifically so drift is caught here.
+        const MIRRORED_CONTEXT_RS_MAX_SLIPPAGE_BPS_SA: u16 = 30;
+        assert!(
+            SA_SLIPPAGE_BPS <= MIRRORED_CONTEXT_RS_MAX_SLIPPAGE_BPS_SA,
+            "SA_SLIPPAGE_BPS ({SA_SLIPPAGE_BPS}) exceeds the mirrored risk-policy \
+             cap ({MIRRORED_CONTEXT_RS_MAX_SLIPPAGE_BPS_SA}) — every SA blueprint \
+             would fail omega_risk::checks::check_slippage (check 9, MissSlippage) \
+             in production. Verify against the real MAX_SLIPPAGE_BPS_SA in \
+             crates/omega-risk/src/context.rs before changing either value."
         );
     }
 }

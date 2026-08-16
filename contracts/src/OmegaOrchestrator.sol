@@ -2,8 +2,8 @@
 // SPDX-License-Identifier: MIT
 pragma solidity 0.8.24;
 
-import "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
-import "@openzeppelin/contracts/utils/Pausable.sol";
+import "@openzeppelin/contracts/security/ReentrancyGuard.sol";
+import "@openzeppelin/contracts/security/Pausable.sol";
 import "@openzeppelin/contracts/access/AccessControl.sol";
 import "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
@@ -62,6 +62,15 @@ import "@openzeppelin/contracts/utils/cryptography/ECDSA.sol";
 ///      didn't exist here, and reverted. See the blueprint layout below (now carries
 ///      `providerType` and `providerContract`) and the three callback functions
 ///      (`receiveFlashLoan`, `executeOperation`, `uniswapV3FlashCallback`).
+///   8. ADDED — `maxBaseFee` guard. The blueprint now carries a caller-chosen ceiling on
+///      `block.basefee`; execute() reverts with `BaseFeeTooHigh` if the current base fee
+///      exceeds it. This lets whoever signs a blueprint off-chain cap the network
+///      conditions they're willing to have it executed under (e.g. refuse to run a
+///      thin-margin strategy during a base-fee spike that would eat the profit), without
+///      needing a separate on-chain price oracle — `block.basefee` is already trustworthy
+///      context. Pass `type(uint256).max` to opt out entirely. Checked immediately after
+///      decoding, before any other validation, since it depends only on blueprint contents
+///      and current chain state, not on any other check's outcome.
 ///
 /// DESIGN NOTE — provider handling, per provider type:
 ///   - Balancer V2: one admin-configured Vault address (`flashloanProvider`), shared across
@@ -146,7 +155,9 @@ contract OmegaOrchestrator is ReentrancyGuard, Pausable, AccessControl {
     //                             // address(0) for those two.
     //   bytes   strategyCalldata,
     //   uint256 flashloanAmount,
-    //   uint256 minNetProfit
+    //   uint256 minNetProfit,
+    //   uint256 maxBaseFee        // ceiling on block.basefee at execution time; pass
+    //                             // type(uint256).max to opt out — see change #8 above.
     // )
     //
     // The value actually signed and used for replay protection is:
@@ -191,6 +202,7 @@ contract OmegaOrchestrator is ReentrancyGuard, Pausable, AccessControl {
     error InvalidFlashloanCallback();
     error InvalidProviderType();
     error TokenNotInPool(address pool, address flashloanToken);
+    error BaseFeeTooHigh(uint256 actualBaseFee, uint256 maxBaseFee);
 
     // ─────────────────────────────────────────────────────────────────────────
     // Constructor
@@ -241,13 +253,21 @@ contract OmegaOrchestrator is ReentrancyGuard, Pausable, AccessControl {
             address providerContract,
             bytes memory strategyCalldata,
             uint256 flashloanAmount,
-            uint256 minNetProfit
+            uint256 minNetProfit,
+            uint256 maxBaseFee
         ) = abi.decode(
             blueprintCalldata,
-            (uint64, uint64, bytes32, FlashloanProviderType, address, address, bytes, uint256, uint256)
+            (uint64, uint64, bytes32, FlashloanProviderType, address, address, bytes, uint256, uint256, uint256)
         );
 
         if (flashloanToken == address(0)) revert ZeroAddress();
+
+        // ── 2a. Base fee guard ────────────────────────────────────────────────
+        // Depends only on blueprint contents (maxBaseFee) and current chain state
+        // (block.basefee), not on any other check's outcome — checked immediately after
+        // decoding rather than deferred. type(uint256).max is the documented opt-out.
+        if (block.basefee > maxBaseFee)
+            revert BaseFeeTooHigh(block.basefee, maxBaseFee);
 
         // ── 3. Blueprint expiry ───────────────────────────────────────────────
         if (block.number > expiry_block)

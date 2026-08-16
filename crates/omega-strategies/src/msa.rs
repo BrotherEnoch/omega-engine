@@ -478,4 +478,38 @@ mod tests {
         let bp = make().build_blueprint(&sig(0x21, 5)).await.unwrap();
         assert!(bp.verify_idempotency_key());
     }
+
+    // ── Cross-crate constant drift guard ─────────────────────────────────────
+
+    /// Same pattern as sa.rs's `sa_slippage_within_known_risk_policy_cap` —
+    /// see that test's doc comment for the full rationale (omega-strategies
+    /// deliberately doesn't depend on omega-risk, so this mirrors the real
+    /// cap as a manually-synced local constant rather than importing it).
+    ///
+    /// MSA currently has real headroom (40 vs. cap 50) — this test exists
+    /// so that headroom stays visible and enforced, not just true by
+    /// coincidence today.
+    ///
+    /// Both operands below are local `const`s, so clippy's
+    /// `assertions_on_constants` lint flags this as evaluable at
+    /// compile time and suggests a `const { assert!(..) }` block.
+    /// Deliberately not taking that suggestion: this is a genuine test
+    /// (see "IF THIS TEST FAILS" framing in the sibling strategy files)
+    /// whose job is to surface as a normal `cargo test` failure if
+    /// either constant drifts, not to become a hard compile error —
+    /// that's a real behavioral choice, not a lint nuisance.
+    #[allow(clippy::assertions_on_constants)]
+    #[test]
+    fn msa_slippage_within_known_risk_policy_cap() {
+        /// Mirrors omega_risk::context::MAX_SLIPPAGE_BPS_MSA.
+        const MIRRORED_CONTEXT_RS_MAX_SLIPPAGE_BPS_MSA: u16 = 50;
+        assert!(
+            MSA_SLIPPAGE_BPS <= MIRRORED_CONTEXT_RS_MAX_SLIPPAGE_BPS_MSA,
+            "MSA_SLIPPAGE_BPS ({MSA_SLIPPAGE_BPS}) exceeds the mirrored risk-policy \
+             cap ({MIRRORED_CONTEXT_RS_MAX_SLIPPAGE_BPS_MSA}) — every MSA blueprint \
+             would fail omega_risk::checks::check_slippage (check 9, MissSlippage) \
+             in production. Verify against the real MAX_SLIPPAGE_BPS_MSA in \
+             crates/omega-risk/src/context.rs before changing either value."
+        );
+    }
 }

@@ -1,4 +1,4 @@
-// crates/omega-rpc/src/net.rs
+﻿// crates/omega-rpc/src/net.rs
 //     gives an operator no signal that the problem needs their
 //     attention, not more patience.
 //   - verify_chain_id: nothing anywhere in this crate previously checked
@@ -6,23 +6,35 @@
 //     configured. A misrouted or misconfigured endpoint would silently
 //     mislabel every downstream signal with the wrong chain_id.
 //   - redact_ws_url: most RPC providers embed an API key directly in
-//     the WS URL (path or query string). Logging the raw URL — as the
-//     previous code did at info/warn level — leaks that key into log
+//     the WS URL (path or query string). Logging the raw URL â€” as the
+//     previous code did at info/warn level â€” leaks that key into log
 //     aggregation.
-//   - wei_to_gwei_saturating: a bare `as u64` cast after wei→gwei
+//   - wei_to_gwei_saturating: a bare `as u64` cast after weiâ†’gwei
 //     division silently wraps an absurd/malformed value from the RPC
-//     endpoint into a small, WRONG number — dangerous specifically
+//     endpoint into a small, WRONG number â€” dangerous specifically
 //     because it's wrong in the unsafe direction (an artificially low
 //     gas cost estimate makes a trade look more profitable than it is).
 //   - validate_ws_scheme: fail immediately and clearly on an obviously
 //     wrong URL (e.g. a copy-paste of an http:// endpoint) rather than
 //     relying on whatever downstream error eventually surfaces.
+//
+// ## Fix (this revision): clippy::bool_comparison in
+// validate_ws_scheme_rejects_http
+//
+// `assert!(!err.is_fatal() == false || err.is_fatal());` was leftover
+// edit debris â€” a tautology (`!x == false` is just `x`, so this reduces
+// to `assert!(err.is_fatal() || err.is_fatal())`) that clippy's
+// `bool_comparison` lint correctly flags as a no-op comparison against a
+// literal `false`. The very next line already asserts the real
+// invariant (`assert!(err.is_fatal())`), so the redundant line is
+// removed rather than rewritten â€” nothing of value was being checked
+// that isn't already covered.
 
 use alloy::providers::Provider;
 
-// ─────────────────────────────────────────────────────────────────────────────
+// â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 // RpcClientError
-// ─────────────────────────────────────────────────────────────────────────────
+// â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 /// Errors from establishing or verifying an RPC connection.
 ///
@@ -39,21 +51,21 @@ pub enum RpcClientError {
     InvalidUrl { url: String, reason: String },
 
     /// The connected endpoint reports a different chain than configured.
-    /// Retrying with the same URL can never succeed — the endpoint
+    /// Retrying with the same URL can never succeed â€” the endpoint
     /// itself is pointed at the wrong network.
     #[error("chain ID mismatch: configured {expected}, endpoint reports {actual}")]
     ChainIdMismatch { expected: u64, actual: u64 },
 
     /// Connection or a required initial RPC call failed for reasons
     /// that may well be transient (network blip, node restart, DNS
-    /// hiccup) — safe to retry.
+    /// hiccup) â€” safe to retry.
     #[error("connection failed: {0}")]
     ConnectFailed(String),
 }
 
 impl RpcClientError {
     /// True for errors where retrying with the SAME configuration can
-    /// never succeed — these are configuration/misuse errors, not
+    /// never succeed â€” these are configuration/misuse errors, not
     /// transient network conditions.
     pub fn is_fatal(&self) -> bool {
         matches!(
@@ -63,9 +75,9 @@ impl RpcClientError {
     }
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
+// â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 // URL validation and redaction
-// ─────────────────────────────────────────────────────────────────────────────
+// â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 /// Rejects a `ws_url` that doesn't start with `ws://` or `wss://` before
 /// any connection attempt is made. `ProviderBuilder::on_builtin` performs
@@ -84,7 +96,7 @@ pub(crate) fn validate_ws_scheme(ws_url: &str) -> Result<(), RpcClientError> {
     }
 }
 
-/// Redacts everything after the host in a URL — scheme and host are
+/// Redacts everything after the host in a URL â€” scheme and host are
 /// kept, path/query/userinfo are dropped. Most RPC providers embed an
 /// API key directly in the path or query string (e.g.
 /// `wss://host/v2/<API_KEY>`); logging the raw URL at info/warn level
@@ -92,7 +104,7 @@ pub(crate) fn validate_ws_scheme(ws_url: &str) -> Result<(), RpcClientError> {
 /// and anywhere those logs are shipped.
 ///
 /// Best-effort string parsing rather than a full URL-parsing dependency
-/// — this crate's dependency list is deliberately minimal, and the
+/// â€” this crate's dependency list is deliberately minimal, and the
 /// redaction only needs to be conservative (better to over-redact than
 /// under-redact), not RFC-3986-perfect.
 pub(crate) fn redact_ws_url(url: &str) -> String {
@@ -111,9 +123,9 @@ pub(crate) fn redact_ws_url(url: &str) -> String {
     format!("{scheme}://{host}/<redacted>")
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
+// â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 // Chain ID verification
-// ─────────────────────────────────────────────────────────────────────────────
+// â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 /// Verifies the connected endpoint reports the expected chain ID via
 /// `eth_chainId`. This is the single check that closes the biggest gap
@@ -136,15 +148,15 @@ pub(crate) async fn verify_chain_id(
     Ok(())
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
+// â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 // Numeric conversions
-// ─────────────────────────────────────────────────────────────────────────────
+// â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 /// Converts a wei amount to gwei, saturating rather than silently
 /// wrapping on overflow.
 ///
-/// A bare `(wei / 1_000_000_000) as u64` cast — the previous pattern in
-/// this crate — truncates any value whose gwei-denominated form exceeds
+/// A bare `(wei / 1_000_000_000) as u64` cast â€” the previous pattern in
+/// this crate â€” truncates any value whose gwei-denominated form exceeds
 /// `u64::MAX` down to a small, WRONG number via integer wraparound. That
 /// is the dangerous direction for a value that feeds directly into gas
 /// cost / profitability calculations: an artificially LOW gas cost
@@ -156,7 +168,7 @@ pub(crate) async fn verify_chain_id(
 /// accept.
 ///
 /// Takes `u128` so it's correct regardless of whether the caller's
-/// underlying field type is `u64` or `u128` — callers widen with `as
+/// underlying field type is `u64` or `u128` â€” callers widen with `as
 /// u128`, which is always a safe, lossless cast in that direction.
 pub(crate) fn wei_to_gwei_saturating(wei: u128) -> u64 {
     (wei / 1_000_000_000).min(u128::from(u64::MAX)) as u64
@@ -209,8 +221,10 @@ mod tests {
     fn validate_ws_scheme_rejects_http() {
         let err = validate_ws_scheme("https://node.example.com").unwrap_err();
         assert!(matches!(err, RpcClientError::InvalidUrl { .. }));
-        assert!(!err.is_fatal() == false || err.is_fatal()); // sanity: is_fatal() must be true
-        assert!(err.is_fatal());
+        assert!(
+            err.is_fatal(),
+            "an InvalidUrl error must be fatal â€” retrying the same misconfigured URL can never succeed"
+        );
     }
 
     #[test]

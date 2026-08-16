@@ -73,6 +73,20 @@
 //    shape for a gRPC auth-check helper — the alternative isn't a better
 //    design, just a different set of trade-offs clippy can't see from
 //    here.
+//
+// 3. UNNECESSARY_MIN_OR_MAX in `adjust_rollout_clamps_bps_to_ten_thousand`:
+//    the test previously asserted `15_000u32.min(10_000) == 10_000` and
+//    `7_500u32.min(10_000) == 7_500` directly — two literals compared via
+//    `.min()`, which is a compile-time-foldable no-op and, more
+//    importantly, never actually called anything `adjust_rollout` calls.
+//    The clamp (`req.into_inner().rollout_bps.min(10_000)`) was inlined
+//    directly in the RPC handler, so nothing outside a full tonic
+//    `Request<RolloutTier>` round-trip exercised it. Fixed by extracting
+//    the clamp into `clamp_rollout_bps`, a small pure function with a
+//    named `MAX_ROLLOUT_BPS` constant, having `adjust_rollout` call it,
+//    and having the test call the SAME function — so the test now
+//    actually exercises the production clamping logic instead of
+//    re-deriving the identical literal comparison independently of it.
 
 use std::pin::Pin;
 use std::sync::Arc;
@@ -116,6 +130,30 @@ fn chrono_to_proto_timestamp(dt: chrono::DateTime<chrono::Utc>) -> prost_types::
         seconds: dt.timestamp(),
         nanos: dt.timestamp_subsec_nanos() as i32,
     }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Rollout clamping
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Upper bound for `RolloutTier.rollout_bps` — 10,000 bps = 100%.
+///
+/// `rollout_bps` is `u32`, so it can never go negative; only this upper
+/// bound needs enforcing. See this file's module-level audit note,
+/// change 2, for the `fraction: f64` -> `rollout_bps: u32` proto change
+/// this constant replaces the old `.clamp(0.0, 1.0)` for.
+const MAX_ROLLOUT_BPS: u32 = 10_000;
+
+/// Clamps a requested rollout percentage (in basis points) to
+/// `[0, MAX_ROLLOUT_BPS]`.
+///
+/// Extracted as a standalone function (see this file's module-level
+/// Clippy fixes note, change 3) so `adjust_rollout` and its test call
+/// the identical logic rather than the test re-deriving the same
+/// literal comparison independently.
+#[inline]
+fn clamp_rollout_bps(requested_bps: u32) -> u32 {
+    requested_bps.min(MAX_ROLLOUT_BPS)
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -380,10 +418,11 @@ impl OmegaControl for OmegaControlService {
     ) -> Result<Response<CommandResult>, Status> {
         check_metadata(&req, &self.state.api_token)?;
         // Was a [0.0, 1.0] `fraction: f64`, clamped with `.clamp(0.0, 1.0)`
-        // — see this file's module-level audit note, change 2. `rollout_bps`
-        // is u32, so it can never go negative; only the upper bound (10_000
-        // bps = 100%) needs clamping here.
-        let rollout_bps = req.into_inner().rollout_bps.min(10_000);
+        // — see this file's module-level audit note, change 2. Clamping
+        // itself now lives in `clamp_rollout_bps` (see this file's Clippy
+        // fixes note, change 3) so the test suite exercises the same
+        // function this handler calls.
+        let rollout_bps = clamp_rollout_bps(req.into_inner().rollout_bps);
         tracing::warn!(rollout_bps, "AdjustRollout (L2 fast-approve)");
         Ok(Response::new(CommandResult {
             ok: true,
@@ -467,10 +506,29 @@ mod tests {
 
     #[test]
     fn adjust_rollout_clamps_bps_to_ten_thousand() {
-        // rollout_bps is u32, so only the upper bound needs clamping —
-        // this guards that 100% (10_000) is the true ceiling, not left
-        // unbounded after the fraction -> bps field change.
-        assert_eq!(15_000u32.min(10_000), 10_000);
-        assert_eq!(7_500u32.min(10_000), 7_500);
+        // Calls the SAME function `adjust_rollout` calls (see this file's
+        // Clippy fixes note, change 3) rather than re-deriving the
+        // identical `.min(10_000)` comparison independently — the
+        // previous version of this test asserted on two bare literals
+        // and never touched production code at all.
+        assert_eq!(clamp_rollout_bps(15_000), MAX_ROLLOUT_BPS);
+        assert_eq!(clamp_rollout_bps(7_500), 7_500);
+    }
+
+    #[test]
+    fn clamp_rollout_bps_boundary_is_inclusive() {
+        // Exactly at the ceiling must pass through unchanged, not be
+        // treated as "over" — a strict-> comparison here would be an
+        // off-by-one that silently rejects a legitimate 100% rollout.
+        assert_eq!(clamp_rollout_bps(MAX_ROLLOUT_BPS), MAX_ROLLOUT_BPS);
+        assert_eq!(clamp_rollout_bps(MAX_ROLLOUT_BPS - 1), MAX_ROLLOUT_BPS - 1);
+    }
+
+    #[test]
+    fn clamp_rollout_bps_zero_is_unchanged() {
+        // u32 can't go negative, so zero is the only lower-bound case
+        // worth a regression test — confirms clamping doesn't
+        // accidentally push a legitimate 0% rollout to some other value.
+        assert_eq!(clamp_rollout_bps(0), 0);
     }
 }

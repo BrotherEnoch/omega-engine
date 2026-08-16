@@ -11,14 +11,24 @@
 //   §3  — Nonce registry (chain-scoped per-strategy)
 //   §16 — Prometheus metrics
 //
-// ## Audit fix (this revision)
+// ## Audit fix (prior revision)
 //
 // Re-exports `StrategyDeployment` / `DeploymentManifest` /
 // `strategy_entries_from_manifest` alongside the existing integrity exports —
 // see `integrity.rs`'s own audit note for why the old placeholder-shipping
 // `default_strategy_entries()` was removed and replaced with these.
+//
+// ## Fix (this revision): exposure module
+//
+// Added `exposure` — `AccountExposureTracker`, a real per-strategy
+// tracker backing `CheckContext::current_account_exposure_wei` (check
+// 14, `MissExposureLimit`). See that module's own doc comment for the
+// full design (TTL-by-expiry-block, conservative-overcounting
+// approximation, in-memory only). Constructed and wired in `src/
+// main.rs`, the same pattern already established for `NonceRegistry`.
 
 pub mod error;
+pub mod exposure;
 pub mod integrity;
 pub mod key_manager;
 pub mod metrics;
@@ -32,6 +42,7 @@ mod tests;
 // ── Re-exports ────────────────────────────────────────────────────────────────
 
 pub use error::SecurityError;
+pub use exposure::AccountExposureTracker;
 pub use integrity::{
     strategy_entries_from_manifest, DeploymentManifest, IntegrityRegistry, StrategyDeployment,
     StrategyEntry, StrategyFreezeGuard,

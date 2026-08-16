@@ -1,17 +1,18 @@
-// crates/omega-dag/src/tests.rs
+﻿// crates/omega-dag/src/tests.rs
 
 use alloy_primitives::{Address, B256, U256};
 use omega_core::errors::DropCode;
 use omega_core::types::blueprint::{ExecutionBlueprint, StrategyId};
+use omega_core::types::flashloan_provider::FlashloanProviderType;
 use omega_core::types::lane::{Lane, Simulator};
 use uuid::Uuid;
 
 use crate::scheduler::ExecutionDag;
 use crate::types::{DagConfig, DagError};
 
-// ─────────────────────────────────────────────────────────────────────────────
+// â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 // Helpers
-// ─────────────────────────────────────────────────────────────────────────────
+// â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 fn test_config() -> DagConfig {
     DagConfig {
@@ -26,8 +27,8 @@ fn make_bp(hash_byte: u8, strategy: StrategyId, lane: Lane) -> ExecutionBlueprin
     hash.0[0] = hash_byte;
     // signal_id/client_order_id/idempotency_key: these DAG scheduling
     // tests exercise admission/dependency/eviction logic only, never
-    // verify_hash()/verify_idempotency_key(), so — same as
-    // blueprint_hash above — these are deterministic placeholders keyed
+    // verify_hash()/verify_idempotency_key(), so â€” same as
+    // blueprint_hash above â€” these are deterministic placeholders keyed
     // off hash_byte for uniqueness across test cases, not integrity-
     // checked values. Do not copy this pattern into code that DOES rely
     // on hash/idempotency integrity.
@@ -45,6 +46,15 @@ fn make_bp(hash_byte: u8, strategy: StrategyId, lane: Lane) -> ExecutionBlueprin
         flashloan_provider: Address::ZERO,
         flashloan_amount: U256::ZERO,
         flashloan_available: U256::ZERO,
+        // No flashloan is actually sourced by these scheduler-only test
+        // blueprints (flashloan_provider is the legacy ZERO sentinel
+        // above); provider_contract/flashloan_token mirror that with
+        // ZERO, and flashloan_provider_type picks an arbitrary variant
+        // since ExecutionBlueprint has no "none" discriminant for it â€”
+        // none of these DAG tests read this field.
+        flashloan_provider_type: FlashloanProviderType::Balancer,
+        provider_contract: Address::ZERO,
+        flashloan_token: Address::ZERO,
         calldata: Default::default(),
         strategy_bytecode_hash: B256::ZERO,
         l2_exec_gas_estimate: 21_000,
@@ -58,6 +68,7 @@ fn make_bp(hash_byte: u8, strategy: StrategyId, lane: Lane) -> ExecutionBlueprin
         base_fee_at_creation: 10,
         l1_data_fee_at_creation: 2,
         priority_fee_gwei: 10,
+        max_base_fee_gwei: ExecutionBlueprint::derive_max_base_fee_gwei(10, 3.0),
         price_impact_bps: None,
         ofa_compliant: false,
         expiry_block: 1_001,
@@ -70,9 +81,9 @@ fn make_bp(hash_byte: u8, strategy: StrategyId, lane: Lane) -> ExecutionBlueprin
     }
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
+// â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 // Admit / complete
-// ─────────────────────────────────────────────────────────────────────────────
+// â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 #[test]
 fn admit_and_complete_basic() {
@@ -146,9 +157,9 @@ fn multi_dep_node_only_ready_when_all_deps_complete() {
     assert!(after_b.contains(&c_hash));
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
+// â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 // Cycle / dependency detection
-// ─────────────────────────────────────────────────────────────────────────────
+// â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 #[test]
 fn dependency_on_unknown_hash_returns_cycle_error() {
@@ -157,7 +168,7 @@ fn dependency_on_unknown_hash_returns_cycle_error() {
     bad_hash.0[0] = 0xFF;
 
     let d = make_bp(4, StrategyId::Msa, Lane::Normal);
-    // scheduler maps DependencyNotFound → Cycle(String)
+    // scheduler maps DependencyNotFound â†’ Cycle(String)
     assert!(matches!(dag.admit(d, &[bad_hash]), Err(DagError::Cycle(_))));
 }
 
@@ -177,9 +188,9 @@ fn three_node_dag_no_cycle() {
     assert_eq!(dag.node_count(), 3);
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
+// â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 // Capacity
-// ─────────────────────────────────────────────────────────────────────────────
+// â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 #[test]
 fn capacity_full_rejects_same_priority_blueprint() {
@@ -195,7 +206,7 @@ fn capacity_full_rejects_same_priority_blueprint() {
     dag.admit(make_bp(2, StrategyId::Sa, Lane::Microtx), &[])
         .unwrap();
 
-    // DagError::LaneFull — not CapacityFull (doesn't exist in types.rs)
+    // DagError::LaneFull â€” not CapacityFull (doesn't exist in types.rs)
     let result = dag.admit(make_bp(3, StrategyId::Sa, Lane::Microtx), &[]);
     assert!(matches!(result, Err(DagError::LaneFull { .. })));
 }
@@ -237,7 +248,7 @@ fn eviction_record_correct_strategy_info() {
         .unwrap();
 
     let eviction = &dag.evictions()[0];
-    // evicted_strat is String, not StrategyId — verify it names SA
+    // evicted_strat is String, not StrategyId â€” verify it names SA
     assert!(
         eviction.evicted_strat.contains("SA"),
         "expected SA in evicted_strat, got: {}",
@@ -251,9 +262,9 @@ fn eviction_record_correct_strategy_info() {
     );
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
+// â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 // CNRY exemption
-// ─────────────────────────────────────────────────────────────────────────────
+// â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 #[test]
 fn cnry_does_not_consume_slots() {
@@ -278,9 +289,9 @@ fn cnry_does_not_consume_slots() {
     assert_eq!(dag.normal_count(), 1);
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
+// â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 // Duplicate rejection
-// ─────────────────────────────────────────────────────────────────────────────
+// â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 #[test]
 fn duplicate_blueprint_rejected() {
@@ -291,9 +302,9 @@ fn duplicate_blueprint_rejected() {
     assert!(matches!(dag.admit(bp, &[]), Err(DagError::Cycle(_))));
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Snapshot — use actual DagSnapshot field names from types.rs
-// ─────────────────────────────────────────────────────────────────────────────
+// â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+// Snapshot â€” use actual DagSnapshot field names from types.rs
+// â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 #[test]
 fn snapshot_reflects_state() {
@@ -307,7 +318,7 @@ fn snapshot_reflects_state() {
     assert_eq!(snap.microtx_used, 1);
     assert_eq!(snap.normal_used, 1);
     assert_eq!(snap.total_admitted, 2);
-    assert_eq!(dag.ready().len(), 2); // no deps → both ready
+    assert_eq!(dag.ready().len(), 2); // no deps â†’ both ready
 }
 
 #[test]
@@ -328,9 +339,9 @@ fn snapshot_eviction_count_after_eviction() {
     assert_eq!(snap.total_evicted, 1); // not eviction_count
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
+// â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 // OmegaError mapping
-// ─────────────────────────────────────────────────────────────────────────────
+// â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 #[test]
 fn cycle_error_maps_to_miss_dag_cycle() {

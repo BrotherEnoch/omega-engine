@@ -1,0 +1,23 @@
+# .cargo/config.toml — OmegaEngine workspace
+# Project-local Cargo configuration.
+# Do NOT define an alias named "clippy" — that collides with the real
+# cargo-clippy subcommand and produces:
+#   error: multiple input filenames provided (... and `clippy`)
+
+[alias]
+# Safe alias for the same flags the Makefile uses.
+# Invoke with: cargo lint
+lint = "clippy --workspace --all-targets -- -D warnings"
+
+# Optional convenience aliases (non-colliding)
+check-all = "check --workspace --all-targets"
+test-all  = "test --workspace --all-targets"
+
+[build]
+# Uncomment if you want rustc/clippy warnings elevated by default:
+# rustflags = ["-D", "warnings"]
+
+[term]
+# Slightly quieter progress on CI / large workspaces
+# quiet = false
+# verbose = false

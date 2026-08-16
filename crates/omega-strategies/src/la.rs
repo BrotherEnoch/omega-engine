@@ -462,4 +462,41 @@ mod tests {
             "1.05 should not be hot tier"
         );
     }
+
+    // ── Cross-crate constant drift guard ─────────────────────────────────────
+
+    /// Same pattern as sa.rs's `sa_slippage_within_known_risk_policy_cap` —
+    /// see that test's doc comment for the full rationale (omega-strategies
+    /// deliberately doesn't depend on omega-risk, so this mirrors the real
+    /// cap as a manually-synced local constant rather than importing it).
+    ///
+    /// LA currently has the most headroom of any strategy (50 vs. cap
+    /// 100) — this test exists so that headroom stays visible and
+    /// enforced, not just true by coincidence today. Confirmed against
+    /// the real crates/omega-risk/src/context.rs this session (unlike
+    /// SA, this pairing was never actually checked before — main.rs's
+    /// own cross-check comment only covered SA/MSA/MEV).
+    ///
+    /// Both operands below are local `const`s, so clippy's
+    /// `assertions_on_constants` lint flags this as evaluable at
+    /// compile time and suggests a `const { assert!(..) }` block.
+    /// Deliberately not taking that suggestion: this is a genuine test
+    /// (see "IF THIS TEST FAILS" framing in the sibling strategy files)
+    /// whose job is to surface as a normal `cargo test` failure if
+    /// either constant drifts, not to become a hard compile error —
+    /// that's a real behavioral choice, not a lint nuisance.
+    #[allow(clippy::assertions_on_constants)]
+    #[test]
+    fn la_slippage_within_known_risk_policy_cap() {
+        /// Mirrors omega_risk::context::MAX_SLIPPAGE_BPS_LA.
+        const MIRRORED_CONTEXT_RS_MAX_SLIPPAGE_BPS_LA: u16 = 100;
+        assert!(
+            LA_SLIPPAGE_BPS <= MIRRORED_CONTEXT_RS_MAX_SLIPPAGE_BPS_LA,
+            "LA_SLIPPAGE_BPS ({LA_SLIPPAGE_BPS}) exceeds the mirrored risk-policy \
+             cap ({MIRRORED_CONTEXT_RS_MAX_SLIPPAGE_BPS_LA}) — every LA blueprint \
+             would fail omega_risk::checks::check_slippage (check 9, MissSlippage) \
+             in production. Verify against the real MAX_SLIPPAGE_BPS_LA in \
+             crates/omega-risk/src/context.rs before changing either value."
+        );
+    }
 }

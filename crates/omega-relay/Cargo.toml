@@ -82,6 +82,21 @@ tempfile     = "3"
 proptest     = "1"
 criterion    = { version = "0.5", features = ["async_tokio"] }
 
+# ── Benchmarks ────────────────────────────────────────────────────────────────
+# `relay_throughput` imports `MockRelayClient`, which lives behind
+# `#[cfg(any(test, feature = "test-utils"))]` in client.rs (see that
+# file's own `MockRelayClient` cfg). Bench targets are compiled as their
+# own crate, outside `cfg(test)`, so the feature must be enabled
+# explicitly — `required-features` tells Cargo to skip this target
+# (rather than fail with E0432: unresolved import) when the feature
+# isn't on. Build/run it with:
+#
+#     cargo bench -p omega-relay --features test-utils
+#
+# `cargo build --all-targets` / `cargo clippy --all-targets --workspace`
+# without that feature enabled will now correctly skip this bench
+# instead of erroring on the missing `MockRelayClient` import.
 [[bench]]
-name    = "relay_throughput"
-harness = false
+name               = "relay_throughput"
+harness            = false
+required-features  = ["test-utils"]

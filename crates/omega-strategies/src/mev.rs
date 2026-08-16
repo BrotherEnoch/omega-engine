@@ -657,4 +657,43 @@ mod tests {
         let bp = strategy.build_blueprint(&signal).await.unwrap();
         assert!(bp.verify_idempotency_key());
     }
+
+    // ── Cross-crate constant drift guard ─────────────────────────────────────
+
+    /// Same pattern as sa.rs's `sa_slippage_within_known_risk_policy_cap` —
+    /// see that test's doc comment for the full rationale (omega-strategies
+    /// deliberately doesn't depend on omega-risk, so this mirrors the real
+    /// cap as a manually-synced local constant rather than importing it).
+    ///
+    /// MEV sits exactly at its cap today (30 == 30, same zero-headroom
+    /// shape SA had before its fix) — the equality still passes check 9
+    /// (`slippage_bps > max_slippage_bps` is a strict `>`), but it means
+    /// EITHER constant moving by even 1 bps reintroduces a MissSlippage
+    /// failure with no advance warning. This test is what now provides
+    /// that warning, on the omega-strategies side.
+    ///
+    /// Both operands below are local `const`s, so clippy's
+    /// `assertions_on_constants` lint flags this as evaluable at
+    /// compile time and suggests a `const { assert!(..) }` block.
+    /// Deliberately not taking that suggestion: this is a genuine test
+    /// (see "IF THIS TEST FAILS" framing in the sibling strategy files)
+    /// whose job is to surface as a normal `cargo test` failure if
+    /// either constant drifts, not to become a hard compile error —
+    /// that's a real behavioral choice, not a lint nuisance.
+    #[allow(clippy::assertions_on_constants)]
+    #[test]
+    fn mev_slippage_within_known_risk_policy_cap() {
+        /// Mirrors omega_risk::context::MAX_SLIPPAGE_BPS_MEV.
+        const MIRRORED_CONTEXT_RS_MAX_SLIPPAGE_BPS_MEV: u16 = 30;
+        assert!(
+            MEV_SLIPPAGE_BPS <= MIRRORED_CONTEXT_RS_MAX_SLIPPAGE_BPS_MEV,
+            "MEV_SLIPPAGE_BPS ({MEV_SLIPPAGE_BPS}) exceeds the mirrored risk-policy \
+             cap ({MIRRORED_CONTEXT_RS_MAX_SLIPPAGE_BPS_MEV}) — every MEV blueprint \
+             would fail omega_risk::checks::check_slippage (check 9, MissSlippage) \
+             in production. Verify against the real MAX_SLIPPAGE_BPS_MEV in \
+             crates/omega-risk/src/context.rs before changing either value. Note: \
+             MEV sits exactly at this cap by design (zero headroom) — if that \
+             changes, update this comment too."
+        );
+    }
 }

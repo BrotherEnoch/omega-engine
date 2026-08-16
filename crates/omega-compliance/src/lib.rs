@@ -1,5 +1,4 @@
 // crates/omega-compliance/src/lib.rs
-// crates/omega-compliance/src/lib.rs
 //
 // omega-compliance — Comprehensive policy + OFA compliance validation library (v12).
 //

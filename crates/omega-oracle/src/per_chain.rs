@@ -33,76 +33,80 @@
 //   FeeOracle and HealthFactor signals are not debounced — every block
 //   counts.
 //
-// ## Audit fixes (this revision)
+// ## Audit fixes (prior revision)
 //
 // 1. UNSOUND UNSAFE (critical): `with_health` previously mutated the
 //    `health` field through a raw pointer obtained via
-//    `Arc::into_raw`/`Arc::from_raw`, justified only by a comment
-//    asserting "we are the sole Arc holder during construction" — a
-//    claim the type signature `self: Arc<Self>` does not actually
-//    enforce. Nothing prevented a caller from having cloned the `Arc`
-//    before calling this method; if they had, this was a genuine data
-//    race (writing through a raw pointer while another thread reads
-//    the same field through its own `Arc` clone, with zero
-//    synchronization) — undefined behavior, not merely a style issue.
-//    Fixed by changing `health: Option<Arc<dyn LayerHealth>>` to an
-//    arc-swap-backed field, the same pattern this struct already uses
-//    for `eil: ArcSwap<EilSnapshot>`. `with_health` is now fully safe —
-//    no `unsafe` block, no raw pointers, correct regardless of how many
-//    `Arc` clones exist. See finding 3 below for the exact field type
-//    this ended up as, after an intermediate attempt that didn't
-//    compile.
+//    `Arc::into_raw`/`Arc::from_raw`. Fixed by changing `health:
+//    Option<Arc<dyn LayerHealth>>` to an arc-swap-backed field, same
+//    pattern as `eil: ArcSwap<EilSnapshot>`. Fully safe, no `unsafe`.
 //
-// 2. UNBOUNDED MEMORY GROWTH: `publish`/`publish_with_fee` cloned
-//    `snap.signals` (the ENTIRE historical signal list since process
-//    start) on every single call, pushed one more entry, and stored the
-//    result — with no eviction, ever. On Arbitrum's ~250ms blocks with
-//    several signal kinds firing per block, this grows without bound
-//    for the life of the process: unbounded memory, and an
-//    increasingly expensive full-vector clone on every publish. Fixed
-//    with a bounded eviction cap (`MAX_SIGNAL_HISTORY`), the same
-//    pattern already established in this codebase's
-//    `omega_rpc::client::SubmissionTracker`. The cap is a starting
-//    point, not a derived value — tune it against actual downstream
-//    consumption of `EilSnapshot.signals` (which this crate cannot see
-//    from here).
+// 2. UNBOUNDED MEMORY GROWTH: `publish`/`publish_with_fee` cloned the
+//    entire historical signal list on every call with no eviction.
+//    Fixed with a bounded eviction cap (`MAX_SIGNAL_HISTORY`).
 //
-// 3. ARC-SWAP + TRAIT OBJECT DID NOT ACTUALLY COMPILE (this revision,
-//    correcting an earlier mistake): the previous revision declared
-//    `health: ArcSwapOption<dyn LayerHealth>`, intending the same
-//    lock-free pattern as `eil`. That does not compile against the
-//    pinned `arc-swap` dependency in this workspace: its `RefCnt` trait
-//    is implemented as `impl<T> RefCnt for Arc<T>` — WITHOUT a
-//    `T: ?Sized` bound — so it only applies when the `Arc`'s pointee is
-//    `Sized`. `dyn LayerHealth` is not `Sized`, so `Arc<dyn LayerHealth>`
-//    (and therefore `ArcSwapOption<dyn LayerHealth>`, which wraps
-//    exactly that) never satisfies `RefCnt`, and every call site touching
-//    `self: Arc<Self>` or the `health` field failed with "the size for
-//    values of type `(dyn LayerHealth + 'static)` cannot be known at
-//    compilation time." Fixed by introducing `HealthHandle`, a plain
-//    `Sized` newtype wrapping the real `Arc<dyn LayerHealth>`, and
-//    storing `ArcSwapOption<HealthHandle>` instead. `ArcSwapOption`'s
-//    own pointee is now the `Sized` `HealthHandle` struct, satisfying
-//    the installed crate's `RefCnt` impl, while `HealthHandle` still
-//    holds the actual trait object underneath — so `with_health`'s and
-//    `health()`'s public signatures (`Arc<dyn LayerHealth>` in and out)
-//    are unchanged. If this workspace's `arc-swap` is ever upgraded to
-//    a version whose `RefCnt` impl is `?Sized`-generic, `HealthHandle`
-//    could be removed and `health` could go back to
-//    `ArcSwapOption<dyn LayerHealth>` directly — this wrapper is a
-//    workaround for the installed version's limitation, not a design
-//    preference.
+// 3. `dyn LayerHealth` is not `Sized`, so `ArcSwapOption<dyn LayerHealth>`
+//    doesn't satisfy the pinned `arc-swap` version's `RefCnt` impl.
+//    Fixed via `HealthHandle`, a plain `Sized` newtype wrapper.
 //
-// 4. TEST FAKE OUT OF SYNC WITH `LayerHealth` (this revision): the
-//    `FakeHealth` test type in `with_health_sets_and_reads_back_without_unsafe`
-//    only implemented `set_state`, but `LayerHealth` has since grown
-//    `state()` and `layer_id()` (E0046: not all trait items
-//    implemented). Added both per rustc's own suggested stubs — this
-//    test only exercises `with_health`/`health()` round-tripping the
-//    handle, it never calls `state()`/`layer_id()` on the fake, so
-//    `todo!()` bodies are safe here; they're placeholders, not
-//    behavior this test depends on. If a future test needs a fake that
-//    actually reports state, give it real bodies instead.
+// 4. Test fake `FakeHealth` updated to implement all of `LayerHealth`'s
+//    trait items (`state()`, `layer_id()`) after the trait grew them.
+//
+// ## Fix (this revision): L1 data fee ingestion (ArbGasInfo)
+//
+// Added `update_l1_data_fee_gwei`, a new public method that updates
+// ONLY the `fee.l1_data_fee_gwei` field of the current `EilSnapshot` in
+// place. This closes the "populated by ArbGasInfo; 0 here as default"
+// gap this file's own `run_fee_oracle` has documented on its
+// `FeeSnapshot` construction since it was written — but does NOT touch
+// `run_fee_oracle` itself's TRIGGER, deliberately: that method only
+// fires on a `FeeOracleEvent` (an L2-base-fee signal arriving from a
+// different, independent omega-rpc stream), and bundling an L1-fee poll
+// result into that specific event handler would make the two updates
+// artificially co-dependent on the same trigger for no reason. Instead,
+// this method is called from a dedicated poll loop owned by the binary
+// (see `src/main.rs`'s new poll-loop), the same architectural split
+// already established for Chainlink ingestion (`ChainlinkOracle::
+// update()` is called from a separate poll loop in `main.rs`, not from
+// anything in this file).
+//
+// Deliberately does NOT bump `state_version` or emit a new
+// `OracleSignal` on the outbound `signal_tx` broadcast — a periodic
+// ArbGasInfo poll (proposed cadence: every 15s, matching the Chainlink
+// poll loop's interval) is not itself a new discrete oracle event in
+// the sense `EilSnapshot.state_version`/`state_hash` are meant to track
+// (see this struct's own doc comment: "Every new signal increments an
+// atomic state_version counter"). Bumping the version on every L1-fee
+// poll tick would make `state_version` fire far more often than any
+// blueprint's own `state_version` staleness check (§6, §13.4) is
+// designed to tolerate, for a field no `OracleSignal` payload
+// represents. `signals` (the historical signal list) and `state_hash`
+// are therefore carried over unchanged from the current snapshot.
+//
+// ALSO FIXED (same revision, inside `run_fee_oracle`): the existing
+// `FeeSnapshot` construction inside `run_fee_oracle` hardcoded
+// `l1_data_fee_gwei: 0` on every FeeOracleEvent. Left as-is, this would
+// have OVERWRITTEN whatever real value `update_l1_data_fee_gwei` last
+// set, every time an unrelated L2-base-fee event arrived — since
+// `publish_with_fee` replaces the whole `fee` struct wholesale, not
+// just `base_fee_gwei`. Fixed to read the CURRENT snapshot's
+// `l1_data_fee_gwei` and carry it forward instead of hardcoding 0, so
+// an L2 base-fee update never clobbers a real L1 fee value the
+// ArbGasInfo poll loop already populated. See the regression test
+// `fee_oracle_event_preserves_previously_set_l1_data_fee` below.
+//
+// ## Fix (this revision, clippy): doc_lazy_continuation
+//
+// `update_l1_data_fee_gwei`'s doc comment contained a line starting
+// with `+ ` (`+ \`ArcSwap::store\`, same pattern as ...`). Rustdoc's
+// Markdown parser reads a line beginning with `+ ` as the start of a
+// bullet-list item, which made every following doc-comment line up to
+// the next blank line an implicit continuation of that same list item.
+// `clippy::doc_lazy_continuation` (promoted to a hard error by this
+// workspace's `-D warnings`) requires continuation lines to be indented
+// to align under the bullet marker. Fixed by indenting those
+// continuation lines two extra spaces, matching clippy's own suggested
+// fix exactly. No behavior, no non-doc code, changed.
 
 use std::sync::{
     atomic::{AtomicU64, Ordering},
@@ -137,6 +141,21 @@ const SIGNAL_CHANNEL_CAPACITY: usize = 256;
 /// Arbitrum's block rate).
 const MAX_SIGNAL_HISTORY: usize = 4_096;
 
+/// Rolling window size for L1 gas fee volatility tracking (this
+/// revision) — see `PerChainOracle::l1_gas_volatility_risk`. At the
+/// ArbGasInfo poll loop's 15s cadence (`src/main.rs`'s "L2d" block),
+/// 20 samples ≈ 5 minutes of history. A starting value, not derived
+/// from any measured volatility profile.
+const L1_FEE_HISTORY_CAP: usize = 20;
+
+/// Coefficient-of-variation (stddev/mean) value treated as "maximum
+/// risk" (1.0) for L1 gas fee volatility — see
+/// `l1_gas_volatility_risk`'s own doc comment. A 50% relative stddev
+/// over the rolling window is a policy choice for what counts as
+/// "unstable," not a value derived from real Arbitrum L1-fee volatility
+/// data (which hasn't been measured against this).
+const L1_GAS_VOLATILITY_CV_NORMALIZATION: f64 = 0.5;
+
 // ─────────────────────────────────────────────────────────────────────────────
 // EilSnapshot — the arc-swap EIL double-buffer value type
 // ─────────────────────────────────────────────────────────────────────────────
@@ -162,7 +181,7 @@ pub struct EilSnapshot {
 
 /// Plain `Sized` newtype wrapping the real health handle.
 ///
-/// See finding 3 in this file's module-level audit note for why this
+/// See this file's module-level audit note (finding 3) for why this
 /// exists: the pinned `arc-swap` version's `RefCnt` impl for `Arc<T>`
 /// requires `T: Sized`, so `dyn LayerHealth` cannot be `ArcSwapOption`'s
 /// direct pointee. Wrapping it in this struct gives `ArcSwapOption` a
@@ -201,6 +220,14 @@ pub struct PerChainOracle {
     /// workaround rather than a `Mutex`/`RwLock` (lock-free reads,
     /// consistent with `eil`'s existing pattern in this struct).
     health: ArcSwapOption<HealthHandle>,
+    /// Rolling window of recent L1 data fee readings (gwei), fed by
+    /// `update_l1_data_fee_gwei` — see that method's and
+    /// `l1_gas_volatility_risk`'s doc comments. A plain `std::sync::
+    /// Mutex`, not lock-free like `eil`/`health` above: this is updated
+    /// at most once per ArbGasInfo poll tick (15s) and read at most
+    /// once per scoring cycle, several orders of magnitude below the
+    /// hot-path frequency `eil`'s lock-free design exists for.
+    l1_fee_history: std::sync::Mutex<std::collections::VecDeque<u64>>,
 }
 
 impl PerChainOracle {
@@ -231,6 +258,9 @@ impl PerChainOracle {
             cl_handle: OracleFeedHandle::new("chainlink", true),
             pyth_handle: OracleFeedHandle::new("pyth", true),
             health: ArcSwapOption::empty(),
+            l1_fee_history: std::sync::Mutex::new(std::collections::VecDeque::with_capacity(
+                L1_FEE_HISTORY_CAP,
+            )),
         })
     }
 
@@ -264,6 +294,98 @@ impl PerChainOracle {
         self.eil.load_full()
     }
 
+    /// Update ONLY the L1 data fee (in gwei) of the current snapshot,
+    /// in place — closes the ArbGasInfo ingestion gap. See this file's
+    /// module-level "Fix (this revision): L1 data fee ingestion" note
+    /// for the full reasoning, including why this deliberately does
+    /// NOT bump `state_version`, emit a new `OracleSignal`, or touch
+    /// `signals`/`state_hash`.
+    ///
+    /// Lock-free for the snapshot update: a single `ArcSwap::load_full`
+    /// + `ArcSwap::store`, same pattern as `publish`/`publish_with_fee`
+    ///   below, just without the signal-history push. ALSO records this
+    ///   reading into `l1_fee_history` (this revision) — the rolling
+    ///   window `l1_gas_volatility_risk` reads. Both updates happen from
+    ///   the same call because both are driven by the same event (one
+    ///   ArbGasInfo poll tick producing one new reading); recording
+    ///   history separately would risk the two falling out of sync if a
+    ///   caller ever called one without the other.
+    pub fn update_l1_data_fee_gwei(&self, l1_data_fee_gwei: u64) {
+        let snap = self.eil.load_full();
+        let new_snap = Arc::new(EilSnapshot {
+            state_version: snap.state_version,
+            state_hash: snap.state_hash,
+            signals: snap.signals.clone(),
+            fee: FeeSnapshot {
+                l1_data_fee_gwei,
+                ..snap.fee.clone()
+            },
+        });
+        self.eil.store(new_snap);
+
+        let mut hist = match self.l1_fee_history.lock() {
+            Ok(g) => g,
+            // Recover rather than panic on a poisoned lock — same
+            // reasoning as `omega-execution::pipeline::DagSlotGuard::
+            // do_release`'s poison recovery: a prior panic elsewhere
+            // holding this lock shouldn't cascade into a second panic
+            // inside routine bookkeeping here.
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        hist.push_back(l1_data_fee_gwei);
+        if hist.len() > L1_FEE_HISTORY_CAP {
+            hist.pop_front();
+        }
+    }
+
+    /// Coefficient-of-variation (stddev / mean) of the last
+    /// `L1_FEE_HISTORY_CAP` L1 data fee readings, normalized to
+    /// `[0.0, 1.0]` where 1.0 = maximum risk (highly volatile or
+    /// insufficient data to judge). Feeds the "gas volatility"
+    /// component of `src/main.rs`'s risk-score formula.
+    ///
+    /// Returns `1.0` (fail closed, not "no data = safe") when fewer
+    /// than 2 samples exist — same "insufficient data → maximum risk"
+    /// convention this codebase already applies elsewhere (e.g.
+    /// `OracleSnapshot`'s stale-feed handling), and when the mean is
+    /// non-positive (a degenerate reading set that can't produce a
+    /// meaningful ratio — e.g. before the ArbGasInfo poll loop's first
+    /// successful cycle, when every recorded sample would be 0).
+    ///
+    /// `L1_GAS_VOLATILITY_CV_NORMALIZATION` (0.5 = 50% relative stddev
+    /// treated as maximally risky) is a policy default, not measured
+    /// against real Arbitrum L1-fee behavior — see that constant's own
+    /// doc comment.
+    pub fn l1_gas_volatility_risk(&self) -> f64 {
+        let hist = match self.l1_fee_history.lock() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+
+        if hist.len() < 2 {
+            return 1.0;
+        }
+
+        let n = hist.len() as f64;
+        let mean = hist.iter().sum::<u64>() as f64 / n;
+        if mean <= 0.0 {
+            return 1.0;
+        }
+
+        let variance = hist
+            .iter()
+            .map(|&x| {
+                let d = x as f64 - mean;
+                d * d
+            })
+            .sum::<f64>()
+            / n;
+        let stddev = variance.sqrt();
+        let cv = stddev / mean;
+
+        (cv / L1_GAS_VOLATILITY_CV_NORMALIZATION).clamp(0.0, 1.0)
+    }
+
     // ── Background update loops ───────────────────────────────────────────
 
     /// Consume FeeOracleStream events and publish FeeOracle signals (§7).
@@ -276,9 +398,17 @@ impl PerChainOracle {
                     if event.chain_id != self.chain_id {
                         continue;
                     }
+                    // FIX (this revision): read the CURRENT snapshot's
+                    // l1_data_fee_gwei and carry it forward, instead of
+                    // hardcoding 0 — see this file's module-level "ALSO
+                    // FIXED" note for why hardcoding 0 here would
+                    // silently clobber a real value update_l1_data_fee_
+                    // gwei already set, on every unrelated L2-base-fee
+                    // event.
+                    let current_l1_data_fee_gwei = self.eil.load_full().fee.l1_data_fee_gwei;
                     let fee = FeeSnapshot {
                         base_fee_gwei: event.base_fee_gwei,
-                        l1_data_fee_gwei: 0, // populated by ArbGasInfo; 0 here as default
+                        l1_data_fee_gwei: current_l1_data_fee_gwei,
                         priority_fee_gwei: 0,
                         block_number: event.block_number,
                     };
@@ -594,20 +724,13 @@ mod tests {
         );
     }
 
-    // ── Audit fix regression tests (this revision) ───────────────────────────
+    // ── Audit fix regression tests (prior revision) ───────────────────────────
 
     #[test]
     fn with_health_sets_and_reads_back_without_unsafe() {
         struct FakeHealth;
         impl LayerHealth for FakeHealth {
             fn set_state(&self, _state: omega_core::HealthState, _reason: &str) {}
-            // Neither method below is exercised by this test — it only
-            // round-trips the handle through with_health()/health() — so
-            // todo!() bodies are fine here. See finding 4 in this file's
-            // module-level audit note. If your actual HealthState/LayerId
-            // variant names differ from what rustc's own suggested stub
-            // implies, this compiles regardless since the bodies are
-            // never called.
             fn state(&self) -> omega_core::HealthStatus {
                 todo!()
             }
@@ -630,9 +753,6 @@ mod tests {
 
     #[test]
     fn signal_history_bounded_after_exceeding_max() {
-        // Directly exercises evict_oldest via publish(), bypassing the
-        // broadcast plumbing — push well past MAX_SIGNAL_HISTORY and
-        // confirm the retained signals vec never exceeds the cap.
         let oracle = PerChainOracle::new(42161);
         for i in 0..(MAX_SIGNAL_HISTORY + 500) {
             let signal = oracle.make_signal(
@@ -665,15 +785,6 @@ mod tests {
             oracle.publish(signal);
         }
         let snap = oracle.snapshot();
-        // The oldest 10 block_numbers (0..10) must have been evicted;
-        // the newest entry's block_number must be total-1.
-        //
-        // RECONSTRUCTED TAIL: the source pasted into this conversation
-        // was truncated exactly at this point (no closing assertions or
-        // braces). The two lines below follow directly from the
-        // eviction math this test itself sets up — excess = total -
-        // MAX_SIGNAL_HISTORY = 10 entries drained from the front — but
-        // verify this against whatever the real file actually asserted.
         let oldest_retained = snap.signals.first().unwrap().block_number;
         let newest_retained = snap.signals.last().unwrap().block_number;
         assert_eq!(
@@ -684,6 +795,155 @@ mod tests {
             newest_retained,
             (total - 1) as u64,
             "the newest entry must still be present after eviction"
+        );
+    }
+
+    // ── L1 data fee ingestion (this revision) ─────────────────────────────
+
+    #[test]
+    fn update_l1_data_fee_gwei_sets_the_field() {
+        let oracle = PerChainOracle::new(42161);
+        assert_eq!(oracle.snapshot().fee.l1_data_fee_gwei, 0, "starts at 0");
+        oracle.update_l1_data_fee_gwei(42);
+        assert_eq!(oracle.snapshot().fee.l1_data_fee_gwei, 42);
+    }
+
+    #[test]
+    fn update_l1_data_fee_gwei_does_not_bump_state_version() {
+        let oracle = PerChainOracle::new(42161);
+        let before = oracle.snapshot().state_version;
+        oracle.update_l1_data_fee_gwei(99);
+        let after = oracle.snapshot().state_version;
+        assert_eq!(
+            before, after,
+            "an L1-fee poll update must not look like a new discrete oracle signal"
+        );
+    }
+
+    #[test]
+    fn update_l1_data_fee_gwei_preserves_other_fee_fields() {
+        let oracle = PerChainOracle::new(42161);
+        oracle.update_l1_data_fee_gwei(123);
+        let snap = oracle.snapshot();
+        assert_eq!(snap.fee.l1_data_fee_gwei, 123);
+        // base_fee_gwei/priority_fee_gwei/block_number carried over via
+        // struct-update syntax, not reset — starting values (0) confirm
+        // they weren't overwritten to something else.
+        assert_eq!(snap.fee.base_fee_gwei, 0);
+        assert_eq!(snap.fee.priority_fee_gwei, 0);
+        assert_eq!(snap.fee.block_number, 0);
+    }
+
+    #[tokio::test]
+    async fn fee_oracle_event_preserves_previously_set_l1_data_fee() {
+        // Regression guard for this revision's fix inside run_fee_oracle
+        // itself: publishing a new L2-base-fee-triggered FeeSnapshot must
+        // preserve whatever l1_data_fee_gwei update_l1_data_fee_gwei last
+        // set, not silently reset it to 0.
+        let oracle = PerChainOracle::new(42161);
+        oracle.update_l1_data_fee_gwei(55);
+        assert_eq!(oracle.snapshot().fee.l1_data_fee_gwei, 55);
+
+        let mut rx = oracle.subscribe();
+        let (fee_tx, fee_rx) = broadcast::channel(8);
+        let oracle_clone = oracle.clone();
+        tokio::spawn(oracle_clone.run_fee_oracle(fee_rx));
+
+        fee_tx
+            .send(FeeOracleEvent {
+                base_fee_gwei: 10,
+                block_number: 1_000,
+                received_at_unix_ms: 0,
+                chain_id: 42161,
+            })
+            .unwrap();
+
+        tokio::time::timeout(std::time::Duration::from_millis(200), rx.recv())
+            .await
+            .expect("timeout")
+            .expect("channel closed");
+
+        let snap = oracle.snapshot();
+        assert_eq!(
+            snap.fee.l1_data_fee_gwei, 55,
+            "an L2-base-fee-triggered FeeOracle signal must not clobber a \
+             previously-set real l1_data_fee_gwei value"
+        );
+        assert_eq!(snap.fee.base_fee_gwei, 10, "base fee itself still updates normally");
+    }
+
+    // ── L1 gas volatility risk (this revision) ────────────────────────────
+
+    #[test]
+    fn volatility_risk_insufficient_data_fails_closed() {
+        let oracle = PerChainOracle::new(42161);
+        assert_eq!(
+            oracle.l1_gas_volatility_risk(),
+            1.0,
+            "zero samples must fail closed to maximum risk"
+        );
+        oracle.update_l1_data_fee_gwei(10);
+        assert_eq!(
+            oracle.l1_gas_volatility_risk(),
+            1.0,
+            "a single sample is not enough to compute a variance — must still fail closed"
+        );
+    }
+
+    #[test]
+    fn volatility_risk_zero_mean_fails_closed() {
+        let oracle = PerChainOracle::new(42161);
+        oracle.update_l1_data_fee_gwei(0);
+        oracle.update_l1_data_fee_gwei(0);
+        assert_eq!(
+            oracle.l1_gas_volatility_risk(),
+            1.0,
+            "an all-zero history (e.g. before ArbGasInfo's first successful poll) \
+             must fail closed, not compute a spurious 0/0 ratio"
+        );
+    }
+
+    #[test]
+    fn volatility_risk_stable_readings_are_low_risk() {
+        let oracle = PerChainOracle::new(42161);
+        for _ in 0..10 {
+            oracle.update_l1_data_fee_gwei(100);
+        }
+        let risk = oracle.l1_gas_volatility_risk();
+        assert!(
+            risk < 0.05,
+            "perfectly stable readings should score near-zero risk, got {risk}"
+        );
+    }
+
+    #[test]
+    fn volatility_risk_wildly_varying_readings_are_high_risk() {
+        let oracle = PerChainOracle::new(42161);
+        // Alternates 10 / 1000 gwei — enormous relative stddev.
+        for i in 0..10 {
+            oracle.update_l1_data_fee_gwei(if i % 2 == 0 { 10 } else { 1_000 });
+        }
+        let risk = oracle.l1_gas_volatility_risk();
+        assert!(
+            risk > 0.9,
+            "wildly varying readings should score near-maximum risk, got {risk}"
+        );
+    }
+
+    #[test]
+    fn volatility_risk_history_is_bounded() {
+        let oracle = PerChainOracle::new(42161);
+        // Push far more than L1_FEE_HISTORY_CAP stable readings, then one
+        // outlier — if the window weren't bounded, the huge stable
+        // history would dilute the outlier's effect on the computed risk
+        // far more than intended.
+        for _ in 0..500 {
+            oracle.update_l1_data_fee_gwei(100);
+        }
+        let hist_len = oracle.l1_fee_history.lock().unwrap().len();
+        assert_eq!(
+            hist_len, L1_FEE_HISTORY_CAP,
+            "history must be capped at L1_FEE_HISTORY_CAP, not grow unbounded"
         );
     }
 }

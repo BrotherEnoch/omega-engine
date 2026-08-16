@@ -31,12 +31,16 @@
 //   was confirmed to fail against the original logic and pass against the
 //   fix — not just reviewed by eye.
 //
-// ## CHANGE — portability
+// ## CHANGE — portability vs. workspace clippy gate
 //
-//   `encode_bytes_abi`'s padding previously used `std::iter::repeat_n`,
-//   which requires Rust 1.82+. Replaced with `repeat().take()`, which does
-//   the same thing and has worked since Rust 1.0 — no reason to require a
-//   newer toolchain than the rest of this crate needs.
+//   `encode_bytes_abi`'s padding intentionally uses `std::iter::repeat().take()`
+//   instead of `std::iter::repeat_n` (stabilized in Rust 1.82) so this crate
+//   doesn't require a newer toolchain than the rest of the workspace needs.
+//   `cargo clippy --workspace --all-targets -- -D warnings` promotes every
+//   clippy lint to a hard error, including `clippy::manual_repeat_n`, which
+//   would otherwise fail this build over a deliberate, documented choice.
+//   The `#[allow(clippy::manual_repeat_n)]` right below is scoped to this
+//   one call so it can't mask an unrelated lint elsewhere in the function.
 
 use alloy_primitives::{keccak256, Address, Bytes, U256};
 
@@ -221,5 +225,9 @@ pub(crate) fn encode_bytes_abi(data: &[u8], buf: &mut Vec<u8>) {
     buf.extend_from_slice(&u256_to_bytes32(U256::from(len)));
     buf.extend_from_slice(data);
     let padding = (32 - (len % 32)) % 32;
+    // See module-level CHANGE note: repeat().take() is deliberate (pre-1.82
+    // portability), so the workspace's `-D warnings` clippy gate needs an
+    // explicit, narrowly-scoped allow rather than a code change.
+    #[allow(clippy::manual_repeat_n)]
     buf.extend(std::iter::repeat(0u8).take(padding));
 }

@@ -1,10 +1,10 @@
-// crates/omega-compliance/src/policy.rs
+﻿// crates/omega-compliance/src/policy.rs
 //
 // ## Fix (this revision): asset_symbol()/notional_value() don't exist on
 // ExecutionBlueprint, and can't be implemented on it
 //
 // `validate_blueprint` previously called `bp.asset_symbol()` and
-// `bp.notional_value()` — neither method exists on
+// `bp.notional_value()` â€” neither method exists on
 // `omega_core::types::blueprint::ExecutionBlueprint`
 // (`error[E0599]: no method named ... found`). The original code's own
 // comments ("Implement or adapt to your blueprint fields", "Implement
@@ -14,24 +14,24 @@
 // They can't be added to `ExecutionBlueprint` itself, either: that
 // struct's actual fields are `flashloan_provider: Address`,
 // `flashloan_amount: U256` (raw token units), and
-// `expected_profit_net: U256` (wei) — there is no human-readable token
+// `expected_profit_net: U256` (wei) â€” there is no human-readable token
 // symbol anywhere on it, and no USD-denominated price. Deriving an
 // "asset symbol" from a raw contract address, or a "notional value" in
 // USD without a price oracle, would mean fabricating exactly the data
-// this compliance check exists to verify — an allowlist/position-size
+// this compliance check exists to verify â€” an allowlist/position-size
 // gate that silently guesses at the asset and dollar value it's
 // checking is worse than one that fails to compile, since a wrong guess
 // here fails *open* (a disallowed asset or oversized position reads as
 // compliant) rather than failing loudly.
 //
 // This crate's own dependency list (see imports below: `omega_core`,
-// `chrono`, `serde`, `thiserror` — no `omega_oracle`) confirms it has no
+// `chrono`, `serde`, `thiserror` â€” no `omega_oracle`) confirms it has no
 // price-feed access of its own to compute either value correctly.
 //
 // Fixed by making both values explicit, caller-supplied parameters to
 // `validate_blueprint` instead of methods on the blueprint. The caller
-// — whatever code sits between the oracle/pricing layer and this
-// compliance gate — already has to resolve "what token does this
+// â€” whatever code sits between the oracle/pricing layer and this
+// compliance gate â€” already has to resolve "what token does this
 // blueprint touch, and what's it worth in USD" for other reasons (gas
 // cost accounting, profit reporting); this makes that resolution an
 // explicit, visible input to the compliance decision rather than an
@@ -39,6 +39,50 @@
 // is a breaking signature change for any existing caller of
 // `validate_blueprint`; there was no way to fix the underlying missing
 // data without one.
+//
+// ## Fix (this revision, 2): sample_blueprint missing 4
+// ExecutionBlueprint fields
+//
+// `omega-core` added four more required fields to `ExecutionBlueprint`
+// (`flashloan_provider_type`, `provider_contract`, `flashloan_token`,
+// `max_base_fee_gwei`) to support real flashloan provider/pool
+// selection â€” see that crate's `types::blueprint` module doc comment.
+// `sample_blueprint` here predates them
+// (`error[E0063]: missing fields flashloan_provider_type,
+// flashloan_token, max_base_fee_gwei and 1 other field`).
+// `ComplianceChecker::validate_blueprint` reads none of the four â€” its
+// checks are asset/chain/position-size/time-window/strategy only â€” so
+// these are inert placeholders, same treatment as every other
+// test-only `ExecutionBlueprint` literal fixed elsewhere in this
+// workspace: `flashloan_provider_type: FlashloanProviderType::Balancer`
+// / `provider_contract: Address::ZERO` / `flashloan_token: Address::ZERO`
+// alongside the existing `flashloan_provider: Address::ZERO` no-flashloan
+// path, and `max_base_fee_gwei` derived from `base_fee_at_creation * 3`
+// matching the placeholder headroom multiplier used in
+// `omega-strategies`' `sa.rs`/`la.rs`/`msa.rs`/`mev.rs`.
+
+// ## Fix (this revision, 3): CompliancePolicy::default()'s
+// allowed_strategies could never match any real blueprint
+//
+// `bp.strategy_id.to_string()` (via `StrategyId`'s `Display` impl in
+// `omega_core::types::blueprint`) produces uppercase abbreviations â€”
+// `"SA"`, `"CNRY"`, `"MSA"`, `"LA"`, `"MEV"` â€” not the lowercase
+// `["mev", "flashloan"]` the previous default listed. `"flashloan"`
+// additionally isn't a `StrategyId` variant at all (flashloan is a
+// capital-sourcing mechanism a strategy may use, not a strategy
+// itself), so it could never match regardless of casing. The net
+// effect: the strategy-allowlist check in `validate_blueprint` would
+// reject every single real blueprint the compliance gate was ever
+// asked to check â€” not merely a strict default, but a default that
+// failed even the passing-case test
+// (`allowed_asset_and_chain_and_size_passes`, whose `sample_blueprint`
+// uses `StrategyId::Sa` â†’ `"SA"`) with `expected .is_ok(), got Err`.
+// Fixed by listing the real, correctly-cased strategies this policy
+// intends to permit by default: SA, MSA, LA, MEV. CNRY is deliberately
+// excluded â€” per `omega-strategies`' own `cnry.rs` module doc comment,
+// CNRY never produces a real, submittable blueprint (`build_blueprint`
+// always returns `Err`), so there is nothing for this compliance gate
+// to ever check for it.
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -81,7 +125,16 @@ impl Default for CompliancePolicy {
             max_leverage_bps: 5000, // 50x example
             trading_windows: vec![],
             cooldown_period_secs: 300,
-            allowed_strategies: vec!["mev".into(), "flashloan".into()],
+            // Real, correctly-cased StrategyId::Display values â€” see
+            // this file's module-level "Fix (this revision, 3)" note.
+            // CNRY excluded deliberately: it never produces a real
+            // blueprint for this checker to validate.
+            allowed_strategies: vec![
+                "SA".into(),
+                "MSA".into(),
+                "LA".into(),
+                "MEV".into(),
+            ],
         }
     }
 }
@@ -101,7 +154,7 @@ impl ComplianceChecker {
     /// Validate a blueprint against the configured compliance policy.
     ///
     /// `asset_symbol` and `notional_value_usd` are supplied by the
-    /// caller rather than read off `bp` — see this file's module-level
+    /// caller rather than read off `bp` â€” see this file's module-level
     /// "Fix" note for why: `ExecutionBlueprint` carries a raw
     /// `flashloan_provider` address and wei-denominated amounts, not a
     /// human-readable symbol or a USD price, so resolving either
@@ -172,6 +225,7 @@ mod tests {
     use super::*;
     use alloy_primitives::{Address, Bytes, B256, U256};
     use omega_core::types::blueprint::StrategyId;
+    use omega_core::types::flashloan_provider::FlashloanProviderType;
     use omega_core::types::lane::{Lane, Simulator};
     use uuid::Uuid;
 
@@ -191,6 +245,9 @@ mod tests {
             flashloan_provider: Address::ZERO,
             flashloan_amount: U256::from(1_000_000u64),
             flashloan_available: U256::from(2_000_000u64),
+            flashloan_provider_type: FlashloanProviderType::Balancer,
+            provider_contract: Address::ZERO,
+            flashloan_token: Address::ZERO,
             calldata: Bytes::from_static(&[0xde, 0xad, 0xbe, 0xef]),
             strategy_bytecode_hash: B256::from([0xCDu8; 32]),
             l2_exec_gas_estimate: 100_000,
@@ -204,6 +261,7 @@ mod tests {
             base_fee_at_creation: 1,
             l1_data_fee_at_creation: 40,
             priority_fee_gwei: 10,
+            max_base_fee_gwei: 3, // base_fee_at_creation * 3 â€” see module note
             price_impact_bps: None,
             ofa_compliant: true,
             expiry_block: 1_000,

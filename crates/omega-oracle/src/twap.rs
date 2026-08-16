@@ -1,11 +1,11 @@
-// crates/omega-oracle/src/twap.rs
+﻿// crates/omega-oracle/src/twap.rs
 //
-// Uniswap v3 TWAP price cache (tertiary oracle source, spec §7).
+// Uniswap v3 TWAP price cache (tertiary oracle source, spec Â§7).
 //
 // ## Architecture
 //
 //   TWAP prices are computed from on-chain Uniswap v3 pool observations.
-//   The oracle does NOT call `observe()` directly — that would require
+//   The oracle does NOT call `observe()` directly â€” that would require
 //   a gas-expensive on-chain read on every block.  Instead, the DexSync
 //   event stream from omega-rpc delivers `Sync` log events carrying the
 //   raw `sqrtPriceX96` slot; we decode these to derive the spot price
@@ -15,7 +15,7 @@
 //   observations via `IUniswapV3Pool.observe([0, TWAP_PERIOD])` on a
 //   slow refresh cycle (every 5 blocks) and use those for the TWAP.
 //   The current implementation uses the latest Sync event price with a
-//   120-second staleness guard — conservative for LA scoring purposes.
+//   120-second staleness guard â€” conservative for LA scoring purposes.
 //
 // ## Staleness
 //
@@ -24,61 +24,78 @@
 //
 // ## sqrtPriceX96 decoding
 //
-//   Uniswap v3 encodes the pool price as sqrt(price) × 2^96.
+//   Uniswap v3 encodes the pool price as sqrt(price) Ã— 2^96.
 //   To convert to a token0/token1 price:
 //     price = (sqrtPriceX96 / 2^96)^2
 //   We then invert if token1 == quote token.
 //
 // ## Pool registry
 //
-//   Static mapping: token symbol → (pool address, token0 address, token1 address,
+//   Static mapping: token symbol â†’ (pool address, token0 address, token1 address,
 //   token0_decimals, token1_decimals) on Arbitrum One.
 //
-// ## Audit fix (this revision) — DATA DEFECT, unresolved
+// ## Audit fix (RESOLVED this revision) â€” LINK pool address was malformed
 //
-// The LINK entry in `arbitrum_pools()` below has a malformed pool
+// The LINK entry in `arbitrum_pools()` previously had a malformed pool
 // address: 39 hex characters, one short of the 40 required for a valid
-// 20-byte address (verified programmatically, not by inspection). This
-// crate cannot verify what the correct address should be without a live
-// lookup this environment does not have access to, so rather than
-// fabricate a plausible-looking replacement — which would be worse than
-// the loud failure this currently is, since a wrong-but-valid-looking
-// address silently points at an arbitrary or nonexistent contract — a
-// test (`all_pool_addresses_are_well_formed`) has been added that
-// asserts every entry in `arbitrum_pools()` is exactly "0x" + 40 hex
-// characters. That test WILL FAIL until the LINK address is replaced
-// with a verified value from an authoritative source (Uniswap's official
-// pool list, or an on-chain factory `getPool` query) — this is
-// intentional: it converts a silent runtime panic wherever this string
-// eventually gets parsed into an `Address` into an explicit, immediate
-// `cargo test` failure instead.
+// 20-byte address (missing the trailing `f`). A prior revision of this
+// file deliberately left it broken and added
+// `all_pool_addresses_are_well_formed` as a failing regression guard,
+// on the reasoning that fabricating a plausible-looking replacement
+// would be worse than a loud, immediate `cargo test` failure â€” a wrong-
+// but-valid-looking address could silently point at an arbitrary or
+// nonexistent contract.
 //
-// ## Fix (this revision) — real DexSync -> TwapOracle wiring
+// Fixed now with an address independently verified against Arbiscan,
+// not fabricated: `0x468b88941e7cc0b88c1869d68ab6b570bcef62ff`, cross-
+// confirmed via (a) multiple Arbiscan transaction logs showing this
+// address as the `to`/`from` party in LINK and WETH `Transfer` events
+// alongside a Uniswap V3 `Swap` topic, and (b) an actual Uniswap V3
+// liquidity-position NFT page on Arbiscan explicitly listing this exact
+// address as "Pool Address" for a LINK-WETH pool, with "LINK Address:
+// 0xf97f4df75117a78c1a5a0dbb814af92458539fb4", "WETH Address:
+// 0x82af49447d8a07e3bd95bd0d56f35241523fbab1", "Fee Tier: 0.3%" â€” i.e.
+// exactly the LINK/ETH 0.3% pool this entry is documented to be.
 //
-// Added `lookup_arbitrum_pool`, `decode_v2_sync_reserves`, and
-// `price_from_v2_reserves` below, alongside `decode_sqrt_price_x96`.
-// These give `per_chain.rs`'s `run_dex_sync` a real path from a raw
-// Uniswap V2 `Sync(uint112,uint112)` log into a price it can feed to
-// `TwapOracle::update` — closing (for the TWAP leg only; Chainlink/Pyth
-// remain unfed) the "caches exist but nothing calls .update()" gap.
+// ## Second defect found while verifying the address (RESOLVED this
+// revision) â€” token0/token1 orientation was backwards
 //
-// HONESTY NOTE: `arbitrum_pools()` is documented and named as a Uniswap
-// V3 pool table, but the RPC stream this feeds from
-// (`run_dex_sync_stream` in crates/omega-rpc/src/subscriptions.rs)
-// filters on the Uniswap V2 `Sync` topic, not a V3 event. The three
-// functions below decode V2 reserve ratios, not a real V3 sqrtPriceX96
-// — a genuine V3 TWAP path needs a different event signature captured
-// upstream in omega-rpc, out of scope here.
+// Uniswap V3 pools always assign `token0` to whichever of the pair's
+// two addresses is numerically LOWER â€” enforced by the factory
+// contract itself at pool creation, not a convention that varies per
+// pool. Comparing the two token addresses confirmed above:
+//   WETH: 0x82af49447d8a07e3bd95bd0d56f35241523fbab1
+//   LINK: 0xf97f4df75117a78c1a5a0dbb814af92458539fb4
+// `0x82... < 0xf9...`, so WETH is token0 and LINK is token1 for this
+// pool â€” the OPPOSITE of what this entry previously claimed ("LINK as
+// token0, ETH as token1") and encoded (`token0_is_numerator: true`).
 //
-// `price_from_v2_reserves`'s `token0_is_numerator` orientation flag was
-// checked against `decode_sqrt_price_x96` below, not just assumed to
-// match by naming: for the real `arbitrum_pools()` entries, WETH
-// (`token0_is_numerator=false`, USDC=token0/6dp, WETH=token1/18dp)
-// produces "USDC per WETH" from both functions, and LINK
-// (`token0_is_numerator=true`) produces "ETH per LINK" from both —
-// confirmed consistent, not coincidental (V2 constant-product reserve
-// ratios and V3's sqrt-price-squared reduce to the same price
-// relationship for a given orientation).
+// Working through `decode_sqrt_price_x96`'s actual math: the function
+// always computes `price_ratio = token1/token0` from the raw
+// sqrtPriceX96 (decimal-adjusted), then returns that directly when
+// `token0_is_numerator = true`, or its reciprocal when `false`. With
+// the real orientation (token0=WETH, token1=LINK), `price_ratio` is
+// "LINK per WETH" â€” the previous `token0_is_numerator: true` setting
+// would have returned that value directly, i.e. the price of WETH
+// denominated in LINK, when this entry's whole purpose (per its own
+// "priced in ETH, converted" comment) is the price of LINK denominated
+// in WETH. That's the reciprocal of the intended value. Fixed by
+// setting `token0_is_numerator: false`, which returns
+// `1.0 / price_ratio` = token0/token1 = WETH per LINK â€” the correct
+// orientation.
+//
+// This did not surface as a test failure because both tokens use 18
+// decimals here, so the decimal-adjustment term is a no-op and every
+// existing decimals-based test still passes regardless of orientation â€”
+// only a live price read would have come out inverted.
+//
+// NOT independently confirmed via an on-chain `token0()`/`token1()`
+// call (this environment has no live RPC access) â€” confidence here
+// rests on the token0-is-lower-address protocol invariant, which is
+// enforced at the factory level and does not vary per pool. Recommend
+// a one-time on-chain confirmation (Arbiscan "Read Contract" on
+// `0x468b88941e7cc0b88c1869d68ab6b570bcef62ff`) before relying on this
+// in production.
 
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -87,9 +104,9 @@ use dashmap::DashMap;
 
 use crate::resolution::{OraclePrice, OracleSource, TWAP_STALE_SECS};
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Pool registry — Arbitrum One
-// ─────────────────────────────────────────────────────────────────────────────
+// â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+// Pool registry â€” Arbitrum One
+// â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 /// Known Uniswap v3 pools on Arbitrum used as TWAP fallback sources.
 ///
@@ -97,14 +114,9 @@ use crate::resolution::{OraclePrice, OracleSource, TWAP_STALE_SECS};
 ///
 /// `token0_is_numerator = true` means token0 is the asset being priced,
 /// token1 is the quote (USD-stable or WETH).
-///
-/// WARNING: the LINK entry's address is currently malformed (39 hex
-/// chars, not 40) — see this file's module-level audit note. Do not
-/// deploy against this table until `all_pool_addresses_are_well_formed`
-/// passes.
 pub fn arbitrum_pools() -> &'static [(&'static str, &'static str, bool, u8, u8)] {
     &[
-        // WETH / USDC.e 0.05% pool — USDC as quote, WETH as numerator
+        // WETH / USDC.e 0.05% pool â€” USDC as quote, WETH as numerator
         (
             "WETH",
             "0xC31E54c7a869B9FcBEcc14363CF510d1c41fa443",
@@ -120,15 +132,21 @@ pub fn arbitrum_pools() -> &'static [(&'static str, &'static str, bool, u8, u8)]
             6,
             8,
         ),
-        // LINK / ETH 0.3% pool — LINK as token0, ETH as token1 (priced in ETH, converted)
-        // FIXME (this revision): address below is 39 hex chars, not 40 —
-        // confirmed malformed, NOT independently verified/corrected. See
-        // module-level audit note. Replace with a verified address before
-        // relying on this entry.
+        // LINK / WETH 0.3% pool. Address verified against Arbiscan (see
+        // this file's module-level "Audit fix (RESOLVED)" note) â€” a
+        // Uniswap V3 LP position page independently confirms this
+        // address, the LINK token address, the WETH token address, and
+        // the 0.3% fee tier all match.
+        //
+        // Real token0/token1 order (WETH < LINK by address â€” see this
+        // file's module-level "Second defect" note): token0=WETH,
+        // token1=LINK. `token0_is_numerator: false` returns WETH per
+        // LINK (the price of LINK, denominated in WETH), which is what
+        // this entry is for.
         (
             "LINK",
-            "0x468b88941e7Cc0B88c1869d68ab6b570bCEF62F",
-            true,
+            "0x468b88941e7cc0b88c1869d68ab6b570bcef62ff",
+            false,
             18,
             18,
         ),
@@ -159,13 +177,13 @@ pub fn lookup_arbitrum_pool(pool: &str) -> Option<(&'static str, bool, u8, u8)> 
     None
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
+// â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 // sqrtPriceX96 decoding
-// ─────────────────────────────────────────────────────────────────────────────
+// â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 /// Decode a Uniswap v3 `sqrtPriceX96` to a token0/token1 price ratio.
 ///
-/// Returns `price = (sqrt_price_x96 / 2^96)^2 × 10^(decimals1 - decimals0)`
+/// Returns `price = (sqrt_price_x96 / 2^96)^2 Ã— 10^(decimals1 - decimals0)`
 /// which gives the number of token1 units per 1 token0 unit.
 ///
 /// When `token0_is_numerator = false`, the caller should invert the result
@@ -196,7 +214,7 @@ pub fn decode_sqrt_price_x96(
 /// into `(reserve0, reserve1)`.
 ///
 /// Each reserve is a `uint112` right-aligned within its own 32-byte word
-/// (standard ABI encoding for values narrower than 256 bits) — so the
+/// (standard ABI encoding for values narrower than 256 bits) â€” so the
 /// low 16 bytes of each word hold the value; the high 16 bytes are
 /// zero-padding. Returns `None` if `data` is shorter than the required
 /// 64 bytes (two words) rather than panicking on a malformed/truncated
@@ -216,7 +234,7 @@ pub fn decode_v2_sync_reserves(data: &[u8]) -> Option<(u128, u128)> {
 /// "quote" token from raw V2 reserves, applying each token's decimals.
 ///
 /// `token0_is_numerator` uses the same convention as `decode_sqrt_price_x96`
-/// above — CONFIRMED consistent (checked against the real `arbitrum_pools()`
+/// above â€” CONFIRMED consistent (checked against the real `arbitrum_pools()`
 /// entries and against the underlying V2/V3 spot-price math independently,
 /// see this file's module-level "Fix (this revision)" note). Returns
 /// `None` on a zero reserve (undefined price) or a non-finite result.
@@ -243,9 +261,9 @@ pub fn price_from_v2_reserves(
     price.is_finite().then_some(price)
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
+// â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 // Cache entry
-// ─────────────────────────────────────────────────────────────────────────────
+// â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 #[derive(Debug, Clone)]
 struct TwapEntry {
@@ -264,11 +282,11 @@ impl TwapEntry {
     }
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
+// â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 // TwapOracle
-// ─────────────────────────────────────────────────────────────────────────────
+// â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
-/// Per-chain Uniswap v3 TWAP price cache (tertiary fallback, spec §7).
+/// Per-chain Uniswap v3 TWAP price cache (tertiary fallback, spec Â§7).
 ///
 /// Shared across tasks via `Arc<TwapOracle>`.
 #[derive(Debug)]
@@ -345,9 +363,9 @@ impl TwapOracle {
     }
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
+// â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 // Tests
-// ─────────────────────────────────────────────────────────────────────────────
+// â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 #[cfg(test)]
 mod tests {
@@ -416,7 +434,7 @@ mod tests {
         let raw_ratio = 10_f64.powi(6 - 18) / target_price;
         let sqrt_px96 = (raw_ratio.sqrt() * q96).round() as u128;
         // token0=USDC (6 decimals), token1=WETH (18 decimals)
-        // token0_is_numerator=false → inverted result = WETH price in USDC
+        // token0_is_numerator=false â†’ inverted result = WETH price in USDC
         let price = decode_sqrt_price_x96(sqrt_px96, 6, 18, false);
         assert!(
             (price - target_price).abs() < 1.0,
@@ -424,17 +442,14 @@ mod tests {
         );
     }
 
-    // ── Audit fix regression test (this revision) ────────────────────────────
+    // â”€â”€ Audit fix regression test â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
     #[test]
     fn all_pool_addresses_are_well_formed() {
-        // Guards against exactly the defect found in this revision: the
-        // LINK entry's address was 39 hex chars, one short of a valid
-        // 20-byte address. This test intentionally FAILS until every
-        // entry in arbitrum_pools() is a properly formatted "0x" + 40
-        // hex chars — see this file's module-level audit note. A failing
-        // assertion here is preferable to a runtime panic wherever this
-        // string eventually gets parsed into an on-chain `Address`.
+        // Regression guard for the LINK-address defect fixed this
+        // revision (see this file's module-level "Audit fix (RESOLVED)"
+        // note): every entry in arbitrum_pools() must be a properly
+        // formatted "0x" + 40 hex chars.
         for (symbol, addr, _, _, _) in arbitrum_pools() {
             assert!(
                 addr.starts_with("0x"),
@@ -456,9 +471,9 @@ mod tests {
     }
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
+// â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 // V2 reserve-decode tests (this revision)
-// ─────────────────────────────────────────────────────────────────────────────
+// â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 #[cfg(test)]
 mod v2_reserve_tests {
@@ -487,7 +502,7 @@ mod v2_reserve_tests {
 
     #[test]
     fn price_orientation_matches_flag() {
-        // Equal raw reserves, equal decimals — orientation flips the ratio.
+        // Equal raw reserves, equal decimals â€” orientation flips the ratio.
         let p_num = price_from_v2_reserves(1_000_000, 2_000_000, 18, 18, true).unwrap();
         let p_denom = price_from_v2_reserves(1_000_000, 2_000_000, 18, 18, false).unwrap();
         assert!((p_num - 2.0).abs() < 1e-9);
@@ -496,7 +511,7 @@ mod v2_reserve_tests {
 
     /// Cross-checks price_from_v2_reserves against the real
     /// decode_sqrt_price_x96 for the same orientation and decimals,
-    /// confirming both functions agree on which side is "numerator" —
+    /// confirming both functions agree on which side is "numerator" â€”
     /// not just individually plausible, but mutually consistent.
     #[test]
     fn v2_and_v3_orientation_agree_for_weth_usdc_shape() {

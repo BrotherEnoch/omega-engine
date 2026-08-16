@@ -1,0 +1,65 @@
+# crates/omega-manifest-gen/Cargo.toml
+[package]
+name = "omega-manifest-gen"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = """
+C4-A tooling: generates config/deployment_manifest.toml from REAL,
+live-chain-verified data (eth_getCode -> keccak256), never from
+fabricated or guessed addresses/hashes. See src/main.rs module doc
+comment for full design and — importantly — the list of assumptions
+about omega_security's manifest TOML shape that must be checked against
+the real crates/omega-security/src/integrity.rs before this is trusted
+in production.
+"""
+
+[[bin]]
+name = "gen-manifest"
+path = "src/main.rs"
+
+[dependencies]
+# omega-rpc is the ONLY crate in the workspace permitted to use the full
+# alloy transport stack (providers, transports-ws, pubsub) — see that
+# crate's own lib.rs "Architectural role (§22.1)" doc comment. This tool
+# respects that boundary: it depends on omega-rpc for the one thing it
+# needs from the chain (a real eth_getCode read via
+# OmegaRpcClient::get_or_connect()'s already-public Arc<dyn Provider>),
+# rather than pulling in alloy-provider/alloy-transport-ws directly.
+omega-rpc = { path = "../omega-rpc" }
+
+# alloy-primitives (Address, keccak256, Bytes) is NOT part of the
+# "transport stack" the §22.1 rule restricts — sa.rs/la.rs/msa.rs/
+# mev.rs/cnry.rs in omega-strategies already depend on it directly for
+# exactly this kind of primitive-type/hashing use, without violating
+# that rule. Pin the version to match whatever the rest of the
+# workspace uses — NOT independently verified here; check the
+# workspace root Cargo.toml / Cargo.lock before assuming this pin is
+# correct.
+alloy-primitives = { version = "0.7", features = ["serde"] }
+
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+tracing = "0.1"
+tracing-subscriber = "0.3"
+hex = "0.4"
+
+# ── NOT VERIFIED against the real workspace ─────────────────────────────
+#
+# This Cargo.toml was written without access to the workspace's root
+# Cargo.toml or Cargo.lock. In particular:
+#   - `alloy-primitives`'s version here (0.7) is a guess consistent with
+#     chainlink_agg.rs's own comment referencing "alloy-network-0.3.6"
+#     for the `alloy` facade crate — but the facade version and the
+#     `alloy-primitives` sub-crate version are not necessarily the same
+#     number, and this was not cross-checked against a real Cargo.lock.
+#   - `clap`/`serde`/`toml`/`hex` versions are reasonable current majors,
+#     not pinned against anything already resolved in this workspace.
+# Run `cargo update -p omega-manifest-gen` (or just `cargo build`) after
+# adding this crate to the workspace `members` list and correct any
+# version conflicts `cargo` reports — don't assume these numbers are
+# right as shipped.

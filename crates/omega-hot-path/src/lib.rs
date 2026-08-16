@@ -1,12 +1,12 @@
-// crates/omega-hot-path/src/lib.rs
+﻿// crates/omega-hot-path/src/lib.rs
 //
-// omega-hot-path — <1ms Microtx execution lane for SA and LA hot-tier (§4, §11.1).
+// omega-hot-path â€” <1ms Microtx execution lane for SA and LA hot-tier (Â§4, Â§11.1).
 //
-// ## Spec §4 — hot-path constraints
+// ## Spec Â§4 â€” hot-path constraints
 //
 //   Only two strategy configurations qualify for the hot path:
-//     1. SA (Simple Arbitrage) — Microtx lane, gas < 200,000.
-//     2. LA hot-tier — HF < 1.01 (§11.1), Microtx lane.
+//     1. SA (Simple Arbitrage) â€” Microtx lane, gas < 200,000.
+//     2. LA hot-tier â€” HF < 1.01 (Â§11.1), Microtx lane.
 //   Canary (CNRY) blueprints MUST never enter the hot path.
 //
 //   Target latency: < 1ms per blueprint (CPU-pinned Tokio task).
@@ -14,11 +14,11 @@
 //   Max RPC reads per blueprint: 8 (MICROTX_MAX_READS).
 //   Simulator: revm in-process (zero-copy, no Anvil fork).
 //
-// ## Architectural role (§22.1)
+// ## Architectural role (Â§22.1)
 //
-//   omega-hot-path ← omega-core, omega-risk
+//   omega-hot-path â† omega-core, omega-risk
 //
-//   The dependency on omega-risk is new as of this revision — see the
+//   The dependency on omega-risk is new as of this revision â€” see the
 //   "oracle freshness / price sanity / slippage" audit note below for
 //   why. Before this revision this crate depended only on omega-core.
 //
@@ -28,23 +28,23 @@
 //   respective modules:
 //
 //   gate.rs:
-//     HotPathGate::new() — takes 0 args (HOT_PATH_SLOTS is compiled in)
-//     AdmissionResult — variants NOT including "Rejected { code }";
+//     HotPathGate::new() â€” takes 0 args (HOT_PATH_SLOTS is compiled in)
+//     AdmissionResult â€” variants NOT including "Rejected { code }";
 //       lib.rs uses a catch-all pattern for the non-Admitted branch.
 //
 //   simulator.rs:
 //     MicrotxSimulator::simulate(&self, bp, read_budget, oracle, metrics)
-//       — 4 args as of this revision (previously 3; `oracle` is new —
+//       â€” 4 args as of this revision (previously 3; `oracle` is new â€”
 //       see the audit note below).
 //     SimulationError variants: WrongSimulator, GasLimitExceeded,
 //       Expired, OracleStale, OracleDiverged, PriceSanityViolation,
 //       SlippageExceeded, Unprofitable, ReadBudgetExhausted (the four
 //       oracle/slippage variants are new as of this revision).
-//     HotPathSimResult::inner.profit_net — access via .inner field
+//     HotPathSimResult::inner.profit_net â€” access via .inner field
 //
 //   metrics.rs:
-//     record_success(latency_us: u64, profit_net: U256) — 2 args (no strategy_id)
-//     record_miss() — used for all failure/rejection cases (no record_failure/record_rejection)
+//     record_success(latency_us: u64, profit_net: U256) â€” 2 args (no strategy_id)
+//     record_miss() â€” used for all failure/rejection cases (no record_failure/record_rejection)
 //
 // ## Audit fix (this revision): lint escalation split
 //
@@ -55,13 +55,13 @@
 // can't express "deny outside tests, warn inside them" on its own, so
 // that split is expressed here instead. Verified before adding: this
 // crate's non-test code (`HotPathRunner::run` and everything it calls)
-// contains no `.unwrap()`/`.expect()` calls — every `.unwrap()`/
-// `.expect()` in this file lives inside `#[cfg(test)] mod tests` — so
+// contains no `.unwrap()`/`.expect()` calls â€” every `.unwrap()`/
+// `.expect()` in this file lives inside `#[cfg(test)] mod tests` â€” so
 // the deny should apply cleanly with nothing to fix first. The
 // `unreachable!()` inside the `other` match arm below is unaffected by
 // either `clippy::panic` (which targets `panic!()` specifically, not
 // `unreachable!()`) or this new attribute (which only covers
-// unwrap_used/expect_used) — it's a distinct, deliberate invariant, not
+// unwrap_used/expect_used) â€” it's a distinct, deliberate invariant, not
 // an oversight covered by this fix.
 //
 // ## Audit fix (this revision): oracle freshness, price sanity, and
@@ -70,21 +70,21 @@
 // Before this revision, nothing in this crate ever read oracle data or
 // `bp.slippage_bps`. A blueprint could reach `Ok(HotPathSimResult)` on
 // this lane with a stale oracle, a non-sane or wildly-diverged price, or
-// a slippage tolerance the system never configured — independent of
+// a slippage tolerance the system never configured â€” independent of
 // `omega-execution::ExecutionPipeline`'s 16-check pipeline, which this
 // lane structurally never goes through.
 //
 // Fixed with two changes:
 //   1. `HotPathRequest` now carries a mandatory `oracle:
-//      omega_risk::context::OracleSnapshot` field — the caller
+//      omega_risk::context::OracleSnapshot` field â€” the caller
 //      constructing a request must assemble a live snapshot, the same
 //      requirement `ExecutionPipeline::execute` already places on its
 //      `CheckContext` parameter. There is no default, and none is
 //      offered: a missing snapshot must fail the freshness check, not
 //      silently skip it.
 //   2. `MicrotxSimulator::simulate` (see simulator.rs's own audit note)
-//      now runs four checks — freshness, hierarchy, price sanity,
-//      slippage — before it can report success. `run()` below maps each
+//      now runs four checks â€” freshness, hierarchy, price sanity,
+//      slippage â€” before it can report success. `run()` below maps each
 //      new failure mode to the SAME `DropCode` the 16-check pipeline
 //      would produce for the equivalent condition (`MissOracle`,
 //      `MissOracleDiverge`, `MissFlashCrash`, `MissSlippage`), so
@@ -92,11 +92,22 @@
 //      execution route caught the problem.
 //
 // `HotPathRequest` gaining a required field, and `simulate()` gaining a
-// required parameter, are both breaking API changes — the same category
+// required parameter, are both breaking API changes â€” the same category
 // of breaking-but-correct fix already established elsewhere in this
 // codebase: the alternative (an optional field defaulting to "skip these
 // checks") would silently reintroduce the exact bypass this fix exists
 // to close.
+//
+// ## Audit fix (this revision): test helper missing flashloan
+// provider/token + max_base_fee_gwei fields
+//
+// `omega-core` added four more required fields to `ExecutionBlueprint`
+// (`flashloan_provider_type`, `provider_contract`, `flashloan_token`,
+// `max_base_fee_gwei`). Nothing in `HotPathRunner::run` or anything it
+// calls reads these â€” same reasoning as gate.rs's and simulator.rs's own
+// audit notes â€” so `tests::make_bp` below is a test-construction-only
+// fix, same category as the pre-existing `signal_id`/`client_order_id`/
+// `idempotency_key` fix noted in that helper's own doc comment.
 
 #![cfg_attr(not(test), deny(clippy::unwrap_used, clippy::expect_used))]
 
@@ -113,7 +124,7 @@ use omega_core::errors::{DropCode, OmegaError};
 use omega_core::types::blueprint::ExecutionBlueprint;
 use omega_risk::context::OracleSnapshot;
 
-// ── Re-exports (pub use only — no duplicate private use crate:: imports) ──────
+// â”€â”€ Re-exports (pub use only â€” no duplicate private use crate:: imports) â”€â”€â”€â”€â”€â”€
 
 pub use gate::{
     AdmissionResult, HotPathGate, HOT_PATH_SLOTS, MICROTX_GAS_LIMIT, MICROTX_MAX_READS,
@@ -121,16 +132,16 @@ pub use gate::{
 pub use metrics::{HotPathMetrics, HotPathMetricsSnapshot};
 pub use simulator::{HotPathSimResult, MicrotxSimulator, SimulationError};
 
-// ─────────────────────────────────────────────────────────────────────────────
+// â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 // HotPathRequest / HotPathResponse
-// ─────────────────────────────────────────────────────────────────────────────
+// â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 pub struct HotPathRequest {
     pub blueprint: ExecutionBlueprint,
     /// Live oracle snapshot for the blueprint's asset, assembled fresh by
     /// the caller at request time. See this file's module-level audit
     /// note ("oracle freshness, price sanity, and slippage protection")
-    /// for why this field is mandatory rather than optional/defaulted —
+    /// for why this field is mandatory rather than optional/defaulted â€”
     /// a missing or stale snapshot must fail `MicrotxSimulator::
     /// simulate`'s freshness check, not silently bypass it.
     pub oracle: OracleSnapshot,
@@ -143,9 +154,9 @@ pub struct HotPathResponse {
     pub elapsed_us: u64,
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
+// â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 // HotPathRunner
-// ─────────────────────────────────────────────────────────────────────────────
+// â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 pub struct HotPathRunner {
     gate: Arc<HotPathGate>,
@@ -173,7 +184,7 @@ impl HotPathRunner {
     pub fn new(config: HotPathConfig) -> (Self, mpsc::Sender<HotPathRequest>) {
         let (tx, rx) = mpsc::channel(config.channel_capacity);
 
-        // HotPathGate::new() takes 0 arguments — HOT_PATH_SLOTS is a compile-time
+        // HotPathGate::new() takes 0 arguments â€” HOT_PATH_SLOTS is a compile-time
         // constant embedded in gate.rs, not a runtime parameter.
         let gate = Arc::new(HotPathGate::new());
         let simulator = Arc::new(MicrotxSimulator::new(config.revm_trust_window_blocks));
@@ -194,7 +205,7 @@ impl HotPathRunner {
 
     /// Run the hot-path event loop.
     ///
-    /// Must be spawned as a dedicated Tokio task pinned to a CPU core (§4).
+    /// Must be spawned as a dedicated Tokio task pinned to a CPU core (Â§4).
     pub async fn run(mut self) {
         tracing::info!(slots = HOT_PATH_SLOTS, "HotPathRunner started");
 
@@ -206,7 +217,7 @@ impl HotPathRunner {
             let result: Result<HotPathSimResult, OmegaError> = match admission {
                 AdmissionResult::Admitted { read_budget } => {
                     // simulate() takes 4 args as of this revision: blueprint,
-                    // read_budget, oracle, metrics — see this file's and
+                    // read_budget, oracle, metrics â€” see this file's and
                     // simulator.rs's audit notes.
                     let sim_result = self.simulator.simulate(
                         &req.blueprint,
@@ -220,7 +231,7 @@ impl HotPathRunner {
 
                     match sim_result {
                         Ok(sim) => {
-                            // record_success takes (latency_us, profit_net) — no strategy_id
+                            // record_success takes (latency_us, profit_net) â€” no strategy_id
                             // profit_net is on sim.inner, not sim directly
                             self.metrics.record_success(
                                 start.elapsed().as_micros() as u64,
@@ -229,7 +240,7 @@ impl HotPathRunner {
                             Ok(sim)
                         }
 
-                        // Map actual SimulationError variants → DropCode.
+                        // Map actual SimulationError variants â†’ DropCode.
                         // (NOT Reverted / StaleCache / GasMiscalc / BudgetExceeded)
                         Err(SimulationError::WrongSimulator { .. }) => {
                             self.metrics.record_miss();
@@ -244,7 +255,7 @@ impl HotPathRunner {
                             Err(OmegaError::dropped(DropCode::SimulationStateMismatch))
                         }
 
-                        // New as of this revision — oracle/price/slippage
+                        // New as of this revision â€” oracle/price/slippage
                         // failures map to the SAME DropCode the 16-check
                         // pipeline (omega_risk::checks::run_all_checks)
                         // would produce for the equivalent condition, not
@@ -313,19 +324,30 @@ impl HotPathRunner {
             let _ = req.resp_tx.send(HotPathResponse { result, elapsed_us });
         }
 
-        tracing::info!("HotPathRunner stopped — channel closed");
+        tracing::info!("HotPathRunner stopped â€” channel closed");
     }
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
+// â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 // Tests
-// ─────────────────────────────────────────────────────────────────────────────
+// â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
+// See gate.rs's test module for why this scoped allow is needed: this
+// crate's Cargo.toml `[lints]` table sets clippy::unwrap_used/expect_used
+// to "warn" unconditionally (no cfg(test) carve-out possible at the
+// manifest level), and `cargo clippy -- -D warnings` promotes that to a
+// hard error for this module's ordinary test-only `.unwrap()`/
+// `.expect()`/`panic!()` calls otherwise. `clippy::panic` in particular
+// is NOT covered by this file's own `#![cfg_attr(not(test), deny(...))]`
+// (that attribute only lists unwrap_used/expect_used â€” see this file's
+// "lint escalation split" module note), so it needs the allow here too.
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
     use alloy_primitives::{Address, Bytes, B256, U256};
     use omega_core::types::blueprint::{ExecutionBlueprint, StrategyId};
+    use omega_core::types::flashloan_provider::FlashloanProviderType;
     use omega_core::types::lane::{Lane, Simulator};
     use uuid::Uuid;
 
@@ -334,8 +356,12 @@ mod tests {
         hash.0[0] = hash_byte;
         // signal_id/client_order_id/idempotency_key: these hot-path gate
         // tests exercise admission/simulation logic only, never
-        // verify_hash()/verify_idempotency_key() — same placeholder
-        // caveat as omega-dag's test helper.
+        // verify_hash()/verify_idempotency_key() â€” same placeholder
+        // caveat as omega-dag's test helper. flashloan_provider_type/
+        // provider_contract/flashloan_token/max_base_fee_gwei: none of
+        // these blueprints source a real flashloan and
+        // `HotPathRunner::run` reads none of the four â€” see this file's
+        // audit note â€” so these are ZERO/placeholder values too.
         let signal_id = Uuid::from_bytes([hash_byte; 16]);
         let client_order_id =
             ExecutionBlueprint::derive_client_order_id(strategy, 42161, 0, signal_id);
@@ -351,6 +377,9 @@ mod tests {
             flashloan_provider: Address::ZERO,
             flashloan_amount: U256::ZERO,
             flashloan_available: U256::ZERO,
+            flashloan_provider_type: FlashloanProviderType::Balancer,
+            provider_contract: Address::ZERO,
+            flashloan_token: Address::ZERO,
             calldata: Bytes::default(),
             strategy_bytecode_hash: B256::ZERO,
             l2_exec_gas_estimate: gas,
@@ -360,7 +389,7 @@ mod tests {
             dynamic_min_profit: U256::from(100_000_u64),
             l2_buffer_factor: 1.15,
             l1_data_buffer_factor: 1.10,
-            // 20 bps — comfortably under MAX_SLIPPAGE_BPS_SA (30), the
+            // 20 bps â€” comfortably under MAX_SLIPPAGE_BPS_SA (30), the
             // tightest per-strategy cap any blueprint built by this
             // helper could be checked against. The previous hardcoded
             // 100 predates slippage actually being enforced on this
@@ -370,6 +399,7 @@ mod tests {
             base_fee_at_creation: 10,
             l1_data_fee_at_creation: 2,
             priority_fee_gwei: 10,
+            max_base_fee_gwei: ExecutionBlueprint::derive_max_base_fee_gwei(10, 3.0),
             price_impact_bps: None,
             ofa_compliant: false,
             expiry_block: 1_001,
@@ -382,7 +412,7 @@ mod tests {
         }
     }
 
-    /// A live, sane, mutually-consistent oracle snapshot — every check
+    /// A live, sane, mutually-consistent oracle snapshot â€” every check
     /// this crate's simulator runs should pass against this.
     fn passing_oracle() -> OracleSnapshot {
         OracleSnapshot {
@@ -508,7 +538,7 @@ mod tests {
         );
     }
 
-    // ── Oracle freshness / price sanity / slippage (this revision) ──────
+    // â”€â”€ Oracle freshness / price sanity / slippage (this revision) â”€â”€â”€â”€â”€â”€
 
     #[tokio::test]
     async fn runner_rejects_stale_oracle() {
@@ -542,8 +572,8 @@ mod tests {
 
         let mut oracle = passing_oracle();
         oracle.chainlink_price = 2000.0;
-        oracle.pyth_price = 2000.0; // agrees with chainlink — check 8 passes
-        oracle.twap_price = 1.0; // wildly diverged — flash-crash guard must catch it
+        oracle.pyth_price = 2000.0; // agrees with chainlink â€” check 8 passes
+        oracle.twap_price = 1.0; // wildly diverged â€” flash-crash guard must catch it
 
         let bp = make_bp(StrategyId::Sa, 100_000, 6);
         let (resp_tx, resp_rx) = oneshot::channel();
@@ -678,7 +708,7 @@ mod tests {
 
     #[test]
     fn constants_exported() {
-        // FIX: assertions_on_constants → move into const blocks
+        // FIX: assertions_on_constants â†’ move into const blocks
         const { assert!(HOT_PATH_SLOTS > 0) }
         const { assert!(MICROTX_GAS_LIMIT > 0) }
         const { assert!(MICROTX_MAX_READS > 0) }

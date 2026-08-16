@@ -37,9 +37,85 @@
 #
 # ## Fix (this revision, 4): E0308 duplicate `alloy_primitives::Address` types
 #
-# Fixed by raising `alloy-primitives` to `"0.8"` below, so every crate
-# that writes `alloy-primitives = { workspace = true }` resolves to the
-# same 0.8.x line `alloy-core` already forces in transitively.
+# ATTEMPTED, WRONG DIAGNOSIS — kept here so the mistake isn't silently
+# erased. This revision raised `alloy-primitives` to `"0.8"`, reasoning
+# that every crate writing `alloy-primitives = { workspace = true }`
+# would then resolve to the same 0.8.x line "alloy-core already forces
+# in transitively." That assumption was never actually checked against
+# what `alloy` 0.3.x itself depends on, and it was wrong: `alloy` (the
+# full umbrella crate, pinned to "0.3" below) has its OWN fixed internal
+# dependency on `alloy-primitives`, baked into `alloy` 0.3.6's own
+# already-published Cargo.toml — confirmed via the compiler's own error
+# text (`cargo test --workspace` output, checked this session) to be
+# `alloy-primitives-0.7.7`. A workspace.dependencies override cannot
+# change what an already-published crate requires internally. Raising
+# the DIRECT `alloy-primitives` dependency to "0.8" didn't unify
+# anything — 0.8.x and alloy's internal `^0.7` requirement are
+# semver-incompatible (pre-1.0 crates: every minor bump is breaking, per
+# Cargo's caret-version rules), so Cargo kept BOTH versions in the
+# graph instead of collapsing them into one. That's the literal cause of
+# the "multiple different versions of crate `alloy_primitives`" the
+# compiler reports: any type that arrives via `alloy::primitives::*`
+# (omega-rpc/src/chainlink_agg.rs, e.g. `fetch_chainlink_round`'s `feed:
+# Address` parameter — it has to stay on alloy's internal version
+# because it's passed straight into `TransactionRequest::with_to`,
+# which alloy 0.3.6 requires its own Address type for) is structurally
+# a different Rust type than one obtained via the direct
+# `alloy-primitives = { workspace = true }` dependency (omega-core,
+# omega-oracle, and omega-rpc's own boundary types), even though both
+# ultimately wrap the same 20 bytes.
+#
+# ## Fix (this revision, 6): ATTEMPTED, WRONG DIRECTION — kept here,
+# not erased
+#
+# This revision downgraded the version above from "0.8" to "0.7",
+# reasoning (WITHOUT checking `cargo tree -i`, purely from the ordering
+# of paths in the compiler's error text) that `alloy` 0.3.6 must
+# internally require 0.7.7. That reasoning was backwards and was
+# corrected the same session once real evidence was checked — see
+# revision 7 immediately below. Left in the history rather than quietly
+# rewritten, per this file's own convention of narrating fix attempts
+# honestly, including wrong ones.
+#
+# ## Fix (this revision, 7): confirmed via `cargo tree -i
+# -p alloy-primitives@<version>` (both versions, run this session,
+# real output, not inferred) — revision 6 was backwards; reverting to 0.8
+#
+# `cargo tree -i -p alloy-primitives@0.8.26` shows EVERY real sub-crate
+# of `alloy` 0.3.6 — alloy-core, alloy-consensus, alloy-provider,
+# alloy-network, alloy-contract, alloy-json-abi, alloy-sol-types, and
+# more — depending on alloy-primitives 0.8.26. None of them depend on
+# 0.7.7 anywhere in that tree.
+#
+# `cargo tree -i -p alloy-primitives@0.7.7` shows a SINGLE root:
+# omega-core. Every other crate appearing in that tree is there only
+# because it transitively depends on omega-core — there is no
+# independent 0.7.7 requirement anywhere else in the graph. The entire
+# 0.7.7 subtree exists solely because of this workspace's own pin
+# choice, not because anything in the `alloy` ecosystem needs it.
+#
+# So revision 6 was backwards: it moved omega-core (and, transitively,
+# nearly the entire workspace — omega-oracle, omega-rpc, omega-risk,
+# omega-hot-path, omega-strategies, and more, per the tree output) AWAY
+# from the version `alloy` actually requires, not toward it. Reverted
+# to "0.8" here, matching what the tree output actually shows `alloy`
+# 0.3.6 needs.
+#
+# IMPORTANT — a version bump in this file alone may not be sufficient.
+# The original "revision 4" attempt already set this same value ("0.8")
+# once before, and the workspace still built with a version conflict
+# afterward — most likely because an existing `Cargo.lock` entry for
+# omega-core's alloy-primitives edge was left over from whatever pin
+# preceded revision 4, and a manifest edit alone doesn't always force
+# Cargo to re-resolve an edge if the lock is still being read as
+# compatible. To avoid repeating that outcome a third time, after
+# applying this change run one of:
+#     cargo update -p alloy-primitives --precise 0.8.26
+# or, if that doesn't fully clear it:
+#     rm Cargo.lock && cargo build --workspace
+# and confirm with `cargo tree -i -p alloy-primitives` (should list only
+# ONE version, or the ambiguous-spec error should stop occurring at
+# all) before trusting the manifest change alone.
 #
 # ## Cleanup (this revision, 3): removed invalid `[alias]` table
 #
@@ -165,6 +241,15 @@ tokio-stream       = "0.1"
 # pubsub is listed here explicitly so it is guaranteed present for
 # ProviderBuilder::on_builtin to resolve wss:// correctly.
 alloy              = { version = "0.3", features = ["serde", "providers", "transport-ws", "pubsub", "rpc-types", "rpc-types-eth"] }
+# Pinned to 0.8, matching what `alloy` 0.3.6 actually requires
+# internally — confirmed via `cargo tree -i -p alloy-primitives@0.8.26`
+# this session (real output, see this file's own "Fix (this revision,
+# 7)" note above), not inferred. A prior revision of this file (6)
+# guessed the opposite direction without that evidence and was wrong;
+# see that note for the correction history. If you still see two
+# versions of alloy-primitives after pulling this change, run
+# `cargo update -p alloy-primitives --precise 0.8.26` (or delete
+# Cargo.lock) rather than re-guessing the pin direction again.
 alloy-primitives   = { version = "0.8", features = ["serde"] }
 revm               = { version = "8",   features = ["serde"] }
 serde              = { version = "1",   features = ["derive"] }
