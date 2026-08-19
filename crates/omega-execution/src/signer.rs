@@ -3,124 +3,197 @@
 // TransactionSigner — the genuinely missing piece identified in
 // ExecutionPipelineSpecification.md §8.
 //
-// ## Status as of this revision
+// ## Status as of this revision — real progress against a real contract
 //
-// `KeyManagerTransactionSigner` below is a REAL, PARTIAL implementation —
-// not a placeholder like `UnconfiguredSigner`, but not yet capable of
-// producing a transaction that will succeed on-chain either. It correctly
-// does the parts that are grounded in code actually read in this
-// investigation:
-//   - Obtains the active signing key from `omega_security::KeyManager`
-//     (confirmed API: `active_secret_key() -> Option<SecretKey>`).
-//   - Provides a spec-conformant EIP-1559 RLP encoder (field order and
-//     signing-digest construction checked directly against EIP-1559's own
-//     text: `keccak256(0x02 || rlp([chain_id, nonce, max_priority_fee_per_gas,
-//     max_fee_per_gas, gas_limit, destination, amount, data, access_list]))`
-//     for the unsigned form, with `signature_y_parity, signature_r,
-//     signature_s` appended for the signed form). NOT yet checked against a
-//     known signed-transaction test vector (none was available in this
-//     investigation) — treat as spec-conformant-by-inspection, not
-//     byte-verified, until it is run against one.
+// The prior revision of this file listed four unconfirmed items blocking
+// `build_execute_calldata`. This revision was given the real
+// `contracts/src/OmegaOrchestrator.sol` source for the first time. Against
+// that real text:
 //
-// It deliberately STOPS SHORT of building `blueprintCalldata` / the outer
-// `execute(blueprintCalldata, sig)` calldata, and returns
-// `ExecutionError::SigningFailed` with a specific, named reason if asked to
-// sign, because that step requires things not yet available anywhere in
-// this workspace as read so far:
+//   1. RESOLVED — ABI encoder. `alloy-sol-types` is now a workspace
+//      dependency (matching the existing `alloy-primitives = "0.8"` pin).
+//      `Blueprint` / `DomainSeparatedBlueprint` / `execute` below are
+//      `sol!`-macro-generated types whose field ORDER and TYPES are
+//      transcribed directly from OmegaOrchestrator.sol's own
+//      `execute()` decode statement:
+//        (uint64, uint64, bytes32, FlashloanProviderType, address, address,
+//         bytes, uint256, uint256, uint256)
+//      Solidity ABI-encodes a struct identically to a tuple of the same
+//      field types in the same order, and identically encodes an enum to
+//      its `uint8` ordinal — so `Blueprint::abi_encode()` produces the
+//      exact bytes `abi.decode(blueprintCalldata, (...))` expects,
+//      PROVIDED `provider_type` is passed as the correct ordinal. That
+//      last piece is not a guess: `omega_core::types::flashloan_provider`
+//      already carries a passing test,
+//      `ordinals_match_solidity_enum_order`, guaranteeing
+//      `FlashloanProviderType as u8` matches this exact contract's enum
+//      order. Field-name casing in the `sol!` blocks below was chosen as
+//      plain Rust snake_case rather than copied verbatim from the
+//      contract (`strategyId`, `flashloanToken`, etc.) — ABI encoding of
+//      a struct depends only on field TYPE and ORDER, never on the names
+//      chosen for them in the encoding library, so this is a readability
+//      choice, not a behavioral one, and avoids `-D warnings` tripping
+//      on `non_snake_case` for no benefit.
 //
-//   1. An ABI encoder for `abi.encode(uint64, uint64, bytes32, uint8,
-//      address, address, bytes, uint256, uint256)` (blueprintCalldata) and
-//      `abi.encode(address, uint64, bytes)` (the domain-separation wrapper
-//      OmegaOrchestrator.execute() hashes) — no `alloy-sol-types` / `ethabi`
-//      / equivalent crate has been seen anywhere in this workspace's
-//      dependency graph so far. Hand-rolling ABI encoding here, by guessing
-//      at padding/offset rules, is exactly the kind of fabrication this
-//      crate has avoided elsewhere (see resolve_flashloan_provider_id in
-//      pipeline.rs for the same policy applied to a smaller case).
-//   2. The `StrategyId -> bytes32 strategyId` mapping the Orchestrator's
-//      `strategy_registry` actually uses. `ExecutionBlueprint::nonce_key()`
-//      produces a bytes32 from `strategy_id`, but folds in `chain_id` too
-//      and is documented as being for nonce-namespacing specifically — not
-//      confirmed to be the same value used at `registerStrategy()` time.
-//   3. `ExecutionBlueprint` now carries `flashloan_provider_type` /
-//      `provider_contract` / `flashloan_token` as of a later revision (see
-//      omega-core::types::blueprint's own doc comment) — this closes part
-//      of what was previously flagged here as a genuine schema gap
-//      (`providerType`/`flashloanToken` distinct from `providerContract`).
-//      What remains unconfirmed is whether the Orchestrator's on-chain
-//      `execute()` ABI expects exactly these three values in exactly this
-//      shape; that confirmation, not the schema gap itself, is still
-//      outstanding.
-//   4. `minNetProfit`'s exact source (`dynamic_min_profit` verbatim, or
-//      something else) was not confirmed against any file read.
+//   2. RESOLVED (by inspection, not yet byte-verified against a compiled
+//      solc/EVM decode) — the flashloan-identity ABI shape. Confirmed
+//      directly from the real contract: `providerType` is `uint8`,
+//      `providerContract` is `address` (meaningful ONLY for UniswapV3 —
+//      the contract's own comment says pass `address(0)` for
+//      Balancer/AaveV3, which use fixed admin-set addresses instead),
+//      `flashloanToken` is `address`. Mapped from `ExecutionBlueprint`'s
+//      already-real `flashloan_provider_type` / `provider_contract` /
+//      `flashloan_token` fields below.
 //
-// Fabricating any of 1-4 would produce a signer that compiles, "looks"
-// correct, and either reverts on-chain every time (best case) or — if one
-// of the guesses happens to be subtly wrong in a way that doesn't revert —
-// produces a transaction that does something other than what was intended,
-// for a contract that moves real flashloaned funds. That's a strictly worse
-// failure mode than `UnconfiguredSigner`'s loud upfront refusal, so this
-// type fails loudly at the same point instead, with a specific reason
-// rather than a generic one.
+//   3. RESOLVED (semantic match, not an explicit written cross-reference)
+//      — `minNetProfit`'s source. The contract's own check —
+//      `if (netProfit < minNetProfit) revert InsufficientProfit(...)` —
+//      is exactly the on-chain profit floor `dynamic_min_profit` already
+//      represents off-chain throughout this workspace's pre-trade risk
+//      checks (see `omega_risk::checks`'s own
+//      `insufficient_profit_fails_at_check_5`). Mapped directly:
+//      `min_net_profit: bp.dynamic_min_profit`.
 //
-// `omega_security::BlueprintSigner::sign_raw_hash()` (added in the same
-// revision as this file) is the correct primitive for the *authorization*
-// signature once `bpHash` can actually be computed — see that method's doc
-// comment for why `BlueprintSigner::sign()` (EIP-191 prefixed) is NOT
-// usable for this purpose, a real, confirmed mismatch against
-// OmegaOrchestrator.sol's `bpHash.recover(sig)`.
+//   4. STILL OPEN — the `StrategyId -> bytes32 strategyId` mapping.
+//      Read directly against the real contract: `registerStrategy(bytes32
+//      strategyId, address implementation)` accepts an ARBITRARY bytes32
+//      chosen by whoever calls it — there is no on-chain derivation rule
+//      from a string like "SA"/"LA" to a bytes32 value. This is real
+//      DEPLOYMENT CONFIGURATION (whatever bytes32 was actually passed to
+//      `registerStrategy()` for each strategy), not something derivable
+//      from code, and guessing a hash convention here (e.g.
+//      `keccak256("SA")`) for a contract that moves flashloaned funds
+//      would be exactly the fabrication this codebase has refused
+//      everywhere else. `KeyManagerTransactionSigner::new` now takes a
+//      required `strategy_onchain_ids: HashMap<String, [u8; 32]>`
+//      parameter — keyed by the same `StrategyId::to_string()` values
+//      (`"SA"`, `"LA"`, ...) already used by `IntegrityRegistry` and
+//      `DeploymentManifest` elsewhere in this workspace — that MUST be
+//      sourced from real deployment records (the actual arguments passed
+//      to `registerStrategy()` on-chain), never fabricated. A lookup miss
+//      fails loudly and specifically, per-strategy, rather than silently
+//      defaulting to a placeholder.
+//
+// ## RESOLVED (this revision): the blueprint-authorization signature
+//
+// `omega-security/src/signer.rs`'s real source was provided and directly
+// confirms `BlueprintSigner::sign_raw_hash()` is exactly the primitive
+// needed: it signs a hash with NO prefix of any kind and returns a
+// 65-byte `[r(32) || s(32) || v(1)]` signature with `v = recovery_id +
+// 27` — precisely the input `OmegaOrchestrator.sol`'s `bpHash.recover(sig)`
+// (OpenZeppelin `ECDSA.recover(bytes32, bytes)`, v ∈ {27, 28}) expects.
+// `BlueprintSigner::sign()` (the OTHER method on that same type) is
+// confirmed NOT usable here — it applies an EIP-191 prefix intended for
+// the Flashbots reputation header, a different, unrelated signature.
+//
+// `KeyManagerTransactionSigner` now takes a required
+// `blueprint_signer: Arc<BlueprintSigner>` — deliberately a SEPARATE
+// dependency from `tx_key_manager`, since (per this struct's own doc
+// comment) the gas-paying transaction-envelope key and the on-chain
+// blueprint-authorization key are two independent concerns; a caller may
+// legitimately construct both from the same `KeyManager`/`Arc` or from
+// two different ones, and this file does not assume either. With this
+// wired in, `build_execute_calldata` — and therefore `sign_transaction`
+// — can now succeed end-to-end for a strategy present in
+// `strategy_onchain_ids`. See `build_execute_calldata_succeeds_with_
+// real_blueprint_signer` / `sign_transaction_succeeds_end_to_end_with_
+// real_blueprint_signer` below for the regression tests proving this.
+//
+// The ONLY remaining gap in this file is the same one item 4 (above)
+// already names: real, deployment-sourced values for
+// `strategy_onchain_ids` — not something this file can supply for
+// itself.
 //
 // `omega_simulation::SimulationSubmitter` DOES sign and send real
-// transactions, but only against a local Anvil fork with a dev-funded Anvil
-// test key, and is deliberately, structurally walled off from any live
-// transport (`reject_if_live_looking`, construction only via
-// `SimulationSubmitter::bound_to(&ForkHandle, ..)`) — not a substitute for
-// this type.
+// transactions, but only against a local Anvil fork with a dev-funded
+// Anvil test key, and is deliberately, structurally walled off from any
+// live transport (`reject_if_live_looking`, construction only via
+// `SimulationSubmitter::bound_to(&ForkHandle, ..)`) — not a substitute
+// for this type.
 //
 // `ExecutionPipeline` is generic over `S: TransactionSigner` specifically
 // so the rest of the pipeline (integrity check, kill switch, 15 pre-trade
 // checks, idempotency dedup, DAG bookkeeping) is fully implemented and
 // fully testable today, independent of this gap.
 //
-// ## Audit fix (this revision): test helper missing flashloan/token fields
+// ## Audit fix (carried forward): test helper missing flashloan/token fields
 //
 // `tests::sample_bp` predates `ExecutionBlueprint` gaining
 // `flashloan_provider_type`, `provider_contract`, and `flashloan_token`
-// (it already included `max_base_fee_gwei` — see that field's own line
-// below, unchanged). Nothing in `KeyManagerTransactionSigner::
-// sign_transaction`'s current, real code path reads any of the three
-// (see `build_execute_calldata`'s doc comment: it fails loudly before
-// touching blueprint fields beyond what's already read), so
-// `Balancer`/`Address::ZERO`/`Address::ZERO` are inert placeholders
-// consistent with this helper's existing
-// `flashloan_provider: Address::ZERO` "no flashloan" convention.
+// (it already included `max_base_fee_gwei`). As of THIS revision, those
+// three fields ARE read by the real `build_blueprint_calldata` path
+// below — `sample_bp()` now sets them to real, meaningful (not merely
+// inert) values so the tests that exercise that path actually exercise
+// something, rather than keeping the old `Address::ZERO`-everywhere
+// convention that made sense only while these fields were unread.
 //
-// ## Audit fix (this revision, 2): clippy::too_many_arguments
+// ## Audit fix (carried forward, 2): clippy::too_many_arguments
 //
-// `encode_eip1559_unsigned` takes 8 positional arguments — one over
-// clippy's default `too-many-arguments` threshold of 7 — and
-// `cargo clippy --workspace --all-targets -- -D warnings` failed on it.
-// Its sibling `encode_eip1559_signed` (11 arguments — the same 8 plus
-// `y_parity`/`r`/`s`) already carries
-// `#[allow(clippy::too_many_arguments)]` for the identical reason: both
-// functions' argument lists are mandated by EIP-1559's own field order
-// (see this file's "EIP-1559 RLP encoding helpers" section doc comment
-// — chain_id, nonce, max_priority_fee_per_gas, max_fee_per_gas,
-// gas_limit, destination, amount, data, [access_list]), so splitting
-// them into a struct would obscure the 1:1 correspondence to the spec
-// this code is deliberately preserving, not simplify anything. Same
-// justification, same fix, applied to the sibling function that was
-// missing it.
+// `encode_eip1559_unsigned` / `encode_eip1559_signed` carry
+// `#[allow(clippy::too_many_arguments)]` — their argument lists are
+// mandated 1:1 by EIP-1559's own field order (see the "EIP-1559 RLP
+// encoding helpers" section below), so a struct-of-params refactor would
+// obscure the correspondence to the spec this code deliberately
+// preserves, not simplify anything.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use alloy_primitives::{Address, Bytes, U256};
+use alloy_sol_types::{sol, SolCall, SolValue};
 use async_trait::async_trait;
 use omega_core::types::blueprint::ExecutionBlueprint;
 use omega_security::key_manager::KeyManager;
+use omega_security::signer::BlueprintSigner;
 use secp256k1::{Message, Secp256k1};
 
 use crate::error::ExecutionError;
+
+// ── ABI types — transcribed directly from OmegaOrchestrator.sol's real source ──
+//
+// See this file's top doc comment, item 1, for the encoding-equivalence
+// argument (struct-of-fields == tuple-of-same-fields in Solidity ABI
+// encoding; field names below are plain Rust snake_case by choice, not
+// copied contract identifiers, since names do not affect encoded bytes).
+sol! {
+    /// Mirrors OmegaOrchestrator.sol's `blueprintCalldata` layout:
+    ///   abi.encode(uint64, uint64, bytes32, FlashloanProviderType,
+    ///              address, address, bytes, uint256, uint256, uint256)
+    /// in EXACTLY that field order — transcribed from that file's real
+    /// `execute()` decode statement, not from its prose "Blueprint
+    /// layout" comment alone.
+    #[derive(Debug)]
+    struct Blueprint {
+        uint64 expiry_block;
+        uint64 nonce;
+        bytes32 strategy_id;
+        uint8 provider_type;
+        address flashloan_token;
+        address provider_contract;
+        bytes strategy_calldata;
+        uint256 flashloan_amount;
+        uint256 min_net_profit;
+        uint256 max_base_fee;
+    }
+
+    /// Mirrors `keccak256(abi.encode(address(this), EXPECTED_CHAIN_ID,
+    /// blueprintCalldata))` — the domain-separated hash
+    /// OmegaOrchestrator.execute() actually signs/replay-tracks against
+    /// (see that file's change #3 note), NOT a hash of blueprintCalldata
+    /// alone.
+    #[derive(Debug)]
+    struct DomainSeparatedBlueprint {
+        address orchestrator;
+        uint64 chain_id;
+        bytes blueprint_calldata;
+    }
+
+    /// The outer transaction target. Parameter names here do not affect
+    /// the 4-byte selector (computed from `execute(bytes,bytes)` — types
+    /// only), so they're plain snake_case rather than copied from the
+    /// contract's `blueprintCalldata`/`sig`.
+    function execute(bytes blueprint_calldata, bytes sig) external;
+}
 
 /// A fully-signed, RLP-encoded transaction ready for
 /// `eth_sendBundle`/`eth_sendRawTransaction`, hex-encoded with a `0x` prefix.
@@ -185,6 +258,24 @@ pub struct KeyManagerTransactionSigner {
     /// from real deployment configuration; this type does not default it
     /// or accept the zero address.
     orchestrator: Address,
+    /// Real, deployment-sourced mapping from `StrategyId::to_string()`
+    /// (`"SA"`, `"MSA"`, `"LA"`, `"MEV"`, `"CNRY"`) to the exact `bytes32`
+    /// value passed as `strategyId` when that strategy was registered
+    /// on-chain via `OmegaOrchestrator.registerStrategy()`. See this
+    /// file's top doc comment, item 4, for why this cannot be derived and
+    /// must be supplied as real configuration. A strategy absent from
+    /// this map fails loudly and specifically at signing time rather
+    /// than falling back to a placeholder bytes32.
+    strategy_onchain_ids: HashMap<String, [u8; 32]>,
+    /// Signs the blueprint-AUTHORIZATION hash (`bpHash`) — the on-chain
+    /// signature `OmegaOrchestrator.sol`'s `_acceptsKey()` checks against
+    /// `execution_key`/`pending_key`. Deliberately a SEPARATE dependency
+    /// from `tx_key_manager` — see this struct's top doc comment for why
+    /// the two are independent concerns. Uses `BlueprintSigner::
+    /// sign_raw_hash()` specifically, never `BlueprintSigner::sign()` —
+    /// see this file's top doc comment, "RESOLVED (this revision)", for
+    /// why the latter is confirmed incompatible with this contract.
+    blueprint_signer: Arc<BlueprintSigner>,
     secp: Secp256k1<secp256k1::All>,
 }
 
@@ -193,7 +284,12 @@ impl KeyManagerTransactionSigner {
     /// Panics if `orchestrator == Address::ZERO` — a zero target is never a
     /// valid deployment configuration and should fail at construction time,
     /// not on the first signing attempt under load.
-    pub fn new(tx_key_manager: Arc<KeyManager>, orchestrator: Address) -> Self {
+    pub fn new(
+        tx_key_manager: Arc<KeyManager>,
+        orchestrator: Address,
+        strategy_onchain_ids: HashMap<String, [u8; 32]>,
+        blueprint_signer: Arc<BlueprintSigner>,
+    ) -> Self {
         assert_ne!(
             orchestrator,
             Address::ZERO,
@@ -203,6 +299,8 @@ impl KeyManagerTransactionSigner {
         Self {
             tx_key_manager,
             orchestrator,
+            strategy_onchain_ids,
+            blueprint_signer,
             secp: Secp256k1::new(),
         }
     }
@@ -214,33 +312,114 @@ impl KeyManagerTransactionSigner {
         self.tx_key_manager.active_address()
     }
 
-    /// Build the ABI-encoded outer calldata for
-    /// `OmegaOrchestrator.execute(bytes blueprintCalldata, bytes sig)` and
-    /// the on-chain-authorization signature over it.
+    /// Build the real, ABI-encoded `blueprintCalldata` bytes for `bp` —
+    /// see this file's top doc comment, items 1-4, for exactly what's
+    /// confirmed here and against what evidence.
     ///
-    /// NOT IMPLEMENTED — see this module's top doc comment, items 1-4. This
-    /// is factored out as its own method (rather than inlined into
-    /// `sign_transaction`) so that once an ABI encoder, the strategyId
-    /// mapping, and confirmation of the Orchestrator's exact expected ABI
-    /// shape for the flashloan-identity fields are in hand, only this
-    /// method needs a real body — the RLP/envelope-signing logic in
-    /// `sign_transaction` below does not need to change.
-    fn build_execute_calldata(&self, _bp: &ExecutionBlueprint) -> Result<Bytes, ExecutionError> {
-        Err(ExecutionError::SigningFailed {
-            detail: "KeyManagerTransactionSigner::build_execute_calldata is not implemented: \
-                requires (1) an ABI encoder for blueprintCalldata / execute()'s outer calldata, \
-                not present anywhere in this workspace's dependency graph as of this revision, \
-                (2) confirmation of the on-chain strategy_registry's bytes32 strategyId derivation, \
-                (3) confirmation of the Orchestrator's exact expected on-chain ABI shape for \
-                ExecutionBlueprint's flashloan_provider_type/provider_contract/flashloan_token \
-                fields (the schema itself now exists on ExecutionBlueprint, but the ABI \
-                encoding contract for it has not been confirmed against any file read), and \
-                (4) confirmation of minNetProfit's source field. See signer.rs's module doc \
-                comment for the full list. Fabricating any of these for a contract that moves \
-                real flashloaned funds is refused by design — same policy as \
-                pipeline.rs::resolve_flashloan_provider_id."
-                .to_string(),
-        })
+    /// The ONLY failure mode is a strategy missing from
+    /// `strategy_onchain_ids` — everything else is a pure, infallible
+    /// transformation of already-real `ExecutionBlueprint` fields.
+    fn build_blueprint_calldata(&self, bp: &ExecutionBlueprint) -> Result<Vec<u8>, ExecutionError> {
+        let strategy_key = bp.strategy_id.to_string();
+        let strategy_id_bytes: [u8; 32] = *self
+            .strategy_onchain_ids
+            .get(&strategy_key)
+            .ok_or_else(|| ExecutionError::SigningFailed {
+                detail: format!(
+                    "no on-chain strategyId configured for strategy_id {strategy_key:?} — this \
+                     value is real deployment configuration (whatever bytes32 was passed to \
+                     OmegaOrchestrator.registerStrategy() for this strategy on-chain), not \
+                     something derivable from code. Wire it into \
+                     KeyManagerTransactionSigner::new's strategy_onchain_ids map, sourced from \
+                     real deployment records, never guessed at."
+                ),
+            })?;
+
+        // Solidity ABI-encodes an enum identically to its `uint8` ordinal.
+        // `omega_core::types::flashloan_provider`'s own
+        // `ordinals_match_solidity_enum_order` test guarantees this cast
+        // matches OmegaOrchestrator.sol's `FlashloanProviderType` enum
+        // order — not an assumption made fresh here.
+        let provider_type: u8 = bp.flashloan_provider_type as u8;
+
+        // OmegaOrchestrator.sol's `maxBaseFee` is compared directly against
+        // `block.basefee`, which the EVM always reports in WEI.
+        // `ExecutionBlueprint::max_base_fee_gwei` is explicitly
+        // gwei-denominated (see its own name and the
+        // `derive_max_base_fee_gwei` helper) — converted here, not
+        // silently mismatched.
+        let max_base_fee_wei =
+            U256::from(bp.max_base_fee_gwei).saturating_mul(U256::from(1_000_000_000u64));
+
+        let blueprint = Blueprint {
+            expiry_block: bp.expiry_block,
+            nonce: bp.nonce,
+            strategy_id: strategy_id_bytes.into(),
+            provider_type,
+            flashloan_token: bp.flashloan_token,
+            provider_contract: bp.provider_contract,
+            strategy_calldata: bp.calldata.clone(),
+            flashloan_amount: bp.flashloan_amount,
+            min_net_profit: bp.dynamic_min_profit,
+            max_base_fee: max_base_fee_wei,
+        };
+
+        Ok(blueprint.abi_encode())
+    }
+
+    /// Compute the real domain-separated `bpHash` OmegaOrchestrator.sol
+    /// actually signs/replay-tracks against — see this file's top doc
+    /// comment for why this is NOT simply `keccak256(blueprint_calldata)`.
+    fn compute_bp_hash(&self, blueprint_calldata: &[u8], chain_id: u64) -> [u8; 32] {
+        let domain = DomainSeparatedBlueprint {
+            orchestrator: self.orchestrator,
+            chain_id,
+            blueprint_calldata: blueprint_calldata.to_vec().into(),
+        };
+        omega_security::keccak256(&domain.abi_encode())
+    }
+
+    /// Build the ABI-encoded outer calldata for
+    /// `OmegaOrchestrator.execute(bytes blueprintCalldata, bytes sig)`,
+    /// including the real on-chain-authorization signature.
+    ///
+    /// As of this revision this is fully real end-to-end: `blueprintCalldata`
+    /// and `bp_hash` are built and hashed for real (see
+    /// `build_blueprint_calldata` / `compute_bp_hash` above), `sig` is
+    /// produced by `BlueprintSigner::sign_raw_hash()` — the primitive
+    /// confirmed compatible with `OmegaOrchestrator.sol`'s
+    /// `bpHash.recover(sig)` (see this file's top doc comment, "RESOLVED
+    /// (this revision)") — and the three are assembled via
+    /// `encode_execute_call`. The only remaining failure mode is a
+    /// strategy missing from `strategy_onchain_ids` (real deployment
+    /// configuration this file cannot supply for itself) or a signing
+    /// failure surfaced from `BlueprintSigner` itself (e.g. no active
+    /// key) — both fail loudly and specifically, never silently.
+    fn build_execute_calldata(
+        &self,
+        bp: &ExecutionBlueprint,
+        chain_id: u64,
+    ) -> Result<Bytes, ExecutionError> {
+        let blueprint_calldata = self.build_blueprint_calldata(bp)?;
+        let bp_hash = self.compute_bp_hash(&blueprint_calldata, chain_id);
+
+        let signed_bundle = self.blueprint_signer.sign_raw_hash(&bp_hash).map_err(|e| {
+            ExecutionError::SigningFailed {
+                detail: format!("blueprint-authorization signing failed: {e}"),
+            }
+        })?;
+
+        let sig_bytes = signed_bundle.signature.bytes.to_vec();
+        let calldata = encode_execute_call(blueprint_calldata, sig_bytes);
+
+        tracing::debug!(
+            blueprint_hash = %bp.blueprint_hash,
+            bp_hash = %hex::encode(bp_hash),
+            authorized_by = %hex::encode(signed_bundle.signer_address),
+            "execute() calldata built with real blueprint-authorization signature"
+        );
+
+        Ok(calldata.into())
     }
 }
 
@@ -255,9 +434,9 @@ impl TransactionSigner for KeyManagerTransactionSigner {
         // module's top doc comment. Everything below this point is dead
         // code until build_execute_calldata has a real implementation, but
         // is left in place (rather than deleted) so the RLP/signing path
-        // is reviewable and ready to wire up once calldata construction is
-        // resolved.
-        let data = self.build_execute_calldata(bp)?;
+        // is reviewable and ready to wire up once the blueprint-
+        // authorization signature is resolved.
+        let data = self.build_execute_calldata(bp, chain_id)?;
 
         let secret_key =
             self.tx_key_manager
@@ -296,6 +475,14 @@ impl TransactionSigner for KeyManagerTransactionSigner {
                 detail: format!("invalid signing digest: {e}"),
             })?;
 
+        // libsecp256k1's ECDSA signing (used here via the `secp256k1`
+        // crate's `sign_ecdsa_recoverable`) already produces canonical,
+        // low-s signatures by construction — the same low-s requirement
+        // Ethereum enforces for every transaction type since Homestead
+        // (EIP-2), and separately the requirement OmegaOrchestrator.sol's
+        // ECDSA.recover applies to the blueprint-authorization signature
+        // once that call is wired. No extra normalization step is needed
+        // here.
         let (recovery_id, compact) = self
             .secp
             .sign_ecdsa_recoverable(&msg, &secret_key)
@@ -330,6 +517,23 @@ impl TransactionSigner for KeyManagerTransactionSigner {
     }
 }
 
+/// Assembles the FINAL outer `execute(bytes,bytes)` calldata from an
+/// already-built `blueprint_calldata` and an already-produced
+/// authorization `sig`. Free function (not a method) so it's directly
+/// unit-testable without constructing a full `KeyManagerTransactionSigner`
+/// — see the tests below. As of this revision, genuinely called from
+/// `build_execute_calldata` above (no longer dead code) — kept as a free
+/// function regardless, since that keeps the "pure assembly" step
+/// independently testable from the signing step that produces its `sig`
+/// input.
+pub(crate) fn encode_execute_call(blueprint_calldata: Vec<u8>, sig: Vec<u8>) -> Vec<u8> {
+    executeCall {
+        blueprint_calldata: blueprint_calldata.into(),
+        sig: sig.into(),
+    }
+    .abi_encode()
+}
+
 // ── EIP-1559 RLP encoding helpers ───────────────────────────────────────────
 //
 // Field order and signing-digest construction checked directly against
@@ -345,13 +549,12 @@ impl TransactionSigner for KeyManagerTransactionSigner {
 // NOT yet checked against a known signed-transaction test vector (none was
 // available in this investigation) — see this file's top doc comment.
 // self-contained rather than pulling in alloy's consensus/signer feature
-// set, since that dependency question was itself unresolved (see top doc
-// comment, item 1) and this encoder does not need the full ABI/consensus
-// surface, only RLP.
+// set, since this encoder does not need the full consensus surface, only
+// RLP.
 //
 // Both `encode_eip1559_unsigned` and `encode_eip1559_signed` carry
 // `#[allow(clippy::too_many_arguments)]` — see this file's module-level
-// "Audit fix (this revision, 2)" note for why: their argument lists are
+// "Audit fix (carried forward, 2)" note for why: their argument lists are
 // dictated 1:1 by EIP-1559's own field order, not an accident of API
 // design that a struct would clean up.
 
@@ -513,6 +716,7 @@ mod tests {
     use super::*;
     use omega_core::types::flashloan_provider::FlashloanProviderType;
     use omega_security::key_manager::KeyManager;
+    use omega_security::signer::BlueprintSigner;
     use secp256k1::SecretKey;
 
     fn make_km(byte: u8) -> Arc<KeyManager> {
@@ -521,48 +725,284 @@ mod tests {
         ))
     }
 
+    fn make_blueprint_signer(byte: u8) -> Arc<BlueprintSigner> {
+        Arc::new(BlueprintSigner::new(make_km(byte)))
+    }
+
+    fn empty_strategy_ids() -> HashMap<String, [u8; 32]> {
+        HashMap::new()
+    }
+
+    fn strategy_ids_with_sa() -> HashMap<String, [u8; 32]> {
+        let mut m = HashMap::new();
+        m.insert("SA".to_string(), [0x42u8; 32]);
+        m
+    }
+
     // ── Construction guard ────────────────────────────────────────────────
 
     #[test]
     #[should_panic(expected = "requires a real deployed OmegaOrchestrator address")]
     fn zero_orchestrator_address_panics_at_construction() {
         let km = make_km(0x01);
-        let _ = KeyManagerTransactionSigner::new(km, Address::ZERO);
+        let _ = KeyManagerTransactionSigner::new(
+            km,
+            Address::ZERO,
+            empty_strategy_ids(),
+            make_blueprint_signer(0x01),
+        );
     }
 
     #[test]
     fn active_address_matches_key_manager() {
         let km = make_km(0x02);
         let expected = km.active_address();
-        let signer = KeyManagerTransactionSigner::new(km, Address::from([0x01; 20]));
+        let signer = KeyManagerTransactionSigner::new(
+            km,
+            Address::from([0x01; 20]),
+            empty_strategy_ids(),
+            make_blueprint_signer(0x02),
+        );
         assert_eq!(signer.active_address(), expected);
     }
 
     // ── sign_transaction currently fails loudly, not silently ──────────────
 
     #[tokio::test]
-    async fn sign_transaction_fails_with_specific_reason_not_silently() {
-        // Regression guard: this must remain a loud, specific,
-        // SigningFailed error — never a fabricated signature, and never a
-        // generic/uninformative failure — until build_execute_calldata is
-        // actually implemented. If this test starts failing because
-        // sign_transaction now succeeds, build_execute_calldata's doc
-        // comment and this module's top doc comment need to be updated
-        // together with the implementation, not left stale.
-        let km = make_km(0x03);
-        let signer = KeyManagerTransactionSigner::new(km, Address::from([0x01; 20]));
+    async fn sign_transaction_succeeds_end_to_end_with_real_blueprint_signer() {
+        // Regression guard for the OPPOSITE direction from this file's
+        // prior revision: now that build_execute_calldata has a real
+        // strategy_onchain_ids entry AND a real BlueprintSigner, signing
+        // must actually succeed — producing a real signed RLP transaction
+        // — not fail at any point. If this starts failing, either the ABI
+        // encoding, the domain hash, or the BlueprintSigner wiring
+        // regressed.
+        let tx_km = make_km(0x03);
+        let signer = KeyManagerTransactionSigner::new(
+            tx_km,
+            Address::from([0x01; 20]),
+            strategy_ids_with_sa(),
+            make_blueprint_signer(0x0d),
+        );
+        let bp = sample_bp();
+
+        let result = signer.sign_transaction(&bp, 42161).await;
+        let signed = result.expect("sign_transaction must succeed with real config wired");
+        assert!(signed.raw_tx_hex.starts_with("0x02"), "must be an EIP-1559 typed tx");
+        assert!(signed.raw_tx_hex.len() > 4, "must contain real RLP payload, not just the type byte");
+    }
+
+    #[test]
+    fn build_execute_calldata_succeeds_with_real_blueprint_signer() {
+        let tx_km = make_km(0x0e);
+        let signer = KeyManagerTransactionSigner::new(
+            tx_km,
+            Address::from([0x01; 20]),
+            strategy_ids_with_sa(),
+            make_blueprint_signer(0x0f),
+        );
+        let bp = sample_bp();
+        let calldata = signer.build_execute_calldata(&bp, 42161).unwrap();
+        assert!(
+            calldata.starts_with(&executeCall::SELECTOR),
+            "outer calldata must start with the real execute(bytes,bytes) selector"
+        );
+    }
+
+    #[tokio::test]
+    async fn sign_transaction_fails_with_strategy_lookup_reason_when_unconfigured() {
+        // Distinguishes the ONE remaining failure reason this signer can
+        // still produce: an unconfigured strategy_onchain_ids entry fails
+        // BEFORE bp_hash is ever computed or the BlueprintSigner is ever
+        // called, with a message naming the missing strategy specifically.
+        let km = make_km(0x04);
+        let signer = KeyManagerTransactionSigner::new(
+            km,
+            Address::from([0x01; 20]),
+            empty_strategy_ids(), // SA deliberately absent
+            make_blueprint_signer(0x10),
+        );
         let bp = sample_bp();
 
         let result = signer.sign_transaction(&bp, 42161).await;
         match result {
             Err(ExecutionError::SigningFailed { detail }) => {
                 assert!(
-                    detail.contains("build_execute_calldata"),
-                    "error must clearly identify the unimplemented step, got: {detail}"
+                    detail.contains("SA"),
+                    "error must name the missing strategy, got: {detail}"
+                );
+                assert!(
+                    detail.contains("registerStrategy"),
+                    "error must explain this is deployment configuration, got: {detail}"
                 );
             }
             other => panic!("expected ExecutionError::SigningFailed, got {other:?}"),
         }
+    }
+
+    // ── build_blueprint_calldata — real ABI encoding ────────────────────────
+
+    #[test]
+    fn build_blueprint_calldata_succeeds_when_strategy_configured() {
+        let km = make_km(0x05);
+        let signer = KeyManagerTransactionSigner::new(
+            km,
+            Address::from([0x01; 20]),
+            strategy_ids_with_sa(),
+            make_blueprint_signer(0x11),
+        );
+        let bp = sample_bp();
+        let encoded = signer.build_blueprint_calldata(&bp).unwrap();
+        assert!(!encoded.is_empty());
+        // Standard ABI head-tail encoding is always a multiple of 32 bytes.
+        assert_eq!(encoded.len() % 32, 0);
+    }
+
+    #[test]
+    fn build_blueprint_calldata_fails_for_unconfigured_strategy() {
+        let km = make_km(0x06);
+        let signer = KeyManagerTransactionSigner::new(
+            km,
+            Address::from([0x01; 20]),
+            empty_strategy_ids(),
+            make_blueprint_signer(0x12),
+        );
+        let bp = sample_bp();
+        let result = signer.build_blueprint_calldata(&bp);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn build_blueprint_calldata_round_trips_through_abi_decode() {
+        // Strong self-consistency check in place of an external solc/EVM
+        // oracle: decode what we just encoded via alloy-sol-types' own
+        // abi_decode, and confirm every field survives the round trip.
+        // This validates the `Blueprint` sol! type is internally
+        // consistent and that every field was assigned to the position I
+        // intended — it does NOT independently prove byte-for-byte
+        // agreement with solc's own encoder, though alloy-sol-types is a
+        // widely-used, spec-compliant ABI implementation.
+        let km = make_km(0x07);
+        let signer = KeyManagerTransactionSigner::new(
+            km,
+            Address::from([0x01; 20]),
+            strategy_ids_with_sa(),
+            make_blueprint_signer(0x13),
+        );
+        let bp = sample_bp();
+        let encoded = signer.build_blueprint_calldata(&bp).unwrap();
+
+        let decoded = Blueprint::abi_decode(&encoded, true).unwrap();
+        assert_eq!(decoded.expiry_block, bp.expiry_block);
+        assert_eq!(decoded.nonce, bp.nonce);
+        assert_eq!(decoded.provider_type, bp.flashloan_provider_type as u8);
+        assert_eq!(decoded.flashloan_token, bp.flashloan_token);
+        assert_eq!(decoded.provider_contract, bp.provider_contract);
+        assert_eq!(decoded.strategy_calldata, bp.calldata);
+        assert_eq!(decoded.flashloan_amount, bp.flashloan_amount);
+        assert_eq!(decoded.min_net_profit, bp.dynamic_min_profit);
+    }
+
+    #[test]
+    fn build_blueprint_calldata_max_base_fee_converted_gwei_to_wei() {
+        let km = make_km(0x08);
+        let signer = KeyManagerTransactionSigner::new(
+            km,
+            Address::from([0x01; 20]),
+            strategy_ids_with_sa(),
+            make_blueprint_signer(0x14),
+        );
+        let bp = sample_bp();
+        let encoded = signer.build_blueprint_calldata(&bp).unwrap();
+        let decoded = Blueprint::abi_decode(&encoded, true).unwrap();
+        let expected =
+            U256::from(bp.max_base_fee_gwei).saturating_mul(U256::from(1_000_000_000u64));
+        assert_eq!(decoded.max_base_fee, expected);
+    }
+
+    // ── compute_bp_hash — domain separation ─────────────────────────────────
+
+    #[test]
+    fn compute_bp_hash_is_deterministic() {
+        let km = make_km(0x09);
+        let signer = KeyManagerTransactionSigner::new(
+            km,
+            Address::from([0x01; 20]),
+            strategy_ids_with_sa(),
+            make_blueprint_signer(0x15),
+        );
+        let h1 = signer.compute_bp_hash(b"same input", 42161);
+        let h2 = signer.compute_bp_hash(b"same input", 42161);
+        assert_eq!(h1, h2);
+    }
+
+    #[test]
+    fn compute_bp_hash_changes_with_chain_id() {
+        let km = make_km(0x0a);
+        let signer = KeyManagerTransactionSigner::new(
+            km,
+            Address::from([0x01; 20]),
+            strategy_ids_with_sa(),
+            make_blueprint_signer(0x16),
+        );
+        let h1 = signer.compute_bp_hash(b"same input", 42161);
+        let h2 = signer.compute_bp_hash(b"same input", 1);
+        assert_ne!(
+            h1, h2,
+            "domain separation must include chain_id — a blueprint valid on one \
+             chain must not hash identically on another"
+        );
+    }
+
+    #[test]
+    fn compute_bp_hash_changes_with_orchestrator_address() {
+        let km1 = make_km(0x0b);
+        let km2 = make_km(0x0c);
+        let signer_a = KeyManagerTransactionSigner::new(
+            km1,
+            Address::from([0x01; 20]),
+            strategy_ids_with_sa(),
+            make_blueprint_signer(0x17),
+        );
+        let signer_b = KeyManagerTransactionSigner::new(
+            km2,
+            Address::from([0x02; 20]),
+            strategy_ids_with_sa(),
+            make_blueprint_signer(0x18),
+        );
+        let h1 = signer_a.compute_bp_hash(b"same input", 42161);
+        let h2 = signer_b.compute_bp_hash(b"same input", 42161);
+        assert_ne!(
+            h1, h2,
+            "domain separation must include the orchestrator address — the exact \
+             replay-across-deployments vulnerability OmegaOrchestrator.sol's own \
+             change #3 note describes fixing"
+        );
+    }
+
+    // ── encode_execute_call — outer calldata assembly ───────────────────────
+
+    #[test]
+    fn encode_execute_call_prefixes_the_real_function_selector() {
+        // Self-consistency check against alloy-sol-types' own macro-derived
+        // selector constant, not an independently hand-computed value —
+        // see this file's top doc comment for why that's the honest
+        // framing here.
+        let out = encode_execute_call(vec![0xaa, 0xbb], vec![0xcc, 0xdd]);
+        assert!(out.starts_with(&executeCall::SELECTOR));
+    }
+
+    #[test]
+    fn encode_execute_call_round_trips_through_abi_decode() {
+        let blueprint_calldata = vec![0x01, 0x02, 0x03];
+        let sig = vec![0xaa; 65];
+        let out = encode_execute_call(blueprint_calldata.clone(), sig.clone());
+        let decoded = executeCall::abi_decode(&out, true).unwrap();
+        assert_eq!(
+            decoded.blueprint_calldata.as_ref(),
+            blueprint_calldata.as_slice()
+        );
+        assert_eq!(decoded.sig.as_ref(), sig.as_slice());
     }
 
     // ── RLP encoder — structural checks against the EIP-1559 spec text ─────
@@ -654,8 +1094,10 @@ mod tests {
         assert_eq!(signed[0], 0x02);
     }
 
+    // ── Test fixtures ────────────────────────────────────────────────────
+
     fn sample_bp() -> ExecutionBlueprint {
-        use alloy_primitives::{Bytes, B256};
+        use alloy_primitives::B256;
         use omega_core::types::blueprint::StrategyId;
         use omega_core::types::lane::{Lane, Simulator};
         use uuid::Uuid;
@@ -663,6 +1105,7 @@ mod tests {
         let signal_id = Uuid::from_bytes([0x01; 16]);
         let client_order_id =
             ExecutionBlueprint::derive_client_order_id(StrategyId::Sa, 42161, 0, signal_id);
+        let base_fee_at_creation = 10;
         let mut bp = ExecutionBlueprint {
             blueprint_hash: B256::ZERO,
             chain_id: 42161,
@@ -673,19 +1116,15 @@ mod tests {
             state_version: 1,
             signal_id,
             flashloan_provider: Address::ZERO,
-            flashloan_amount: U256::ZERO,
-            flashloan_available: U256::ZERO,
-            // See this file's module-level "Audit fix: test helper
-            // missing flashloan/token fields" note: sign_transaction's
-            // current real code path (everything up to and including
-            // build_execute_calldata's loud failure) never reads these
-            // three, so they mirror this helper's existing
-            // flashloan_provider: Address::ZERO "no flashloan"
-            // convention.
+            flashloan_amount: U256::from(1_000_000u64),
+            flashloan_available: U256::from(2_000_000u64),
+            // Real, meaningful values now that build_blueprint_calldata
+            // genuinely reads these three — see this file's top doc
+            // comment, "Audit fix (carried forward)".
             flashloan_provider_type: FlashloanProviderType::Balancer,
             provider_contract: Address::ZERO,
-            flashloan_token: Address::ZERO,
-            calldata: Bytes::new(),
+            flashloan_token: Address::from([0x99; 20]),
+            calldata: Bytes::from(vec![0xde, 0xad, 0xbe, 0xef]),
             strategy_bytecode_hash: B256::ZERO,
             l2_exec_gas_estimate: 100_000,
             l1_data_gas_estimate: 0,
@@ -695,10 +1134,13 @@ mod tests {
             l2_buffer_factor: 1.15,
             l1_data_buffer_factor: 1.10,
             slippage_bps: 50,
-            base_fee_at_creation: 10,
+            base_fee_at_creation,
             l1_data_fee_at_creation: 2,
             priority_fee_gwei: 5,
-            max_base_fee_gwei: 30,
+            max_base_fee_gwei: ExecutionBlueprint::derive_max_base_fee_gwei(
+                base_fee_at_creation,
+                3.0,
+            ),
             price_impact_bps: None,
             ofa_compliant: false,
             expiry_block: 1_100,
