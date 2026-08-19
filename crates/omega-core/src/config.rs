@@ -1,8 +1,8 @@
 ﻿// crates/omega-core/src/config.rs
 //
-// OmegaConfig â€” runtime configuration for the Omega Engine.
+// OmegaConfig — runtime configuration for the Omega Engine.
 //
-// ## Governance tiers (Â§5)
+// ## Governance tiers (§5)
 //
 // Every field is annotated with the governance tier required to change it
 // in production.  The tiers and their properties are:
@@ -11,7 +11,7 @@
 //                    Risk: low.  Scope: operational knobs (log levels,
 //                    metrics endpoints, relay timeouts).
 //
-//   L2 (Fast-Approve) Signed by â‰¥2/5 governance keys.  Effective
+//   L2 (Fast-Approve) Signed by ≥2/5 governance keys.  Effective
 //                    immediately after signature validation.
 //                    Risk: medium.  Scope: strategy parameters, fee
 //                    ceilings, ML learning rate.
@@ -19,7 +19,7 @@
 //   L3 (Timelock)   48-hour timelock + 3/5 multisig.  Risk: high.
 //                   Scope: phase gates, Vault parameters, DAO fee bps.
 //                   Emergency L3 path: 24h + 3/5, qualifying criteria
-//                   only (Â§5.1).
+//                   only (§5.1).
 //
 // Fields that are IMMUTABLE after deployment (chain_id, contract
 // addresses that are Certora-verified invariants) are marked IMMUTABLE.
@@ -28,22 +28,22 @@
 // ## Serialisation contract
 //
 // OmegaConfig is loaded from a TOML file at startup and can be
-// hot-reloaded via the control-plane API (Â§17).  All defaults are set
+// hot-reloaded via the control-plane API (§17).  All defaults are set
 // via serde's `default` attribute so that a minimal config file works
 // in development.  Production deployments must provide all L3 fields
-// explicitly â€” missing L3 fields cause a `OmegaError::Config` halt.
+// explicitly — missing L3 fields cause a `OmegaError::Config` halt.
 //
 // `#[serde(deny_unknown_fields)]` is applied at every level, including
-// the top-level `OmegaConfig` itself (previously missing here â€” an
+// the top-level `OmegaConfig` itself (previously missing here — an
 // unrecognised top-level TOML key would have been silently ignored
 // rather than rejected, the one place in this file that didn't match
 // its own stated strictness policy).
 //
-// ## WeiAmount â€” u128 amounts that survive TOML round-trips
+// ## WeiAmount — u128 amounts that survive TOML round-trips
 //
 // The `toml` crate (v0.5/v0.8) represents all TOML integers as `i64`
-// internally and rejects values that don't fit â€” `i64::MAX` â‰ˆ
-// 9.223 Ã— 10^18, which is only ~9.223 ETH in wei. Neither a plain `u64`
+// internally and rejects values that don't fit — `i64::MAX` ≈
+// 9.223 × 10^18, which is only ~9.223 ETH in wei. Neither a plain `u64`
 // nor a plain `u128` Rust field changes this: the TOML *parser* rejects
 // the literal before serde ever sees it, regardless of what Rust type
 // is on the receiving end. `WeiAmount` (defined below) sidesteps this
@@ -51,7 +51,7 @@
 // magnitude limit) while storing the value as `u128` internally.
 //
 // This replaces a previous `u64`-typed workaround whose defaults were
-// both hardcoded to ~9 ETH â€” not merely an approximation of the spec's
+// both hardcoded to ~9 ETH — not merely an approximation of the spec's
 // 50 ETH / 500 ETH values, but numerically IDENTICAL to each other,
 // which collapsed the per-transfer and daily caps into one limit in
 // practice (a single transfer could already exhaust the entire "daily"
@@ -66,37 +66,80 @@
 // `struct Wrapper { amount: WeiAmount }` test fixtures near the bottom
 // of this file, `wei_amount_deserializes_from_plain_integer_too` reads
 // `parsed.amount` and was never flagged. `wei_amount_rejects_garbage_string`
-// only asserts `result.is_err()` â€” since deserialization always fails in
+// only asserts `result.is_err()` — since deserialization always fails in
 // that test, `Wrapper` is never successfully constructed, so `.amount`
 // is genuinely, permanently unread there: the field's TYPE (driving
 // `WeiAmount`'s custom `Deserialize` impl) is what's under test, not any
 // value read from it. Fixed with a scoped `#[allow(dead_code)]` on that
-// one local struct rather than changing the test's behavior â€” reading
+// one local struct rather than changing the test's behavior — reading
 // `.amount` after confirming `is_err()` isn't possible (there's no `Ok`
 // value to read it from), so there's no way to make the field
 // "genuinely used" without testing something this test isn't about.
 //
+// ## C5 (this revision): RelayConfig gains phase_1_relays /
+// phase_2plus_relays / blind_fallback
+//
+// `omega-execution::config_translation::translate_relay_config` (Gap 4)
+// needed these three fields from a caller and had no source for them
+// anywhere in this codebase — confirmed at the time by reading this
+// type's real, complete field list, which had none of the three. That
+// forced `main.rs`'s relay-bootstrap block to construct
+// `omega_relay::RelayConfig` from `Default::default()` instead of via
+// the real translator, and to treat every relay this codebase has a
+// verified auth convention for as a candidate for every phase (no way
+// to phase-gate without a real field to gate on) — see `main.rs`'s own
+// "FIX (this revision)" doc comment, item 1, for the full prior
+// reasoning.
+//
+// This revision adds the three fields directly here, closing that gap
+// at its actual source rather than continuing to work around it
+// downstream. Deliberately `Vec<String>`, not `omega_relay::RelayName`:
+// `omega-core` is the foundational crate nearly everything else in this
+// workspace depends on, and must not gain a dependency on `omega-relay`
+// (a much higher-level crate) just to hold a relay-name list. The
+// String -> RelayName conversion happens at the translation boundary in
+// `omega-execution::config_translation`, which already depends on both
+// crates.
+//
+// ## Backward compatibility (the load-bearing part of this change)
+//
+// Every existing `config/*.toml` file predates these three keys. Both
+// `Vec<String>` fields use `#[serde(default = "...")]` pointing at
+// `defaults::relay_phase_1_relays()` / `defaults::relay_phase_2plus_relays()`,
+// which return the SAME four relay names (`flashbots`, `titan`,
+// `bloxroute`, `eden`) `main.rs`'s own (now-removed) `KNOWN_RELAY_NAMES`
+// constant listed as candidates for every phase — i.e. an operator who
+// upgrades without touching their config file gets the IDENTICAL
+// relay-candidate set they had before this change, for every phase, not
+// a narrower or empty one. `blind_fallback` defaults to `false` via a
+// bare `#[serde(default)]` (no prior behavior to match — this capability
+// didn't exist before this revision, so `false`, the conservative
+// choice, is a genuine new policy default rather than a compatibility
+// constraint). See `wei_amount_round_trips_through_real_toml`'s sibling
+// test below, `relay_config_toml_without_new_fields_uses_backward_compatible_defaults`,
+// for the regression guard on this specific claim.
+//
 // Spec references:
-//   Â§1.1  â€” phase gates â†’ active_phase
-//   Â§5    â€” governance tiers
-//   Â§5.1  â€” emergency L3 criteria
-//   Â§7    â€” dual-component gas model â†’ GasConfig
-//   Â§11.1 â€” LA tier thresholds â†’ LaConfig
-//   Â§11.2 â€” cascade backpressure â†’ RelayConfig
-//   Â§12.1 â€” emergency bundle profit check â†’ GasConfig
-//   Â§12.2 â€” 500 gwei priority fee ceiling â†’ GasConfig
-//   Â§13   â€” ML online learner â†’ MlConfig
-//   Â§14   â€” address rotation â†’ RotationConfig
-//   Â§15   â€” Vault parameters â†’ VaultConfig
-//   Â§15.2 â€” per-transfer / daily caps â†’ VaultConfig::{per_transfer_cap_wei, daily_cap_wei}
-//   Â§17.1 â€” WebSocket rate limits â†’ ApiConfig
-//   Â§18   â€” CHI/GST gas tokens (Phase 4+ L1 only) â†’ GasConfig
+//   §1.1  — phase gates → active_phase
+//   §5    — governance tiers
+//   §5.1  — emergency L3 criteria
+//   §7    — dual-component gas model → GasConfig
+//   §11.1 — LA tier thresholds → LaConfig
+//   §11.2 — cascade backpressure → RelayConfig
+//   §12.1 — emergency bundle profit check → GasConfig
+//   §12.2 — 500 gwei priority fee ceiling → GasConfig
+//   §13   — ML online learner → MlConfig
+//   §14   — address rotation → RotationConfig
+//   §15   — Vault parameters → VaultConfig
+//   §15.2 — per-transfer / daily caps → VaultConfig::{per_transfer_cap_wei, daily_cap_wei}
+//   §17.1 — WebSocket rate limits → ApiConfig
+//   §18   — CHI/GST gas tokens (Phase 4+ L1 only) → GasConfig
 
 use serde::{Deserialize, Serialize};
 
-// â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+// ─────────────────────────────────────────────────────────────────────────────
 // WeiAmount
-// â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+// ─────────────────────────────────────────────────────────────────────────────
 
 /// Wei-denominated amount that can express values larger than
 /// `i64::MAX` in TOML config files. See the module doc comment above
@@ -118,7 +161,7 @@ impl WeiAmount {
     }
 
     /// Construct from a whole-ETH amount, converting to wei internally.
-    /// Panics on overflow â€” unreachable with any realistic config value;
+    /// Panics on overflow — unreachable with any realistic config value;
     /// even 1 million ETH fits comfortably under `u128::MAX`.
     #[inline]
     pub fn from_eth(eth: u64) -> Self {
@@ -145,12 +188,12 @@ impl Serialize for WeiAmount {
         // type TOML-safe (see module doc comment) and is also
         // unambiguous in JSON, which silently loses precision for
         // integers beyond 2^53 in many JSON consumers (e.g.
-        // JavaScript's Number type) â€” a string sidesteps that too.
+        // JavaScript's Number type) — a string sidesteps that too.
         serializer.serialize_str(&self.0.to_string())
     }
 }
 
-/// Accepts either a decimal string (the canonical wire format â€” see
+/// Accepts either a decimal string (the canonical wire format — see
 /// `Serialize` above) or a plain integer (so config constructed
 /// programmatically, or via a JSON source with a small-enough value,
 /// still deserializes without requiring the string form).
@@ -177,9 +220,9 @@ impl<'de> Deserialize<'de> for WeiAmount {
     }
 }
 
-// â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+// ─────────────────────────────────────────────────────────────────────────────
 // Top-level config
-// â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+// ─────────────────────────────────────────────────────────────────────────────
 
 /// Full runtime configuration for the Omega Engine.
 ///
@@ -189,41 +232,41 @@ impl<'de> Deserialize<'de> for WeiAmount {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct OmegaConfig {
-    /// Currently active system phase (Â§1.1, Â§20).
+    /// Currently active system phase (§1.1, §20).
     ///
     /// GOVERNANCE: L3 (48h timelock).  Phase activation is a
-    /// high-stakes irreversible operation â€” once Phase 3 is active,
+    /// high-stakes irreversible operation — once Phase 3 is active,
     /// Phase 2 strategies continue running alongside it.
     ///
     /// Valid values: 0 (Shadow/Backtest), 1 (SA), 2 (MSA), 3 (LA), 4 (MEV).
     #[serde(default = "defaults::active_phase")]
     pub active_phase: u8,
 
-    /// Gas model configuration (Â§7, Â§12.1, Â§12.2).
+    /// Gas model configuration (§7, §12.1, §12.2).
     #[serde(default)]
     pub gas: GasConfig,
 
-    /// LA-specific configuration (Â§11).
+    /// LA-specific configuration (§11).
     #[serde(default)]
     pub la: LaConfig,
 
-    /// Relay submission configuration (Â§11.2, Â§12).
+    /// Relay submission configuration (§11.2, §12).
     #[serde(default)]
     pub relay: RelayConfig,
 
-    /// ML online learner configuration (Â§13).
+    /// ML online learner configuration (§13).
     #[serde(default)]
     pub ml: MlConfig,
 
-    /// Address rotation configuration (Â§14).
+    /// Address rotation configuration (§14).
     #[serde(default)]
     pub rotation: RotationConfig,
 
-    /// Vault and PIL treasury configuration (Â§15).
+    /// Vault and PIL treasury configuration (§15).
     #[serde(default)]
     pub vault: VaultConfig,
 
-    /// Control-plane API configuration (Â§17).
+    /// Control-plane API configuration (§17).
     #[serde(default)]
     pub api: ApiConfig,
 }
@@ -243,17 +286,17 @@ impl Default for OmegaConfig {
     }
 }
 
-// â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+// ─────────────────────────────────────────────────────────────────────────────
 // GasConfig
-// â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+// ─────────────────────────────────────────────────────────────────────────────
 
-/// Arbitrum dual-component gas model parameters (Â§7, Â§12.1, Â§12.2).
+/// Arbitrum dual-component gas model parameters (§7, §12.1, §12.2).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct GasConfig {
     /// L2 execution gas estimate buffer factor.
     ///
-    /// Applied as: `l2_gas_budget = l2_exec_estimate Ã— l2_buffer_factor`.
+    /// Applied as: `l2_gas_budget = l2_exec_estimate × l2_buffer_factor`.
     /// Default 1.15 = 15% headroom.
     ///
     /// GOVERNANCE: L2 (fast-approve).
@@ -262,7 +305,7 @@ pub struct GasConfig {
 
     /// L1 data gas estimate buffer factor.
     ///
-    /// Applied to the calldata-bytes Ã— 16 estimate.  Default 1.10 = 10%.
+    /// Applied to the calldata-bytes × 16 estimate.  Default 1.10 = 10%.
     ///
     /// GOVERNANCE: L2 (fast-approve).
     #[serde(default = "defaults::l1_data_buffer_factor")]
@@ -270,44 +313,44 @@ pub struct GasConfig {
 
     /// Maximum priority fee submitted to the Arbitrum sequencer, in gwei.
     ///
-    /// Spec Â§12.2: 500 gwei ceiling.  At Arbitrum's 250ms block time
-    /// this is ~0.0105 ETH per block â€” comparable to 50 gwei on L1.
+    /// Spec §12.2: 500 gwei ceiling.  At Arbitrum's 250ms block time
+    /// this is ~0.0105 ETH per block — comparable to 50 gwei on L1.
     ///
     /// GOVERNANCE: L2 (fast-approve).
     #[serde(default = "defaults::max_priority_fee_gwei")]
     pub max_priority_fee_gwei: u64,
 
-    /// Conservative bundle fee as a fraction of the cap (0.0â€“1.0).
+    /// Conservative bundle fee as a fraction of the cap (0.0–1.0).
     ///
-    /// Spec Â§12: conservative_fee = cap Ã— conservative_fee_fraction.
+    /// Spec §12: conservative_fee = cap × conservative_fee_fraction.
     /// Default 0.70 = 70% of cap.
     ///
     /// GOVERNANCE: L2 (fast-approve).
     #[serde(default = "defaults::conservative_fee_fraction")]
     pub conservative_fee_fraction: f64,
 
-    /// Whether to enable emergency bundle emission (Â§12.1).
+    /// Whether to enable emergency bundle emission (§12.1).
     ///
-    /// When true, a third bundle at 2Ã— cap is emitted IFF
+    /// When true, a third bundle at 2× cap is emitted IFF
     /// `expected_profit_net > emergency_gas_cost + dynamic_min_profit`.
-    /// The profit check is MANDATORY â€” bundles are never submitted at a
+    /// The profit check is MANDATORY — bundles are never submitted at a
     /// loss (fix M2).
     ///
     /// GOVERNANCE: L2 (fast-approve).
     #[serde(default = "defaults::emergency_bundle_enabled")]
     pub emergency_bundle_enabled: bool,
 
-    /// Whether to evaluate CHI/GST gas token redemption (Â§18).
+    /// Whether to evaluate CHI/GST gas token redemption (§18).
     ///
     /// Applicable on Ethereum L1 (Phase 4+) only.  Must be `false` on
-    /// Arbitrum and Base â€” EVM storage refunds do not exist there.
+    /// Arbitrum and Base — EVM storage refunds do not exist there.
     ///
     /// GOVERNANCE: L2 (fast-approve).
     #[serde(default = "defaults::gas_token_enabled")]
     pub gas_token_enabled: bool,
 
     /// Minimum L1 base fee in gwei above which CHI/GST redemption is
-    /// evaluated (Â§18).  Spec recommendation: 80 gwei.
+    /// evaluated (§18).  Spec recommendation: 80 gwei.
     ///
     /// Ignored when `gas_token_enabled` is false.
     ///
@@ -330,17 +373,17 @@ impl Default for GasConfig {
     }
 }
 
-// â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+// ─────────────────────────────────────────────────────────────────────────────
 // LaConfig
-// â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+// ─────────────────────────────────────────────────────────────────────────────
 
-/// Liquidation Arbitrage configuration (Â§11).
+/// Liquidation Arbitrage configuration (§11).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct LaConfig {
     /// Maximum number of positions in the hot-tier index.
     ///
-    /// Spec Â§11.1: ~2,000â€“5,000 on Arbitrum in normal markets.
+    /// Spec §11.1: ~2,000–5,000 on Arbitrum in normal markets.
     ///
     /// GOVERNANCE: L1 (operator).
     #[serde(default = "defaults::la_hot_tier_max_positions")]
@@ -348,7 +391,7 @@ pub struct LaConfig {
 
     /// Maximum number of positions in the warm-tier index.
     ///
-    /// Spec Â§11.1: ~15,000â€“30,000 on Arbitrum.
+    /// Spec §11.1: ~15,000–30,000 on Arbitrum.
     ///
     /// GOVERNANCE: L1 (operator).
     #[serde(default = "defaults::la_warm_tier_max_positions")]
@@ -356,7 +399,7 @@ pub struct LaConfig {
 
     /// Maximum number of positions in the cold-tier index.
     ///
-    /// Spec Â§11.1: ~100,000â€“200,000.
+    /// Spec §11.1: ~100,000–200,000.
     ///
     /// GOVERNANCE: L1 (operator).
     #[serde(default = "defaults::la_cold_tier_max_positions")]
@@ -364,40 +407,40 @@ pub struct LaConfig {
 
     /// Total position index capacity (all tiers combined).
     ///
-    /// Spec Â§11.1: ~500,000 total.
+    /// Spec §11.1: ~500,000 total.
     ///
     /// GOVERNANCE: L1 (operator).
     #[serde(default = "defaults::la_total_position_capacity")]
     pub total_position_capacity: usize,
 
     /// Warm-tier oracle price move threshold that triggers immediate
-    /// recompute (Â§11.1).  In basis points.  Default 50 = 0.5%.
+    /// recompute (§11.1).  In basis points.  Default 50 = 0.5%.
     ///
     /// GOVERNANCE: L2 (fast-approve).
     #[serde(default = "defaults::la_warm_price_move_bps")]
     pub warm_price_move_threshold_bps: u16,
 
-    /// Warm-tier batch recompute interval in milliseconds (Â§11.1).
+    /// Warm-tier batch recompute interval in milliseconds (§11.1).
     /// Default 200ms.
     ///
     /// GOVERNANCE: L2 (fast-approve).
     #[serde(default = "defaults::la_warm_batch_interval_ms")]
     pub warm_batch_interval_ms: u64,
 
-    /// Cold-tier lazy recompute interval in milliseconds (Â§11.1).
+    /// Cold-tier lazy recompute interval in milliseconds (§11.1).
     /// Default 2,000ms (2 seconds).
     ///
     /// GOVERNANCE: L2 (fast-approve).
     #[serde(default = "defaults::la_cold_recompute_interval_ms")]
     pub cold_recompute_interval_ms: u64,
 
-    /// Archived-tier cycle length in blocks (Â§11.1).  Default 500 blocks.
+    /// Archived-tier cycle length in blocks (§11.1).  Default 500 blocks.
     ///
     /// GOVERNANCE: L1 (operator).
     #[serde(default = "defaults::la_archived_cycle_blocks")]
     pub archived_cycle_blocks: u64,
 
-    /// Sequencer restart deduplication window in blocks (Â§11.3).
+    /// Sequencer restart deduplication window in blocks (§11.3).
     /// Default 60 blocks (~15s on Arbitrum).
     ///
     /// NOTE: this is intentionally kept in config (not only in ChainId)
@@ -424,15 +467,15 @@ impl Default for LaConfig {
     }
 }
 
-// â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+// ─────────────────────────────────────────────────────────────────────────────
 // RelayConfig
-// â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+// ─────────────────────────────────────────────────────────────────────────────
 
-/// Relay submission configuration (Â§11.2, Â§12).
+/// Relay submission configuration (§11.2, §12).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RelayConfig {
-    /// Maximum bundles submitted per relay per second (Â§11.2, fix C2).
+    /// Maximum bundles submitted per relay per second (§11.2, fix C2).
     /// Default 4.
     ///
     /// GOVERNANCE: L2 (fast-approve).
@@ -440,20 +483,20 @@ pub struct RelayConfig {
     pub max_bundles_per_relay_per_second: usize,
 
     /// Stagger delay between sequential bundle submissions in
-    /// cascade mode, in milliseconds (Â§11.2).  Default 10ms.
+    /// cascade mode, in milliseconds (§11.2).  Default 10ms.
     ///
     /// GOVERNANCE: L2 (fast-approve).
     #[serde(default = "defaults::relay_stagger_ms")]
     pub cascade_stagger_ms: u64,
 
-    /// Maximum number of relays in the cascade submission set (Â§11.2).
+    /// Maximum number of relays in the cascade submission set (§11.2).
     /// Default 4.
     ///
     /// GOVERNANCE: L2 (fast-approve).
     #[serde(default = "defaults::relay_cascade_max")]
     pub cascade_max_relays: usize,
 
-    /// Tie-band width for LA-inclusion-rate ranking (Â§11.2).
+    /// Tie-band width for LA-inclusion-rate ranking (§11.2).
     ///
     /// Relays within this fraction of the best inclusion rate are
     /// eligible for the randomised round-robin (anti-fingerprinting).
@@ -462,6 +505,46 @@ pub struct RelayConfig {
     /// GOVERNANCE: L2 (fast-approve).
     #[serde(default = "defaults::relay_tie_band_fraction")]
     pub inclusion_rate_tie_band_fraction: f64,
+
+    /// Relay names (lowercase, e.g. `"flashbots"`) eligible for
+    /// construction while `active_phase == 1`.
+    ///
+    /// See this file's module-level "C5 (this revision)" doc comment for
+    /// why this is `Vec<String>` (not `omega_relay::RelayName`) and for
+    /// the backward-compatibility guarantee on its default. Consumed by
+    /// `omega-execution::config_translation::translate_relay_config`,
+    /// which parses each string into a `RelayName` (case-insensitive;
+    /// an unrecognized name becomes `RelayName::Other(_)`, surfaced to
+    /// the caller rather than silently dropped).
+    ///
+    /// GOVERNANCE: L2 (fast-approve) — which relays are active per
+    /// phase is an operational/risk decision, not a timelocked one.
+    #[serde(default = "defaults::relay_phase_1_relays")]
+    pub phase_1_relays: Vec<String>,
+
+    /// Same as `phase_1_relays`, but for `active_phase >= 2`. Kept as a
+    /// SEPARATE list (not "phase_1 plus additions") so an operator can
+    /// remove a relay from later phases explicitly, without relying on
+    /// set-difference reasoning against another field.
+    ///
+    /// GOVERNANCE: L2 (fast-approve).
+    #[serde(default = "defaults::relay_phase_2plus_relays")]
+    pub phase_2plus_relays: Vec<String>,
+
+    /// Whether to fall back to the public mempool if every configured
+    /// relay client construction fails (e.g. no endpoints/secrets
+    /// present in the environment) or every relay rejects a submission.
+    ///
+    /// Defaults to `false` — no prior behavior to preserve (this
+    /// capability did not exist before this revision), and submitting
+    /// through the public mempool loses whatever MEV/front-running
+    /// protection private relay submission exists to provide, so this
+    /// is an explicit opt-in, not a convenience default.
+    ///
+    /// GOVERNANCE: L2 (fast-approve) — this is a real risk decision an
+    /// operator should make deliberately, not inherit silently.
+    #[serde(default)]
+    pub blind_fallback: bool,
 }
 
 impl Default for RelayConfig {
@@ -471,26 +554,29 @@ impl Default for RelayConfig {
             cascade_stagger_ms: defaults::relay_stagger_ms(),
             cascade_max_relays: defaults::relay_cascade_max(),
             inclusion_rate_tie_band_fraction: defaults::relay_tie_band_fraction(),
+            phase_1_relays: defaults::relay_phase_1_relays(),
+            phase_2plus_relays: defaults::relay_phase_2plus_relays(),
+            blind_fallback: false,
         }
     }
 }
 
-// â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+// ─────────────────────────────────────────────────────────────────────────────
 // MlConfig
-// â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+// ─────────────────────────────────────────────────────────────────────────────
 
-/// Gas model ML online learner configuration (Â§13).
+/// Gas model ML online learner configuration (§13).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct MlConfig {
-    /// Learning rate for the online fee multiplier updates (Â§13).
+    /// Learning rate for the online fee multiplier updates (§13).
     /// Default 0.01.
     ///
     /// GOVERNANCE: L2 (fast-approve).
     #[serde(default = "defaults::ml_learning_rate")]
     pub learning_rate: f64,
 
-    /// Fraction of loss events held out for validation (Â§13.1, fix C1).
+    /// Fraction of loss events held out for validation (§13.1, fix C1).
     /// Default 0.20 = 20%.
     ///
     /// GOVERNANCE: L2 (fast-approve).
@@ -498,14 +584,14 @@ pub struct MlConfig {
     pub validation_ratio: f64,
 
     /// Number of loss events between validation passes and checkpoint
-    /// saves (Â§13.1).  Default 1,000.
+    /// saves (§13.1).  Default 1,000.
     ///
     /// GOVERNANCE: L2 (fast-approve).
     #[serde(default = "defaults::ml_checkpoint_interval")]
     pub checkpoint_interval: u64,
 
     /// Maximum win-rate degradation below the last checkpoint before
-    /// automatic model revert (Â§13.1, fix C1).
+    /// automatic model revert (§13.1, fix C1).
     ///
     /// Default 0.05 = 5 percentage points.
     ///
@@ -513,34 +599,34 @@ pub struct MlConfig {
     #[serde(default = "defaults::ml_revert_threshold")]
     pub revert_threshold: f64,
 
-    /// Upper bound on fee multiplier (Â§13.3, fix I5).  Default 5.0.
+    /// Upper bound on fee multiplier (§13.3, fix I5).  Default 5.0.
     ///
-    /// GOVERNANCE: L3 (48h timelock) â€” ceiling changes affect maximum
+    /// GOVERNANCE: L3 (48h timelock) — ceiling changes affect maximum
     /// gas spend; requires careful analysis.
     #[serde(default = "defaults::ml_multiplier_ceiling")]
     pub multiplier_ceiling: f64,
 
-    /// Lower bound on fee multiplier (Â§13).  Default 0.3.
+    /// Lower bound on fee multiplier (§13).  Default 0.3.
     ///
     /// GOVERNANCE: L2 (fast-approve).
     #[serde(default = "defaults::ml_multiplier_floor")]
     pub multiplier_floor: f64,
 
     /// Consecutive LOST_GAS_LOW events at the ceiling before triggering
-    /// DEGRADED alert and model pause (Â§13.3, fix I5).  Default 100.
+    /// DEGRADED alert and model pause (§13.3, fix I5).  Default 100.
     ///
     /// GOVERNANCE: L2 (fast-approve).
     #[serde(default = "defaults::ml_ceiling_escalation_threshold")]
     pub ceiling_escalation_threshold: u64,
 
-    /// Number of checkpoint files to retain on disk (Â§13.2, fix I1).
+    /// Number of checkpoint files to retain on disk (§13.2, fix I1).
     /// Older files are pruned.  Default 10.
     ///
     /// GOVERNANCE: L1 (operator).
     #[serde(default = "defaults::ml_checkpoint_retention")]
     pub checkpoint_retention: usize,
 
-    /// Directory for checkpoint files (Â§13.2).
+    /// Directory for checkpoint files (§13.2).
     /// Default `/var/omega`.
     ///
     /// GOVERNANCE: L1 (operator).
@@ -564,31 +650,31 @@ impl Default for MlConfig {
     }
 }
 
-// â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+// ─────────────────────────────────────────────────────────────────────────────
 // RotationConfig
-// â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+// ─────────────────────────────────────────────────────────────────────────────
 
-/// Address rotation and relay reputation carryover configuration (Â§14).
+/// Address rotation and relay reputation carryover configuration (§14).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RotationConfig {
     /// Exponential decay time constant for reputation carryover, in months
-    /// (Â§14.1, fix C4 + I4).  Default 3.
+    /// (§14.1, fix C4 + I4).  Default 3.
     ///
-    /// The authoritative formula from the Â§14.1 code block is:
-    ///   `carryover_pct = base_carryover Ã— exp(-months_since_rotation / decay_rate_months)`
+    /// The authoritative formula from the §14.1 code block is:
+    ///   `carryover_pct = base_carryover × exp(-months_since_rotation / decay_rate_months)`
     ///
     /// With the default of 3 this produces:
-    ///   0 months â†’ 50.0%,  3 months â†’ 18.4%
+    ///   0 months → 50.0%,  3 months → 18.4%
     ///
-    /// NOTE: Â§14.1 refers to this as "half-life" but the spec's illustrative
+    /// NOTE: §14.1 refers to this as "half-life" but the spec's illustrative
     /// table values do not match a true half-life formula.  The CODE BLOCK in
-    /// Â§14.1 is authoritative; this field is the divisor in that formula.
-    /// The true half-life of the default configuration is 3 Ã— ln(2) â‰ˆ 2.08
+    /// §14.1 is authoritative; this field is the divisor in that formula.
+    /// The true half-life of the default configuration is 3 × ln(2) ≈ 2.08
     /// months, not 3 months.
     ///
-    /// This value is a DIVISOR in the formula above â€” `validate()` now
-    /// rejects a value â‰¤ 0.0, since zero would divide by zero (NaN) and
+    /// This value is a DIVISOR in the formula above — `validate()` now
+    /// rejects a value ≤ 0.0, since zero would divide by zero (NaN) and
     /// a negative value would invert decay into growth, both silently
     /// corrupting every reputation-carryover calculation with no error
     /// raised anywhere near the actual computation.
@@ -597,7 +683,7 @@ pub struct RotationConfig {
     #[serde(default = "defaults::rotation_decay_rate_months")]
     pub reputation_decay_rate_months: f64,
 
-    /// Base carryover fraction immediately after rotation (Â§14.1).
+    /// Base carryover fraction immediately after rotation (§14.1).
     /// Default 0.50 = 50%.
     ///
     /// GOVERNANCE: L2 (fast-approve).
@@ -614,24 +700,24 @@ impl Default for RotationConfig {
     }
 }
 
-// â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+// ─────────────────────────────────────────────────────────────────────────────
 // VaultConfig
-// â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+// ─────────────────────────────────────────────────────────────────────────────
 
-/// Vault and PIL treasury parameters (Â§15).
+/// Vault and PIL treasury parameters (§15).
 ///
 /// ## WeiAmount instead of u64
 ///
 /// `per_transfer_cap_wei` and `daily_cap_wei` are `WeiAmount`, not a raw
-/// integer â€” see the module doc comment for why a plain integer field
+/// integer — see the module doc comment for why a plain integer field
 /// (of any width) can't survive a TOML round-trip at the magnitude the
 /// spec actually requires (50 ETH / 500 ETH), and why the previous `u64`
 /// workaround silently collapsed both caps to the same reduced value.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct VaultConfig {
-    /// DAO fee in basis points (Â§15.1).  Default 500 = 5%.
-    /// Range: 0â€“1,000 bps (0â€“10%).  Certora invariant C9 enforces
+    /// DAO fee in basis points (§15.1).  Default 500 = 5%.
+    /// Range: 0–1,000 bps (0–10%).  Certora invariant C9 enforces
     /// the 10% ceiling on-chain.
     ///
     /// GOVERNANCE: L3 (48h timelock).
@@ -639,7 +725,7 @@ pub struct VaultConfig {
     pub dao_fee_bps: u16,
 
     /// Required on-chain confirmation depth before Vault releases profit
-    /// (Â§15).  Minimum 12 â€” enforced by the Vault contract.
+    /// (§15).  Minimum 12 — enforced by the Vault contract.
     ///
     /// IMMUTABLE (Vault contract enforces this; config value must
     /// match the deployed contract or OmegaError::Config is emitted).
@@ -647,7 +733,7 @@ pub struct VaultConfig {
     pub confirmation_depth: u8,
 
     /// Maximum profit released per single Vault transfer, in ETH wei.
-    /// Default: 50 ETH (Â§15.2), expressed as the full spec value now
+    /// Default: 50 ETH (§15.2), expressed as the full spec value now
     /// that `WeiAmount` removes the TOML-integer magnitude limitation.
     ///
     /// GOVERNANCE: L3 (48h timelock).
@@ -655,7 +741,7 @@ pub struct VaultConfig {
     pub per_transfer_cap_wei: WeiAmount,
 
     /// Maximum aggregate profit released per 24h rolling window, in ETH
-    /// wei. Default: 500 ETH (Â§15.2).
+    /// wei. Default: 500 ETH (§15.2).
     ///
     /// GOVERNANCE: L3 (48h timelock).
     #[serde(default = "defaults::vault_daily_cap_wei")]
@@ -673,22 +759,22 @@ impl Default for VaultConfig {
     }
 }
 
-// â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+// ─────────────────────────────────────────────────────────────────────────────
 // ApiConfig
-// â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+// ─────────────────────────────────────────────────────────────────────────────
 
-/// Control-plane API configuration (Â§17, Â§17.1).
+/// Control-plane API configuration (§17, §17.1).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ApiConfig {
-    /// WebSocket messages per minute for authenticated connections (Â§17.1,
+    /// WebSocket messages per minute for authenticated connections (§17.1,
     /// fix M4).  Default 300.
     ///
     /// GOVERNANCE: L2 (fast-approve).
     #[serde(default = "defaults::api_ws_authed_rate")]
     pub ws_authenticated_msgs_per_min: u32,
 
-    /// WebSocket messages per minute for anonymous connections (Â§17.1).
+    /// WebSocket messages per minute for anonymous connections (§17.1).
     /// Default 100.
     ///
     /// GOVERNANCE: L2 (fast-approve).
@@ -712,31 +798,31 @@ impl Default for ApiConfig {
     }
 }
 
-// â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+// ─────────────────────────────────────────────────────────────────────────────
 // Default value functions
 //
 // Each constant is a named function rather than a bare literal so that
 // serde's `default = "..."` attribute can reference it and so that the
-// value appears exactly once â€” no risk of the struct Default and the serde
+// value appears exactly once — no risk of the struct Default and the serde
 // default drifting apart.
-// â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+// ─────────────────────────────────────────────────────────────────────────────
 
 mod defaults {
     use super::WeiAmount;
 
-    // â”€â”€ Top-level â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    // ── Top-level ────────────────────────────────────────────────────────
     pub fn active_phase() -> u8 {
         0
     }
 
-    // â”€â”€ GasConfig â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    // ── GasConfig ────────────────────────────────────────────────────────
     pub fn l2_buffer_factor() -> f64 {
         1.15
     }
     pub fn l1_data_buffer_factor() -> f64 {
         1.10
     }
-    /// Spec Â§12.2: 500 gwei ceiling.
+    /// Spec §12.2: 500 gwei ceiling.
     pub fn max_priority_fee_gwei() -> u64 {
         500
     }
@@ -746,145 +832,167 @@ mod defaults {
     pub fn emergency_bundle_enabled() -> bool {
         true
     }
-    /// Spec Â§18: disabled by default; evaluate for Phase 4+ L1 only.
+    /// Spec §18: disabled by default; evaluate for Phase 4+ L1 only.
     pub fn gas_token_enabled() -> bool {
         false
     }
-    /// Spec Â§18: revisit if L1 base fee routinely exceeds 80 gwei.
+    /// Spec §18: revisit if L1 base fee routinely exceeds 80 gwei.
     pub fn gas_token_min_base_fee_gwei() -> u64 {
         80
     }
 
-    // â”€â”€ LaConfig â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-    /// Spec Â§11.1: ~2,000â€“5,000; use midpoint as default.
+    // ── LaConfig ─────────────────────────────────────────────────────────
+    /// Spec §11.1: ~2,000–5,000; use midpoint as default.
     pub fn la_hot_tier_max_positions() -> usize {
         5_000
     }
-    /// Spec Â§11.1: ~15,000â€“30,000.
+    /// Spec §11.1: ~15,000–30,000.
     pub fn la_warm_tier_max_positions() -> usize {
         30_000
     }
-    /// Spec Â§11.1: ~100,000â€“200,000.
+    /// Spec §11.1: ~100,000–200,000.
     pub fn la_cold_tier_max_positions() -> usize {
         200_000
     }
-    /// Spec Â§11.1: ~500,000 total.
+    /// Spec §11.1: ~500,000 total.
     pub fn la_total_position_capacity() -> usize {
         500_000
     }
-    /// Spec Â§11.1: >0.5% price move triggers warm recompute.
+    /// Spec §11.1: >0.5% price move triggers warm recompute.
     pub fn la_warm_price_move_bps() -> u16 {
         50
     }
-    /// Spec Â§11.1: 200ms warm batch interval.
+    /// Spec §11.1: 200ms warm batch interval.
     pub fn la_warm_batch_interval_ms() -> u64 {
         200
     }
-    /// Spec Â§11.1: 2s cold lazy interval.
+    /// Spec §11.1: 2s cold lazy interval.
     pub fn la_cold_recompute_interval_ms() -> u64 {
         2_000
     }
-    /// Spec Â§11.1: 500-block archived cycle.
+    /// Spec §11.1: 500-block archived cycle.
     pub fn la_archived_cycle_blocks() -> u64 {
         500
     }
-    /// Spec Â§11.3: 60 blocks â‰ˆ 15s on Arbitrum.
+    /// Spec §11.3: 60 blocks ≈ 15s on Arbitrum.
     pub fn la_sequencer_restart_window_blocks() -> u64 {
         60
     }
 
-    // â”€â”€ RelayConfig â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-    /// Spec Â§11.2 fix C2: max 4 bundles/relay/second.
+    // ── RelayConfig ──────────────────────────────────────────────────────
+    /// Spec §11.2 fix C2: max 4 bundles/relay/second.
     pub fn relay_max_per_second() -> usize {
         4
     }
-    /// Spec Â§11.2: 10ms stagger between bundles.
+    /// Spec §11.2: 10ms stagger between bundles.
     pub fn relay_stagger_ms() -> u64 {
         10
     }
-    /// Spec Â§11.2: up to 4 relays in cascade.
+    /// Spec §11.2: up to 4 relays in cascade.
     pub fn relay_cascade_max() -> usize {
         4
     }
-    /// Spec Â§11.2 fix I2: 5% tie band for round-robin randomisation.
+    /// Spec §11.2 fix I2: 5% tie band for round-robin randomisation.
     pub fn relay_tie_band_fraction() -> f64 {
         0.05
     }
+    /// C5 (this revision): every relay this codebase has a verified auth
+    /// convention for (see `main.rs`'s relay-bootstrap block) — matches
+    /// the pre-this-revision behavior exactly, where every such relay
+    /// was a candidate for every phase. See this file's module-level
+    /// "C5 (this revision)" doc comment for the backward-compatibility
+    /// argument this default exists to satisfy.
+    pub fn relay_phase_1_relays() -> Vec<String> {
+        vec![
+            "flashbots".to_string(),
+            "titan".to_string(),
+            "bloxroute".to_string(),
+            "eden".to_string(),
+        ]
+    }
+    /// C5 (this revision): identical to `relay_phase_1_relays()` by
+    /// default — see that function's doc comment. An operator who wants
+    /// a narrower or different set for phase 2+ sets this explicitly in
+    /// their config; the default changes nothing about pre-this-revision
+    /// behavior.
+    pub fn relay_phase_2plus_relays() -> Vec<String> {
+        relay_phase_1_relays()
+    }
 
-    // â”€â”€ MlConfig â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-    /// Spec Â§13.1: online learner learning rate.
+    // ── MlConfig ─────────────────────────────────────────────────────────
+    /// Spec §13.1: online learner learning rate.
     pub fn ml_learning_rate() -> f64 {
         0.01
     }
-    /// Spec Â§13.1 fix C1: 20% holdout for validation.
+    /// Spec §13.1 fix C1: 20% holdout for validation.
     pub fn ml_validation_ratio() -> f64 {
         0.20
     }
-    /// Spec Â§13.1: validate every 1,000 losses.
+    /// Spec §13.1: validate every 1,000 losses.
     pub fn ml_checkpoint_interval() -> u64 {
         1_000
     }
-    /// Spec Â§13.1 fix C1: revert if holdout win rate drops >5%.
+    /// Spec §13.1 fix C1: revert if holdout win rate drops >5%.
     pub fn ml_revert_threshold() -> f64 {
         0.05
     }
-    /// Spec Â§13.3 fix I5: 5.0Ã— ceiling.
+    /// Spec §13.3 fix I5: 5.0× ceiling.
     pub fn ml_multiplier_ceiling() -> f64 {
         5.0
     }
-    /// Spec Â§13: 0.3Ã— floor.
+    /// Spec §13: 0.3× floor.
     pub fn ml_multiplier_floor() -> f64 {
         0.3
     }
-    /// Spec Â§13.3 fix I5: 100 consecutive ceiling hits â†’ DEGRADED.
+    /// Spec §13.3 fix I5: 100 consecutive ceiling hits → DEGRADED.
     pub fn ml_ceiling_escalation_threshold() -> u64 {
         100
     }
-    /// Spec Â§13.2 fix I1: retain last 10 checkpoints.
+    /// Spec §13.2 fix I1: retain last 10 checkpoints.
     pub fn ml_checkpoint_retention() -> usize {
         10
     }
-    /// Spec Â§13.2: checkpoint directory.
+    /// Spec §13.2: checkpoint directory.
     pub fn ml_checkpoint_dir() -> String {
         "/var/omega".to_string()
     }
 
-    // â”€â”€ RotationConfig â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-    /// Spec Â§14.1 code block: divisor in exp(-months/decay_rate).
+    // ── RotationConfig ───────────────────────────────────────────────────
+    /// Spec §14.1 code block: divisor in exp(-months/decay_rate).
     pub fn rotation_decay_rate_months() -> f64 {
         3.0
     }
-    /// Spec Â§14.1 fix C4: 50% base carryover at rotation time.
+    /// Spec §14.1 fix C4: 50% base carryover at rotation time.
     pub fn rotation_base_carryover() -> f64 {
         0.50
     }
 
-    // â”€â”€ VaultConfig â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-    /// Spec Â§15.1: 500 bps = 5% DAO fee.
+    // ── VaultConfig ──────────────────────────────────────────────────────
+    /// Spec §15.1: 500 bps = 5% DAO fee.
     pub fn vault_dao_fee_bps() -> u16 {
         500
     }
-    /// Spec Â§15.2: minimum 12 confirmations.
+    /// Spec §15.2: minimum 12 confirmations.
     pub fn vault_confirmation_depth() -> u8 {
         12
     }
-    /// Spec Â§15.2: 50 ETH per-transfer cap â€” the actual spec value, not
+    /// Spec §15.2: 50 ETH per-transfer cap — the actual spec value, not
     /// an i64-representable approximation, now that WeiAmount stores
     /// this as a TOML string rather than a plain integer.
     pub fn vault_per_transfer_cap_wei() -> WeiAmount {
         WeiAmount::from_eth(50)
     }
-    /// Spec Â§15.2: 500 ETH daily cap â€” the actual spec value.
+    /// Spec §15.2: 500 ETH daily cap — the actual spec value.
     pub fn vault_daily_cap_wei() -> WeiAmount {
         WeiAmount::from_eth(500)
     }
 
-    // â”€â”€ ApiConfig â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-    /// Spec Â§17.1 fix M4: 300/min authenticated.
+    // ── ApiConfig ────────────────────────────────────────────────────────
+    /// Spec §17.1 fix M4: 300/min authenticated.
     pub fn api_ws_authed_rate() -> u32 {
         300
     }
-    /// Spec Â§17.1 fix M4: 100/min anonymous.
+    /// Spec §17.1 fix M4: 100/min anonymous.
     pub fn api_ws_anon_rate() -> u32 {
         100
     }
@@ -893,9 +1001,9 @@ mod defaults {
     }
 }
 
-// â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+// ─────────────────────────────────────────────────────────────────────────────
 // Validation
-// â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+// ─────────────────────────────────────────────────────────────────────────────
 
 impl OmegaConfig {
     /// Validate that all config fields satisfy their invariants.
@@ -910,7 +1018,7 @@ impl OmegaConfig {
         // Phase gate
         if self.active_phase > 4 {
             errors.push(format!(
-                "active_phase {} is invalid â€” must be 0â€“4",
+                "active_phase {} is invalid — must be 0–4",
                 self.active_phase
             ));
         }
@@ -924,7 +1032,7 @@ impl OmegaConfig {
         }
         // Previously unvalidated: l1_data_buffer_factor feeds directly
         // into the same dual-component gas cost estimate as
-        // l2_buffer_factor (Â§7) but had no range check at all â€” a
+        // l2_buffer_factor (§7) but had no range check at all — a
         // misconfigured value here (e.g. 0.0, or negative) would
         // silently under-cost every blueprint's L1 data component.
         if !(1.0..=2.0).contains(&self.gas.l1_data_buffer_factor) {
@@ -935,7 +1043,7 @@ impl OmegaConfig {
         }
         if self.gas.max_priority_fee_gwei > 500 {
             errors.push(format!(
-                "gas.max_priority_fee_gwei {} exceeds 500 gwei ceiling (Â§12.2)",
+                "gas.max_priority_fee_gwei {} exceeds 500 gwei ceiling (§12.2)",
                 self.gas.max_priority_fee_gwei
             ));
         }
@@ -946,7 +1054,7 @@ impl OmegaConfig {
             ));
         }
 
-        // LA tier capacity â€” previously unchecked: nothing stopped
+        // LA tier capacity — previously unchecked: nothing stopped
         // hot + warm + cold from exceeding total_position_capacity,
         // which is the kind of misconfiguration that produces an
         // inconsistent/unbounded index at runtime rather than a clear
@@ -959,8 +1067,8 @@ impl OmegaConfig {
         if tier_sum > self.la.total_position_capacity {
             errors.push(format!(
                 "la: hot_tier_max_positions + warm_tier_max_positions + cold_tier_max_positions \
-                 ({tier_sum}) exceeds total_position_capacity ({}) â€” the tier hierarchy assumes \
-                 the sum leaves room for the archived tier within the total (Â§11.1)",
+                 ({tier_sum}) exceeds total_position_capacity ({}) — the tier hierarchy assumes \
+                 the sum leaves room for the archived tier within the total (§11.1)",
                 self.la.total_position_capacity
             ));
         }
@@ -974,26 +1082,26 @@ impl OmegaConfig {
         }
         if self.ml.multiplier_ceiling > 5.0 {
             errors.push(format!(
-                "ml.multiplier_ceiling {} exceeds 5.0 (Â§13.3)",
+                "ml.multiplier_ceiling {} exceeds 5.0 (§13.3)",
                 self.ml.multiplier_ceiling
             ));
         }
         if self.ml.multiplier_floor < 0.1 {
             errors.push(format!(
-                "ml.multiplier_floor {} below 0.1 â€” would suppress all gas bids",
+                "ml.multiplier_floor {} below 0.1 — would suppress all gas bids",
                 self.ml.multiplier_floor
             ));
         }
         // Previously unchecked: floor and ceiling were each validated
         // independently, but nothing stopped floor > ceiling as a pair
         // (e.g. ceiling overridden to 2.0 while floor stays at a
-        // default that's individually valid but now above it) â€” an
+        // default that's individually valid but now above it) — an
         // inverted [floor, ceiling] range downstream (e.g. a
         // `.clamp(floor, ceiling)` call) either panics or silently
         // produces a nonsensical multiplier.
         if self.ml.multiplier_floor > self.ml.multiplier_ceiling {
             errors.push(format!(
-                "ml.multiplier_floor ({}) exceeds ml.multiplier_ceiling ({}) â€” \
+                "ml.multiplier_floor ({}) exceeds ml.multiplier_ceiling ({}) — \
                  this range is inverted",
                 self.ml.multiplier_floor, self.ml.multiplier_ceiling
             ));
@@ -1015,15 +1123,15 @@ impl OmegaConfig {
             ));
         }
 
-        // Rotation â€” previously unvalidated. reputation_decay_rate_months
+        // Rotation — previously unvalidated. reputation_decay_rate_months
         // is a DIVISOR in the carryover formula (see RotationConfig doc
         // comment); zero or negative silently corrupts every carryover
-        // calculation (division by zero â†’ NaN, or inverted decay into
+        // calculation (division by zero → NaN, or inverted decay into
         // growth) with no error anywhere near the actual computation.
         if self.rotation.reputation_decay_rate_months <= 0.0 {
             errors.push(format!(
-                "rotation.reputation_decay_rate_months {} must be > 0.0 â€” it is a divisor \
-                 in the carryover formula (Â§14.1); zero or negative corrupts every \
+                "rotation.reputation_decay_rate_months {} must be > 0.0 — it is a divisor \
+                 in the carryover formula (§14.1); zero or negative corrupts every \
                  reputation calculation silently (NaN or inverted decay)",
                 self.rotation.reputation_decay_rate_months
             ));
@@ -1038,21 +1146,21 @@ impl OmegaConfig {
         // Vault
         if self.vault.dao_fee_bps > 1_000 {
             errors.push(format!(
-                "vault.dao_fee_bps {} exceeds 1,000 bps (10%) ceiling (Â§15.1, Certora C9)",
+                "vault.dao_fee_bps {} exceeds 1,000 bps (10%) ceiling (§15.1, Certora C9)",
                 self.vault.dao_fee_bps
             ));
         }
         if self.vault.confirmation_depth < 12 {
             errors.push(format!(
-                "vault.confirmation_depth {} is below 12 â€” Vault contract will reject (Â§15.2)",
+                "vault.confirmation_depth {} is below 12 — Vault contract will reject (§15.2)",
                 self.vault.confirmation_depth
             ));
         }
         // Previously unvalidated: nothing stopped either cap from being
         // zero, and nothing stopped per_transfer_cap_wei from exceeding
-        // daily_cap_wei â€” a single transfer capped higher than the
+        // daily_cap_wei — a single transfer capped higher than the
         // supposed daily aggregate limit defeats the purpose of having
-        // two separate limits (Â§15.2).
+        // two separate limits (§15.2).
         if self.vault.per_transfer_cap_wei == WeiAmount::ZERO {
             errors.push("vault.per_transfer_cap_wei must be > 0".to_string());
         }
@@ -1061,19 +1169,19 @@ impl OmegaConfig {
         }
         if self.vault.per_transfer_cap_wei > self.vault.daily_cap_wei {
             errors.push(format!(
-                "vault.per_transfer_cap_wei ({} wei) exceeds vault.daily_cap_wei ({} wei) â€” \
-                 a single transfer could not legitimately exceed the daily aggregate cap (Â§15.2)",
+                "vault.per_transfer_cap_wei ({} wei) exceeds vault.daily_cap_wei ({} wei) — \
+                 a single transfer could not legitimately exceed the daily aggregate cap (§15.2)",
                 self.vault.per_transfer_cap_wei, self.vault.daily_cap_wei
             ));
         }
 
         // Relay
         if self.relay.cascade_max_relays == 0 {
-            errors.push("relay.cascade_max_relays must be â‰¥ 1".to_string());
+            errors.push("relay.cascade_max_relays must be ≥ 1".to_string());
         }
         if self.relay.cascade_stagger_ms == 0 {
             errors.push(
-                "relay.cascade_stagger_ms must be > 0 â€” zero stagger re-introduces C2 (Â§11.2)"
+                "relay.cascade_stagger_ms must be > 0 — zero stagger re-introduces C2 (§11.2)"
                     .to_string(),
             );
         }
@@ -1083,6 +1191,27 @@ impl OmegaConfig {
                 "relay.inclusion_rate_tie_band_fraction {} out of range [0.0, 1.0]",
                 self.relay.inclusion_rate_tie_band_fraction
             ));
+        }
+        // C5 (this revision): if blind_fallback is false and BOTH relay
+        // lists are empty, no submission path can ever succeed — every
+        // phase would silently have zero relays and no fallback. This is
+        // a real, catchable misconfiguration, not a policy this file
+        // should guess a fix for (the correct fix is operator-supplied
+        // data: real relay names, or blind_fallback = true). Flagging it
+        // at validate() time surfaces it at startup instead of as a
+        // runtime "zero relay clients constructed" warning discovered
+        // only when the first trade would have submitted.
+        if !self.relay.blind_fallback
+            && self.relay.phase_1_relays.is_empty()
+            && self.relay.phase_2plus_relays.is_empty()
+        {
+            errors.push(
+                "relay.phase_1_relays and relay.phase_2plus_relays are both empty and \
+                 relay.blind_fallback is false — no submission path exists for any phase; \
+                 set at least one relay list, or set blind_fallback = true if public-mempool \
+                 fallback is genuinely intended"
+                    .to_string(),
+            );
         }
 
         // API
@@ -1099,9 +1228,9 @@ impl OmegaConfig {
     }
 }
 
-// â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+// ─────────────────────────────────────────────────────────────────────────────
 // Tests
-// â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+// ─────────────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
@@ -1270,7 +1399,7 @@ mod tests {
         // Regression test for the bug this fix addresses: the previous
         // u64-typed defaults were both silently reduced to ~9 ETH (the
         // largest TOML-representable magnitude) instead of the spec's
-        // 50 ETH / 500 ETH â€” and, worse, were numerically IDENTICAL to
+        // 50 ETH / 500 ETH — and, worse, were numerically IDENTICAL to
         // each other. WeiAmount removes that constraint entirely.
         let cfg = OmegaConfig::default();
         assert_eq!(
@@ -1314,7 +1443,7 @@ mod tests {
     fn wei_amount_rejects_garbage_string() {
         // `amount` is intentionally unread below: this test only proves
         // deserialization FAILS for a malformed string, so `Wrapper` is
-        // never successfully constructed â€” there is no `Ok` value to
+        // never successfully constructed — there is no `Ok` value to
         // read `.amount` from. The field's presence is what drives
         // `WeiAmount`'s custom `Deserialize` impl under test here, not
         // any value read from it. See this file's module-level "Fix
@@ -1348,29 +1477,131 @@ mod tests {
     #[test]
     fn default_values_match_spec() {
         let cfg = OmegaConfig::default();
-        // Â§12.2
+        // §12.2
         assert_eq!(cfg.gas.max_priority_fee_gwei, 500);
-        // Â§11.2 fix C2
+        // §11.2 fix C2
         assert_eq!(cfg.relay.max_bundles_per_relay_per_second, 4);
         assert_eq!(cfg.relay.cascade_stagger_ms, 10);
-        // Â§13.1 fix C1
+        // §13.1 fix C1
         assert!((cfg.ml.validation_ratio - 0.20).abs() < f64::EPSILON);
         assert_eq!(cfg.ml.checkpoint_interval, 1_000);
-        // Â§13.3 fix I5
+        // §13.3 fix I5
         assert_eq!(cfg.ml.ceiling_escalation_threshold, 100);
-        // Â§14.1 fix C4
+        // §14.1 fix C4
         assert!((cfg.rotation.base_carryover_fraction - 0.50).abs() < f64::EPSILON);
         assert!((cfg.rotation.reputation_decay_rate_months - 3.0).abs() < f64::EPSILON);
-        // Â§15.1
+        // §15.1
         assert_eq!(cfg.vault.dao_fee_bps, 500);
         assert_eq!(cfg.vault.confirmation_depth, 12);
-        // Â§17.1 fix M4
+        // §17.1 fix M4
         assert_eq!(cfg.api.ws_authenticated_msgs_per_min, 300);
         assert_eq!(cfg.api.ws_anonymous_msgs_per_min, 100);
-        // Â§11.1
+        // §11.1
         assert_eq!(cfg.la.warm_batch_interval_ms, 200);
         assert_eq!(cfg.la.archived_cycle_blocks, 500);
-        // Â§11.3
+        // §11.3
         assert_eq!(cfg.la.sequencer_restart_window_blocks, 60);
+    }
+
+    // ── C5 (this revision): RelayConfig phase_1_relays / phase_2plus_relays / blind_fallback ──
+
+    #[test]
+    fn relay_config_default_matches_pre_revision_all_relays_all_phases_behavior() {
+        let cfg = RelayConfig::default();
+        assert_eq!(cfg.phase_1_relays.len(), 4);
+        assert_eq!(cfg.phase_2plus_relays.len(), 4);
+        assert!(cfg.phase_1_relays.contains(&"flashbots".to_string()));
+        assert!(cfg.phase_1_relays.contains(&"titan".to_string()));
+        assert!(cfg.phase_1_relays.contains(&"bloxroute".to_string()));
+        assert!(cfg.phase_1_relays.contains(&"eden".to_string()));
+        assert_eq!(cfg.phase_1_relays, cfg.phase_2plus_relays);
+        assert!(!cfg.blind_fallback);
+    }
+
+    #[test]
+    fn relay_config_toml_without_new_fields_deserializes_to_backward_compatible_defaults() {
+        // The exact scenario this change must not break: a config.toml
+        // written before phase_1_relays/phase_2plus_relays/blind_fallback
+        // existed — every key present is one that already existed prior
+        // to this revision.
+        let toml_str = r#"
+            max_bundles_per_relay_per_second = 4
+            cascade_stagger_ms = 10
+            cascade_max_relays = 4
+            inclusion_rate_tie_band_fraction = 0.05
+        "#;
+        let cfg: RelayConfig = toml::from_str(toml_str).unwrap();
+        assert_eq!(cfg.phase_1_relays, defaults::relay_phase_1_relays());
+        assert_eq!(cfg.phase_2plus_relays, defaults::relay_phase_2plus_relays());
+        assert!(!cfg.blind_fallback);
+    }
+
+    #[test]
+    fn full_omega_config_toml_without_relay_section_at_all_still_validates() {
+        // Even stronger backward-compat case: a config.toml that omits
+        // the [relay] table ENTIRELY (relying on RelayConfig's own
+        // #[serde(default)] at the OmegaConfig field level) must still
+        // produce a valid, fully-populated RelayConfig.
+        let toml_str = r#"
+            active_phase = 1
+        "#;
+        let cfg: OmegaConfig = toml::from_str(toml_str).unwrap();
+        assert_eq!(cfg.relay.phase_1_relays.len(), 4);
+        assert!(cfg.validate().is_empty());
+    }
+
+    #[test]
+    fn relay_config_toml_can_override_phase_relay_lists_and_blind_fallback() {
+        let toml_str = r#"
+            max_bundles_per_relay_per_second = 4
+            cascade_stagger_ms = 10
+            cascade_max_relays = 4
+            inclusion_rate_tie_band_fraction = 0.05
+            phase_1_relays = ["flashbots"]
+            phase_2plus_relays = ["flashbots", "titan"]
+            blind_fallback = true
+        "#;
+        let cfg: RelayConfig = toml::from_str(toml_str).unwrap();
+        assert_eq!(cfg.phase_1_relays, vec!["flashbots".to_string()]);
+        assert_eq!(
+            cfg.phase_2plus_relays,
+            vec!["flashbots".to_string(), "titan".to_string()]
+        );
+        assert!(cfg.blind_fallback);
+    }
+
+    #[test]
+    fn relay_config_round_trips_through_real_toml() {
+        let cfg = RelayConfig::default();
+        let toml_str = toml::to_string(&cfg).expect("serialize to TOML");
+        let parsed: RelayConfig = toml::from_str(&toml_str).expect("deserialize from TOML");
+        assert_eq!(parsed.phase_1_relays, cfg.phase_1_relays);
+        assert_eq!(parsed.phase_2plus_relays, cfg.phase_2plus_relays);
+        assert_eq!(parsed.blind_fallback, cfg.blind_fallback);
+    }
+
+    #[test]
+    fn empty_relay_lists_without_blind_fallback_rejected() {
+        let mut cfg = OmegaConfig::default();
+        cfg.relay.phase_1_relays = vec![];
+        cfg.relay.phase_2plus_relays = vec![];
+        cfg.relay.blind_fallback = false;
+        let errors = cfg.validate();
+        assert!(errors
+            .iter()
+            .any(|e| e.contains("phase_1_relays") && e.contains("blind_fallback")));
+    }
+
+    #[test]
+    fn empty_relay_lists_with_blind_fallback_true_is_accepted() {
+        let mut cfg = OmegaConfig::default();
+        cfg.relay.phase_1_relays = vec![];
+        cfg.relay.phase_2plus_relays = vec![];
+        cfg.relay.blind_fallback = true;
+        let errors = cfg.validate();
+        assert!(
+            !errors.iter().any(|e| e.contains("phase_1_relays")),
+            "blind_fallback = true is an explicit opt-in and must not be flagged: {errors:?}"
+        );
     }
 }

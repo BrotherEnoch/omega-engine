@@ -14,22 +14,55 @@
 //   omega_core::config::RelayConfig::cascade_stagger_ms
 //     -> omega_relay::RelayConfig::stagger_ms
 //
-// ## Fields with NO source anywhere in OmegaConfig
+// NOTE (this revision): `omega_core::config::RelayConfig::
+// max_bundles_per_relay_per_second` is `usize`. This function assigns it
+// directly into `omega_relay::RelayConfig::max_bundles_per_relay_per_second`
+// with no cast, exactly as the pre-this-revision version of this file
+// already did — that assignment compiled before this revision's changes
+// and nothing here touches that field's type on either side, so it is
+// assumed to still be correct. Flagged explicitly rather than silently
+// carried forward: if `omega_relay::RelayConfig`'s own field type ever
+// differs from `usize`, this is the exact line that would need a cast,
+// and it wasn't independently re-verified against `omega_relay::
+// RelayConfig`'s real definition in this revision (not pasted into this
+// investigation).
 //
-// These are required parameters on `RelayBootstrapInputs` below —
-// **not** given a default here, since each is a real decision this
-// module has no basis to make silently:
+// ## Fields with NO source anywhere in OmegaConfig — RESOLVED (this revision)
 //
-//   phase_1_relays, phase_2plus_relays — which relays are active per
-//     phase is an operational decision, not derivable from any field
-//     read in this investigation.
-//   blind_fallback — whether to fall back to the public mempool on
-//     total relay failure is a risk decision.
-//   confirmation_rpc_url — NOT a relay endpoint (per that field's own
-//     doc comment in omega-relay: "a regular node"). `main.rs` already
-//     reads `ARBITRUM_RPC_URL` for exactly this purpose at startup; pass
-//     that same value through here rather than inventing a second,
-//     independent RPC URL config entry.
+// Previously `RelayBootstrapInputs` required `phase_1_relays`,
+// `phase_2plus_relays`, and `blind_fallback` to be supplied entirely by
+// the caller, because `omega_core::config::RelayConfig` had no relay-name
+// field at all — confirmed at the time by grepping that type's real
+// field list. This revision assumes `omega_core::config::RelayConfig`
+// has gained `phase_1_relays: Vec<String>`, `phase_2plus_relays:
+// Vec<String>`, and `blind_fallback: bool` (see the companion change to
+// that file). `RelayBootstrapInputs` below is updated accordingly: the
+// two relay-name lists and the fallback flag are no longer caller-
+// supplied — they're derived from `core_cfg` itself via
+// `parse_relay_names`. Only `confirmation_rpc_url` remains a required
+// caller input, since it is NOT a relay endpoint (per that field's own
+// doc comment in omega-relay: "a regular node") and has no home in
+// `omega_core::config::RelayConfig` — `main.rs` already reads
+// `ARBITRUM_HTTP_RPC_URL` for exactly this purpose at startup; pass that
+// same value through here rather than inventing a second, independent
+// RPC URL config entry.
+//
+// ## String -> RelayName parsing
+//
+// `omega_core::config::RelayConfig`'s new `phase_1_relays`/
+// `phase_2plus_relays` fields are `Vec<String>`, not `Vec<RelayName>` —
+// deliberately: `omega-core` is the foundational crate nearly everything
+// else depends on, and must not gain a dependency on `omega-relay` (a
+// much higher-level crate) just to hold a relay-name list. The
+// String -> RelayName conversion happens here, at the translation
+// boundary, via `parse_relay_names` — matching the same four relay names
+// (case-insensitive) `main.rs`'s own relay-construction loop has a
+// verified auth convention for. An unrecognized name becomes
+// `RelayName::Other(raw)`, NOT dropped — `main.rs`'s existing
+// `RelayName::Other(raw) => { error!(...); continue }` arm already
+// handles rejecting it explicitly and loudly; silently dropping it here
+// instead would hide a likely typo or unsupported-relay configuration
+// from ever surfacing.
 //
 // ## Fields with no destination at all
 //
@@ -48,15 +81,34 @@
 
 use omega_relay::{RelayConfig, RelayName};
 
+/// Parses relay-name strings from `omega_core::config::RelayConfig`
+/// (`phase_1_relays`/`phase_2plus_relays`) into `omega_relay::RelayName`.
+/// Matches the same four names `main.rs`'s own relay-construction loop
+/// has a verified auth convention for (case-insensitive, since operators
+/// may write "Flashbots" or "flashbots" in TOML). Anything else becomes
+/// `RelayName::Other(raw)` — NOT dropped silently — so a caller still
+/// sees it and can reject it explicitly, rather than this function
+/// quietly discarding a typo'd or unsupported relay name.
+pub fn parse_relay_names(names: &[String]) -> Vec<RelayName> {
+    names
+        .iter()
+        .map(|n| match n.to_lowercase().as_str() {
+            "flashbots" => RelayName::Flashbots,
+            "titan" => RelayName::Titan,
+            "bloxroute" => RelayName::Bloxroute,
+            "eden" => RelayName::Eden,
+            _ => RelayName::Other(n.clone()),
+        })
+        .collect()
+}
+
 /// Fields `omega_core::config::RelayConfig` cannot supply. See this
-/// module's doc comment for why each is a real decision rather than a
-/// derivable default.
+/// module's doc comment for why `confirmation_rpc_url` specifically is
+/// still a required caller input even after `phase_1_relays`/
+/// `phase_2plus_relays`/`blind_fallback` moved onto `core_cfg` itself.
 pub struct RelayBootstrapInputs {
-    pub phase_1_relays: Vec<RelayName>,
-    pub phase_2plus_relays: Vec<RelayName>,
-    pub blind_fallback: bool,
-    /// Pass `ARBITRUM_RPC_URL` (already read at startup in `main.rs`)
-    /// through here — see this module's doc comment.
+    /// Pass `ARBITRUM_HTTP_RPC_URL` (already read at startup in
+    /// `main.rs`) through here — see this module's doc comment.
     pub confirmation_rpc_url: String,
 }
 
@@ -80,9 +132,9 @@ pub fn translate_relay_config(
     inputs: RelayBootstrapInputs,
 ) -> TranslatedRelayConfig {
     let config = RelayConfig {
-        phase_1_relays: inputs.phase_1_relays,
-        phase_2plus_relays: inputs.phase_2plus_relays,
-        blind_fallback: inputs.blind_fallback,
+        phase_1_relays: parse_relay_names(&core_cfg.phase_1_relays),
+        phase_2plus_relays: parse_relay_names(&core_cfg.phase_2plus_relays),
+        blind_fallback: core_cfg.blind_fallback,
         max_bundles_per_relay_per_second: core_cfg.max_bundles_per_relay_per_second,
         stagger_ms: core_cfg.cascade_stagger_ms,
         confirmation_rpc_url: inputs.confirmation_rpc_url,
@@ -118,9 +170,6 @@ mod tests {
 
     fn sample_inputs() -> RelayBootstrapInputs {
         RelayBootstrapInputs {
-            phase_1_relays: vec![RelayName::Flashbots],
-            phase_2plus_relays: vec![RelayName::Flashbots, RelayName::Bloxroute],
-            blind_fallback: true,
             confirmation_rpc_url: "http://localhost:8545".to_string(),
         }
     }
@@ -137,15 +186,51 @@ mod tests {
     }
 
     #[test]
-    fn caller_supplied_fields_pass_through_unchanged() {
+    fn caller_supplied_confirmation_rpc_url_passes_through_unchanged() {
         let result = translate_relay_config(&sample_core_cfg(), sample_inputs());
+        assert_eq!(result.config.confirmation_rpc_url, "http://localhost:8545");
+    }
+
+    #[test]
+    fn phase_relay_lists_are_derived_from_core_cfg_not_caller_supplied() {
+        // This is the resolved half of the prior gap: phase_1_relays/
+        // phase_2plus_relays now come from core_cfg itself (via
+        // parse_relay_names), not from a caller-supplied
+        // RelayBootstrapInputs field — RelayBootstrapInputs no longer even
+        // has those fields (compile-time proof: sample_inputs() above
+        // doesn't set them).
+        let mut core = sample_core_cfg();
+        core.phase_1_relays = vec!["flashbots".to_string()];
+        core.phase_2plus_relays = vec!["flashbots".to_string(), "bloxroute".to_string()];
+        let result = translate_relay_config(&core, sample_inputs());
         assert_eq!(result.config.phase_1_relays, vec![RelayName::Flashbots]);
         assert_eq!(
             result.config.phase_2plus_relays,
             vec![RelayName::Flashbots, RelayName::Bloxroute]
         );
+    }
+
+    #[test]
+    fn blind_fallback_is_derived_from_core_cfg() {
+        let mut core = sample_core_cfg();
+        core.blind_fallback = true;
+        let result = translate_relay_config(&core, sample_inputs());
         assert!(result.config.blind_fallback);
-        assert_eq!(result.config.confirmation_rpc_url, "http://localhost:8545");
+    }
+
+    #[test]
+    fn default_core_cfg_produces_all_four_relays_for_both_phases() {
+        // Confirms the full chain end-to-end from the real
+        // omega_core::config::RelayConfig::default() through this
+        // translator, matching the backward-compatibility guarantee
+        // documented on that type's own defaults::relay_phase_1_relays().
+        let result = translate_relay_config(&sample_core_cfg(), sample_inputs());
+        assert_eq!(result.config.phase_1_relays.len(), 4);
+        assert_eq!(result.config.phase_2plus_relays.len(), 4);
+        assert!(result.config.phase_1_relays.contains(&RelayName::Flashbots));
+        assert!(result.config.phase_1_relays.contains(&RelayName::Titan));
+        assert!(result.config.phase_1_relays.contains(&RelayName::Bloxroute));
+        assert!(result.config.phase_1_relays.contains(&RelayName::Eden));
     }
 
     #[test]
@@ -177,5 +262,48 @@ mod tests {
             .unmapped_fields
             .iter()
             .any(|f| f.field_name == "inclusion_rate_tie_band_fraction"));
+    }
+
+    // ── String -> RelayName parsing ──────────────────────────────────────
+
+    #[test]
+    fn known_names_map_correctly_case_insensitive() {
+        let names = vec![
+            "flashbots".to_string(),
+            "TITAN".to_string(),
+            "BloXroute".to_string(),
+            "eden".to_string(),
+        ];
+        let parsed = parse_relay_names(&names);
+        assert_eq!(
+            parsed,
+            vec![
+                RelayName::Flashbots,
+                RelayName::Titan,
+                RelayName::Bloxroute,
+                RelayName::Eden,
+            ]
+        );
+    }
+
+    #[test]
+    fn unknown_name_becomes_other_not_dropped() {
+        let names = vec!["some_new_relay".to_string()];
+        let parsed = parse_relay_names(&names);
+        assert_eq!(
+            parsed,
+            vec![RelayName::Other("some_new_relay".to_string())]
+        );
+        assert_eq!(
+            parsed.len(),
+            1,
+            "unknown names must be surfaced, not silently dropped"
+        );
+    }
+
+    #[test]
+    fn empty_list_parses_to_empty_list() {
+        let parsed = parse_relay_names(&[]);
+        assert!(parsed.is_empty());
     }
 }

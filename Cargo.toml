@@ -150,6 +150,29 @@
 # for the actual object construction and for what is deliberately left
 # fail-closed / unconstructed (real signer, real relay endpoints, real
 # deployment manifest, real kill-switch thresholds).
+#
+# ## Fix (this revision, 8): added crates/omega-manifest-gen to
+# [workspace].members
+#
+# `crates/omega-manifest-gen/Cargo.toml` (the C4-A tooling crate —
+# `gen-manifest`, a standalone binary producing a real, chain-verified
+# `config/deployment_manifest.toml` via `eth_getCode` + keccak256, never
+# a fabricated one) already existed on disk but was never added to this
+# file's `members` list below — `cargo build --workspace` silently
+# excludes any crate directory not listed here, same class of "exists
+# on disk but not wired into the workspace" gap as every other fix in
+# this file's history. This is a MECHANICAL addition only: one line, in
+# the same alphabetical-ish position as its sibling `crates/omega-*`
+# entries. It does NOT touch that crate's own `Cargo.toml` (its
+# dependency versions — alloy-primitives, clap, serde, etc. — are
+# flagged as unverified against this workspace's real `Cargo.lock` in
+# that file's own header comment and need a real `cargo build`/`cargo
+# update` pass to resolve, not a guess made here), and it does NOT
+# verify `gen-manifest`'s assumptions about
+# `omega_security::DeploymentManifest`'s real field shape (see that
+# crate's own module-level "UNVERIFIED ASSUMPTION" doc comment) — both
+# of those need a real compiler run against the actual tree, which this
+# file alone cannot provide.
 
 [package]
 name        = "omega-engine"
@@ -221,6 +244,11 @@ members = [
     "crates/omega-chaos",
     "crates/omega-prl",
     "crates/omega-execution",
+    # Fix (this revision, 8): newly added — see this file's own note
+    # above. Standalone C4-A tooling binary (`gen-manifest`); not a
+    # dependency of the omega-engine binary itself, so it has no entry
+    # in the [dependencies] table above, only here.
+    "crates/omega-manifest-gen",
     "ops/control-plane",
     "ops/shadow",
     "ops/backtest",
@@ -250,6 +278,16 @@ alloy              = { version = "0.3", features = ["serde", "providers", "trans
 # versions of alloy-primitives after pulling this change, run
 # `cargo update -p alloy-primitives --precise 0.8.26` (or delete
 # Cargo.lock) rather than re-guessing the pin direction again.
+#
+# NOTE for crates/omega-manifest-gen's own Cargo.toml (Fix, this
+# revision, 8): that crate's alloy-primitives entry is currently pinned
+# to "0.7" directly rather than `{ workspace = true }`, flagged in its
+# own header as unverified against this pin. It should very likely be
+# switched to `{ workspace = true }` to resolve to 0.8 like every other
+# workspace member, but that edit belongs in that crate's own
+# Cargo.toml, and confirming it's correct needs the same real
+# `cargo build`/`cargo tree -i` verification called for throughout this
+# file's history — not assumed here.
 alloy-primitives   = { version = "0.8", features = ["serde"] }
 revm               = { version = "8",   features = ["serde"] }
 serde              = { version = "1",   features = ["derive"] }

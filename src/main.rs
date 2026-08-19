@@ -225,6 +225,14 @@
 // `(number, hash)` from its block subscription) before it can be wired
 // — not attempted blind in this revision.
 //
+// RESOLVED (follow-up revision): `omega_rpc::client::BlockEvent` already
+// carried a real `hash: B256` field the whole time — confirmed against
+// that type's own source. The missing piece was never a cross-crate
+// change; nothing in this file ever called `rpc.subscribe_blocks()`.
+// It does now — see the new block-hash-feed task in `main()`, placed
+// right after `MultiRelayClient::new`, and the `feed_block_event_to_
+// reorg_guard` helper below.
+//
 // `reconcile_inclusions`, by contrast, only needs a block NUMBER (see
 // `confirmation.rs`'s own `reconcile(current_block: u64)` signature) —
 // so that half of the reconciliation lifecycle IS wired this revision,
@@ -284,6 +292,15 @@
 //      translation belongs. `omega_relay::RelayConfig::default()`'s own
 //      values are the same known-good defaults every prior revision of
 //      this file has already run with successfully.
+//
+// RESOLVED (follow-up revision): `omega_core::config::RelayConfig` has
+// gained real `phase_1_relays: Vec<String>` / `phase_2plus_relays:
+// Vec<String>` / `blind_fallback: bool` fields (backward-compatible
+// defaults — see that file's own doc comment). `omega_execution::
+// config_translation::translate_relay_config` is now called for real
+// below, replacing the `Default::default()` stub item 2 above
+// describes, and relay-candidate selection is genuinely phase-gated
+// instead of "every relay, every phase" per item 1 above.
 //
 // ## C6 (this revision): risk-score formula constants ──────────────────
 //
@@ -434,6 +451,27 @@
 // which already carry `#[allow(clippy::too_many_arguments)]` from prior
 // revisions for the identical reason (see each function's own comment
 // history) — consistent with, not a new exception to, that precedent.
+//
+// ## FIX (this revision): E0433 in reorg_block_feed_tests — unresolved
+// `alloy` path
+//
+// `reorg_block_feed_tests::feed_block_event_to_reorg_guard_detects_a_
+// real_reorg` referenced `alloy::primitives::B256::from(...)` directly,
+// but this binary crate (`omega-engine`) has no direct dependency on
+// the `alloy` crate — it only reaches `alloy`'s types transitively
+// through `omega-rpc`/`omega-relay`'s own public API, so the bare
+// crate-root path `alloy::...` does not resolve here (E0433), even
+// though `omega_rpc::BlockEvent.hash` is genuinely typed as a real
+// `B256` under the hood. Fixed WITHOUT adding a new `alloy` dependency
+// to this crate: `B256: From<[u8; 32]>` (alloy-primitives' own
+// conversion), so `[1u8; 32].into()` / `[2u8; 32].into()` let type
+// inference resolve to `BlockEvent::hash`'s real field type with no
+// explicit reference to the `alloy` crate name at all. This is the
+// smaller fix relative to adding `alloy` as a dev-dependency purely to
+// spell out a type this crate doesn't otherwise need to name directly
+// — consistent with this file's own established preference (see e.g.
+// the RelayConfig-translation notes above) for not pulling in
+// cross-crate surface area a call site doesn't strictly require.
 
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -448,6 +486,10 @@ use omega_dag::{DagConfig, ExecutionDag};
 // C1: ExecutionPipeline + UnconfiguredSigner — see this file's module-level
 // "C1" doc comment for the UnconfiguredSigner caveat specifically.
 use omega_execution::{ExecutionPipeline, UnconfiguredSigner};
+// C5 FOLLOW-UP (this revision): the real config-translation entry point —
+// see this file's module-level "RESOLVED (follow-up revision)" note under
+// the "FIX (this revision)" doc comment.
+use omega_execution::config_translation::{translate_relay_config, RelayBootstrapInputs};
 use omega_health::{halt::HaltFlag, LayerHealthImpl};
 use omega_hot_path::{HotPathConfig, HotPathRequest, HotPathRunner, MICROTX_GAS_LIMIT};
 use omega_observability::{
@@ -470,7 +512,7 @@ use omega_oracle::{ChainlinkOracle, PerChainOracle, PythOracle, TwapOracle};
 // same name.
 use omega_relay::{
     BuilderBlacklist, ExecutionAddress, LaRelayMetrics, MultiRelayClient, RelayAuth, RelayClient,
-    RelayConfig, RelayName,
+    RelayName,
 };
 // C2: CheckContext + FlashloanSnapshot.
 // C6 (this revision): also the three oracle staleness constants
@@ -523,21 +565,11 @@ const BUILDER_BLACKLIST_PATH: &str = "config/builder_blacklist.toml";
 // differently, and why neither path fabricates deployment data.
 const DEPLOYMENT_MANIFEST_PATH: &str = "config/deployment_manifest.toml";
 
-// C5 FIX (this revision): the set of relay names this file has a
-// verified auth convention for (see the module-level "FIX (this
-// revision)" doc comment, item 1, and the match on `name` inside
-// main()'s relay-bootstrap block below). Every relay here is a
-// CANDIDATE for every active_phase — not phase-gated, since
-// `omega_core::RelayConfig` has no real per-phase relay-selection field
-// to gate on. Actual construction still requires a real
-// `OMEGA_RELAY_ENDPOINT_<NAME>` and the matching auth secret to be
-// present in the environment; this list alone constructs nothing.
-const KNOWN_RELAY_NAMES: [RelayName; 4] = [
-    RelayName::Flashbots,
-    RelayName::Titan,
-    RelayName::Bloxroute,
-    RelayName::Eden,
-];
+// C5 FOLLOW-UP (this revision): the static KNOWN_RELAY_NAMES candidate
+// list (every relay, every phase) is removed — relay candidates are now
+// the real, phase-gated `omega_core::config::RelayConfig::phase_1_relays`
+// / `phase_2plus_relays`, translated into `omega_relay::RelayName` via
+// `translate_relay_config` (see main()'s relay-bootstrap block below).
 
 // ── C6 (this revision): risk-score formula constants ──────────────────────────
 //
@@ -670,7 +702,7 @@ fn load_config(path: &str) -> Result<OmegaConfig> {
 /// empty registry," same as every previous revision's behavior.
 ///
 /// Returns `Err` when the file exists but is not valid TOML, or does not
-/// deserialize into `DeploymentManifest`'s shape (`strategies: Vec<
+/// deserialize into `DeploymentManifest`'s shape (`strategies: Vec
 /// StrategyDeployment>`, each with `strategy_id`/`bytecode_hash`/
 /// `contract_address`/`min_phase` — see integrity.rs). This function
 /// does NOT itself validate hex encoding, byte length, or reject
@@ -856,6 +888,22 @@ fn resolve_strategy_bytecode_hash(
         .find(|e| e.strategy_id == id_str)
         .map(|e| e.bytecode_hash)
         .unwrap_or([0u8; 32])
+}
+
+/// C5 FOLLOW-UP (this revision): converts a real `omega_rpc::BlockEvent`
+/// into the `(block_number, block_hash)` call `MultiRelayClient::
+/// on_new_block` needs, and makes that call. Extracted as a standalone,
+/// synchronous function (rather than inlined in the spawned task in
+/// `main()`) so the actual conversion this file performs is directly
+/// unit-testable without a live RPC connection — see
+/// `reorg_block_feed_tests` below. `*event.hash` follows the same
+/// `B256 -> [u8; 32]` deref-copy pattern already used elsewhere in this
+/// codebase (e.g. `omega-execution::pipeline.rs`'s
+/// `let hb: [u8; 32] = *bp.blueprint_hash;`), not a new idiom introduced
+/// here.
+fn feed_block_event_to_reorg_guard(relay: &MultiRelayClient, event: &omega_rpc::BlockEvent) {
+    let hash_bytes: [u8; 32] = *event.hash;
+    relay.on_new_block(event.number, hash_bytes);
 }
 
 /// Builds the `CheckContext` passed to `ExecutionPipeline::execute`'s
@@ -1477,20 +1525,53 @@ async fn main() -> Result<()> {
     // Replaces C1's zero-relay stub with real HttpRelayClients built from
     // config/secrets. See this file's module-level "C5 (this revision,
     // separate task): relay production bootstrap" doc comment, AND the
-    // module-level "FIX (this revision)" doc comment (the E0609/E0308
-    // corrections), for the full design and every fallback/skip rule
+    // module-level "FIX (this revision)" / "RESOLVED (follow-up revision)"
+    // doc comments, for the full design and every fallback/skip rule
     // below.
+    //
+    // `confirmation_rpc_url` is read FIRST — it's needed to build
+    // `translated` below, and has no dependency on anything else in this
+    // block, so pulling it to the top avoids an artificial ordering
+    // constraint the previous revision had (reading it only after the
+    // relay-client loop, for no causal reason).
+    let confirmation_rpc_url = std::env::var("ARBITRUM_HTTP_RPC_URL").context(
+        "ARBITRUM_HTTP_RPC_URL must be set — a real chain JSON-RPC HTTP endpoint for \
+         inclusion confirmation, distinct from ARBITRUM_RPC_URL's WebSocket endpoint",
+    )?;
+
+    // C5 FOLLOW-UP (this revision): real translation, replacing the prior
+    // `RelayConfig { confirmation_rpc_url, ..Default::default() }` stub —
+    // see this file's module-level "RESOLVED (follow-up revision)" note.
+    let translated = translate_relay_config(
+        &config.relay,
+        RelayBootstrapInputs {
+            confirmation_rpc_url: confirmation_rpc_url.clone(),
+        },
+    );
+    for f in &translated.unmapped_fields {
+        tracing::warn!(
+            field = f.field_name,
+            configured_value = %f.configured_value,
+            "C5: config.relay field has no counterpart in omega_relay::RelayConfig \
+             — configured value is not taking effect at this layer"
+        );
+    }
+    let relay_cfg = translated.config;
+
+    // Real phase gate, replacing the prior "every relay, every phase"
+    // KNOWN_RELAY_NAMES list — see this file's module-level "RESOLVED
+    // (follow-up revision)" note under "FIX (this revision)", item 1.
+    let candidate_relays: &[RelayName] = if active_phase >= 2 {
+        &relay_cfg.phase_2plus_relays
+    } else {
+        &relay_cfg.phase_1_relays
+    };
+
     let relay_http_client = omega_relay::client::HttpRelayClient::build_http_client()
         .context("building shared reqwest client for relay submission")?;
 
-    // FIX (this revision): every relay this file has a verified auth
-    // convention for is a CANDIDATE for every phase — see
-    // KNOWN_RELAY_NAMES's own doc comment and this file's module-level
-    // "FIX (this revision)" doc comment, item 1, for why a real
-    // per-phase selection field does not exist on `omega_core::
-    // RelayConfig` to gate this on instead.
     let mut relay_clients: HashMap<String, Arc<dyn RelayClient>> = HashMap::new();
-    for name in KNOWN_RELAY_NAMES.iter() {
+    for name in candidate_relays.iter() {
         let endpoint_var = format!("OMEGA_RELAY_ENDPOINT_{}", name.to_string().to_uppercase());
         let endpoint = match std::env::var(&endpoint_var) {
             Ok(v) => v,
@@ -1607,28 +1688,6 @@ async fn main() -> Result<()> {
     let blacklist =
         BuilderBlacklist::load(BUILDER_BLACKLIST_PATH).context("BuilderBlacklist::load")?;
 
-    // C5: real, deliberately SEPARATE from ARBITRUM_RPC_URL — see this
-    // file's module-level "C5" doc comment for why InclusionTracker's
-    // plain-HTTP eth_getTransactionReceipt calls cannot share the
-    // WebSocket URL used for the block/log subscriptions above. Missing
-    // this halts startup rather than silently degrading every relay's
-    // measured inclusion rate to 0% forever.
-    let confirmation_rpc_url = std::env::var("ARBITRUM_HTTP_RPC_URL").context(
-        "ARBITRUM_HTTP_RPC_URL must be set — a real chain JSON-RPC HTTP endpoint for \
-         inclusion confirmation, distinct from ARBITRUM_RPC_URL's WebSocket endpoint",
-    )?;
-
-    // FIX (this revision): build `omega_relay::RelayConfig` — the relay
-    // crate's OWN type — from ITS OWN `Default::default()`, rather than
-    // struct-update-spreading `omega_core::RelayConfig` (a distinct type
-    // with the same name) into it. See this file's module-level "FIX
-    // (this revision)" doc comment, item 2, for why the rest of
-    // `config.relay`'s fields are deliberately NOT hand-mapped here.
-    let relay_cfg = RelayConfig {
-        confirmation_rpc_url,
-        ..Default::default()
-    };
-
     // startup_block: still 0 — see this file's module-level "C5" doc
     // comment for why (no synchronous "current height" read available
     // off `rpc` in this file today). Flagged, not fabricated.
@@ -1640,11 +1699,38 @@ async fn main() -> Result<()> {
         while let Some(ev) = rx.recv().await {
             tracing::debug!(
                 ?ev,
-                "C5: LaReorgRiskEvent received (on_new_block not wired yet — see \
-                 this file's own 'NOT DONE, deliberately' C5 doc comment on why)"
+                "C5: LaReorgRiskEvent received (rescoring not wired to it yet — the \
+                 block-hash feed task below now drives detection; consuming the \
+                 rescore signal itself is a separate, still-open piece)"
             );
         }
     });
+
+    // ── C5 FOLLOW-UP (this revision): real block-hash feed for the reorg
+    // guard ─────────────────────────────────────────────────────────────
+    //
+    // Genuinely independent of every other task spawned in this function
+    // (its own subscription, its own loop, no shared mutable state besides
+    // `relay` itself, which is internally synchronized) — spawned as its
+    // own task rather than folded into an existing one, so it runs
+    // concurrently with the reorg-drain-log task above and the
+    // reconciliation task below rather than serializing behind either.
+    {
+        let relay6 = Arc::clone(&relay);
+        let mut block_rx = rpc.subscribe_blocks();
+        tokio::spawn(async move {
+            loop {
+                match block_rx.recv().await {
+                    Ok(event) => feed_block_event_to_reorg_guard(&relay6, &event),
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                        tracing::warn!(skipped = n, "C5: reorg block-feed loop lagged");
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                }
+            }
+        });
+        tracing::info!("C5: reorg guard now receiving real (block_number, block_hash) pairs");
+    }
 
     let signer = Arc::new(UnconfiguredSigner);
 
@@ -2148,5 +2234,246 @@ async fn run_health_monitor(layers: [Arc<LayerHealthImpl>; 16], halt: HaltFlag) 
         } else {
             tracing::debug!("health check: all layers healthy");
         }
+    }
+}
+
+#[cfg(test)]
+mod deployment_manifest_bootstrap_tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+
+    use super::*;
+    use std::io::Write;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    // ── Test helper ──────────────────────────────────────────────────────────
+    //
+    // Same pattern as omega-manifest-gen's own test module (write_temp_file):
+    // a uniquely-named file per test in the OS temp dir, so these tests can
+    // exercise load_deployment_manifest's real disk-reading behavior without
+    // colliding with concurrently-running test threads or requiring a fixed
+    // path this file's own DEPLOYMENT_MANIFEST_PATH constant points at.
+    fn write_temp_manifest(content: &str) -> std::path::PathBuf {
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let path = std::env::temp_dir().join(format!(
+            "omega_main_manifest_test_{}_{}_{}.toml",
+            std::process::id(),
+            n,
+            nanos
+        ));
+        let mut f = std::fs::File::create(&path).expect("create temp manifest file");
+        f.write_all(content.as_bytes())
+            .expect("write temp manifest file");
+        path
+    }
+
+    fn valid_manifest_toml() -> String {
+        format!(
+            r#"
+                [[strategies]]
+                strategy_id = "SA"
+                bytecode_hash = "0x{}"
+                contract_address = "0x{}"
+                min_phase = 1
+            "#,
+            "11".repeat(32),
+            "21".repeat(20),
+        )
+    }
+
+    // ── load_deployment_manifest: the real function main() calls at boot ──────
+
+    #[test]
+    fn load_deployment_manifest_missing_file_returns_ok_none() {
+        let path = std::path::Path::new("/this/path/should/not/exist/on/any/machine.toml");
+        let result = load_deployment_manifest(path.to_str().unwrap());
+        assert!(result.is_ok());
+        assert!(result.unwrap().is_none());
+    }
+
+    #[test]
+    fn load_deployment_manifest_malformed_toml_returns_err() {
+        let path = write_temp_manifest("this is { not valid toml at all [[[");
+        let result = load_deployment_manifest(path.to_str().unwrap());
+        assert!(
+            result.is_err(),
+            "malformed TOML must fail to load, not silently return an empty manifest"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn load_deployment_manifest_wrong_shape_returns_err() {
+        let path = write_temp_manifest("not_a_strategies_field = 42\n");
+        let result = load_deployment_manifest(path.to_str().unwrap());
+        assert!(
+            result.is_err(),
+            "well-formed TOML that doesn't match DeploymentManifest's shape must still fail"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn load_deployment_manifest_valid_file_returns_ok_some() {
+        let path = write_temp_manifest(&valid_manifest_toml());
+        let result = load_deployment_manifest(path.to_str().unwrap()).unwrap();
+        assert!(result.is_some());
+        let manifest = result.unwrap();
+        assert_eq!(manifest.strategies.len(), 1);
+        assert_eq!(manifest.strategies[0].strategy_id, "SA");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn full_bootstrap_chain_valid_manifest_populates_registry() {
+        let path = write_temp_manifest(&valid_manifest_toml());
+        let active_phase: u8 = 1;
+
+        let manifest = load_deployment_manifest(path.to_str().unwrap())
+            .unwrap()
+            .expect("valid manifest must load as Some");
+        let entries = strategy_entries_from_manifest(&manifest, active_phase)
+            .expect("valid entries must pass validation");
+
+        let integrity_registry = IntegrityRegistry::new();
+        integrity_registry.register_all(entries);
+
+        let expected_hash = {
+            let mut h = [0u8; 32];
+            h.fill(0x11);
+            h
+        };
+        assert!(integrity_registry
+            .check_bytecode("SA", &expected_hash)
+            .is_ok());
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn full_bootstrap_chain_one_bad_entry_fails_the_whole_load_and_registry_stays_empty() {
+        let bad_manifest = format!(
+            r#"
+                [[strategies]]
+                strategy_id = "SA"
+                bytecode_hash = "0x{}"
+                contract_address = "0x{}"
+                min_phase = 1
+
+                [[strategies]]
+                strategy_id = "LA"
+                bytecode_hash = "0x{}"
+                contract_address = "0x{}"
+                min_phase = 3
+            "#,
+            "11".repeat(32),
+            "21".repeat(20),
+            "00".repeat(32), // placeholder — must fail validation
+            "22".repeat(20),
+        );
+        let path = write_temp_manifest(&bad_manifest);
+
+        let manifest = load_deployment_manifest(path.to_str().unwrap())
+            .unwrap()
+            .expect("well-formed TOML must still load as Some — the bad data is \
+                     caught one step later, by strategy_entries_from_manifest");
+
+        let result = strategy_entries_from_manifest(&manifest, 4);
+        assert!(
+            result.is_err(),
+            "one placeholder entry must fail the WHOLE manifest, exactly as main() \
+             relies on via its own `?` propagation — a partially-registered \
+             IntegrityRegistry (SA checked, LA silently unchecked) must never happen"
+        );
+
+        let integrity_registry = IntegrityRegistry::new();
+        assert!(integrity_registry.registered_ids().is_empty());
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn full_bootstrap_chain_missing_manifest_leaves_registry_empty_and_authorizes_nothing() {
+        let path = std::path::Path::new("/this/path/should/not/exist/on/any/machine.toml");
+        let result = load_deployment_manifest(path.to_str().unwrap()).unwrap();
+        assert!(result.is_none());
+
+        let integrity_registry = IntegrityRegistry::new();
+        assert!(integrity_registry
+            .check_bytecode("SA", &[0x11; 32])
+            .is_err());
+    }
+}
+
+#[cfg(test)]
+mod reorg_block_feed_tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+
+    use super::*;
+
+    /// Writes a minimal, valid empty builder-blacklist file for
+    /// `BuilderBlacklist::load` — same pattern `main()` itself uses to
+    /// create one on-demand, reused here to avoid a `tempfile` crate
+    /// dependency in the binary just for this test.
+    fn write_empty_blacklist() -> std::path::PathBuf {
+        let path = std::env::temp_dir().join(format!(
+            "omega_main_blacklist_test_{}.toml",
+            std::process::id()
+        ));
+        std::fs::write(&path, "# empty blacklist for test\n").unwrap();
+        path
+    }
+
+    #[tokio::test]
+    async fn feed_block_event_to_reorg_guard_detects_a_real_reorg() {
+        // Proves the actual call this file makes in production — the
+        // B256 -> [u8; 32] extraction and the on_new_block call itself —
+        // is correct, using the real MultiRelayClient and LaReorgGuard,
+        // not a stand-in.
+        let path = write_empty_blacklist();
+        let blacklist = BuilderBlacklist::load(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+
+        let metrics = LaRelayMetrics::new(10, ExecutionAddress("0xTEST".into()));
+        let clients: HashMap<String, Arc<dyn RelayClient>> = HashMap::new();
+        let cfg = omega_relay::RelayConfig {
+            confirmation_rpc_url: "http://localhost:1".into(),
+            ..Default::default()
+        };
+        let (relay, mut event_rx) = MultiRelayClient::new(clients, metrics, blacklist, &cfg, 0);
+
+        relay.on_bundle_submitted(omega_relay::TxHash("0xfeed".into()), 700);
+
+        // FIX (this revision): construct B256 via From<[u8; 32]> instead of
+        // the unresolved `alloy::primitives::B256::from(...)` path — see
+        // this file's module-level "FIX (this revision): E0433 in
+        // reorg_block_feed_tests" doc comment for why.
+        let event_a = omega_rpc::BlockEvent {
+            number: 700,
+            hash: [1u8; 32].into(),
+            base_fee_gwei: None,
+            timestamp: 0,
+            is_reorg_or_stale: false,
+        };
+        let event_b = omega_rpc::BlockEvent {
+            number: 700,
+            hash: [2u8; 32].into(), // different hash, same height
+            base_fee_gwei: None,
+            timestamp: 0,
+            is_reorg_or_stale: true,
+        };
+
+        feed_block_event_to_reorg_guard(&relay, &event_a);
+        feed_block_event_to_reorg_guard(&relay, &event_b);
+
+        let ev = tokio::time::timeout(std::time::Duration::from_millis(200), event_rx.recv())
+            .await
+            .expect("must not time out — this is the real production call path")
+            .expect("channel must not be closed");
+        assert_eq!(ev.orphaned_block, 700);
     }
 }

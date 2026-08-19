@@ -28,15 +28,41 @@ path = "src/main.rs"
 # rather than pulling in alloy-provider/alloy-transport-ws directly.
 omega-rpc = { path = "../omega-rpc" }
 
-# alloy-primitives (Address, keccak256, Bytes) is NOT part of the
-# "transport stack" the §22.1 rule restricts — sa.rs/la.rs/msa.rs/
-# mev.rs/cnry.rs in omega-strategies already depend on it directly for
-# exactly this kind of primitive-type/hashing use, without violating
-# that rule. Pin the version to match whatever the rest of the
-# workspace uses — NOT independently verified here; check the
-# workspace root Cargo.toml / Cargo.lock before assuming this pin is
-# correct.
-alloy-primitives = { version = "0.7", features = ["serde"] }
+# Fix (this revision): alloy-primitives now resolves via the workspace's
+# own pin, not a second, independent direct pin — see below.
+#
+# ROOT CAUSE, confirmed via real `cargo build --workspace --release` /
+# `cargo check --workspace` / `cargo test --workspace` output this
+# session (E0308, "expected `alloy_primitives::bits::address::Address`
+# ... found `alloy_primitives::Address`", plus the compiler's own
+# "multiple different versions of crate `alloy_primitives`" note citing
+# BOTH 0.7.7 and 0.8.26 in the dependency graph): this file previously
+# pinned `alloy-primitives = { version = "0.7", features = ["serde"] }`
+# directly — flagged as an unverified guess in this file's own prior
+# header comment ("consistent with chainlink_agg.rs's own comment
+# referencing alloy-network-0.3.6 ... but not cross-checked against a
+# real Cargo.lock"). That guess was wrong, and it reproduced the EXACT
+# same class of bug the root workspace Cargo.toml's own multi-revision
+# "Fix (this revision, 4)" / "Fix (this revision, 7)" history already
+# fought through and resolved for the rest of the workspace: `Address`
+# arriving via this crate's own direct 0.7.x pin is a structurally
+# different Rust type than the `Address` `alloy-provider-0.3.6`'s
+# `Provider::get_code_at` expects (which resolves through the
+# workspace's `alloy = "0.3"` facade dependency to alloy-primitives
+# 0.8.26 — see the root Cargo.toml's own "Fix (this revision, 7)" note,
+# confirmed there via real `cargo tree -i -p alloy-primitives@<version>`
+# output), even though both wrap the same 20 bytes.
+#
+# Fixed the same way every other workspace member already avoids this:
+# `{ workspace = true }`, resolving to whatever
+# `[workspace.dependencies].alloy-primitives` pins in the root
+# Cargo.toml (currently "0.8", features = ["serde"] — matching what
+# `alloy` 0.3.6 actually requires internally). This crate no longer
+# maintains its own independent version number for this dependency at
+# all, which is what actually prevents this class of bug from
+# recurring — not just picking the "right" number once, but removing
+# the second source of truth that let it drift in the first place.
+alloy-primitives = { workspace = true }
 
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
@@ -50,16 +76,35 @@ hex = "0.4"
 
 # ── NOT VERIFIED against the real workspace ─────────────────────────────
 #
-# This Cargo.toml was written without access to the workspace's root
-# Cargo.toml or Cargo.lock. In particular:
-#   - `alloy-primitives`'s version here (0.7) is a guess consistent with
-#     chainlink_agg.rs's own comment referencing "alloy-network-0.3.6"
-#     for the `alloy` facade crate — but the facade version and the
-#     `alloy-primitives` sub-crate version are not necessarily the same
-#     number, and this was not cross-checked against a real Cargo.lock.
-#   - `clap`/`serde`/`toml`/`hex` versions are reasonable current majors,
-#     not pinned against anything already resolved in this workspace.
-# Run `cargo update -p omega-manifest-gen` (or just `cargo build`) after
-# adding this crate to the workspace `members` list and correct any
-# version conflicts `cargo` reports — don't assume these numbers are
-# right as shipped.
+# `alloy-primitives`'s version is now resolved via the workspace pin
+# (see the fix note above) rather than guessed independently — that
+# part of the original concern is closed.
+#
+# Still NOT independently verified against this workspace's real
+# Cargo.lock as of this revision:
+#   - `clap`/`serde`/`serde_json`/`toml`/`tokio`/`tracing`/
+#     `tracing-subscriber`/`hex` versions here are reasonable current
+#     majors, not pinned against — or switched to `{ workspace = true }`
+#     for — whatever the rest of the workspace already resolves. Every
+#     one of these already appears in the root Cargo.toml's own
+#     `[workspace.dependencies]` table (`clap`, `serde`, `serde_json`,
+#     `toml` is used directly at "0.8" by the omega-engine binary
+#     itself, `tokio`, `tracing`, `tracing-subscriber`) — switching this
+#     crate's matching entries to `{ workspace = true }` would very
+#     likely be the more correct fix, for the same "remove the second
+#     source of truth" reason the alloy-primitives fix above gives, but
+#     that has NOT been done here and needs the same real
+#     `cargo build`/`cargo check` verification pass this file's alloy-
+#     primitives fix just went through — do not assume these are
+#     conflict-free just because the one confirmed conflict is now
+#     fixed.
+#   - `anyhow`/`hex` are also `[workspace.dependencies]` entries
+#     (`anyhow` directly; `hex` is used by other crates in this
+#     workspace per e.g. omega-relay's Cargo.toml, though it may not be
+#     hoisted to `[workspace.dependencies]` — not confirmed here) and
+#     carry the same "should probably be `{ workspace = true }`, not
+#     independently re-verified" caveat.
+# Run `cargo build --workspace` (already required after this fix
+# regardless, to confirm the E0308 is actually resolved) and watch for
+# any FURTHER "multiple different versions of crate X" notes on any of
+# these — that is the real verification step, not this comment.

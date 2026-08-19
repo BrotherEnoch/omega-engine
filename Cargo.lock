@@ -3437,6 +3437,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "omega-manifest-gen"
+version = "0.1.0"
+dependencies = [
+ "alloy-primitives 0.8.26",
+ "anyhow",
+ "clap",
+ "hex",
+ "omega-rpc",
+ "serde",
+ "serde_json",
+ "tokio",
+ "toml",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "omega-observability"
 version = "12.0.0"
 dependencies = [

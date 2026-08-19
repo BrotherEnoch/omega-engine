@@ -762,3 +762,35 @@ mod integrity_tests {
         assert!(entries.is_empty());
     }
 }
+
+#[test]
+fn registry_never_populated_due_to_upstream_load_failure_authorizes_nothing() {
+    // This does not exercise main.rs's actual manifest-file-load path (that function
+    // wasn't available to write this test against — see the C4 audit note on this
+    // gap). What it DOES prove: whatever the real bootstrap sequence is, if it fails
+    // before register_all() is ever called — file missing, unreadable, malformed TOML,
+    // whatever the failure mode — the resulting IntegrityRegistry is indistinguishable
+    // from strategy_entries_from_manifest's own empty-manifest case, and behaves
+    // identically: every strategy is StrategyUnknown, nothing can pass
+    // full_integrity_check. This is the property that actually matters for C4-N01/N11/
+    // N12 (manifest missing/unreadable) — that a failed load can never silently degrade
+    // into "trust everything" rather than "trust nothing." The real gap this test
+    // doesn't close: proving main.rs's bootstrap sequence actually treats a load error
+    // as fatal (process exit / no engine start) rather than continuing with whatever
+    // partial state exists. That requires main.rs itself, not this crate.
+    let reg = IntegrityRegistry::new();
+    // Deliberately never call register() or register_all() — simulating "bootstrap
+    // never got that far."
+
+    for strategy_id in ["SA", "LA", "MSA", "MEV", "CNRY"] {
+        assert!(matches!(
+            reg.check_bytecode(strategy_id, &[0xaa; 32]),
+            Err(SecurityError::StrategyUnknown { .. })
+        ));
+        assert!(matches!(
+            reg.full_integrity_check(strategy_id, &[0xaa; 32]),
+            Err(SecurityError::StrategyUnknown { .. })
+        ));
+    }
+    assert!(reg.registered_ids().is_empty());
+}

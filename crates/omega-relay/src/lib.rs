@@ -381,4 +381,63 @@ mod integration_tests {
             .expect("channel must not be closed");
         assert_eq!(event.orphaned_block, 500);
     }
+
+    #[tokio::test]
+    async fn reorg_is_never_detected_without_a_real_on_new_block_caller() {
+        // This is NOT a bug in LaReorgGuard or MultiRelayClient — both are
+        // proven correct in isolation (see reorg.rs's own
+        // submitted_blueprint_moves_to_reorg_risk_on_orphan, and this file's
+        // own new_returns_a_live_reorg_event_receiver). It documents the
+        // production gap main.rs's own module-level doc comment names
+        // explicitly: "NOT DONE, deliberately... reorg-guard block wiring
+        // (MultiRelayClient::on_new_block). That method needs a real
+        // (block_number, block_hash) pair per new canonical block. Nothing
+        // currently wired in this file exposes a block hash back to main()."
+        //
+        // This test proves the CONSEQUENCE of that gap concretely: a
+        // MultiRelayClient that receives submissions but is NEVER fed
+        // on_new_block (exactly main.rs's current situation — its own spawned
+        // reorg-drain task only logs events, and nothing else in main.rs calls
+        // this method at all) cannot detect a reorg no matter how one happens
+        // on the real chain, because on_new_block is the only path that can
+        // trigger reorg detection — there's no other entry point.
+        let f = make_blacklist_file();
+        let blacklist = BuilderBlacklist::load(f.path()).unwrap();
+        let metrics = LaRelayMetrics::new(10, ExecutionAddress("0xGAP".into()));
+        let mut clients: HashMap<String, Arc<dyn RelayClient>> = HashMap::new();
+        clients.insert("flashbots".into(), Arc::new(MockRelayClient::new(true)));
+        let cfg = RelayConfig {
+            confirmation_rpc_url: "http://localhost:1".into(),
+            ..Default::default()
+        };
+
+        let (mr, mut event_rx) = MultiRelayClient::new(clients, metrics, blacklist, &cfg, 0);
+
+        mr.on_bundle_submitted(TxHash("0xnevercalled".into()), 500);
+
+        // Deliberately do NOT call mr.on_new_block(...) at all — this is the
+        // exact state main.rs's own reorg-drain task sits in today: it awaits
+        // reorg_event_rx, but nothing anywhere calls on_new_block to ever
+        // produce an event for it to receive.
+        let timed_out = tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            event_rx.recv(),
+        )
+        .await;
+        assert!(
+            timed_out.is_err(),
+            "with on_new_block never called, no reorg event can ever be emitted — \
+             this is the exact production gap, not a flake: a real reorg on-chain \
+             would be silently unnoticed by this component as main.rs currently \
+             wires it"
+        );
+
+        // Confirm the state is stuck at Submitted forever, not silently
+        // resolved some other way — this blueprint has no path to ReorgRisk
+        // without on_new_block being called.
+        assert!(matches!(
+            mr.reorg_guard().state(&TxHash("0xnevercalled".into())),
+            Some(BlueprintState::Submitted { .. })
+        ));
+    }
 }

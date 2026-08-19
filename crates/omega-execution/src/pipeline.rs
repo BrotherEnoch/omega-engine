@@ -2007,6 +2007,67 @@ mod tests {
         bp
     }
 
+    #[tokio::test]
+async fn property_integrity_freeze_prevents_all_relay_calls() {
+    // The integrity-freeze analogue of property_kill_switch_trip_prevents_all_relay_calls.
+    // That test proves the kill switch never reaches the relay; this proves the SAME
+    // property for Stage 2b (bytecode integrity / freeze) specifically. Structurally
+    // this should already be guaranteed — Stage 2b returns Err before Stage 5 is ever
+    // reached in execute_inner's straight-line control flow — but
+    // integrity_registry_freeze_mid_flight_never_lets_a_post_freeze_call_through only
+    // asserts on execute()'s Err variant, not on relay call count. This closes that gap
+    // with the same CountingRelay instrument used for the kill-switch version, so the
+    // "never reaches the relay" claim is asserted, not just implied by code inspection.
+    let dag = make_dag_with_capacity(16);
+    let kill_switches = make_kill_switches();
+    let integrity_registry = make_integrity_registry();
+    let counting_relay = Arc::new(CountingRelay::new());
+    let relay = make_relay_with(Arc::clone(&counting_relay) as Arc<dyn RelayClient>, 1000);
+    let pipeline = Arc::new(ExecutionPipeline::new(
+        kill_switches,
+        Arc::clone(&integrity_registry),
+        relay,
+        Arc::clone(&dag),
+        Arc::new(MockTransactionSigner { should_fail: false }),
+        42161,
+    ));
+
+    // Freeze completes fully before any execute() call starts — same deterministic
+    // framing as integrity_registry_freeze_mid_flight_never_lets_a_post_freeze_call_through
+    // and load_kill_switch_trip_during_burst_blocks_subsequent_calls: a genuinely
+    // straddling race isn't meaningfully assertable, so this asserts the property that
+    // IS deterministic — no call started strictly after a completed freeze may reach
+    // the relay.
+    integrity_registry.freeze("SA");
+
+    let mut handles = Vec::new();
+    for i in 80u8..90u8 {
+        let bp = sample_bp(i);
+        dag.lock().unwrap().admit(bp.clone(), &[]).unwrap();
+        let ctx = passing_ctx(bp.strategy_bytecode_hash.0);
+        let p = Arc::clone(&pipeline);
+        handles.push(tokio::spawn(async move {
+            p.execute(bp, 1, &ctx, 500, 1_700_000_000).await
+        }));
+    }
+
+    for h in handles {
+        assert!(matches!(
+            h.await.unwrap(),
+            Err(ExecutionError::IntegrityRegistryCheckFailed(
+                omega_security::SecurityError::StrategyFrozen { .. }
+            ))
+        ));
+    }
+
+    assert_eq!(
+        counting_relay.call_count(),
+        0,
+        "relay must never be called for any blueprint once the strategy is frozen \
+         (Stage 2b) — this is the C4 kill-shot invariant, not just the kill-switch one"
+    );
+}
+
     // ── Flashloan provider resolution ─────────────────────────────────
 
     #[test]
