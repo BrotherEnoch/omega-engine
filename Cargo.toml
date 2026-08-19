@@ -289,6 +289,7 @@ alloy              = { version = "0.3", features = ["serde", "providers", "trans
 # `cargo build`/`cargo tree -i` verification called for throughout this
 # file's history — not assumed here.
 alloy-primitives   = { version = "0.8", features = ["serde"] }
+alloy-sol-types    = { version = "0.8" }
 revm               = { version = "8",   features = ["serde"] }
 serde              = { version = "1",   features = ["derive"] }
 serde_json         = "1"

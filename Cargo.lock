@@ -3331,6 +3331,7 @@ name = "omega-execution"
 version = "12.0.0"
 dependencies = [
  "alloy-primitives 0.8.26",
+ "alloy-sol-types",
  "anyhow",
  "async-trait",
  "chrono",
