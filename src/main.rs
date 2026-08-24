@@ -4,6 +4,8 @@
 // Required (this revision, C5): ARBITRUM_HTTP_RPC_URL (plain HTTP JSON-RPC
 //   endpoint — see this file's own "C5" doc comment for why this is a
 //   separate, required variable from ARBITRUM_RPC_URL rather than reusing it)
+// Required (this revision, C9): VAULT_ADDRESS, PROFIT_TOKEN — see this
+//   file's own "C9" doc comment below.
 // Optional: OMEGA_CONFIG (default: config/default.toml)
 // Optional (this revision, C5): OMEGA_RELAY_ENDPOINT_<NAME> per relay (e.g.
 //   OMEGA_RELAY_ENDPOINT_FLASHBOTS), FLASHBOTS_AUTH_KEY, TITAN_AUTH_KEY,
@@ -50,6 +52,19 @@
 // Wires `ExecutionPipeline::execute()` into `score_and_admit`, and
 // removes that function's own `dag.complete()` call — DAG slot release
 // is now owned exclusively by `execute()`'s internal `DagSlotGuard`.
+//
+// NOTE (C9, this revision): this ownership statement is no longer
+// unconditionally true — see the "C9" doc comment below. `execute()`'s
+// `DagSlotGuard` only releases a slot for blueprints that actually reach
+// `execute()`. C9 introduces new early-return paths in `score_and_admit`
+// (a rejected/failed/unverified ZK proof) that occur BEFORE `execute()`
+// is ever called — those paths release the slot themselves, explicitly,
+// via a direct `dag.lock().unwrap().complete(...)` call, the same
+// mechanism this file used unconditionally before the C2 change. This is
+// not a reversion of C2's design — DagSlotGuard is still the sole owner
+// for every blueprint that reaches `execute()` — it's a necessary
+// consequence of C9 adding real rejection paths upstream of that call
+// that didn't exist when C2 was written.
 //
 // ## C4 (this revision): real deployment manifest loading + strategy
 // bytecode hash sourced from IntegrityRegistry (Gap 6, partial)
@@ -472,6 +487,105 @@
 // — consistent with this file's own established preference (see e.g.
 // the RelayConfig-translation notes above) for not pulling in
 // cross-crate surface area a call site doesn't strictly require.
+//
+// ## C9 (this revision): real ZK-gate enforcement — the ZK proof result
+// now actually gates execution
+//
+// Prior to this revision, an investigation this session traced the full
+// call chain and found TWO compounding gaps, both confirmed against
+// real source (not inferred):
+//
+//   1. `omega_zk::ZkVerifier::verify()` was called NOWHERE in this
+//      workspace. `crates/omega-execution/Cargo.toml` — the crate that
+//      actually owns relay submission — has no dependency on omega-zk
+//      at all, so `ExecutionPipeline::execute()` structurally cannot
+//      call it even if it wanted to.
+//   2. Even the WEAKER check — "did proof GENERATION merely not
+//      error" — was not enforced. `score_and_admit`'s prior structure
+//      awaited `proof_queue.submit(...)`'s result inside an `if let
+//      Ok(rx) = ...` / `if let Ok(Ok(proof)) = rx.await` pair, but
+//      logged-and-continued on success and did EXACTLY NOTHING
+//      different on any failure path (`Err` from submit(), `Err` from
+//      the proof-generation Result, or the response channel closing
+//      without a value at all) — every one of those fell through
+//      silently to the SAME unconditional call to
+//      `execution_pipeline.execute(...)` a few lines later. As written,
+//      the ZK proof queue generated proofs into the void.
+//
+// This revision closes both gaps:
+//
+//   - New required env vars `VAULT_ADDRESS` / `PROFIT_TOKEN`, parsed via
+//     the new `parse_address_env` helper into `[u8; 20]`. Needed to
+//     compute the real `publicInputsHash` every proof must bind to —
+//     see `omega_zk::binding::compute_public_inputs_hash`'s own doc
+//     comment for the exact formula (mirrors
+//     `OmegaVault.computePublicInputsHash()` byte for byte; ALSO see
+//     that function's own header for why this has not been run against
+//     a real Solidity/`cast` output in this environment — no Rust
+//     toolchain was available this session to verify it end to end).
+//   - A `ZkVerifier` is now constructed once in `main()` and threaded
+//     through `run_scoring_loop` / `score_and_admit`.
+//   - `score_and_admit`'s non-hot-path branch is restructured into an
+//     explicit match/early-return chain: a rejected submission, a
+//     failed proof, a dropped response channel, OR a proof that fails
+//     `ZkVerifier::verify()` against the expected `publicInputsHash`
+//     now all DROP the blueprint — `execution_pipeline.execute(...)` is
+//     never reached on any of those paths. Only a proof that both
+//     generates successfully AND verifies against the correct
+//     `publicInputsHash` allows the blueprint through to execution.
+//   - Every one of those new early-return paths releases the DAG slot
+//     explicitly (`dag.lock().unwrap().complete(bp.blueprint_hash)`) —
+//     see the "C2" doc comment above for why this is required: C2's
+//     `DagSlotGuard` only covers blueprints that reach `execute()`, and
+//     these new paths, by design, do not.
+//
+// RESOLVED (follow-up revision): `worker.rs` is now available and has been fixed directly
+// — `process_request` reads `req.public_inputs_hash` and passes it through as
+// `T1SoftwareProver::prove()`'s new second argument. That was the one guaranteed compile
+// break; it's closed.
+//
+// RESOLVED (follow-up revision): the `hot` (hot-path) branch of `score_and_admit` now ALSO
+// provisions a ZK proof, closing the "zero proof pathway, forever" gap flagged in the
+// prior revision of this comment — see that branch's own inline comment for the full
+// reasoning. Summary: `OmegaVault.receivePendingProfit()` (called on-chain immediately
+// after execution) does NOT require a proof — only the LATER `releaseProfit()` call does.
+// So hot-path admission is deliberately still NOT gated on proof completion (that would
+// reimport the exact latency cost the hot path exists to avoid, for no on-chain
+// requirement that demands it) — instead, the same `proof_queue.submit()` the non-hot-path
+// branch uses is fired as a detached background task, so a proof eventually becomes
+// available to bind that blueprint's pending profit, without hot-path ever waiting on it.
+//
+// STILL NOT ADDRESSED, even after this fix, and stated plainly rather than implied solved:
+// nothing in this codebase, in anything shown across this entire investigation, actually
+// calls `OmegaVault.submitProof()` ON-CHAIN with a proof once the background task above
+// has generated and verified one. This revision provisions the proof; it does not close
+// the gap of what relayer/keeper component submits it. That remains genuinely open — see
+// the hot-path branch's own comment for the same point made in place.
+//
+// ## C6 (this revision): real TransactionSigner wired in — UnconfiguredSigner replaced
+//
+// main() now constructs a real `omega_execution::signer::KeyManagerTransactionSigner`
+// instead of `UnconfiguredSigner`, closing the last of C1's four fail-closed stand-ins
+// (KillSwitchRegistry/IntegrityRegistry/MultiRelayClient were already made real by
+// C4/C5). Three new required env vars — `ORCHESTRATOR_ADDRESS`, `OMEGA_TX_SIGNING_KEY`,
+// `OMEGA_BLUEPRINT_SIGNING_KEY` — see each one's own read-site comment in main() for what
+// it is and why it's required rather than defaulted or optional. `strategy_onchain_ids()`
+// (new, this revision) transcribes the five real `strategyId` constants directly from
+// `contracts/src/StrategyIds.sol` — the same values `RegisterStrategies.s.sol` already
+// cross-checks every deployment manifest's `onchain_id` field against before registering
+// a strategy on-chain — closing the one item `omega-execution/src/signer.rs`'s own doc
+// comment named as still open (item 4: "the StrategyId -> bytes32 strategyId mapping").
+// These are transcribed byte-for-byte from that Solidity library, not derived or guessed
+// here; if `StrategyIds.sol` is ever changed, this map must be updated to match by hand —
+// nothing in this codebase keeps the two in sync automatically.
+//
+// STILL OPEN, not closed by this change — see signer.rs's own doc comment for the full,
+// still-accurate list: the RLP/ABI encoding has only been self-consistency-checked
+// (encode then decode via alloy-sol-types' own decoder), never against a real solc/EVM
+// oracle or an actual testnet transaction; and `max_fee_per_gas`'s formula in signer.rs
+// remains an explicit, unapproved placeholder. Wiring this in makes C6 signing REACHABLE
+// in production, not independently verified end-to-end — the first real testnet execution
+// is the actual verification step, not this wiring change.
 
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -483,9 +597,15 @@ use tracing::Level;
 // to resolve on Arc<LayerHealthImpl>
 use omega_core::{HealthState, LayerHealth, LayerId, OmegaConfig, StrategyId};
 use omega_dag::{DagConfig, ExecutionDag};
-// C1: ExecutionPipeline + UnconfiguredSigner — see this file's module-level
-// "C1" doc comment for the UnconfiguredSigner caveat specifically.
-use omega_execution::{ExecutionPipeline, UnconfiguredSigner};
+// C1: ExecutionPipeline — see this file's module-level "C1" doc comment.
+// C6 (this revision): UnconfiguredSigner import removed — main() now constructs a real
+// KeyManagerTransactionSigner instead (see this file's new module-level "C6" doc comment
+// below the historical C1-C9 history, and KeyManagerTransactionSigner's own doc comment in
+// omega_execution::signer). Not re-exported at omega_execution's crate root (only
+// SignedTransaction/TransactionSigner/UnconfiguredSigner are — see that crate's lib.rs),
+// hence the explicit submodule path.
+use omega_execution::signer::KeyManagerTransactionSigner;
+use omega_execution::ExecutionPipeline;
 // C5 FOLLOW-UP (this revision): the real config-translation entry point —
 // see this file's module-level "RESOLVED (follow-up revision)" note under
 // the "FIX (this revision)" doc comment.
@@ -540,11 +660,22 @@ use omega_rpc::{
 // this file's use of them is new.
 // C7 (this revision): also AccountExposureTracker — real per-strategy
 // exposure tracking for check 14 (see exposure.rs's own doc comment).
+// C6 (this revision): also KeyManager + BlueprintSigner — needed to construct the real
+// KeyManagerTransactionSigner in main() (see this file's new module-level "C6" doc
+// comment). Both re-exported at omega_security's crate root already (see that crate's
+// lib.rs), so no submodule path needed here.
 use omega_security::{
-    strategy_entries_from_manifest, AccountExposureTracker, DeploymentManifest, IntegrityRegistry,
+    strategy_entries_from_manifest, AccountExposureTracker, BlueprintSigner, DeploymentManifest,
+    IntegrityRegistry, KeyManager,
 };
 use omega_strategies::{registry::StrategyRegistryBuilder, CnryStrategy, StrategyRegistry};
-use omega_zk::{config::ProverTierConfig, ProofQueue, ProofWorkerPool, ZkConfig};
+// C9 (this revision): also compute_public_inputs_hash + ZkVerifier — see this file's own
+// "C9" doc comment for the full design (real ZK-gate enforcement, previously entirely
+// absent from this binary — see the investigation summarized there).
+use omega_zk::{
+    binding::compute_public_inputs_hash, config::ProverTierConfig, ProofQueue, ProofWorkerPool,
+    ZkConfig, ZkVerifier,
+};
 // C1: only used for the relay_clients: HashMap<String, Arc<dyn RelayClient>>
 // type annotation below — the map itself is intentionally empty until C5
 // populates it from real config/secrets.
@@ -720,6 +851,86 @@ fn load_deployment_manifest(path: &str) -> Result<Option<DeploymentManifest>> {
     let manifest: DeploymentManifest =
         toml::from_str(&s).with_context(|| format!("parsing {path} as a DeploymentManifest"))?;
     Ok(Some(manifest))
+}
+
+/// C9 (this revision): parses a required `0x`-prefixed (or bare) hex env var into a raw
+/// 20-byte address. Used for `VAULT_ADDRESS` / `PROFIT_TOKEN` — see this file's own "C9"
+/// doc comment for why both are required and what they feed.
+///
+/// Deliberately returns a raw `[u8; 20]` rather than `alloy_primitives::Address` — this
+/// binary has no direct `alloy-primitives` dependency today (it reaches alloy types only
+/// transitively through omega-core/omega-rpc/omega-relay's own public APIs), and pulling in
+/// a new direct dependency just to name that one type here, when every consumer of these
+/// values (`omega_zk::binding::compute_public_inputs_hash`) already takes raw `[u8; 20]`,
+/// would be exactly the kind of unnecessary cross-crate surface area this file's own
+/// established convention (see the RelayConfig-translation notes above) already avoids
+/// elsewhere.
+fn parse_address_env(var_name: &str) -> Result<[u8; 20]> {
+    let raw = std::env::var(var_name).with_context(|| format!("{var_name} must be set"))?;
+    let trimmed = raw.strip_prefix("0x").unwrap_or(&raw);
+    let bytes =
+        hex::decode(trimmed).with_context(|| format!("{var_name} is not valid hex: {raw}"))?;
+    let len = bytes.len();
+    let arr: [u8; 20] = bytes
+        .try_into()
+        .map_err(|_| anyhow::anyhow!("{var_name} must decode to exactly 20 bytes, got {len}"))?;
+    Ok(arr)
+}
+
+/// C6 (this revision): real, deployment-sourced `strategyId` values, transcribed
+/// byte-for-byte from `contracts/src/StrategyIds.sol`'s own
+/// `keccak256("OMEGA_STRATEGY_<X>")` constants — the canonical values
+/// `RegisterStrategies.s.sol` already cross-checks every deployment manifest's
+/// `onchain_id` field against (via that script's own `_checkManifestIdMatches` guard)
+/// before ever calling `OmegaOrchestrator.registerStrategy()` on-chain. These are NOT
+/// derived or guessed here — they are the actual source of truth that contract was
+/// registered against, copied directly from that Solidity library.
+///
+/// Keyed by the same `StrategyId::to_string()` values ("SA"/"LA"/"MSA"/"MEV"/"CNRY")
+/// `IntegrityRegistry`/`DeploymentManifest` already use elsewhere in this workspace —
+/// picked for consistency with those, not re-derived independently here.
+///
+/// MANUAL-SYNC RISK, flagged rather than silently assumed away: if `StrategyIds.sol` is
+/// ever changed (a new strategy added, or — though the library's own doc comment gives no
+/// indication this is intended — an existing constant's value changed), this map must be
+/// updated to match by hand. Nothing in this codebase keeps the two in sync automatically,
+/// same class of risk already flagged elsewhere in this workspace (e.g. sa.rs's
+/// `SA_SLIPPAGE_BPS` vs. `omega_risk::context::MAX_SLIPPAGE_BPS_SA`).
+fn strategy_onchain_ids() -> HashMap<String, [u8; 32]> {
+    fn hash32(hex_str: &str) -> [u8; 32] {
+        let bytes = hex::decode(hex_str).expect("StrategyIds.sol constant must be valid hex");
+        bytes
+            .try_into()
+            .expect("StrategyIds.sol constant must decode to exactly 32 bytes")
+    }
+
+    let mut m = HashMap::new();
+    // StrategyIds.sol::SIMPLE_ARB — keccak256("OMEGA_STRATEGY_SA")
+    m.insert(
+        "SA".to_string(),
+        hash32("c4bb1c851b1c74593f61f8d1f99ec07e2960d847a94d4a736e321ba387d4d2d7"),
+    );
+    // StrategyIds.sol::LIQUIDATION_ARB — keccak256("OMEGA_STRATEGY_LA")
+    m.insert(
+        "LA".to_string(),
+        hash32("77b0296a1c4dae896ee0ffe05246d8b3e8ecd44a1d4a0c6591b183fb2390a698"),
+    );
+    // StrategyIds.sol::MULTI_STEP_ARB — keccak256("OMEGA_STRATEGY_MSA")
+    m.insert(
+        "MSA".to_string(),
+        hash32("bfd7e8e9c54a6762cb6ff399dc8bdefe2226a32400ed6001e1bee533bbaa25d2"),
+    );
+    // StrategyIds.sol::MEV_OFA — keccak256("OMEGA_STRATEGY_MEV")
+    m.insert(
+        "MEV".to_string(),
+        hash32("892be743cfc8880f51726a84ab1d0d0fc05336d49927c5a9eaaf926a84db319a"),
+    );
+    // StrategyIds.sol::CANARY_ARB — keccak256("OMEGA_STRATEGY_CNRY")
+    m.insert(
+        "CNRY".to_string(),
+        hash32("93879ddf9ec0b01c066594680539ea61eaab23f806b410fda1c18659efcc7725"),
+    );
+    m
 }
 
 // ── Health layers ─────────────────────────────────────────────────────────────
@@ -1192,6 +1403,13 @@ async fn main() -> Result<()> {
 
     let rpc_url = std::env::var("ARBITRUM_RPC_URL").context("ARBITRUM_RPC_URL must be set")?;
     let config_path = std::env::var("OMEGA_CONFIG").unwrap_or_else(|_| DEFAULT_CONFIG.to_string());
+
+    // C9 (this revision): required — see this file's own "C9" doc comment and
+    // parse_address_env's doc comment. Read early, alongside the other required startup
+    // env vars, so a missing/malformed value halts startup immediately rather than being
+    // discovered only once the first blueprint reaches the ZK-proof-gating code path.
+    let vault_address = parse_address_env("VAULT_ADDRESS")?;
+    let profit_token = parse_address_env("PROFIT_TOKEN")?;
 
     let config = load_config(&config_path)?;
     let active_phase = config.active_phase;
@@ -1732,7 +1950,53 @@ async fn main() -> Result<()> {
         tracing::info!("C5: reorg guard now receiving real (block_number, block_hash) pairs");
     }
 
-    let signer = Arc::new(UnconfiguredSigner);
+    // ── C6 (this revision): real TransactionSigner construction ──────────────
+    //
+    // Replaces C1's fail-closed UnconfiguredSigner stub — see this file's module-level
+    // "C6" doc comment for the full design and what's still open after this change
+    // (RLP/ABI encoding self-consistency only, no external solc/EVM oracle checked yet;
+    // the fee formula in signer.rs remains an explicit, unapproved placeholder).
+    let orchestrator_address = parse_address_env("ORCHESTRATOR_ADDRESS")
+        .context("ORCHESTRATOR_ADDRESS must be set -- the deployed OmegaOrchestrator contract \
+                  address every signed transaction this signer produces calls execute() on")?;
+
+    let tx_signing_key_hex = std::env::var("OMEGA_TX_SIGNING_KEY").context(
+        "OMEGA_TX_SIGNING_KEY must be set -- hex-encoded secp256k1 secret key for the \
+         gas-paying transaction-envelope signer. Deliberately a SEPARATE key from \
+         OMEGA_BLUEPRINT_SIGNING_KEY below -- see KeyManagerTransactionSigner's own doc \
+         comment for why the tx-envelope signer and the on-chain blueprint-authorization \
+         signer are independent concerns.",
+    )?;
+    let tx_key_manager = Arc::new(
+        KeyManager::from_hex(&tx_signing_key_hex, CHAIN_ID)
+            .context("constructing tx_key_manager from OMEGA_TX_SIGNING_KEY")?,
+    );
+
+    let blueprint_signing_key_hex = std::env::var("OMEGA_BLUEPRINT_SIGNING_KEY").context(
+        "OMEGA_BLUEPRINT_SIGNING_KEY must be set -- hex-encoded secp256k1 secret key whose \
+         derived address must match OmegaOrchestrator.execution_key (or pending_key, during \
+         a rotation window) on-chain, or every execute() call this signer produces will \
+         revert with InvalidSignature. Confirming that match is an operational deployment \
+         step, not something this file can verify for itself.",
+    )?;
+    let blueprint_key_manager = Arc::new(
+        KeyManager::from_hex(&blueprint_signing_key_hex, CHAIN_ID)
+            .context("constructing blueprint_key_manager from OMEGA_BLUEPRINT_SIGNING_KEY")?,
+    );
+    let blueprint_signer = Arc::new(BlueprintSigner::new(blueprint_key_manager));
+
+    let signer = Arc::new(KeyManagerTransactionSigner::new(
+        tx_key_manager,
+        orchestrator_address.into(),
+        strategy_onchain_ids(),
+        blueprint_signer,
+    ));
+    tracing::info!(
+        orchestrator = %hex::encode(orchestrator_address),
+        tx_signer_address = %hex::encode(signer.active_address()),
+        "C6: KeyManagerTransactionSigner constructed -- real transaction signing wired in, \
+         replacing UnconfiguredSigner"
+    );
 
     let execution_pipeline = Arc::new(ExecutionPipeline::new(
         Arc::clone(&kill_switches),
@@ -1744,7 +2008,7 @@ async fn main() -> Result<()> {
     ));
     tracing::info!(
         idempotency_cache_len = execution_pipeline.idempotency_cache_len(),
-        "C1: ExecutionPipeline constructed (fail-closed signer; relay clients per C5 above)"
+        "C1: ExecutionPipeline constructed (real signer per C6 above; relay clients per C5 above)"
     );
 
     // ── C5 (this revision): reconciliation lifecycle ──────────────────────────
@@ -1799,7 +2063,13 @@ async fn main() -> Result<()> {
     };
     let proof_queue = ProofQueue::new(zk_cfg.clone());
     let _pool = ProofWorkerPool::start(zk_cfg, proof_queue.clone());
-    tracing::info!("L7 ZK: proof worker pool started");
+    // C9 (this revision): the verifier this binary was, until now, never actually calling
+    // anywhere — see this file's own "C9" doc comment for the full investigation. Stateless
+    // (holds only expected_chain_id — see ZkVerifier's own doc comment), so a single
+    // Arc-wrapped instance is shared across every scoring-loop task rather than
+    // reconstructed per call.
+    let zk_verifier = Arc::new(ZkVerifier::new(CHAIN_ID));
+    tracing::info!("L7 ZK: proof worker pool started, ZkVerifier constructed (C9)");
 
     // ── L8: Hot-path ──────────────────────────────────────────────────────────
     let (hp_runner, hp_tx) = HotPathRunner::new(HotPathConfig {
@@ -1879,9 +2149,17 @@ async fn main() -> Result<()> {
         // watch::Receiver is cheap (Arc-backed) to clone, same as every
         // other cross-task handle in this block.
         let fl3 = flashloan_liq_rx.clone();
+        // C9 (this revision): vault_address/profit_token are plain Copy [u8; 20] values —
+        // no Arc needed, same treatment as gas_volatility_risk (f64) elsewhere in this
+        // file. zk_verifier is Arc-cloned, same pattern as every other shared resource
+        // threaded through this spawn block.
+        let va3 = vault_address;
+        let pt3 = profit_token;
+        let zv3 = Arc::clone(&zk_verifier);
         tokio::spawn(async move {
             run_scoring_loop(
-                reg, ora3, cl3, py3, tw3, dag2, tx, pq, halt3, ph, ep3, nr3, ir3, et3, fl3,
+                reg, ora3, cl3, py3, tw3, dag2, tx, pq, halt3, ph, ep3, nr3, ir3, et3, fl3, va3,
+                pt3, zv3,
             )
             .await;
         });
@@ -1941,10 +2219,11 @@ async fn run_canary_loop(
     }
 }
 
-// C4/C8: grown to 14 args (C4 added integrity_registry, C8 adds
-// flashloan_liq_rx) — the existing allow already covers this; not
-// re-litigating the struct-refactor question for one more parameter
-// added to an already-allowed function.
+// C4/C8/C9: grown to 17 args (C4 added integrity_registry, C8 adds
+// flashloan_liq_rx, C9 adds vault_address/profit_token/zk_verifier) — the
+// existing allow already covers this; not re-litigating the
+// struct-refactor question for arguments added to an already-allowed
+// function.
 #[allow(clippy::too_many_arguments)]
 async fn run_scoring_loop(
     registry: StrategyRegistry,
@@ -1957,7 +2236,9 @@ async fn run_scoring_loop(
     proof_queue: ProofQueue,
     halt: HaltFlag,
     active_phase: u8,
-    execution_pipeline: Arc<ExecutionPipeline<UnconfiguredSigner>>,
+    // C6 (this revision): KeyManagerTransactionSigner, not UnconfiguredSigner — see this
+    // file's module-level "C6" doc comment.
+    execution_pipeline: Arc<ExecutionPipeline<KeyManagerTransactionSigner>>,
     nonce_registry: omega_security::replay::NonceRegistry,
     // C4: real IntegrityRegistry, threaded through so score_and_admit
     // can resolve the real registered bytecode hash for check 4.
@@ -1969,6 +2250,10 @@ async fn run_scoring_loop(
     // main()'s "C8" doc comment and FlashloanLiquidityState's own doc
     // comment.
     flashloan_liq_rx: tokio::sync::watch::Receiver<FlashloanLiquidityState>,
+    // C9 (this revision): see main()'s own "C9" doc comment.
+    vault_address: [u8; 20],
+    profit_token: [u8; 20],
+    zk_verifier: Arc<ZkVerifier>,
 ) {
     let mut rx = oracle.subscribe();
     loop {
@@ -2017,10 +2302,14 @@ async fn run_scoring_loop(
                     // C8: watch::Receiver is cheap (Arc-backed) to clone
                     // per spawned task, same as every other handle above.
                     let fl2 = flashloan_liq_rx.clone();
+                    // C9 (this revision): see this function's own "C9" doc comment.
+                    let va2 = vault_address;
+                    let pt2 = profit_token;
+                    let zv2 = Arc::clone(&zk_verifier);
                     tokio::spawn(async move {
                         score_and_admit(
                             strategy, s2, dag2, tx2, pq2, h2, ph, os2, ep2, nr2, ir2, gv2, et2,
-                            fl2,
+                            fl2, va2, pt2, zv2,
                         )
                         .await;
                     });
@@ -2044,7 +2333,9 @@ async fn score_and_admit(
     halt: HaltFlag,
     active_phase: u8,
     oracle_snapshot: OracleSnapshot,
-    execution_pipeline: Arc<ExecutionPipeline<UnconfiguredSigner>>,
+    // C6 (this revision): KeyManagerTransactionSigner, not UnconfiguredSigner — see this
+    // file's module-level "C6" doc comment.
+    execution_pipeline: Arc<ExecutionPipeline<KeyManagerTransactionSigner>>,
     nonce_registry: omega_security::replay::NonceRegistry,
     // C4: real IntegrityRegistry, used to resolve the real registered
     // bytecode hash for this strategy.
@@ -2062,6 +2353,13 @@ async fn score_and_admit(
     // "snapshot at use time" pattern as everything else CheckContext is
     // built from in this function.
     flashloan_liq_rx: tokio::sync::watch::Receiver<FlashloanLiquidityState>,
+    // C9 (this revision): see main()'s own "C9" doc comment for the full design. Required
+    // to compute the real publicInputsHash every ZK proof in this function's non-hot-path
+    // branch must bind to, and to actually verify the returned proof against it before
+    // this blueprint is allowed anywhere near execute().
+    vault_address: [u8; 20],
+    profit_token: [u8; 20],
+    zk_verifier: Arc<ZkVerifier>,
 ) {
     if halt.is_halted() {
         return;
@@ -2106,6 +2404,106 @@ async fn score_and_admit(
         && bp.l2_exec_gas_estimate <= MICROTX_GAS_LIMIT;
 
     if hot {
+        // C9 (follow-up revision): hot-path blueprints now ALSO provision a ZK proof —
+        // fixed, not left as an open question. Full reasoning, stated once here:
+        //
+        // `OmegaVault.receivePendingProfit()` (called on-chain immediately after
+        // execution, inside the Orchestrator's flashloan callback) does NOT require a
+        // proof — only the LATER `OmegaVault.releaseProfit()` call does (that contract's
+        // own C6 gate: `proof_verified && confirmation_depth >= 12`). So a hot-path
+        // blueprint reaching `execute()` below without a proof already in hand is not
+        // itself an on-chain violation — gating hot-path ADMISSION on proof completion
+        // here would only reimport the exact latency cost the hot path exists to avoid,
+        // for no on-chain requirement that actually demands it.
+        //
+        // But leaving hot-path blueprints with NO proof pathway at all, forever (the prior
+        // revision's state), is a real separate bug: any profit they generate sits in
+        // OmegaVault as pending forever, un-releasable, since nothing would ever produce a
+        // proof bound to that blueprintHash. Fixed here by firing the SAME
+        // proof_queue.submit() the non-hot-path branch below uses, but as a DETACHED
+        // background task (tokio::spawn, not awaited) — it cannot add any latency to
+        // hot-path admission, which proceeds immediately after submission regardless of
+        // the background task's outcome.
+        //
+        // `is_microtx: true` is passed deliberately — hot-path blueprints are Microtx lane
+        // by construction (see the `hot` computation above), and the queue's own pressure
+        // FSM already privileges microtx submissions under Suspend pressure, so this
+        // submission correctly inherits that priority rather than competing as a generic
+        // "normal" request.
+        //
+        // WHAT THIS STILL DOES NOT ADDRESS, flagged rather than silently assumed solved:
+        // this makes a verified proof become AVAILABLE for a hot-path blueprint. Nothing
+        // in this codebase, anywhere shown across this investigation, actually calls
+        // `OmegaVault.submitProof()` on-chain with that proof once it's ready — that
+        // relayer/keeper component does not exist here. This closes the "proof never
+        // generated" gap; it does not close "who submits it on-chain."
+        {
+            let hb: [u8; 32] = *bp.blueprint_hash;
+            let profit: u128 = bp.expected_profit_net.try_into().unwrap_or(u128::MAX);
+            let expected_public_inputs_hash =
+                compute_public_inputs_hash(vault_address, hb, profit, profit_token);
+
+            match proof_queue.submit(
+                hb,
+                expected_public_inputs_hash,
+                profit,
+                CHAIN_ID,
+                bp.strategy_id.to_string(),
+                true, // is_microtx — see comment above
+            ) {
+                Ok(proof_rx) => {
+                    let hash_for_log = bp.blueprint_hash;
+                    let zv_bg = Arc::clone(&zk_verifier);
+                    tokio::spawn(async move {
+                        match proof_rx.await {
+                            Ok(Ok(proof)) => {
+                                if let Err(e) = zv_bg.verify(&proof, expected_public_inputs_hash) {
+                                    tracing::error!(
+                                        hash = %hash_for_log,
+                                        error = %e,
+                                        "C9: hot-path background ZK proof FAILED \
+                                         VERIFICATION against expected publicInputsHash"
+                                    );
+                                } else {
+                                    tracing::debug!(
+                                        hash = %hash_for_log,
+                                        gen_ms = proof.generation_ms,
+                                        "C9: hot-path background ZK proof ready and \
+                                         verified (not yet submitted on-chain — see this \
+                                         branch's own comment on what remains open)"
+                                    );
+                                }
+                            }
+                            Ok(Err(zk_error)) => {
+                                tracing::warn!(
+                                    hash = %hash_for_log,
+                                    error = %zk_error,
+                                    "C9: hot-path background ZK proof generation failed"
+                                );
+                            }
+                            Err(_recv_error) => {
+                                tracing::warn!(
+                                    hash = %hash_for_log,
+                                    "C9: hot-path background ZK proof response channel \
+                                     closed before a result arrived"
+                                );
+                            }
+                        }
+                    });
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        hash = %bp.blueprint_hash,
+                        error = %e,
+                        "C9: hot-path ZK proof submission rejected by queue — this \
+                         blueprint's eventual profit will have no proof pathway; \
+                         execute() below is NOT blocked on this, per this branch's own \
+                         reasoning above"
+                    );
+                }
+            }
+        }
+
         let (rtx, rrx) = tokio::sync::oneshot::channel();
         if hp_tx
             .try_send(HotPathRequest {
@@ -2125,21 +2523,98 @@ async fn score_and_admit(
         let hb: [u8; 32] = *bp.blueprint_hash;
         let profit: u128 = bp.expected_profit_net.try_into().unwrap_or(u128::MAX);
         let micro = bp.lane == omega_core::Lane::Microtx;
-        if let Ok(rx) = proof_queue.submit(hb, profit, CHAIN_ID, bp.strategy_id.to_string(), micro)
-        {
-            if let Ok(Ok(proof)) = rx.await {
-                if active_phase >= 1 {
-                    tracing::info!(
-                        hash   = %bp.blueprint_hash,
-                        gen_ms = proof.generation_ms,
-                        "ZK proof ready",
-                    );
-                }
+
+        // C9 (this revision): the real publicInputsHash this blueprint's proof must bind
+        // to — see omega_zk::binding::compute_public_inputs_hash's own doc comment for the
+        // exact formula (mirrors OmegaVault.computePublicInputsHash() byte for byte).
+        let expected_public_inputs_hash =
+            compute_public_inputs_hash(vault_address, hb, profit, profit_token);
+
+        // C9: this whole block replaces what was previously an `if let Ok(rx) = ... { if
+        // let Ok(Ok(proof)) = rx.await { ...log only... } }` structure that did NOTHING
+        // different on ANY failure path — see this file's own module-level "C9" doc
+        // comment for the full investigation that found this gap. Every new early-return
+        // below releases the DAG slot explicitly, since execute() (and its DagSlotGuard)
+        // is never reached on these paths — see the module-level "C2"/"C9" doc comments
+        // for why that release is required here and wasn't needed before this revision.
+        let proof_rx = match proof_queue.submit(
+            hb,
+            expected_public_inputs_hash,
+            profit,
+            CHAIN_ID,
+            bp.strategy_id.to_string(),
+            micro,
+        ) {
+            Ok(rx) => rx,
+            Err(e) => {
+                tracing::warn!(
+                    hash = %bp.blueprint_hash,
+                    error = %e,
+                    "C9: ZK proof submission rejected by queue — dropping blueprint, NOT executing"
+                );
+                dag.lock().unwrap().complete(bp.blueprint_hash);
+                return;
             }
+        };
+
+        let proof = match proof_rx.await {
+            Ok(Ok(proof)) => proof,
+            Ok(Err(zk_error)) => {
+                tracing::warn!(
+                    hash = %bp.blueprint_hash,
+                    error = %zk_error,
+                    "C9: ZK proof generation failed — dropping blueprint, NOT executing"
+                );
+                dag.lock().unwrap().complete(bp.blueprint_hash);
+                return;
+            }
+            Err(_recv_error) => {
+                tracing::warn!(
+                    hash = %bp.blueprint_hash,
+                    "C9: ZK proof response channel closed before a result arrived (worker \
+                     crashed or shut down?) — dropping blueprint, NOT executing"
+                );
+                dag.lock().unwrap().complete(bp.blueprint_hash);
+                return;
+            }
+        };
+
+        // C9: actually verify the returned proof against the SAME expected_public_inputs_hash
+        // computed above, before this blueprint is allowed anywhere near execute(). Prior to
+        // this revision, ZkVerifier::verify() was called NOWHERE in this binary — confirmed
+        // this session by direct inspection, cross-checked against
+        // crates/omega-execution/Cargo.toml having no omega-zk dependency at all (the crate
+        // that actually owns submission structurally could not have called it either).
+        if let Err(verify_err) = zk_verifier.verify(&proof, expected_public_inputs_hash) {
+            tracing::error!(
+                hash = %bp.blueprint_hash,
+                error = %verify_err,
+                "C9: ZK proof FAILED VERIFICATION against expected publicInputsHash — \
+                 dropping blueprint, NOT executing. Should be unreachable in normal \
+                 operation (the proof was just generated from these same inputs) — a hit \
+                 here most likely signals a vault_address/profit_token configuration bug, \
+                 or something worse."
+            );
+            dag.lock().unwrap().complete(bp.blueprint_hash);
+            return;
+        }
+
+        if active_phase >= 1 {
+            tracing::info!(
+                hash   = %bp.blueprint_hash,
+                gen_ms = proof.generation_ms,
+                "C9: ZK proof ready and verified",
+            );
         }
     }
 
-    // ── C2/C3/C4/C6/C7/C8: ExecutionPipeline::execute — real DAG-slot ownership ─
+    // ── C2/C3/C4/C6/C7/C8/C9: ExecutionPipeline::execute — real DAG-slot ownership ─
+    //
+    // Reachable only for: hot-path blueprints (unconditionally, per the C9 note above —
+    // not gated on ZK proof at all), OR non-hot-path blueprints whose ZK proof both
+    // generated successfully AND passed ZkVerifier::verify() against the correct
+    // publicInputsHash. Every other non-hot-path outcome already returned above, releasing
+    // its own DAG slot on the way out.
     let strategy_max_gas = strategy.gas_budget();
     let max_slippage_bps = max_slippage_bps_for(strategy.strategy_id());
     let latest_blueprint_nonce =
@@ -2208,7 +2683,11 @@ async fn score_and_admit(
     }
 
     // C2: dag.complete() REMOVED here — execute() above is now the SOLE
-    // owner of this blueprint's DAG slot via its internal DagSlotGuard.
+    // owner of this blueprint's DAG slot via its internal DagSlotGuard,
+    // for every blueprint that reaches this point. See the module-level
+    // "C2"/"C9" doc comments for why blueprints that DON'T reach this
+    // point (new C9 early-return paths above) release the slot
+    // themselves instead.
 }
 
 async fn run_health_monitor(layers: [Arc<LayerHealthImpl>; 16], halt: HaltFlag) {
@@ -2410,6 +2889,65 @@ mod deployment_manifest_bootstrap_tests {
 }
 
 #[cfg(test)]
+mod parse_address_env_tests {
+    // NEW (this revision, C9).
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+
+    use super::*;
+
+    // NOTE: these tests mutate process-global env vars (std::env::set_var/remove_var), so
+    // they use distinct, test-specific var names to avoid interfering with each other or
+    // with any real VAULT_ADDRESS/PROFIT_TOKEN set in the actual test-running environment
+    // — same caution any std::env-mutating test needs regardless of test-runner
+    // parallelism.
+
+    #[test]
+    fn parses_valid_0x_prefixed_address() {
+        std::env::set_var(
+            "OMEGA_TEST_ADDR_1",
+            "0x1111111111111111111111111111111111111111",
+        );
+        let result = parse_address_env("OMEGA_TEST_ADDR_1").unwrap();
+        assert_eq!(result, [0x11u8; 20]);
+        std::env::remove_var("OMEGA_TEST_ADDR_1");
+    }
+
+    #[test]
+    fn parses_valid_address_without_0x_prefix() {
+        std::env::set_var(
+            "OMEGA_TEST_ADDR_2",
+            "2222222222222222222222222222222222222222",
+        );
+        let result = parse_address_env("OMEGA_TEST_ADDR_2").unwrap();
+        assert_eq!(result, [0x22u8; 20]);
+        std::env::remove_var("OMEGA_TEST_ADDR_2");
+    }
+
+    #[test]
+    fn missing_env_var_errors() {
+        std::env::remove_var("OMEGA_TEST_ADDR_MISSING");
+        assert!(parse_address_env("OMEGA_TEST_ADDR_MISSING").is_err());
+    }
+
+    #[test]
+    fn wrong_length_errors() {
+        std::env::set_var("OMEGA_TEST_ADDR_SHORT", "0x1234");
+        assert!(parse_address_env("OMEGA_TEST_ADDR_SHORT").is_err());
+        std::env::remove_var("OMEGA_TEST_ADDR_SHORT");
+    }
+
+    #[test]
+    fn invalid_hex_errors() {
+        std::env::set_var(
+            "OMEGA_TEST_ADDR_BADHEX",
+            "0xZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZ",
+        );
+        assert!(parse_address_env("OMEGA_TEST_ADDR_BADHEX").is_err());
+        std::env::remove_var("OMEGA_TEST_ADDR_BADHEX");
+    }
+}
+
+#[cfg(test)]
 mod reorg_block_feed_tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
 
@@ -2475,5 +3013,270 @@ mod reorg_block_feed_tests {
             .expect("must not time out — this is the real production call path")
             .expect("channel must not be closed");
         assert_eq!(ev.orphaned_block, 700);
+    }
+}
+
+#[cfg(test)]
+mod hot_path_zk_provisioning_tests {
+    // NEW (this revision). Regression coverage for the "RESOLVED (follow-up revision)"
+    // fix described in this file's own module-level "C9" doc comment: the `hot` branch of
+    // `score_and_admit` now ALSO fires `proof_queue.submit(...)`, but as a DETACHED
+    // background task — hot-path admission must NOT block on that proof ever completing.
+    // Before that fix, hot-path blueprints had no proof pathway at all; the regression this
+    // guards against is the opposite failure mode — accidentally re-gating hot-path
+    // admission on proof completion, which would reimport the exact latency cost the hot
+    // path exists to avoid.
+    //
+    // ASSUMPTION FLAGGED, NOT VERIFIED AGAINST REAL SOURCE: this test imports
+    // `omega_strategies::SaStrategy` on the assumption it is re-exported at that crate's
+    // root, the same way `CnryStrategy` already is per this file's own top-level
+    // `use omega_strategies::{registry::StrategyRegistryBuilder, CnryStrategy,
+    // StrategyRegistry};`. I have not seen `crates/omega-strategies/src/lib.rs` itself in
+    // this session, only `sa.rs`/`la.rs`/`msa.rs`/`mev.rs`'s own module bodies — so this
+    // is inferred from an existing, structurally identical import, not confirmed. If the
+    // re-export doesn't exist, the fix is `use omega_strategies::sa::SaStrategy;` instead.
+    //
+    // Every other constructor/method signature used below is copied directly from a call
+    // site already present in this file's own `main()`/`score_and_admit` — not re-guessed.
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+
+    use super::*;
+    use omega_core::StrategyTrait;
+    use omega_strategies::SaStrategy;
+
+    /// Builds every real dependency `score_and_admit` needs, using ONLY constructor calls
+    /// already present in this file's own `main()` — no new guesses about any of these
+    /// crates' internal shapes.
+    async fn build_harness() -> (
+        Arc<dyn StrategyTrait>,
+        Arc<Mutex<ExecutionDag>>,
+        tokio::sync::mpsc::Sender<HotPathRequest>,
+        tokio::sync::mpsc::Receiver<HotPathRequest>,
+        ProofQueue,
+        // C6 (this revision): KeyManagerTransactionSigner, not UnconfiguredSigner — this
+        // harness must construct the same concrete signer type production's main() now
+        // does, since ExecutionPipeline's signer type parameter is fixed at each call
+        // site, not generic over score_and_admit's own signature.
+        Arc<ExecutionPipeline<KeyManagerTransactionSigner>>,
+        omega_security::replay::NonceRegistry,
+        Arc<IntegrityRegistry>,
+        AccountExposureTracker,
+        tokio::sync::watch::Receiver<FlashloanLiquidityState>,
+        Arc<ZkVerifier>,
+    ) {
+        // B256/Address constructed via From<[u8; N]> rather than by naming
+        // `alloy_primitives::` directly — this binary crate has no direct dependency on
+        // that crate (same class of E0433 already solved once in this file, in
+        // reorg_block_feed_tests, via `[1u8; 32].into()` for BlockEvent::hash; this reuses
+        // the identical, already-proven-working pattern rather than a new guess).
+        let strategy: Arc<dyn StrategyTrait> =
+            SaStrategy::new(CHAIN_ID, [0xABu8; 32].into(), [0u8; 20].into(), &OmegaConfig::default());
+
+        let dag = Arc::new(Mutex::new(ExecutionDag::new(DagConfig {
+            microtx_slots: 16,
+            normal_slots: 4,
+            eviction_log_capacity: 1_000,
+        })));
+
+        let (hp_tx, hp_rx) = tokio::sync::mpsc::channel(64);
+
+        let zk_cfg = ZkConfig {
+            prover_tier: ProverTierConfig::T1Software,
+            worker_count: 1,
+            microtx_sla_ms: 1_200,
+            normal_sla_ms: 4_000,
+            proof_queue_throttle: 128,
+            proof_queue_suspend: 256,
+            proof_queue_halt: 512,
+            allow_skip_in_shadow: true,
+            checkpoint_dir: OmegaConfig::default().ml.checkpoint_dir.clone(),
+            max_checkpoints: OmegaConfig::default().ml.checkpoint_retention,
+        };
+        // Deliberately NOT starting a ProofWorkerPool here — see this test's own
+        // assertion below for why leaving the proof queue permanently unserviced is the
+        // whole point of this test, not an oversight.
+        let proof_queue = ProofQueue::new(zk_cfg);
+
+        let zk_verifier = Arc::new(ZkVerifier::new(CHAIN_ID));
+
+        let kill_switch_cfg = KillSwitchConfig {
+            max_cumulative_loss_wei: u128::MAX / 4,
+            max_loss_per_window_wei: u128::MAX / 8,
+            loss_window: Duration::from_secs(3600),
+            max_consecutive_failures: 32,
+        };
+        let kill_switches = Arc::new(
+            KillSwitchRegistry::new(kill_switch_cfg).expect("KillSwitchRegistry::new"),
+        );
+
+        let integrity_registry = IntegrityRegistry::new();
+
+        let path = std::env::temp_dir().join(format!(
+            "omega_hot_path_provisioning_test_blacklist_{}_{}.toml",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::write(&path, "# empty blacklist for test\n").unwrap();
+        let blacklist = BuilderBlacklist::load(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+
+        let relay_metrics = LaRelayMetrics::new(10, ExecutionAddress("0xTEST".into()));
+        let relay_clients: HashMap<String, Arc<dyn RelayClient>> = HashMap::new();
+        let relay_cfg = omega_relay::RelayConfig {
+            confirmation_rpc_url: "http://localhost:1".into(),
+            ..Default::default()
+        };
+        let (relay, _reorg_event_rx) =
+            MultiRelayClient::new(relay_clients, relay_metrics, blacklist, &relay_cfg, 0);
+
+        // C6 (this revision): real KeyManagerTransactionSigner, built from test-only key
+        // material (same pattern omega-execution::signer's own tests use, e.g.
+        // `make_km(byte)` — never real keys). Constructed via `KeyManager::from_hex`
+        // rather than the `secp256k1` crate directly, since this binary has no direct
+        // dependency on `secp256k1` (same class of E0433 already solved once in this
+        // file for `alloy_primitives` — see `build_harness`'s own comment above). Reuses
+        // the real, production `strategy_onchain_ids()` helper (this file's own C6
+        // addition) rather than a second hand-built map, so this test can never silently
+        // drift from what main() actually configures.
+        let test_tx_key_manager = Arc::new(
+            KeyManager::from_hex(&"3a".repeat(32), CHAIN_ID).unwrap(),
+        );
+        let test_blueprint_key_manager = Arc::new(
+            KeyManager::from_hex(&"3b".repeat(32), CHAIN_ID).unwrap(),
+        );
+        let test_blueprint_signer = Arc::new(BlueprintSigner::new(test_blueprint_key_manager));
+        let signer = Arc::new(KeyManagerTransactionSigner::new(
+            test_tx_key_manager,
+            [0x01u8; 20].into(),
+            strategy_onchain_ids(),
+            test_blueprint_signer,
+        ));
+        let execution_pipeline = Arc::new(ExecutionPipeline::new(
+            Arc::clone(&kill_switches),
+            Arc::clone(&integrity_registry),
+            Arc::clone(&relay),
+            Arc::clone(&dag),
+            Arc::clone(&signer),
+            CHAIN_ID,
+        ));
+
+        let nonce_registry = omega_security::replay::NonceRegistry::new();
+        let exposure_tracker = AccountExposureTracker::new();
+        let (_flashloan_liq_tx, flashloan_liq_rx) =
+            tokio::sync::watch::channel(FlashloanLiquidityState::default());
+
+        (
+            strategy,
+            dag,
+            hp_tx,
+            hp_rx,
+            proof_queue,
+            execution_pipeline,
+            nonce_registry,
+            integrity_registry,
+            exposure_tracker,
+            flashloan_liq_rx,
+            zk_verifier,
+        )
+    }
+
+    /// Low base fee, block 1 — matches sa.rs's own `make_signal(5)` test pattern, so
+    /// `SaStrategy::score`/`build_blueprint` return a genuinely profitable opportunity
+    /// rather than one this test has to fight the strategy's own economics to construct.
+    fn profitable_signal() -> omega_core::SignalState {
+        omega_core::SignalState {
+            state_version: 1,
+            chain_id: CHAIN_ID,
+            block_number: 1_000_000,
+            base_fee_gwei: 5,
+            l1_data_fee_gwei: 2,
+            state_hash: [0x01u8; 32].into(),
+        }
+    }
+
+    #[tokio::test]
+    async fn hot_path_admission_does_not_block_on_zk_proof_completion() {
+        let (
+            strategy,
+            dag,
+            hp_tx,
+            mut hp_rx,
+            proof_queue,
+            execution_pipeline,
+            nonce_registry,
+            integrity_registry,
+            exposure_tracker,
+            flashloan_liq_rx,
+            zk_verifier,
+        ) = build_harness().await;
+
+        // SA is hot_path_eligible with gas_budget() == MICROTX_GAS_LIMIT (200_000, so the
+        // `<=` admission check in score_and_admit's `hot` computation passes) — confirmed
+        // directly against sa.rs's own SA_GAS_BUDGET constant and StrategyTrait impl, not
+        // guessed.
+        assert!(strategy.hot_path_eligible(), "test assumes SA is hot-path eligible");
+
+        // Stub hot-path runner: reply immediately so score_and_admit's
+        // `rrx.await` on the hot-path response channel doesn't hang forever
+        // waiting for a real HotPathRunner this test deliberately doesn't spin up.
+        tokio::spawn(async move {
+            if let Some(req) = hp_rx.recv().await {
+                let _ = req.resp_tx.send(omega_hot_path::HotPathResponse {
+                    result: Err(omega_core::errors::OmegaError::dropped(
+                        omega_core::errors::DropCode::MissCapacity,
+                    )),
+                    elapsed_us: 0,
+                });
+            }
+        });
+
+        let signal = profitable_signal();
+
+        // The critical assertion: score_and_admit must return within a short bound EVEN
+        // THOUGH no ProofWorkerPool was ever started for `proof_queue` above, so the
+        // background ZK-proof task this revision's fix spawns can never complete. If
+        // hot-path admission were (re-)gated on proof completion, this would hang until
+        // the timeout fires and the test would fail — that failure mode is exactly the
+        // regression this test exists to catch.
+        let outcome = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            score_and_admit(
+                strategy,
+                signal,
+                dag,
+                hp_tx,
+                proof_queue,
+                HaltFlag::new(),
+                1, // active_phase
+                OracleSnapshot {
+                    chainlink_price: 2000.0,
+                    pyth_price: 2001.0,
+                    twap_price: 1999.0,
+                    chainlink_age_s: 10,
+                    pyth_age_s: 10,
+                    twap_age_s: 60,
+                },
+                execution_pipeline,
+                nonce_registry,
+                integrity_registry,
+                0.0, // gas_volatility_risk
+                exposure_tracker,
+                flashloan_liq_rx,
+                [0x11u8; 20], // vault_address
+                [0x22u8; 20], // profit_token
+                zk_verifier,
+            ),
+        )
+        .await;
+
+        assert!(
+            outcome.is_ok(),
+            "score_and_admit for a hot-path-eligible blueprint must not block on ZK proof \
+             completion — it hung past the 5s bound instead, which would mean hot-path \
+             admission has regressed back to being gated on the proof queue"
+        );
     }
 }

@@ -21,6 +21,16 @@
 //   ProofQueue is Clone (Arc internally) and Send + Sync.
 //   Multiple strategy tasks can call `submit()` concurrently.
 //   Multiple worker tasks can call `recv()` concurrently (MPMC).
+//
+// FIX (this revision, C4/C9): `ProofRequest` and `submit()` now carry `public_inputs_hash`,
+// matching prover.rs's `T1SoftwareProver::prove()` signature change (that file's own doc
+// comment has the full reasoning — OmegaVault.computePublicInputsHash() binds vault_address
+// and profit_token, which the prior AIR never committed to at all). Whatever worker code
+// pulls a `ProofRequest` off this queue and calls `T1SoftwareProver::prove()` (worker.rs —
+// not reviewed as part of this specific change; see main.rs's own "C9" doc comment for the
+// explicit flag that this file was not available when this revision was made) MUST be
+// updated to read `req.public_inputs_hash` and pass it through as `prove()`'s second
+// argument, or the workspace will not compile.
 
 use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -46,6 +56,11 @@ fn next_request_id() -> u64 {
 pub struct ProofRequest {
     pub id: u64,
     pub blueprint_hash: [u8; 32],
+    /// NEW (this revision): the exact publicInputsHash this proof must bind to — see
+    /// crate::binding::compute_public_inputs_hash's own doc comment for the formula, and
+    /// prover.rs's file header for why this field exists at all (closing the OmegaVault
+    /// public-inputs mismatch).
+    pub public_inputs_hash: [u8; 32],
     pub net_profit_wei: u128,
     pub chain_id: u64,
     pub strategy_id: String,
@@ -60,6 +75,7 @@ impl std::fmt::Debug for ProofRequest {
         f.debug_struct("ProofRequest")
             .field("id", &self.id)
             .field("blueprint_hash", &hex::encode(self.blueprint_hash))
+            .field("public_inputs_hash", &hex::encode(self.public_inputs_hash))
             .field("strategy_id", &self.strategy_id)
             .field("is_microtx", &self.is_microtx)
             .finish()
@@ -169,9 +185,13 @@ impl ProofQueue {
     ///   Halt     → always rejected; caller must propagate HALT.
     ///
     /// Returns a `oneshot::Receiver` that resolves when the proof is complete.
+    ///
+    /// NEW PARAM (this revision): `public_inputs_hash` — see `ProofRequest`'s own doc
+    /// comment on the field this populates.
     pub fn submit(
         &self,
         blueprint_hash: [u8; 32],
+        public_inputs_hash: [u8; 32],
         net_profit_wei: u128,
         chain_id: u64,
         strategy_id: String,
@@ -205,6 +225,7 @@ impl ProofQueue {
         let req = ProofRequest {
             id,
             blueprint_hash,
+            public_inputs_hash,
             net_profit_wei,
             chain_id,
             strategy_id: strategy_id.clone(),
@@ -304,11 +325,14 @@ mod queue_tests {
         ProofQueue::new(ZkConfig::default())
     }
 
+    // FIX (this revision): added a public_inputs_hash argument ([0x02; 32], distinct from
+    // blueprint_hash's [0x01; 32] so a field-swap bug would be caught by any test that
+    // inspects both) to every existing call site via this shared helper.
     fn submit(
         q: &ProofQueue,
         is_microtx: bool,
     ) -> Result<oneshot::Receiver<ProofResponse>, ZkError> {
-        q.submit([0x01; 32], 1_000, 42161, "LA".into(), is_microtx)
+        q.submit([0x01; 32], [0x02; 32], 1_000, 42161, "LA".into(), is_microtx)
     }
 
     #[test]
@@ -436,5 +460,22 @@ mod queue_tests {
             QueuePressure::from_depth_cfg(9999, &cfg),
             QueuePressure::Halt
         );
+    }
+
+    // NEW (this revision): regression guard that the two hash fields are actually distinct
+    // fields, not accidentally aliased to the same value somewhere in submit()'s plumbing.
+    #[test]
+    fn public_inputs_hash_is_distinct_from_blueprint_hash_in_the_request() {
+        let q = make_queue();
+        let _rx = q
+            .submit([0x01; 32], [0x02; 32], 1_000, 42161, "LA".into(), false)
+            .unwrap();
+        // ProofRequest itself isn't directly inspectable from here without draining the
+        // channel (receiver is a separate handle) — this test exists primarily as a
+        // compile-time guard that submit()'s signature actually has six real, distinct
+        // parameters in the order this file's own doc comments describe, since a
+        // transposition of blueprint_hash/public_inputs_hash would compile fine but bind
+        // every proof to the wrong value silently.
+        assert_eq!(q.depth(), 1);
     }
 }

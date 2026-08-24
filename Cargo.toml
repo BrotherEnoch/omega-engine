@@ -173,6 +173,23 @@
 # crate's own module-level "UNVERIFIED ASSUMPTION" doc comment) — both
 # of those need a real compiler run against the actual tree, which this
 # file alone cannot provide.
+#
+# ## C9 (this revision): hex — direct binary dependency for VAULT_ADDRESS/PROFIT_TOKEN parsing
+#
+# src/main.rs now reads two new required env vars, VAULT_ADDRESS and
+# PROFIT_TOKEN, and hex-decodes them into `[u8; 20]` — needed to compute
+# the real publicInputsHash every ZK proof must bind to (see
+# omega_zk::binding's own doc comment). `hex` was already a dependency
+# of omega-zk, omega-relay, omega-risk, omega-security, and omega-core
+# (each pinning it directly at "0.4", not via `[workspace.dependencies]`
+# — hex isn't listed there at all, so each crate that needs it pins its
+# own copy, an existing convention this follows rather than invents) —
+# but never previously by the omega-engine BINARY package itself, since
+# nothing in main.rs called into the hex crate by name before this
+# revision. Same class of fix as every `{ path = "crates/..." }` /
+# direct-dependency gap already documented in this file's history: a
+# crate main.rs uses directly must be listed in ITS OWN [dependencies]
+# table, not just present transitively somewhere in the graph.
 
 [package]
 name        = "omega-engine"
@@ -200,6 +217,8 @@ tracing            = { workspace = true }
 tracing-subscriber = { workspace = true }
 toml               = "0.8"
 reqwest            = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
+# C9 (this revision): see this file's own "C9" doc comment above.
+hex                = "0.4"
 
 omega-core          = { path = "crates/omega-core" }
 omega-health        = { path = "crates/omega-health" }

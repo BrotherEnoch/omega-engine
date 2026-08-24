@@ -99,10 +99,54 @@
 // real_blueprint_signer` / `sign_transaction_succeeds_end_to_end_with_
 // real_blueprint_signer` below for the regression tests proving this.
 //
-// The ONLY remaining gap in this file is the same one item 4 (above)
-// already names: real, deployment-sourced values for
-// `strategy_onchain_ids` — not something this file can supply for
-// itself.
+// The ONLY remaining gap named by items 1-4 above is item 4: real,
+// deployment-sourced values for `strategy_onchain_ids` — not something
+// this file can supply for itself.
+//
+// ## PROPOSED (2026-08-24), PENDING SIGN-OFF: envelope fee formula
+//
+// This section replaces the prior "NOTE: this fee formula is NOT a
+// confirmed policy decision" marker on `sign_transaction`'s
+// `max_priority_fee_per_gas` / `max_fee_per_gas` computation. It is a
+// PROPOSAL under review, not a completed approval — see
+// `docs/fee-policy.md` in this repo, specifically that file's Sign-Off
+// table, which has not been completed as of this revision. Any comment,
+// commit message, or doc claiming this is "approved" or "resolved" is
+// only as good as that Sign-Off table actually being filled in by the
+// person who owns this system's gas/fee policy (Andre Niemand) through
+// a durable channel (e.g. a signed commit, not just a chat message
+// asserting identity) — self-identification in a chat conversation is
+// not independent verification and should not be treated as equivalent
+// to it.
+//
+// Formula (blueprint fields in gwei -> RLP fields in wei), unchanged
+// numerically from the prior placeholder:
+//   max_priority_fee_per_gas = priority_fee_gwei * 1e9
+//   max_fee_per_gas = (base_fee_at_creation + 2 * priority_fee_gwei) * 1e9
+//
+// NOTE: docs/fee-policy.md's own drafted analysis (§3) argued the
+// *opposite* term should carry the 2x multiplier (`2*base + priority`,
+// on the reasoning that base fee, not tip, is what a maxFeePerGas cap
+// is conventionally sized to survive against on Arbitrum). This revision
+// keeps the placeholder's original formula (`base + 2*priority`)
+// because that is what was explicitly specified when this change was
+// requested, not because the base-vs-tip judgment call has been
+// resolved in its favor. Whoever completes the Sign-Off table should
+// confirm the formula, not just the caps.
+//
+// Fail-closed caps (checked BEFORE any key material is touched):
+//   priority_fee_gwei <= MAX_PRIORITY_FEE_GWEI_CAP (50)
+//   base_fee_at_creation + 2 * priority_fee_gwei <= MAX_FEE_GWEI_CAP (500)
+// Exceeding either cap returns `ExecutionError::SigningFailed` naming
+// which cap was exceeded and by how much; it never silently clamps or
+// signs anyway. See `envelope_fees_wei` below.
+//
+// This formula/cap pair is NOT yet a substitute for the broader
+// `docs/fee-policy.md` review — it resolves ONLY the formula module
+// comment previously marked unconfirmed and adds the caps that document
+// discussed in its own §6/§7. Chain scope, refresh-at-sign-time (§5),
+// and the profit-vs-gas-cost guard (§7 item 3) remain open and are not
+// implemented by this revision.
 //
 // `omega_simulation::SimulationSubmitter` DOES sign and send real
 // transactions, but only against a local Anvil fork with a dev-funded
@@ -114,7 +158,7 @@
 // `ExecutionPipeline` is generic over `S: TransactionSigner` specifically
 // so the rest of the pipeline (integrity check, kill switch, 15 pre-trade
 // checks, idempotency dedup, DAG bookkeeping) is fully implemented and
-// fully testable today, independent of this gap.
+// fully testable today, independent of any gap in this file.
 //
 // ## Audit fix (carried forward): test helper missing flashloan/token fields
 //
@@ -203,8 +247,8 @@ pub struct SignedTransaction {
 }
 
 /// Produces a signed transaction from an `ExecutionBlueprint`. See this
-/// module's doc comment for why no COMPLETE production implementation
-/// exists yet.
+/// module's doc comment for exactly what is and isn't confirmed as of
+/// this revision.
 #[async_trait]
 pub trait TransactionSigner: Send + Sync {
     async fn sign_transaction(
@@ -232,6 +276,64 @@ impl TransactionSigner for UnconfiguredSigner {
     ) -> Result<SignedTransaction, ExecutionError> {
         Err(ExecutionError::NoTransactionSigner)
     }
+}
+
+// ── Fee policy (proposed, pending sign-off — see module doc) ────────────────
+
+/// Hard ceiling on `priority_fee_gwei` — see module doc, "PROPOSED
+/// (2026-08-24), PENDING SIGN-OFF: envelope fee formula". Not final until
+/// `docs/fee-policy.md`'s Sign-Off table is completed by Andre Niemand
+/// through a durable channel.
+const MAX_PRIORITY_FEE_GWEI_CAP: u64 = 50;
+
+/// Hard ceiling on `base_fee_at_creation + 2 * priority_fee_gwei`
+/// (i.e. `max_fee_per_gas` expressed in gwei). Same sign-off status as
+/// `MAX_PRIORITY_FEE_GWEI_CAP` above.
+const MAX_FEE_GWEI_CAP: u64 = 500;
+
+const GWEI_TO_WEI: u64 = 1_000_000_000;
+
+/// Compute the EIP-1559 envelope fees (`max_priority_fee_per_gas`,
+/// `max_fee_per_gas`), in wei, per the proposed policy in this module's
+/// top doc comment. Fails closed — before any key material is touched —
+/// if either input would produce a fee above its cap, naming which cap
+/// and by how much, rather than silently clamping (the
+/// `saturating_*` arithmetic below is intentionally NOT used to clamp
+/// out-of-policy inputs to something signable; it's used only to avoid a
+/// panic on the in-policy path, which by construction of the caps cannot
+/// overflow `u64`/`U256` in any case that reaches it).
+///
+/// Returns `(max_priority_fee_per_gas_wei, max_fee_per_gas_wei)`.
+fn envelope_fees_wei(
+    base_fee_at_creation_gwei: u64,
+    priority_fee_gwei: u64,
+) -> Result<(U256, U256), ExecutionError> {
+    if priority_fee_gwei > MAX_PRIORITY_FEE_GWEI_CAP {
+        return Err(ExecutionError::SigningFailed {
+            detail: format!(
+                "priority_fee_gwei {priority_fee_gwei} exceeds policy cap \
+                 {MAX_PRIORITY_FEE_GWEI_CAP} (docs/fee-policy.md, proposed 2026-08-24, \
+                 pending sign-off)"
+            ),
+        });
+    }
+
+    let max_fee_gwei =
+        base_fee_at_creation_gwei.saturating_add(priority_fee_gwei.saturating_mul(2));
+    if max_fee_gwei > MAX_FEE_GWEI_CAP {
+        return Err(ExecutionError::SigningFailed {
+            detail: format!(
+                "max_fee_gwei {max_fee_gwei} (base {base_fee_at_creation_gwei} + \
+                 2×priority {priority_fee_gwei}) exceeds policy cap {MAX_FEE_GWEI_CAP} \
+                 (docs/fee-policy.md, proposed 2026-08-24, pending sign-off)"
+            ),
+        });
+    }
+
+    let max_priority_fee_per_gas =
+        U256::from(priority_fee_gwei).saturating_mul(U256::from(GWEI_TO_WEI));
+    let max_fee_per_gas = U256::from(max_fee_gwei).saturating_mul(U256::from(GWEI_TO_WEI));
+    Ok((max_priority_fee_per_gas, max_fee_per_gas))
 }
 
 // ── Partial production implementation ───────────────────────────────────────
@@ -430,12 +532,6 @@ impl TransactionSigner for KeyManagerTransactionSigner {
         bp: &ExecutionBlueprint,
         chain_id: u64,
     ) -> Result<SignedTransaction, ExecutionError> {
-        // Fails loudly here, before touching key material, per this
-        // module's top doc comment. Everything below this point is dead
-        // code until build_execute_calldata has a real implementation, but
-        // is left in place (rather than deleted) so the RLP/signing path
-        // is reviewable and ready to wire up once the blueprint-
-        // authorization signature is resolved.
         let data = self.build_execute_calldata(bp, chain_id)?;
 
         let secret_key =
@@ -446,17 +542,13 @@ impl TransactionSigner for KeyManagerTransactionSigner {
                 })?;
 
         let gas_limit = bp.total_l2_gas_budget();
-        let max_priority_fee_per_gas =
-            U256::from(bp.priority_fee_gwei).saturating_mul(U256::from(1_000_000_000u64));
-        // NOTE: this fee formula is NOT a confirmed policy decision — see
-        // this module's top doc comment. It's a placeholder conservative
-        // estimate (base_fee_at_creation + 2x priority, converted to wei)
-        // used only to exercise the RLP-encoding path in tests; whoever
-        // owns the gas/fee policy should confirm or replace this before
-        // any real transaction is built from it.
-        let max_fee_per_gas = U256::from(bp.base_fee_at_creation)
-            .saturating_add(U256::from(bp.priority_fee_gwei).saturating_mul(U256::from(2u64)))
-            .saturating_mul(U256::from(1_000_000_000u64));
+
+        // Fee policy (proposed, pending sign-off) — see module doc,
+        // "PROPOSED (2026-08-24), PENDING SIGN-OFF: envelope fee formula",
+        // and `docs/fee-policy.md`. Fails closed, before any RLP is built,
+        // if either input is out of policy.
+        let (max_priority_fee_per_gas, max_fee_per_gas) =
+            envelope_fees_wei(bp.base_fee_at_creation, bp.priority_fee_gwei)?;
 
         let unsigned_rlp = encode_eip1559_unsigned(
             chain_id,
@@ -770,13 +862,12 @@ mod tests {
 
     #[tokio::test]
     async fn sign_transaction_succeeds_end_to_end_with_real_blueprint_signer() {
-        // Regression guard for the OPPOSITE direction from this file's
-        // prior revision: now that build_execute_calldata has a real
-        // strategy_onchain_ids entry AND a real BlueprintSigner, signing
-        // must actually succeed — producing a real signed RLP transaction
-        // — not fail at any point. If this starts failing, either the ABI
-        // encoding, the domain hash, or the BlueprintSigner wiring
-        // regressed.
+        // Regression guard: with a real strategy_onchain_ids entry and a
+        // real BlueprintSigner, and with sample_bp()'s fees within the
+        // proposed caps (base=10, priority=5), signing must actually
+        // succeed end-to-end. If this starts failing, either the ABI
+        // encoding, the domain hash, the BlueprintSigner wiring, or the
+        // fee-cap thresholds regressed.
         let tx_km = make_km(0x03);
         let signer = KeyManagerTransactionSigner::new(
             tx_km,
@@ -811,8 +902,8 @@ mod tests {
 
     #[tokio::test]
     async fn sign_transaction_fails_with_strategy_lookup_reason_when_unconfigured() {
-        // Distinguishes the ONE remaining failure reason this signer can
-        // still produce: an unconfigured strategy_onchain_ids entry fails
+        // Distinguishes one of the failure reasons this signer can still
+        // produce: an unconfigured strategy_onchain_ids entry fails
         // BEFORE bp_hash is ever computed or the BlueprintSigner is ever
         // called, with a message naming the missing strategy specifically.
         let km = make_km(0x04);
@@ -1003,6 +1094,75 @@ mod tests {
             blueprint_calldata.as_slice()
         );
         assert_eq!(decoded.sig.as_ref(), sig.as_slice());
+    }
+
+    // ── envelope_fees_wei — proposed fee policy, pending sign-off ──────────
+
+    #[test]
+    fn envelope_fees_match_proposed_formula() {
+        // base=10, priority=5 -> tip=5 gwei, max_fee=20 gwei
+        let (tip, max_fee) = envelope_fees_wei(10, 5).unwrap();
+        assert_eq!(tip, U256::from(5u64) * U256::from(GWEI_TO_WEI));
+        assert_eq!(max_fee, U256::from(20u64) * U256::from(GWEI_TO_WEI));
+    }
+
+    #[test]
+    fn envelope_fees_reject_priority_above_cap() {
+        let err = envelope_fees_wei(10, MAX_PRIORITY_FEE_GWEI_CAP + 1).unwrap_err();
+        match err {
+            ExecutionError::SigningFailed { detail } => {
+                assert!(detail.contains("priority_fee_gwei"));
+                assert!(detail.contains("cap"));
+            }
+            other => panic!("expected SigningFailed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn envelope_fees_reject_max_fee_above_cap() {
+        // base + 2*priority > 500, with priority still <= 50
+        // e.g. base=401, priority=50 -> max_fee_gwei = 501
+        let err = envelope_fees_wei(401, 50).unwrap_err();
+        match err {
+            ExecutionError::SigningFailed { detail } => {
+                assert!(detail.contains("max_fee_gwei"));
+                assert!(detail.contains("cap"));
+            }
+            other => panic!("expected SigningFailed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn envelope_fees_at_exact_caps_ok() {
+        // priority == 50, max_fee_gwei == 500
+        let (tip, max_fee) = envelope_fees_wei(400, 50).unwrap();
+        assert_eq!(tip, U256::from(50u64) * U256::from(GWEI_TO_WEI));
+        assert_eq!(max_fee, U256::from(500u64) * U256::from(GWEI_TO_WEI));
+    }
+
+    #[tokio::test]
+    async fn sign_transaction_fails_closed_when_priority_fee_exceeds_cap() {
+        // End-to-end: an out-of-policy bp must fail at the fee-cap check,
+        // before any RLP is built or key material touched, even though
+        // strategy_onchain_ids and the blueprint signer are both correctly
+        // configured.
+        let tx_km = make_km(0x19);
+        let signer = KeyManagerTransactionSigner::new(
+            tx_km,
+            Address::from([0x01; 20]),
+            strategy_ids_with_sa(),
+            make_blueprint_signer(0x1a),
+        );
+        let mut bp = sample_bp();
+        bp.priority_fee_gwei = MAX_PRIORITY_FEE_GWEI_CAP + 1;
+
+        let result = signer.sign_transaction(&bp, 42161).await;
+        match result {
+            Err(ExecutionError::SigningFailed { detail }) => {
+                assert!(detail.contains("priority_fee_gwei"));
+            }
+            other => panic!("expected SigningFailed, got {other:?}"),
+        }
     }
 
     // ── RLP encoder — structural checks against the EIP-1559 spec text ─────

@@ -24,6 +24,13 @@
 // Queue interaction:
 //   After completing a proof (success or failure), the worker calls `queue.complete()`
 //   to decrement the depth counter and update the pressure FSM.
+//
+// FIX (this revision, C4/C9): `process_request` now reads `req.public_inputs_hash` and
+// passes it through as `T1SoftwareProver::prove()`'s new second argument — matching that
+// function's signature change (prover.rs's own doc comment has the full reasoning:
+// OmegaVault.computePublicInputsHash() binds vault_address and profit_token, which the
+// prior AIR never committed to at all). This was the one guaranteed compile break flagged
+// when that signature change was made — this file is the actual call site.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -147,6 +154,9 @@ async fn process_request(
     let is_microtx = req.is_microtx;
     let strategy_id = req.strategy_id.clone();
     let blueprint_hash = req.blueprint_hash;
+    // FIX (this revision): read alongside blueprint_hash/net_profit_wei, same as every
+    // other field captured off `req` before it's consumed below.
+    let public_inputs_hash = req.public_inputs_hash;
     let net_profit_wei = req.net_profit_wei;
     let sla_ms = cfg.sla_ms(is_microtx);
     let lane = if is_microtx { "microtx" } else { "normal" };
@@ -159,8 +169,11 @@ async fn process_request(
 
     let prover2 = Arc::clone(prover);
     let strategy_id2 = strategy_id.clone();
+    // FIX (this revision): public_inputs_hash now threaded through as prove()'s new
+    // second argument, matching T1SoftwareProver::prove()'s real signature
+    // (blueprint_hash, public_inputs_hash, net_profit_wei, strategy_id).
     let prove_future = tokio::task::spawn_blocking(move || {
-        prover2.prove(blueprint_hash, net_profit_wei, &strategy_id2)
+        prover2.prove(blueprint_hash, public_inputs_hash, net_profit_wei, &strategy_id2)
     });
 
     let result = tokio::time::timeout(Duration::from_millis(sla_ms), prove_future).await;
@@ -262,8 +275,10 @@ mod worker_tests {
         let queue = ProofQueue::new(cfg.clone());
         let pool = ProofWorkerPool::start(cfg, queue.clone());
 
+        // FIX (this revision): added a public_inputs_hash argument ([0xef; 32]) matching
+        // submit()'s new signature — see queue.rs's own fix history.
         let rx = queue
-            .submit([0xde; 32], 500_000_000, 42161, "LA".into(), false)
+            .submit([0xde; 32], [0xef; 32], 500_000_000, 42161, "LA".into(), false)
             .unwrap();
 
         let result = tokio::time::timeout(Duration::from_secs(60), rx)
@@ -274,6 +289,7 @@ mod worker_tests {
         assert!(result.is_ok(), "proof should succeed: {:?}", result.err());
         let proof = result.unwrap();
         assert_eq!(proof.blueprint_hash, [0xde; 32]);
+        assert_eq!(proof.public_inputs_hash, [0xef; 32]);
         assert!(!proof.proof_bytes.is_empty());
 
         pool.shutdown();
@@ -293,8 +309,11 @@ mod worker_tests {
 
         let mut rxs = Vec::new();
         for i in 0u8..4 {
+            // FIX (this revision): public_inputs_hash argument added, distinct per request
+            // (derived from `i`, same as blueprint_hash) so this test can't accidentally
+            // pass with every request aliased to the same public_inputs_hash.
             let rx = queue
-                .submit([i; 32], 100 + i as u128, 42161, "SA".into(), false)
+                .submit([i; 32], [i.wrapping_add(100); 32], 100 + i as u128, 42161, "SA".into(), false)
                 .unwrap();
             rxs.push(rx);
         }
