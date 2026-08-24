@@ -18,3 +18,4 @@ verification/**/.venv/
 # Build / cache artifacts
 contracts/out/
 contracts/cache/
+config/deployment/
