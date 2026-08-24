@@ -10,3 +10,11 @@ dist/
 # Editor
 .vscode/
 *.bak
+
+# Virtual environments
+**/.venv/
+verification/**/.venv/
+
+# Build / cache artifacts
+contracts/out/
+contracts/cache/
