@@ -1,0 +1,28 @@
+# sp1-program/Cargo.toml -- root workspace manifest for the SP1 proving project.
+#
+# DELIBERATELY SEPARATE from omega-engine/Cargo.toml, not merged into it -- see the reasoning
+# given when this was raised: the guest program (program/) compiles to a different target
+# (riscv32im-succinct-zkvm-elf via `cargo prove build`, not native), and SP1's toolchain
+# commonly needs its own precise/patched crypto-crate versions that could reopen the exact
+# class of alloy-primitives version conflict omega-engine/Cargo.toml's own audit history
+# documents fighting through twice already. Standard `cargo prove new` project layout keeps
+# these fully separate for the same reason.
+#
+# Three members:
+#   lib/    -- shared types (PublicValuesStruct, ProofBundle) used by both program/ and script/.
+#   program/-- the zkVM guest program. Still a stub (todo!() in main.rs) pending the open
+#              question of what this program actually computes -- see program/src/main.rs.
+#   script/ -- host-side proving script. Also blocked on the same open question, since it can't
+#              know what inputs to feed the guest program until that's answered -- see
+#              script/src/main.rs for exactly what's fixed vs. still a gap.
+
+[workspace]
+resolver = "2"
+members = [
+    "lib",
+    "program",
+    "script",
+]
+
+[workspace.dependencies]
+alloy-sol-types = "0.8"

@@ -1,0 +1,15 @@
+# sp1-program/lib/Cargo.toml
+[package]
+name = "omega-proof-lib"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+# Pinned to "0.8" to match omega-engine/Cargo.toml's own workspace pin for alloy-sol-types
+# (same major.minor line used org-wide), NOT independently confirmed compatible with
+# sp1-zkvm 6.x specifically -- multiple real SP1 guest programs using alloy_sol_types::sol!
+# turned up in search (e.g. the "SP1 Precompiles" writeup), so the combination is a known
+# working pattern in the ecosystem, but I have not confirmed 0.8.x exactly against sp1-zkvm
+# 6.x's own toolchain. Run `cargo build` against the real riscv32im-succinct-zkvm-elf target
+# before trusting this compiles; if it doesn't, that's the pin to revisit first.
+alloy-sol-types = "0.8"

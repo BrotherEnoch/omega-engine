@@ -1,0 +1,24 @@
+# sp1-program/script/Cargo.toml
+[package]
+name = "omega-proof-script"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+omega-proof-lib = { path = "../lib" }
+alloy-sol-types = "0.8"
+# Pinned to "6" -- same evidence and same caveat as program/Cargo.toml's sp1-zkvm pin: directly
+# confirmed sp1-sdk is at 6.0.2 via docs.rs, and sibling crates are on an explicit "6.x release
+# track" per crates.io. The "blocking" feature is enabled explicitly because this script uses
+# the synchronous ProverClient::new()/prove() API (see main.rs's own note on why, and on the
+# newer async builder-pattern API I also found evidence of and did NOT use here) -- SP1's own
+# GitHub release notes reference a "blocking" feature flag existing alongside "network" as of
+# a recent 6.x change, so this is not assumed to be on by default.
+sp1-sdk = { version = "6", features = ["blocking"] }
+hex = "0.4"
+anyhow = "1"
+
+# Groth16 proving (required for on-chain verification -- see main.rs) needs Docker running
+# locally, per Succinct's own docs, plus >=16GB RAM. This is a runtime/environment requirement,
+# not a Cargo dependency, so it can't be expressed here -- flagged so it isn't discovered only
+# at `cargo run` time.

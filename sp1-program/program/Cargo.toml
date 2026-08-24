@@ -1,0 +1,24 @@
+# sp1-program/program/Cargo.toml
+[package]
+name = "omega-proof-program"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+omega-proof-lib = { path = "../lib" }
+alloy-sol-types = "0.8"
+sp1-zkvm = "6"
+
+[features]
+# Gates the no-op dev/test path in src/main.rs. NOT on by default. See this crate's own
+# main.rs for exactly what this does and does not mean -- it does not answer what this
+# program should actually prove; it exists solely so the surrounding pipeline (script/,
+# SP1StarkVerifierAdapter, deploy wiring) can be exercised end-to-end before that question is
+# answered. A PROGRAM_VKEY derived from a build with this feature enabled proves nothing
+# about real system behavior and must never be wired into a production STARK_VERIFIER/adapter
+# deployment.
+insecure_dev_noop = []
+
+[[bin]]
+name = "omega-proof-program"
+path = "src/main.rs"
