@@ -19,3 +19,4 @@ verification/**/.venv/
 contracts/out/
 contracts/cache/
 config/deployment/
+verification/
