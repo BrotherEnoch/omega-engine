@@ -52,7 +52,7 @@ contract RegisterStrategies is Script {
         address orchestratorAddr = vm.parseTomlAddress(toml, ".orchestrator.address");
         OmegaOrchestrator orch = OmegaOrchestrator(orchestratorAddr);
 
-        StrategyEntry[4] memory entries = [
+        StrategyEntry[5] memory entries = [
             StrategyEntry(
                 "SA",
                 StrategyIds.SIMPLE_ARB,
