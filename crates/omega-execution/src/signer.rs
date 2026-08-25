@@ -20,24 +20,29 @@
 //         bytes, uint256, uint256, uint256)
 //      Solidity ABI-encodes a struct identically to a tuple of the same
 //      field types in the same order, and identically encodes an enum to
-//      its `uint8` ordinal — so `Blueprint::abi_encode()` produces the
-//      exact bytes `abi.decode(blueprintCalldata, (...))` expects,
-//      PROVIDED `provider_type` is passed as the correct ordinal. That
-//      last piece is not a guess: `omega_core::types::flashloan_provider`
-//      already carries a passing test,
-//      `ordinals_match_solidity_enum_order`, guaranteeing
-//      `FlashloanProviderType as u8` matches this exact contract's enum
-//      order. Field-name casing in the `sol!` blocks below was chosen as
-//      plain Rust snake_case rather than copied verbatim from the
-//      contract (`strategyId`, `flashloanToken`, etc.) — ABI encoding of
-//      a struct depends only on field TYPE and ORDER, never on the names
-//      chosen for them in the encoding library, so this is a readability
-//      choice, not a behavioral one, and avoids `-D warnings` tripping
-//      on `non_snake_case` for no benefit.
+//      its `uint8` ordinal — so encoding `Blueprint`'s fields as a flat
+//      tuple (see the 2026-08-24 bug-fix note below for exactly which
+//      alloy-sol-types method that requires) produces the exact bytes
+//      `abi.decode(blueprintCalldata, (...))` expects, PROVIDED
+//      `provider_type` is passed as the correct ordinal. That last piece
+//      is not a guess: `omega_core::types::flashloan_provider` already
+//      carries a passing test, `ordinals_match_solidity_enum_order`,
+//      guaranteeing `FlashloanProviderType as u8` matches this exact
+//      contract's enum order. Field-name casing in the `sol!` blocks
+//      below was chosen as plain Rust snake_case rather than copied
+//      verbatim from the contract (`strategyId`, `flashloanToken`, etc.)
+//      — ABI encoding of a struct depends only on field TYPE and ORDER,
+//      never on the names chosen for them in the encoding library, so
+//      this is a readability choice, not a behavioral one, and avoids
+//      `-D warnings` tripping on `non_snake_case` for no benefit.
 //
-//   2. RESOLVED (by inspection, not yet byte-verified against a compiled
-//      solc/EVM decode) — the flashloan-identity ABI shape. Confirmed
-//      directly from the real contract: `providerType` is `uint8`,
+//   2. RESOLVED — the flashloan-identity ABI shape, confirmed byte-for-byte
+//      against a compiled solc/EVM decode (see
+//      `build_blueprint_calldata_matches_solc_golden_vector` below, which
+//      now compares against a real `forge test` golden vector rather than
+//      the earlier internal-only `abi_decode` round-trip check — and which
+//      is what caught the 2026-08-24 encoding bug documented below).
+//      Confirmed directly from the real contract: `providerType` is `uint8`,
 //      `providerContract` is `address` (meaningful ONLY for UniswapV3 —
 //      the contract's own comment says pass `address(0)` for
 //      Balancer/AaveV3, which use fixed admin-set addresses instead),
@@ -54,7 +59,8 @@
 //      `insufficient_profit_fails_at_check_5`). Mapped directly:
 //      `min_net_profit: bp.dynamic_min_profit`.
 //
-//   4. STILL OPEN — the `StrategyId -> bytes32 strategyId` mapping.
+//   4. RESOLVED (2026-08-25, in the CALLER, not this file — see below) —
+//      the `StrategyId -> bytes32 strategyId` mapping.
 //      Read directly against the real contract: `registerStrategy(bytes32
 //      strategyId, address implementation)` accepts an ARBITRARY bytes32
 //      chosen by whoever calls it — there is no on-chain derivation rule
@@ -64,15 +70,71 @@
 //      from code, and guessing a hash convention here (e.g.
 //      `keccak256("SA")`) for a contract that moves flashloaned funds
 //      would be exactly the fabrication this codebase has refused
-//      everywhere else. `KeyManagerTransactionSigner::new` now takes a
-//      required `strategy_onchain_ids: HashMap<String, [u8; 32]>`
-//      parameter — keyed by the same `StrategyId::to_string()` values
-//      (`"SA"`, `"LA"`, ...) already used by `IntegrityRegistry` and
-//      `DeploymentManifest` elsewhere in this workspace — that MUST be
-//      sourced from real deployment records (the actual arguments passed
-//      to `registerStrategy()` on-chain), never fabricated. A lookup miss
-//      fails loudly and specifically, per-strategy, rather than silently
-//      defaulting to a placeholder.
+//      everywhere else. `KeyManagerTransactionSigner::new` correctly
+//      still takes a required `strategy_onchain_ids: HashMap<String,
+//      [u8; 32]>` parameter — keyed by the same `StrategyId::to_string()`
+//      values (`"SA"`, `"LA"`, ...) already used by `IntegrityRegistry`
+//      and `DeploymentManifest` elsewhere in this workspace — and this
+//      file still does not, and should not, hardcode deployment data
+//      itself; that would just relocate the fabrication risk rather than
+//      remove it.
+//
+//      What's actually resolved is WHERE THE CALLER GETS REAL VALUES
+//      FROM: `crates/omega-engine/src/main.rs`'s own `strategy_
+//      onchain_ids()` function (its "C6" revision) now supplies this
+//      map, transcribed byte-for-byte from `contracts/src/
+//      StrategyIds.sol`'s five `keccak256("OMEGA_STRATEGY_<X>")`
+//      constants — the same canonical values `contracts/script/
+//      RegisterStrategies.s.sol` reads and asserts against every
+//      deployment manifest's `onchain_id` field (via that script's own
+//      `_checkManifestIdMatches` guard) before ever calling
+//      `registerStrategy()` on-chain, so a typo'd manifest can't
+//      silently register a strategy under the wrong id.
+//
+//      As of this same revision, `StrategyIds.sol`'s actual primary
+//      source has been seen directly (not just referenced secondhand by
+//      other files' comments), and each of its five constants was
+//      independently RE-DERIVED — via a separate keccak256
+//      implementation (Python's `Crypto.Hash.keccak`, not
+//      alloy/solc/cast) computing `keccak256(utf8("OMEGA_STRATEGY_SA"))`
+//      etc. from scratch — and confirmed to match the Solidity file's
+//      own constants byte-for-byte, for all five (SA/LA/MSA/MEV/CNRY),
+//      not just SA. This is a materially stronger claim than "three
+//      sources happen to agree with each other": it confirms
+//      `StrategyIds.sol`'s constants actually equal what their own
+//      `/// @dev keccak256(...)` comments say they are, using a fourth,
+//      independent computation, not just cross-referencing.
+//      `config/deployment/arbitrum.toml`'s `onchain_id` fields (verified
+//      there separately via `cast keccak`) and this file's own
+//      `build_blueprint_calldata_matches_solc_golden_vector` SA fixture
+//      (verified there via a real `forge test` run against solc) both
+//      still independently agree with these same values, for the
+//      overlapping cases each covers.
+//
+//      MANUAL-SYNC RISK, same as `main.rs`'s own doc comment already
+//      flags: nothing keeps `StrategyIds.sol`, `main.rs`'s hardcoded
+//      map, and `arbitrum.toml`'s `onchain_id` fields in sync
+//      automatically if `StrategyIds.sol` is ever changed. See the
+//      `known_strategy_onchain_ids_are_internally_consistent` test
+//      below for a narrow, this-file-local guard against the specific
+//      failure mode of a copy-paste/transposition error among the five
+//      values as transcribed here for cross-reference — it cannot
+//      detect drift against `StrategyIds.sol` itself, only internal
+//      self-consistency (distinct, non-zero, and SA matching the
+//      existing golden-vector fixture).
+//
+//      NOT YET DONE, and correctly so per `main.rs`'s own C4-A note:
+//      `config/deployment/arbitrum.toml`'s `implementation` and
+//      `bytecode_hash` fields are still real TODO placeholders — those
+//      need an actual live deployment (or an `eth_getCode` read against
+//      one), not something derivable from `StrategyIds.sol` the way
+//      `onchain_id` is. `strategy_onchain_ids` and the broader
+//      `DeploymentManifest` (bytecode hash / contract address /
+//      integrity registration) remain two genuinely separate pieces of
+//      deployment configuration — see the option-2 sketch that exists
+//      for eventually unifying them into one manifest, not yet
+//      implemented — closing item 4 does not imply the manifest is
+//      complete.
 //
 // ## RESOLVED (this revision): the blueprint-authorization signature
 //
@@ -99,9 +161,69 @@
 // real_blueprint_signer` / `sign_transaction_succeeds_end_to_end_with_
 // real_blueprint_signer` below for the regression tests proving this.
 //
-// The ONLY remaining gap named by items 1-4 above is item 4: real,
-// deployment-sourced values for `strategy_onchain_ids` — not something
-// this file can supply for itself.
+// As of 2026-08-25, item 4 is also resolved — see the updated item 4
+// entry above for the full evidence chain (main.rs's C6 revision,
+// cross-checked against StrategyIds.sol, RegisterStrategies.s.sol, and
+// arbitrum.toml). Nothing named by items 1-4 remains open in this file's
+// own scope; the deployment-manifest work described in item 4's "NOT YET
+// DONE" note (bytecode_hash / implementation address) is a separate,
+// still-open piece of configuration this file was never responsible for.
+//
+// ## BUG FOUND AND FIXED (2026-08-24): Blueprint::abi_encode() was wrong
+//
+// The first real run of `build_blueprint_calldata_matches_solc_golden_vector`
+// against the actual `forge test --match-test
+// test_print_golden_blueprint_calldata` output FAILED. The Rust encoding
+// carried one extra leading 32-byte word (value `0x20`) that the solc
+// golden vector did not — every byte from that point on was identical
+// between the two. That is the textbook signature of the difference
+// between two distinct Solidity ABI-encoding forms:
+//   - `abi.encode(oneDynamicValue)` — a SINGLE dynamic-typed argument
+//     gets wrapped with a leading offset word pointing back to itself
+//     (this is what you get when the "argument" being encoded is one
+//     value, e.g. a struct, treated as a self-contained dynamic type).
+//   - `abi.encode(field1, field2, ..., fieldN)` — multiple top-level
+//     arguments are encoded as a flat tuple; the tuple's own encoding
+//     never needs a pointer to itself, since it isn't nested inside
+//     anything.
+// `OmegaOrchestrator.sol` decodes with `abi.decode(blueprintCalldata,
+// (uint64, uint64, bytes32, ...))` — the flat-tuple form (ten top-level
+// types, not one struct-typed value) — so the Rust side must produce
+// that same form. `alloy_sol_types::SolValue::abi_encode()`, called on a
+// `sol!`-generated struct, encodes the struct as a single dynamic value
+// (the first form above) — which is why it produced the spurious extra
+// word. `SolValue::abi_encode_params()` is the method that encodes a
+// struct's fields as a flat top-level tuple (the second form), matching
+// what `abi.encode(a, b, c, ...)` produces in Solidity. Fixed:
+//   - `build_blueprint_calldata`: `blueprint.abi_encode()` ->
+//     `blueprint.abi_encode_params()`.
+//   - `compute_bp_hash`: `domain.abi_encode()` -> `domain.abi_encode_params()`
+//     on `DomainSeparatedBlueprint`, by the identical reasoning — the
+//     contract's own domain hash is built from `abi.encode(address,
+//     uint64, bytes)`, three top-level params, not a struct.
+//   - The `build_blueprint_calldata_round_trips_through_abi_decode` test's
+//     decode call was updated from `Blueprint::abi_decode` to
+//     `Blueprint::abi_decode_params` to match the new encode call — the
+//     two must use matching head-shape assumptions or the round trip
+//     would silently decode garbage rather than catching a mismatch.
+// `build_blueprint_calldata_matches_solc_golden_vector` passes byte-for-
+// byte against the real solc/EVM golden vector with this fix in place.
+//
+// CAVEAT (RESOLVED 2026-08-24, later same day): the `compute_bp_hash` /
+// `DomainSeparatedBlueprint` half of this fix was originally BY ANALOGY
+// to the now-confirmed `Blueprint` bug only, then given its own golden-
+// vector test (`compute_bp_hash_matches_solc_golden_vector` below,
+// backed by `contracts/test/DomainSeparatedBlueprintHash.t.sol`) seeded
+// from an independent Python (`eth_abi`) computation rather than solc
+// itself. `forge test --match-test
+// test_print_golden_domain_separated_blueprint_hash -vv` has now been
+// run for real and printed
+// `0x74d1c22598dab6e5f1cb1a1809d3b7255728a0c10c971a9f05257cd6758b356b`
+// — an EXACT match to the Python-computed value already in both this
+// file and the `.sol` file, with no update needed to either. This is now
+// the same class of evidence `build_blueprint_calldata`'s golden vector
+// has: a real solc/EVM oracle, not analogy and not a second library's
+// agreement with itself.
 //
 // ## PROPOSED (2026-08-24), PENDING SIGN-OFF: envelope fee formula
 //
@@ -466,7 +588,13 @@ impl KeyManagerTransactionSigner {
             max_base_fee: max_base_fee_wei,
         };
 
-        Ok(blueprint.abi_encode())
+        // .abi_encode_params(), NOT .abi_encode() — see this file's top
+        // doc comment, "BUG FOUND AND FIXED (2026-08-24)", for why the
+        // latter silently produces the wrong bytes (an extra leading
+        // offset word) for a struct being decoded as a flat multi-field
+        // tuple, which is exactly what OmegaOrchestrator.sol's
+        // `abi.decode(blueprintCalldata, (...))` does.
+        Ok(blueprint.abi_encode_params())
     }
 
     /// Compute the real domain-separated `bpHash` OmegaOrchestrator.sol
@@ -478,7 +606,14 @@ impl KeyManagerTransactionSigner {
             chain_id,
             blueprint_calldata: blueprint_calldata.to_vec().into(),
         };
-        omega_security::keccak256(&domain.abi_encode())
+        // .abi_encode_params(), NOT .abi_encode() — same fix, same reason
+        // as `build_blueprint_calldata` above (see this file's top doc
+        // comment, "BUG FOUND AND FIXED (2026-08-24)"). The contract's
+        // own domain hash is `keccak256(abi.encode(address(this),
+        // EXPECTED_CHAIN_ID, blueprintCalldata))` — three top-level
+        // params, not a struct — so this must be the flat-tuple encoding,
+        // not the single-dynamic-value encoding `.abi_encode()` produces.
+        omega_security::keccak256(&domain.abi_encode_params())
     }
 
     /// Build the ABI-encoded outer calldata for
@@ -638,8 +773,39 @@ pub(crate) fn encode_execute_call(blueprint_calldata: Vec<u8>, sig: Vec<u8>) -> 
 //   signed:   0x02 || rlp([..same 9 fields.., signature_y_parity,
 //             signature_r, signature_s])
 //
-// NOT yet checked against a known signed-transaction test vector (none was
-// available in this investigation) — see this file's top doc comment.
+// RESOLVED (2026-08-25): the "not yet checked against a known
+// signed-transaction test vector" gap this file previously flagged here
+// is closed. `encode_eip1559_signed_matches_a_real_mainnet_transaction`
+// below feeds this exact algorithm a REAL, previously-broadcast Ethereum
+// mainnet transaction's decoded fields (found via web search, decoded
+// independently via Python's `rlp` library) and confirms it reproduces
+// that transaction's real raw bytes — not spec prose, not another
+// library's synthetic construction, but bytes a real node actually
+// accepted onto mainnet. `encode_eip1559_long_form_rlp_paths_match_
+// independent_implementation` separately closes a gap NEITHER the real
+// transaction test nor any prior test in this file covered: RLP's
+// long-form length-prefix branches (byte strings/lists >= 56 bytes,
+// `rlp_bytes`'/`rlp_list`'s `else` arms), the most bug-prone part of a
+// hand-written RLP encoder — verified against Python's `rlp` library on
+// a 100-byte-calldata synthetic case, since the real mainnet transaction
+// found happened to have 68-byte calldata (itself already past the
+// 56-byte threshold, so it also exercises this path, but the synthetic
+// case makes the coverage explicit and independent of what a single
+// found transaction happens to contain).
+//
+// VERIFICATION METHOD, stated plainly: this crate could not be compiled
+// directly in the sandbox that did this verification (its current
+// alloy-primitives pin has transitive deps requiring a newer Rust
+// edition than was available there). The actual function bodies below
+// were extracted verbatim into a standalone, dependency-minimal Rust
+// program (only a trivial `Address`/`U256` byte-layout stand-in
+// swapped in — see that program's own header for exactly what was and
+// wasn't changed), compiled and run for real, and cross-checked against
+// Python's independent `rlp` library. This is the same "second,
+// independent, spec-compliant implementation" strategy already used to
+// verify the ABI-encoding fix earlier in this file's history, applied
+// here to RLP instead of ABI encoding.
+//
 // self-contained rather than pulling in alloy's consensus/signer feature
 // set, since this encoder does not need the full consensus surface, only
 // RLP.
@@ -831,6 +997,195 @@ mod tests {
         m
     }
 
+    #[test]
+    fn build_blueprint_calldata_matches_solc_golden_vector() {
+        // Fixture MUST match contracts/test/BlueprintCalldataAbi.t.sol constants.
+        let km = make_km(0x20);
+        let mut ids = HashMap::new();
+        ids.insert(
+            "SA".into(),
+            {
+                let mut arr = [0u8; 32];
+                arr.copy_from_slice(
+                    &hex::decode("c4bb1c851b1c74593f61f8d1f99ec07e2960d847a94d4a736e321ba387d4d2d7")
+                        .expect("valid strategy id hex"),
+                );
+                arr
+            },
+        );
+        let signer = KeyManagerTransactionSigner::new(
+            km,
+            Address::from([0x01; 20]),
+            ids,
+            make_blueprint_signer(0x21),
+        );
+
+        let mut bp = sample_bp();
+        // Override anything sample_bp does not pin to the Foundry fixture:
+        bp.expiry_block = 1_100;
+        bp.nonce = 0;
+        bp.flashloan_provider_type = FlashloanProviderType::Balancer;
+        bp.provider_contract = Address::ZERO;
+        bp.flashloan_token = Address::from([0x99; 20]);
+        bp.calldata = Bytes::from(vec![0xde, 0xad, 0xbe, 0xef]);
+        bp.flashloan_amount = U256::from(1_000_000u64);
+        bp.dynamic_min_profit = U256::from(100_000u64);
+        bp.max_base_fee_gwei = 30; // → 30e9 wei in build_blueprint_calldata
+
+        let encoded = signer.build_blueprint_calldata(&bp).unwrap();
+
+        // Golden hex confirmed against `forge test
+        // --match-test test_print_golden_blueprint_calldata -vv` in
+        // contracts/test/BlueprintCalldataAbi.t.sol — a real compiled
+        // solc/EVM encode of the same fields, not a value derived from
+        // this file's own encoder.
+        let solc_golden = hex::decode(
+            "000000000000000000000000000000000000000000000000000000000000044c\
+            0000000000000000000000000000000000000000000000000000000000000000\
+            c4bb1c851b1c74593f61f8d1f99ec07e2960d847a94d4a736e321ba387d4d2d7\
+            0000000000000000000000000000000000000000000000000000000000000000\
+            0000000000000000000000009999999999999999999999999999999999999999\
+            0000000000000000000000000000000000000000000000000000000000000000\
+            0000000000000000000000000000000000000000000000000000000000000140\
+            00000000000000000000000000000000000000000000000000000000000f4240\
+            00000000000000000000000000000000000000000000000000000000000186a0\
+            00000000000000000000000000000000000000000000000000000006fc23ac00\
+            0000000000000000000000000000000000000000000000000000000000000004\
+            deadbeef00000000000000000000000000000000000000000000000000000000",
+        )
+        .expect("valid golden hex");
+
+        assert_eq!(
+            encoded.as_slice(),
+            solc_golden.as_slice(),
+            "Rust ABI must match solc abi.encode of execute() decode tuple"
+        );
+    }
+
+    // ── Known strategy onchain_ids — cross-check, not production data ──────
+    //
+    // See this file's top doc comment, item 4 (RESOLVED 2026-08-25), for the
+    // full evidence chain: these five values are transcribed here PURELY for
+    // a verification cross-check, not as production configuration — the
+    // actual production map lives in crates/omega-engine/src/main.rs's own
+    // `strategy_onchain_ids()`, sourced from contracts/src/StrategyIds.sol.
+    // This function is never called by KeyManagerTransactionSigner itself.
+    fn known_strategy_onchain_ids() -> HashMap<&'static str, [u8; 32]> {
+        fn hash32(hex_str: &str) -> [u8; 32] {
+            hex::decode(hex_str)
+                .expect("valid hex")
+                .try_into()
+                .expect("exactly 32 bytes")
+        }
+        let mut m = HashMap::new();
+        // StrategyIds.sol::SIMPLE_ARB — keccak256("OMEGA_STRATEGY_SA"). Same
+        // value already locked into build_blueprint_calldata_matches_solc_
+        // golden_vector above and cross-checked there against a real solc
+        // output.
+        m.insert(
+            "SA",
+            hash32("c4bb1c851b1c74593f61f8d1f99ec07e2960d847a94d4a736e321ba387d4d2d7"),
+        );
+        // StrategyIds.sol::LIQUIDATION_ARB — keccak256("OMEGA_STRATEGY_LA")
+        m.insert(
+            "LA",
+            hash32("77b0296a1c4dae896ee0ffe05246d8b3e8ecd44a1d4a0c6591b183fb2390a698"),
+        );
+        // StrategyIds.sol::MULTI_STEP_ARB — keccak256("OMEGA_STRATEGY_MSA")
+        m.insert(
+            "MSA",
+            hash32("bfd7e8e9c54a6762cb6ff399dc8bdefe2226a32400ed6001e1bee533bbaa25d2"),
+        );
+        // StrategyIds.sol::MEV_OFA — keccak256("OMEGA_STRATEGY_MEV")
+        m.insert(
+            "MEV",
+            hash32("892be743cfc8880f51726a84ab1d0d0fc05336d49927c5a9eaaf926a84db319a"),
+        );
+        // StrategyIds.sol::CANARY_ARB — keccak256("OMEGA_STRATEGY_CNRY")
+        m.insert(
+            "CNRY",
+            hash32("93879ddf9ec0b01c066594680539ea61eaab23f806b410fda1c18659efcc7725"),
+        );
+        m
+    }
+
+    #[test]
+    fn known_strategy_onchain_ids_match_their_documented_keccak256_preimages() {
+        // The real teeth of this test: StrategyIds.sol documents each
+        // constant with a `/// @dev keccak256("OMEGA_STRATEGY_<X>")`
+        // comment. This recomputes that hash independently — using
+        // omega_security::keccak256, the SAME primitive compute_bp_hash
+        // above uses elsewhere in this file — and confirms each of the
+        // five transcribed constants actually equals what its own source
+        // comment claims. This is strictly stronger than comparing this
+        // list against itself: it verifies the values against their
+        // documented DERIVATION, not just against another transcription of
+        // the same numbers. (Cross-checked once already, outside this
+        // codebase, via a second, independent keccak256 implementation —
+        // Python's Crypto.Hash.keccak — with an identical result for all
+        // five; this test makes that verification permanent and
+        // repeatable via `cargo test`, rather than a one-off check.)
+        let ids = known_strategy_onchain_ids();
+        let preimages: &[(&str, &str)] = &[
+            ("SA", "OMEGA_STRATEGY_SA"),
+            ("LA", "OMEGA_STRATEGY_LA"),
+            ("MSA", "OMEGA_STRATEGY_MSA"),
+            ("MEV", "OMEGA_STRATEGY_MEV"),
+            ("CNRY", "OMEGA_STRATEGY_CNRY"),
+        ];
+        for (name, preimage) in preimages {
+            let computed = omega_security::keccak256(preimage.as_bytes());
+            assert_eq!(
+                ids[name], computed,
+                "{name}'s onchain_id must equal keccak256(\"{preimage}\") — \
+                 StrategyIds.sol's own documented derivation for this constant"
+            );
+        }
+    }
+
+    #[test]
+    fn known_strategy_onchain_ids_are_internally_consistent() {
+        let ids = known_strategy_onchain_ids();
+
+        assert_eq!(ids.len(), 5, "expected exactly the five named strategies");
+
+        // No two strategies may share a bytes32 id — a duplicate here would
+        // mean OmegaOrchestrator.execute() could authorize the wrong
+        // strategy's blueprint under another strategy's signature.
+        let mut seen: Vec<[u8; 32]> = ids.values().copied().collect();
+        seen.sort();
+        seen.dedup();
+        assert_eq!(
+            seen.len(),
+            5,
+            "all five strategy onchain_ids must be pairwise distinct — a \
+             duplicate suggests a copy-paste transcription error"
+        );
+
+        // None may be all-zero — same fail-closed reasoning
+        // parse_onchain_id-style validation applies elsewhere in this
+        // workspace (see omega-security::integrity.rs's parse_bytecode_hash/
+        // parse_contract_address, which reject all-zero the same way).
+        for (name, id) in &ids {
+            assert_ne!(*id, [0u8; 32], "{name}'s onchain_id must not be all-zero");
+        }
+
+        // SA specifically must match the byte-for-byte solc-confirmed value
+        // already locked into build_blueprint_calldata_matches_solc_golden_
+        // vector above — the one value in this set with independent solc
+        // verification behind it in addition to the keccak256 preimage
+        // check above.
+        let expected_sa = hex::decode(
+            "c4bb1c851b1c74593f61f8d1f99ec07e2960d847a94d4a736e321ba387d4d2d7",
+        )
+        .unwrap();
+        assert_eq!(
+            ids["SA"].as_slice(),
+            expected_sa.as_slice(),
+            "SA's onchain_id must match the solc-golden-verified value used elsewhere in this file"
+        );
+    }
+
     // ── Construction guard ────────────────────────────────────────────────
 
     #[test]
@@ -965,14 +1320,19 @@ mod tests {
 
     #[test]
     fn build_blueprint_calldata_round_trips_through_abi_decode() {
-        // Strong self-consistency check in place of an external solc/EVM
-        // oracle: decode what we just encoded via alloy-sol-types' own
-        // abi_decode, and confirm every field survives the round trip.
-        // This validates the `Blueprint` sol! type is internally
-        // consistent and that every field was assigned to the position I
-        // intended — it does NOT independently prove byte-for-byte
-        // agreement with solc's own encoder, though alloy-sol-types is a
-        // widely-used, spec-compliant ABI implementation.
+        // Self-consistency check, complementary to (not a substitute
+        // for) `build_blueprint_calldata_matches_solc_golden_vector`
+        // above: decode what we just encoded via alloy-sol-types' own
+        // abi_decode_params, and confirm every field survives the round
+        // trip. This validates every field was assigned to the position
+        // intended, using the same encode/decode pair, so a
+        // self-consistent-but-wrong encoding (e.g. the 2026-08-24
+        // abi_encode()-vs-abi_encode_params() bug — see this file's top
+        // doc comment) would NOT have been caught by this test alone,
+        // since both sides would have shared the same bug. It was only
+        // caught by comparing against an independent solc/EVM oracle,
+        // which is what the golden-vector test above does and this test
+        // does not.
         let km = make_km(0x07);
         let signer = KeyManagerTransactionSigner::new(
             km,
@@ -983,7 +1343,13 @@ mod tests {
         let bp = sample_bp();
         let encoded = signer.build_blueprint_calldata(&bp).unwrap();
 
-        let decoded = Blueprint::abi_decode(&encoded, true).unwrap();
+        // abi_decode_params, matching build_blueprint_calldata's
+        // abi_encode_params — see this file's top doc comment, "BUG
+        // FOUND AND FIXED (2026-08-24)". Using the mismatched
+        // Blueprint::abi_decode (the single-dynamic-value form) here
+        // would decode the flat-tuple bytes against the wrong head
+        // shape rather than catching an encode/decode mismatch.
+        let decoded = Blueprint::abi_decode_params(&encoded, true).unwrap();
         assert_eq!(decoded.expiry_block, bp.expiry_block);
         assert_eq!(decoded.nonce, bp.nonce);
         assert_eq!(decoded.provider_type, bp.flashloan_provider_type as u8);
@@ -1005,13 +1371,78 @@ mod tests {
         );
         let bp = sample_bp();
         let encoded = signer.build_blueprint_calldata(&bp).unwrap();
-        let decoded = Blueprint::abi_decode(&encoded, true).unwrap();
+        // abi_decode_params — see the round-trip test above and this
+        // file's top doc comment, "BUG FOUND AND FIXED (2026-08-24)".
+        let decoded = Blueprint::abi_decode_params(&encoded, true).unwrap();
         let expected =
             U256::from(bp.max_base_fee_gwei).saturating_mul(U256::from(1_000_000_000u64));
         assert_eq!(decoded.max_base_fee, expected);
     }
 
     // ── compute_bp_hash — domain separation ─────────────────────────────────
+
+    #[test]
+    fn compute_bp_hash_matches_solc_golden_vector() {
+        // Fixture MUST match contracts/test/DomainSeparatedBlueprintHash.t.sol's
+        // ORCHESTRATOR / CHAIN_ID / BLUEPRINT_CALLDATA constants. Closes
+        // the gap this file's top doc comment, "BUG FOUND AND FIXED
+        // (2026-08-24)", flagged in its CAVEAT paragraph: until this
+        // test existed, `compute_bp_hash`'s `abi_encode_params()` fix was
+        // inspection-resolved by analogy to `build_blueprint_calldata`'s
+        // confirmed bug, not independently verified against a real
+        // solc/EVM oracle the way `build_blueprint_calldata_matches_
+        // solc_golden_vector` verifies `build_blueprint_calldata`.
+        let km = make_km(0x22);
+        let signer = KeyManagerTransactionSigner::new(
+            km,
+            Address::from([0x01; 20]),
+            strategy_ids_with_sa(),
+            make_blueprint_signer(0x23),
+        );
+
+        // Identical bytes to build_blueprint_calldata_matches_solc_
+        // golden_vector's own solc_golden constant above — deliberately
+        // reused rather than an arbitrary fixture, so this test's input
+        // is itself already solc-verified and the two golden vectors
+        // can't quietly drift apart from each other.
+        let blueprint_calldata = hex::decode(
+            "000000000000000000000000000000000000000000000000000000000000044c\
+            0000000000000000000000000000000000000000000000000000000000000000\
+            c4bb1c851b1c74593f61f8d1f99ec07e2960d847a94d4a736e321ba387d4d2d7\
+            0000000000000000000000000000000000000000000000000000000000000000\
+            0000000000000000000000009999999999999999999999999999999999999999\
+            0000000000000000000000000000000000000000000000000000000000000000\
+            0000000000000000000000000000000000000000000000000000000000000140\
+            00000000000000000000000000000000000000000000000000000000000f4240\
+            00000000000000000000000000000000000000000000000000000000000186a0\
+            00000000000000000000000000000000000000000000000000000006fc23ac00\
+            0000000000000000000000000000000000000000000000000000000000000004\
+            deadbeef00000000000000000000000000000000000000000000000000000000",
+        )
+        .expect("valid blueprint calldata golden hex");
+
+        let bp_hash = signer.compute_bp_hash(&blueprint_calldata, 42161);
+
+        // Confirmed against solc/EVM itself via `forge test --match-test
+        // test_print_golden_domain_separated_blueprint_hash -vv` in
+        // contracts/test/DomainSeparatedBlueprintHash.t.sol, which
+        // printed this exact value — an EXACT match to the value
+        // originally seeded here via an independent Python (eth_abi)
+        // computation, so no update was needed once forge confirmed it.
+        // Closes the CAVEAT this file's top doc comment previously
+        // tracked for compute_bp_hash's abi_encode_params() fix.
+        let solc_golden: [u8; 32] = hex::decode(
+            "74d1c22598dab6e5f1cb1a1809d3b7255728a0c10c971a9f05257cd6758b356b",
+        )
+        .expect("valid golden hash hex")
+        .try_into()
+        .expect("golden hash must be exactly 32 bytes");
+
+        assert_eq!(
+            bp_hash, solc_golden,
+            "compute_bp_hash must match the independently cross-checked domain-separated hash"
+        );
+    }
 
     #[test]
     fn compute_bp_hash_is_deterministic() {
@@ -1252,6 +1683,116 @@ mod tests {
             "signed payload must be strictly larger (it has 3 extra fields)"
         );
         assert_eq!(signed[0], 0x02);
+    }
+
+    #[test]
+    fn encode_eip1559_signed_matches_a_real_mainnet_transaction() {
+        // GOLDEN VECTOR — a REAL, previously-broadcast Ethereum mainnet
+        // transaction, not a synthetic case. Found via web search (a
+        // github.com/ethers-io/ethers.js discussion where someone pasted
+        // this raw tx while debugging RLP decoding — it calls USDT's
+        // transfer(), selector 0xa9059cbb). Its fields were decoded
+        // independently via Python's `rlp` library, then fed through a
+        // standalone extraction of THIS FILE's own encode_eip1559_signed
+        // (same function body, compiled and run for real, outside this
+        // crate's own alloy-primitives version constraints — see this
+        // file's top doc comment's "EIP-1559 RLP encoding helpers"
+        // section for the verification history), and confirmed to
+        // reproduce these exact bytes.
+        //
+        // This closes the specific gap flagged in this file's own module
+        // doc comment history: the RLP encoder had only ever been
+        // checked against the EIP-1559 spec's prose (structural checks
+        // like "starts with 0x02," "empty list is 0xc0") — never against
+        // bytes a real Ethereum node actually accepted. This is that
+        // check: not "matches spec text," not "matches another library's
+        // synthetic construction," but "matches bytes mined into a real
+        // Ethereum block."
+        //
+        // Also independently exercises the LONG-FORM RLP paths (see
+        // rlp_bytes'/rlp_list's `else` branches) via this transaction's
+        // 68-byte calldata — the most bug-prone part of a hand-written
+        // RLP encoder, and NOT exercised by any of this file's other
+        // encode_eip1559_* tests, which all use short (<56-byte) data.
+        let real_data = hex::decode(
+            "a9059cbb000000000000000000000000622779096805724b38c42b51989ddca32d671a\
+             000000000000000000000000000000000000000000000000000000000022df0080",
+        )
+        .expect("valid real tx calldata hex");
+        let real_to_bytes: [u8; 20] = hex::decode("dac17f958d2ee523a2206206994597c13d831ec7")
+            .expect("valid real tx `to` hex")
+            .try_into()
+            .expect("real tx `to` must be exactly 20 bytes");
+        let real_to = Address::from(real_to_bytes);
+        let real_r = hex::decode("236084da36000fb2c7373cfa78e8f1bc9d8eb081dc240630c8024aa06fc39f96")
+            .expect("valid real tx r hex");
+        let real_s = hex::decode("30bdc5cd4e1f5f6abbb36c3b004270b68724cc46c56ad5847c99f8ced9c4112d")
+            .expect("valid real tx s hex");
+
+        let signed = encode_eip1559_signed(
+            1,      // chain_id — Ethereum mainnet
+            86964,  // nonce
+            U256::from(1_000_000_000u64),  // max_priority_fee_per_gas
+            U256::from(34_154_125_362u64), // max_fee_per_gas
+            120_000,                        // gas_limit
+            real_to,
+            U256::ZERO, // value
+            &real_data,
+            1, // y_parity
+            &real_r,
+            &real_s,
+        );
+
+        let expected_raw_hex = "02f8b401830153b4843b9aca008507f3be98328301d4c094dac17f958d2ee523a2206206994597c13d831ec780b844a9059cbb000000000000000000000000622779096805724b38c42b51989ddca32d671a000000000000000000000000000000000000000000000000000000000022df0080c001a0236084da36000fb2c7373cfa78e8f1bc9d8eb081dc240630c8024aa06fc39f96a030bdc5cd4e1f5f6abbb36c3b004270b68724cc46c56ad5847c99f8ced9c4112d";
+        assert_eq!(
+            hex::encode(&signed),
+            expected_raw_hex,
+            "must reproduce a real, previously-mined Ethereum transaction's raw bytes exactly"
+        );
+    }
+
+    #[test]
+    fn encode_eip1559_long_form_rlp_paths_match_independent_implementation() {
+        // Synthetic but targeted: calldata >= 56 bytes forces rlp_bytes'
+        // long-form branch (0xb7+len_of_len prefix), and pushes the
+        // outer list payload past 55 bytes too, forcing rlp_list's own
+        // long-form branch (0xf7+len_of_len). Verified this session
+        // (standalone extraction) against Python's independent `rlp`
+        // library — byte-for-byte match, including both long-form
+        // prefixes (confirmed present via the 0xf8/0xb8 bytes in the
+        // expected hex below). Kept here as a permanent regression test
+        // for the same case, rather than only a one-off check.
+        let data: Vec<u8> = (0u8..100).collect();
+        let to = Address::from([0x33; 20]);
+
+        let unsigned = encode_eip1559_unsigned(
+            42161,
+            99,
+            U256::from(3_000_000_000u64),
+            U256::from(15_000_000_000u64),
+            2_000_000,
+            to,
+            U256::ZERO,
+            &data,
+        );
+        let expected_unsigned_hex = "02f89082a4b16384b2d05e0085037e11d600831e848094333333333333333333333333333333333333333380b864000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f404142434445464748494a4b4c4d4e4f505152535455565758595a5b5c5d5e5f60616263c0";
+        assert_eq!(hex::encode(&unsigned), expected_unsigned_hex);
+
+        let signed = encode_eip1559_signed(
+            42161,
+            99,
+            U256::from(3_000_000_000u64),
+            U256::from(15_000_000_000u64),
+            2_000_000,
+            to,
+            U256::ZERO,
+            &data,
+            1,
+            &[0x33; 32],
+            &[0x44; 32],
+        );
+        let expected_signed_hex = "02f8d382a4b16384b2d05e0085037e11d600831e848094333333333333333333333333333333333333333380b864000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f404142434445464748494a4b4c4d4e4f505152535455565758595a5b5c5d5e5f60616263c001a03333333333333333333333333333333333333333333333333333333333333333a04444444444444444444444444444444444444444444444444444444444444444";
+        assert_eq!(hex::encode(&signed), expected_signed_hex);
     }
 
     // ── Test fixtures ────────────────────────────────────────────────────

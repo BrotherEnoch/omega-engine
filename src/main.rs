@@ -579,13 +579,16 @@
 // here; if `StrategyIds.sol` is ever changed, this map must be updated to match by hand —
 // nothing in this codebase keeps the two in sync automatically.
 //
-// STILL OPEN, not closed by this change — see signer.rs's own doc comment for the full,
-// still-accurate list: the RLP/ABI encoding has only been self-consistency-checked
-// (encode then decode via alloy-sol-types' own decoder), never against a real solc/EVM
-// oracle or an actual testnet transaction; and `max_fee_per_gas`'s formula in signer.rs
-// remains an explicit, unapproved placeholder. Wiring this in makes C6 signing REACHABLE
-// in production, not independently verified end-to-end — the first real testnet execution
-// is the actual verification step, not this wiring change.
+// // C6 ABI vs RLP status (as of 2026-08-24 / post–BlueprintCalldataAbi golden):
+//
+//   - blueprintCalldata ABI: verified bit-for-bit against solc via
+//     contracts/test/BlueprintCalldataAbi.t.sol and
+//     omega-execution::signer::tests::build_blueprint_calldata_matches_solc_golden_vector.
+//   - EIP-1559 RLP (encode_eip1559_unsigned / encode_eip1559_signed): still only
+//     structural checks against the EIP-1559/RLP text (type byte 0x02, list
+//     headers, etc.) — not yet checked against a node-accepted signed-tx vector.
+//   - End-to-end testnet execute() and blueprint-key ↔ execution_key match remain
+//     operational/deployment steps, not closed by the ABI golden alone.
 
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -1954,7 +1957,9 @@ async fn main() -> Result<()> {
     //
     // Replaces C1's fail-closed UnconfiguredSigner stub — see this file's module-level
     // "C6" doc comment for the full design and what's still open after this change
-    // (RLP/ABI encoding self-consistency only, no external solc/EVM oracle checked yet;
+    // (blueprintCalldata ABI: locked to solc golden in BlueprintCalldataAbi.t.sol +
+    //  omega-execution signer golden test; EIP-1559 RLP: structural checks only —
+    //  not yet verified against a node-accepted signed-tx vector;
     // the fee formula in signer.rs remains an explicit, unapproved placeholder).
     let orchestrator_address = parse_address_env("ORCHESTRATOR_ADDRESS")
         .context("ORCHESTRATOR_ADDRESS must be set -- the deployed OmegaOrchestrator contract \
