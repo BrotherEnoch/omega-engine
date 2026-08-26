@@ -1,0 +1,56 @@
+# config/deployment_manifest.toml
+# Gap 6 / C4-A — IntegrityRegistry deployment manifest
+#
+# Loaded at startup by src/main.rs via load_deployment_manifest(DEPLOYMENT_MANIFEST_PATH).
+# Parsed as omega_security::DeploymentManifest { strategies: Vec<StrategyDeployment> }.
+#
+# Rules enforced by strategy_entries_from_manifest():
+#   - bytecode_hash: 32 bytes hex (optional 0x), MUST NOT be all-zero
+#   - contract_address: 20 bytes hex (optional 0x), MUST NOT be all-zero
+#   - malformed hex / wrong length / zero → startup HALTS (fail closed)
+#   - only entries with min_phase <= active_phase are registered
+#
+# DO NOT commit placeholder/zero data. Generate this file with:
+#   cargo run -p omega-manifest-gen -- \
+#     --forge-broadcast broadcast/Deploy.s.sol/42161/run-latest.json \
+#     --strategy-map strategy-map.json \
+#     --output config/deployment_manifest.toml
+# or:
+#   cargo run -p omega-manifest-gen -- \
+#     --manual strategies.toml --output config/deployment_manifest.toml
+#
+# Related (different format, used by Foundry RegisterStrategies.s.sol):
+#   config/deployment/arbitrum.toml  — NOT this file
+
+strategies = [
+  # {
+  #   strategy_id      = "CNRY"   # "SA" | "MSA" | "LA" | "MEV" | "CNRY"
+  #   bytecode_hash    = "0x..."  # keccak256 of runtime bytecode (64 hex chars)
+  #   contract_address = "0x..."  # deployed implementation (40 hex chars)
+  #   min_phase        = 0        # u8; phase at which strategy becomes active
+  # },
+  # {
+  #   strategy_id      = "SA"
+  #   bytecode_hash    = "0x..."
+  #   contract_address = "0x..."
+  #   min_phase        = 1
+  # },
+  # {
+  #   strategy_id      = "MSA"
+  #   bytecode_hash    = "0x..."
+  #   contract_address = "0x..."
+  #   min_phase        = 2
+  # },
+  # {
+  #   strategy_id      = "LA"
+  #   bytecode_hash    = "0x..."
+  #   contract_address = "0x..."
+  #   min_phase        = 3
+  # },
+  # {
+  #   strategy_id      = "MEV"
+  #   bytecode_hash    = "0x..."
+  #   contract_address = "0x..."
+  #   min_phase        = 4
+  # },
+]

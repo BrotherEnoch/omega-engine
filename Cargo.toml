@@ -231,6 +231,7 @@ omega-hot-path      = { path = "crates/omega-hot-path" }
 omega-strategies    = { path = "crates/omega-strategies" }
 omega-observability = { path = "crates/omega-observability" }
 omega-relay         = { path = "crates/omega-relay" }
+omega-flashloan     = { path = "crates/omega-flashloan" }
 # C1: newly added binary dependencies — see this file's own "C1" doc
 # comment above. omega-relay was moved up next to its pre-existing spot
 # in this list (it was already present, used only transitively before
@@ -263,6 +264,10 @@ members = [
     "crates/omega-chaos",
     "crates/omega-prl",
     "crates/omega-execution",
+    "crates/omega-simulation",
+    "crates/omega-testnet",
+    "crates/omega-control-contracts",
+    "crates/omega-frontend",
     # Fix (this revision, 8): newly added — see this file's own note
     # above. Standalone C4-A tooling binary (`gen-manifest`); not a
     # dependency of the omega-engine binary itself, so it has no entry

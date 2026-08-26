@@ -1,3 +1,4 @@
+// crates/omega-frontend/src/render.rs — OmegaEngine v12.0 Render Frame
 use omega_control_contracts::rest::LayerHealthEntry;
 
 use crate::state::{EngineStore, RealtimeStatus};

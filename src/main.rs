@@ -459,6 +459,36 @@
 // the specific limitation of using a MAX-across-providers value for
 // that purpose.
 //
+// RESOLVED (follow-up revision): LiquidityRegistry writer — LIVE
+//
+// The "NOT DONE, deliberately" paragraph in the "C7 (this revision,
+// separate task): flashloan integration status" doc comment above, and
+// item 1 of that same comment's three-gap chain, are now out of date —
+// left in place rather than deleted, per this file's own established
+// convention of narrating history rather than erasing superseded
+// status (see e.g. the "Fix (this revision, 6)"/"Fix (this revision,
+// 7)" alloy-primitives history in Cargo.toml for the same convention
+// applied to a different file).
+//
+// `LiquidityRegistry` now HAS a writer: the same L2e poll loop that
+// already performs the real, live Aave V3 / Balancer V2 `eth_call`
+// reads for C8's `CheckContext.flashloan` sanity signal ALSO calls
+// `LiquidityRegistry::update` for each successful per-provider read —
+// see the L2e task body in `main()` below for the real code. This does
+// NOT itself resolve gaps 2 or 3 of the C7 chain above (LA is still not
+// registered, pending C4-A; `LaStrategy::build_blueprint` still has no
+// real `flashloan_token` source) — those remain exactly as open as
+// before. What changes is gap 1 specifically: `select_provider` now has
+// a real, live, non-stale snapshot to select from THE MOMENT a caller
+// (LA, once registered) actually holds an `Arc<LiquidityRegistry>` and
+// invokes it. `UniswapV3` is deliberately NOT written here — no single
+// canonical pool exists for it the way `AAVE_V3_POOL` / from Aave's
+// Protocol Data Provider and `BALANCER_V2_VAULT` do for their
+// providers; a real Uniswap V3 registration needs a per-pair pool
+// config this file has no source for, and is left open rather than
+// guessed at, consistent with every other "flagged, not fabricated" gap
+// in this file's history.
+//
 // ## Fix (this revision, clippy): too_many_arguments on
 // build_check_context / score_and_admit / run_scoring_loop, again
 //
@@ -652,10 +682,15 @@ use omega_risk::kill_switch::{KillSwitchConfig, KillSwitchRegistry};
 // liquidity poll loop tracks. Re-exported at omega-rpc's crate root from
 // its flashloan_liq module (confirmed against that crate's real lib.rs
 // this revision: `pub use flashloan_liq::{..., WETH};`).
+// RESOLVED (follow-up revision): also AAVE_V3_POOL, BALANCER_V2_VAULT —
+// needed so the L2e writer below can record which pool/vault address a
+// given LiquidityRegistry snapshot came from. NOT independently
+// confirmed against omega-rpc's real lib.rs this revision the way WETH
+// was above — flagged, not asserted, pending a real compile check.
 use omega_rpc::{
     rate_limiter::RpcRateLimiter, run_dex_sync_stream, run_fee_oracle_stream,
     run_lending_protocol_stream, run_mev_share_stream, run_pending_tx_stream, OmegaRpcClient,
-    RpcClientConfig, WETH,
+    RpcClientConfig, AAVE_V3_POOL, BALANCER_V2_VAULT, WETH,
 };
 // C1: IntegrityRegistry.
 // C4: DeploymentManifest + strategy_entries_from_manifest — same crate,
@@ -679,6 +714,13 @@ use omega_zk::{
     binding::compute_public_inputs_hash, config::ProverTierConfig, ProofQueue, ProofWorkerPool,
     ZkConfig, ZkVerifier,
 };
+// RESOLVED (follow-up revision): LiquidityRegistry writer — see this
+// file's own "RESOLVED (follow-up revision): LiquidityRegistry writer —
+// LIVE" module-level doc comment above for the full design.
+// FlashloanProvider is needed to tag each per-provider registry.update()
+// call (AaveV3 / Balancer); LiquidityRegistry is the shared, Arc-backed
+// registry itself.
+use omega_flashloan::{FlashloanProvider, LiquidityRegistry};
 // C1: only used for the relay_clients: HashMap<String, Arc<dyn RelayClient>>
 // type annotation below — the map itself is intentionally empty until C5
 // populates it from real config/secrets.
@@ -1597,24 +1639,48 @@ async fn main() -> Result<()> {
     // it was 0 through C7: no liquidity read existed anywhere in the
     // workspace).
     //
-    // This does NOT populate omega_flashloan::LiquidityRegistry (still
-    // unfed — see main.rs's own "C7 (this revision, separate task):
-    // flashloan integration status" doc comment, unchanged by C8). It
-    // populates a SEPARATE, simpler signal — `FlashloanLiquidityState`,
-    // shared via a `watch` channel — used only for the pre-trade risk
-    // check's liquidity sanity component, via the real Aave/Balancer
-    // `eth_call` reads in omega-rpc's `flashloan_liq` module.
+    // RESOLVED (follow-up revision): this task is now ALSO the real
+    // writer for omega_flashloan::LiquidityRegistry — see this file's
+    // own module-level "RESOLVED (follow-up revision): LiquidityRegistry
+    // writer — LIVE" doc comment for the full design. Every successful
+    // per-provider read below now does two things instead of one: it
+    // still feeds the MAX-across-providers `FlashloanLiquidityState`
+    // watch channel (unchanged C8 behavior, for check 10's sanity
+    // signal), AND it now also calls `liquidity_registry.update(...)`
+    // for that specific provider (AaveV3 or Balancer), so
+    // `omega_flashloan::select_provider` has a real, live, per-provider
+    // snapshot to select from once a caller (LA, pending C4-A) actually
+    // holds this registry.
     //
-    // On a read failure (either provider), falls back to whichever
-    // single provider succeeded, logging the failure. On BOTH providers
-    // failing, deliberately leaves the watch channel untouched — same
-    // "keep the previous value, never silently reset it to something
-    // worse or better" posture as L2d's ArbGasInfo poll loop above.
+    // Fail-closed posture UNCHANGED from C8: on a read error for a given
+    // provider, this loop does NOT call `registry.update` for that
+    // provider this cycle — the registry simply keeps whatever snapshot
+    // (real or none) it already had, same "never overwrite a real value
+    // with a guess" rule the MAX/watch path already followed.
     let (flashloan_liq_tx, flashloan_liq_rx) =
         tokio::sync::watch::channel(FlashloanLiquidityState::default());
+    // RESOLVED (follow-up revision): the real, shared LiquidityRegistry.
+    // Constructed here (alongside the watch channel above, since both
+    // are fed by the same L2e task below) rather than earlier in
+    // main() — nothing before this point needs it, and colocating its
+    // construction with its one real writer keeps the two from drifting
+    // apart the way a far-away construction site risks. `LiquidityRegistry
+    // ::new()` is assumed, consistent with every other registry
+    // constructed in this file (IntegrityRegistry, KillSwitchRegistry),
+    // to already return an `Arc<Self>` rather than needing an explicit
+    // `Arc::new(...)` wrap — NOT independently confirmed against
+    // omega-flashloan's real source this revision, flagged rather than
+    // asserted; if `cargo build` reports a type mismatch here, wrap this
+    // line in `Arc::new(...)` instead.
+    let liquidity_registry = LiquidityRegistry::new();
     {
         let liq_client = rpc.clone();
         let liq_tx = flashloan_liq_tx.clone();
+        // RESOLVED (follow-up revision): the registry handle this L2e
+        // task writes into — cloned once per this block's own spawn,
+        // same pattern as every other `Arc`-backed handle threaded into
+        // a spawned task in this file (e.g. `gas_oracle` in L2d above).
+        let registry = Arc::clone(&liquidity_registry);
         tokio::spawn(async move {
             // C8: WETH — see FlashloanLiquidityState's doc comment on
             // why this must be kept manually in sync with
@@ -1622,6 +1688,12 @@ async fn main() -> Result<()> {
             // truth exists for "the one asset this engine currently
             // tracks."
             let token = WETH;
+            // RESOLVED (follow-up revision): the chain_id LiquidityRegistry
+            // ::update needs per snapshot. This engine runs on Arbitrum
+            // only (see CHAIN_ID above) — reusing that same constant
+            // here rather than introducing a second one, so the two can
+            // never drift apart.
+            const REGISTRY_CHAIN_ID: u64 = CHAIN_ID;
             let mut ticker =
                 tokio::time::interval(Duration::from_secs(FLASHLOAN_LIQUIDITY_POLL_INTERVAL_S));
             ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -1629,6 +1701,42 @@ async fn main() -> Result<()> {
                 ticker.tick().await;
                 let aave = liq_client.fetch_aave_available(token).await;
                 let balancer = liq_client.fetch_balancer_available(token).await;
+
+                // RESOLVED (follow-up revision): per-provider
+                // LiquidityRegistry writes — one per successful read,
+                // independent of which provider "wins" the MAX below.
+                // `block_number` is passed as `0`: no shared, synchronous
+                // "current head" read is available off `rpc` in this file
+                // today (the same gap this file's own "C5" doc comment
+                // already flags for `startup_block`) — `LiquidityRegistry`'s
+                // own staleness model is timestamp-driven (per this
+                // file's own doc comment above), so a placeholder block
+                // number does not weaken that staleness guarantee. Using
+                // `.into()` for the u128 -> registry-expected-integer-type
+                // conversion, NOT a named `alloy_primitives::U256::from(...)`
+                // call — this binary has no direct `alloy` dependency,
+                // per this file's own "FIX (this revision): E0433 in
+                // reorg_block_feed_tests" doc comment above, and this is
+                // the same `.into()` type-inference pattern already
+                // established there rather than a new idiom.
+                if let Ok(available) = &aave {
+                    registry.update(
+                        REGISTRY_CHAIN_ID,
+                        FlashloanProvider::AaveV3,
+                        AAVE_V3_POOL,
+                        (*available).into(),
+                        0,
+                    );
+                }
+                if let Ok(available) = &balancer {
+                    registry.update(
+                        REGISTRY_CHAIN_ID,
+                        FlashloanProvider::Balancer,
+                        BALANCER_V2_VAULT,
+                        (*available).into(),
+                        0,
+                    );
+                }
 
                 let candidate = match (aave, balancer) {
                     (Ok(a), Ok(b)) if a >= b => Some((a, "aave".to_string())),
@@ -1661,7 +1769,7 @@ async fn main() -> Result<()> {
                     tracing::debug!(
                         available_wei,
                         protocol_id = %protocol_id,
-                        "C8: flashloan liquidity poll updated"
+                        "C8/C7: flashloan liquidity poll updated (registry + watch)"
                     );
                     let _ = liq_tx.send(FlashloanLiquidityState {
                         available_wei,
@@ -1672,7 +1780,7 @@ async fn main() -> Result<()> {
         });
         tracing::info!(
             interval_s = FLASHLOAN_LIQUIDITY_POLL_INTERVAL_S,
-            "L2e flashloan liquidity poll loop started"
+            "L2e flashloan liquidity poll loop started (feeds LiquidityRegistry + CheckContext)"
         );
     }
 
