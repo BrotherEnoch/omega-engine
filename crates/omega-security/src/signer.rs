@@ -127,6 +127,13 @@ impl BlueprintSigner {
         }
     }
 
+    /// Ethereum address of the KeyManager's current active key.
+    /// Used by `KeyManagerTransactionSigner` to fail closed if a produced
+    /// authorization signature does not recover to this address.
+    pub fn active_address(&self) -> [u8; 20] {
+        self.key_manager.active_address()
+    }
+
     /// Sign `blueprint_hash` with the current active execution key, using
     /// the EIP-191 personal-sign prefix.
     ///
