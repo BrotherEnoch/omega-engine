@@ -71,7 +71,8 @@ impl EngineStore {
         match &event {
             WsEvent::HealthTransition { layer, to, .. } => {
                 if let Some(health) = &mut self.health {
-                    if let Some(entry) = health.layers.iter_mut().find(|entry| entry.layer == *layer)
+                    if let Some(entry) =
+                        health.layers.iter_mut().find(|entry| entry.layer_id == *layer)
                     {
                         entry.state = to.clone();
                         entry.is_operational = to != "HALTED";
@@ -97,6 +98,18 @@ impl EngineStore {
                 self.consecutive_ceiling_hits = Some(*consecutive_hits);
                 self.model_paused = Some(*paused);
             }
+            // Trading-engine telemetry (bridged from OmegaEvent via obs_bridge).
+            // EngineStore has no dedicated fields for these yet — they're
+            // captured via last_event/last_event_at below but not otherwise
+            // projected into store state. Add fields here if/when the UI
+            // needs to surface gas-model reverts, emergency-skip reasons,
+            // profit splits, reorg risk, or confirmed-blueprint profit.
+            WsEvent::GasModelReverted { .. }
+            | WsEvent::GasModelCeilingEscalation { .. }
+            | WsEvent::EmergencyBundleSkipped { .. }
+            | WsEvent::ProfitSplit { .. }
+            | WsEvent::LaReorgRisk { .. }
+            | WsEvent::BlueprintConfirmed { .. } => {}
         }
 
         self.last_event = Some(event);
@@ -119,7 +132,13 @@ impl EventTimestamp for WsEvent {
             | WsEvent::ModelPauseChanged { timestamp, .. }
             | WsEvent::BlacklistReloaded { timestamp, .. }
             | WsEvent::ConfigReloaded { timestamp }
-            | WsEvent::CeilingEscalation { timestamp, .. } => *timestamp,
+            | WsEvent::CeilingEscalation { timestamp, .. }
+            | WsEvent::GasModelReverted { timestamp, .. }
+            | WsEvent::GasModelCeilingEscalation { timestamp, .. }
+            | WsEvent::EmergencyBundleSkipped { timestamp, .. }
+            | WsEvent::ProfitSplit { timestamp, .. }
+            | WsEvent::LaReorgRisk { timestamp, .. }
+            | WsEvent::BlueprintConfirmed { timestamp, .. } => *timestamp,
         }
     }
 }
@@ -135,9 +154,15 @@ mod tests {
         store.ingest_health(HealthSnapshot {
             generated_at: Utc::now(),
             layers: vec![LayerHealthEntry {
-                layer: "relay".into(),
+                layer_id: "relay".into(),
                 state: "HEALTHY".into(),
                 is_operational: true,
+                // NOTE: `reason` is assumed to be `String` here (empty on a
+                // healthy entry). If `LayerHealthEntry::reason` is actually
+                // `Option<String>` in omega-control-contracts, change this to
+                // `None`. I don't have that struct's definition, only the
+                // compiler's field list, so this line may need a one-word fix.
+                reason: String::new(),
             }],
             system_halted: false,
         });

@@ -35,7 +35,7 @@ impl Default for GateCriteria {
             min_cycles: 500,
             min_soak_hours: 72,
             min_relay_acceptance_rate: 0.90,
-            max_mean_profit_divergence_wei: 50_000_000_000_000, // 0.00005 ETH
+            max_mean_profit_divergence_wei: 50_000_000_000_000.0, // 0.00005 ETH
             min_net_realized_profit_wei: 0,
         }
     }

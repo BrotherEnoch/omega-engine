@@ -100,10 +100,27 @@ impl BundleSubmitter for SimulationSubmitter {
             .max_fee_per_gas(bundle.max_fee_per_gas)
             .max_priority_fee_per_gas(bundle.max_priority_fee_per_gas);
 
+        // FIX (this revision): `client` here is the `SignerMiddleware`
+        // constructed just above, not `self.provider` directly — its
+        // `get_balance` fails with `SignerMiddlewareError<Provider<Http>,
+        // Wallet<...>>`, a distinct type from the plain `ProviderError`
+        // that `SimError::Provider`'s `#[from]` converts. Passing
+        // `SimError::Provider` as a bare function pointer to `map_err`
+        // requires the closure's input type to match exactly, which it
+        // doesn't here (E0631) — the two calls on `self.provider` itself
+        // above (`get_chainid`, `has_sufficient_balance`'s `get_balance`)
+        // are fine as-is since those genuinely run through the bare
+        // `Provider<Http>` and do fail with `ProviderError`. Fixed by
+        // routing these two `client.get_balance` calls through
+        // `SimError::Contract(e.to_string())` instead — the same variant
+        // this function already uses for `send_transaction`/`pending`
+        // errors a few lines below, so this isn't a new error category,
+        // just applying the one already in use here consistently to
+        // every `SignerMiddleware`-sourced error in this function.
         let balance_before = client
             .get_balance(client.address(), None)
             .await
-            .map_err(SimError::Provider)?;
+            .map_err(|e| SimError::Contract(e.to_string()))?;
 
         let pending = client
             .send_transaction(tx, None)
@@ -118,7 +135,7 @@ impl BundleSubmitter for SimulationSubmitter {
         let balance_after = client
             .get_balance(client.address(), None)
             .await
-            .map_err(SimError::Provider)?;
+            .map_err(|e| SimError::Contract(e.to_string()))?;
 
         let success = receipt.status.map(|s| s.as_u64() == 1).unwrap_or(false);
 
@@ -198,7 +215,7 @@ mod tests {
         };
 
         let provider = Arc::new(Provider::<Http>::try_from("http://localhost:8545").unwrap());
-        let signer = LocalWallet::from_bytes(&[0u8; 32]).unwrap();
+        let signer = LocalWallet::from_bytes(&[1u8; 32]).unwrap();
         let submitter = SimulationSubmitter { provider, signer };
 
         let cost = submitter.estimated_cost(&bundle);

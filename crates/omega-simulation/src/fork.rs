@@ -48,9 +48,25 @@ impl ForkHandle {
             builder = builder.fork_block_number(block);
         }
 
-        let anvil = builder
-            .try_spawn()
-            .map_err(|e| SimError::ForkSpawnFailed(e.to_string()))?;
+        // FIX (this revision): `try_spawn()` doesn't exist on this
+        // workspace's pinned `ethers` version — the compiler's own
+        // suggestion (E0599) points at `spawn()` instead. Unlike
+        // `try_spawn()` (which presumably returned a `Result` in a newer
+        // `ethers`), `Anvil::spawn()` here returns `AnvilInstance`
+        // directly and PANICS internally if the child process fails to
+        // start or never becomes reachable (e.g. `anvil` not on PATH).
+        // This is a real behavior change from the prior
+        // `.map_err(SimError::ForkSpawnFailed)?` shape: a spawn failure
+        // now aborts the calling task via panic instead of returning
+        // `Err(SimError::ForkSpawnFailed(..))`. Flagging this rather than
+        // silently absorbing it — if callers of `ForkHandle::spawn` (e.g.
+        // a long-running harness) need spawn failures to be a normal,
+        // recoverable `Err` rather than a panic, that needs either a
+        // newer `ethers` with a real `try_spawn`, or a
+        // `std::panic::catch_unwind` wrapper here, neither of which I've
+        // added since both are bigger decisions than a compile fix
+        // warrants on their own.
+        let anvil = builder.spawn();
 
         let endpoint = anvil.endpoint();
         let provider = Provider::<Http>::try_from(endpoint.clone())

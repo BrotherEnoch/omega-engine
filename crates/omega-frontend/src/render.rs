@@ -34,7 +34,7 @@ impl RenderFrame {
 }
 
 pub fn stable_layer_key(layer: &LayerHealthEntry) -> &str {
-    &layer.layer
+    &layer.layer_id
 }
 
 fn status_label(status: RealtimeStatus) -> &'static str {

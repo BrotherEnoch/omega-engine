@@ -1724,7 +1724,18 @@ async fn main() -> Result<()> {
                         REGISTRY_CHAIN_ID,
                         FlashloanProvider::AaveV3,
                         AAVE_V3_POOL,
-                        (*available).into(),
+                        // FIX (this revision): `.into()` doesn't compile — `ruint::Uint<256, 4>`
+                        // (the alloy-primitives U256 pinned in this workspace's lockfile) has no
+                        // `From<u128>` impl (E0277; the compiler's own error lists only
+                        // FixedBytes<32>/ParseUnits/Index/Panic conversions, not u128). Routed
+                        // through `FromStr` instead via a decimal string round-trip — `Uint`
+                        // does implement `FromStr` for base-10 strings, and target-type
+                        // inference from `registry.update`'s parameter still resolves this with
+                        // no explicit type name needed, same as `.into()` didn't need one. The
+                        // `.expect(...)` is provably infallible here: `available` is a real
+                        // `u128`, and every u128 has a valid decimal string representation that
+                        // U256 (a strictly wider type) can always parse.
+                        available.to_string().parse().expect("u128 decimal string must parse into U256"),
                         0,
                     );
                 }
@@ -1733,7 +1744,7 @@ async fn main() -> Result<()> {
                         REGISTRY_CHAIN_ID,
                         FlashloanProvider::Balancer,
                         BALANCER_V2_VAULT,
-                        (*available).into(),
+                        available.to_string().parse().expect("u128 decimal string must parse into U256"),
                         0,
                     );
                 }

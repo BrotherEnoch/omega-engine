@@ -152,7 +152,17 @@ impl TestnetReport {
             }
         }
         let mut v: Vec<(String, usize)> = counts.into_iter().collect();
-        v.sort_by(|a, b| b.1.cmp(&a.1));
+        // FIX (this revision): clippy's `unnecessary_sort_by` (denied under
+        // this workspace's `-D warnings`) flags the old
+        // `sort_by(|a, b| b.1.cmp(&a.1))` — a descending sort on a single
+        // field is exactly what `sort_by_key` + `Reverse` expresses more
+        // directly, without a two-argument comparator closure. `Reverse`
+        // flips the ordering so the highest count sorts first, matching
+        // this function's documented "most common first" contract exactly
+        // as the old comparator did — this is a lint-driven rewrite, not a
+        // behavior change; `rejection_taxonomy_groups_by_reason` below
+        // still asserts the same descending order.
+        v.sort_by_key(|entry| std::cmp::Reverse(entry.1));
         v
     }
 
