@@ -1712,30 +1712,36 @@ async fn main() -> Result<()> {
                 // own staleness model is timestamp-driven (per this
                 // file's own doc comment above), so a placeholder block
                 // number does not weaken that staleness guarantee. Using
-                // `.into()` for the u128 -> registry-expected-integer-type
-                // conversion, NOT a named `alloy_primitives::U256::from(...)`
-                // call — this binary has no direct `alloy` dependency,
-                // per this file's own "FIX (this revision): E0433 in
-                // reorg_block_feed_tests" doc comment above, and this is
-                // the same `.into()` type-inference pattern already
-                // established there rather than a new idiom.
+                // FIX (this revision): E0277 — `.into()` was wrong here, not
+                // just a style choice. Confirmed via a real `cargo build`
+                // this session: `ruint::Uint<256, 4>` (the type
+                // `alloy_primitives::U256` aliases to) does NOT implement
+                // infallible `From<u128>` in the resolved ruint version —
+                // only `TryFrom<u128>` exists for that pairing. `U256::
+                // from(*available)` (an earlier, unbuilt draft of this same
+                // line) would have hit the identical trait-bound error, for
+                // the same reason — this was never an ambiguity `.into()`
+                // vs. a named path could have fixed on its own. `.try_into()`
+                // still avoids naming `alloy_primitives::` directly (this
+                // binary has no direct `alloy` dependency — see this file's
+                // own "FIX (this revision): E0433 in reorg_block_feed_tests"
+                // doc comment above for that established rule), same
+                // type-inference approach as `.into()`, just the correct
+                // trait for this specific conversion. `.expect(...)` is safe
+                // here, not a fail-open shortcut: a u128 mathematically
+                // always fits inside a 256-bit unsigned integer, so this
+                // conversion cannot fail in practice — a panic here would
+                // only fire if that invariant were somehow violated, which
+                // would itself indicate a deeper bug worth surfacing loudly
+                // rather than silently swallowing via `.unwrap_or_default()`.
                 if let Ok(available) = &aave {
                     registry.update(
                         REGISTRY_CHAIN_ID,
                         FlashloanProvider::AaveV3,
                         AAVE_V3_POOL,
-                        // FIX (this revision): `.into()` doesn't compile — `ruint::Uint<256, 4>`
-                        // (the alloy-primitives U256 pinned in this workspace's lockfile) has no
-                        // `From<u128>` impl (E0277; the compiler's own error lists only
-                        // FixedBytes<32>/ParseUnits/Index/Panic conversions, not u128). Routed
-                        // through `FromStr` instead via a decimal string round-trip — `Uint`
-                        // does implement `FromStr` for base-10 strings, and target-type
-                        // inference from `registry.update`'s parameter still resolves this with
-                        // no explicit type name needed, same as `.into()` didn't need one. The
-                        // `.expect(...)` is provably infallible here: `available` is a real
-                        // `u128`, and every u128 has a valid decimal string representation that
-                        // U256 (a strictly wider type) can always parse.
-                        available.to_string().parse().expect("u128 decimal string must parse into U256"),
+                        (*available)
+                            .try_into()
+                            .expect("u128 always fits in a 256-bit unsigned integer"),
                         0,
                     );
                 }
@@ -1744,7 +1750,9 @@ async fn main() -> Result<()> {
                         REGISTRY_CHAIN_ID,
                         FlashloanProvider::Balancer,
                         BALANCER_V2_VAULT,
-                        available.to_string().parse().expect("u128 decimal string must parse into U256"),
+                        (*available)
+                            .try_into()
+                            .expect("u128 always fits in a 256-bit unsigned integer"),
                         0,
                     );
                 }

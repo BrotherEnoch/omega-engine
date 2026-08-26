@@ -33,6 +33,12 @@ impl RenderFrame {
     }
 }
 
+// FIX (this revision): E0609 — `LayerHealthEntry` has no field named
+// `layer`. Confirmed via the compiler's own note this session:
+// `LayerHealthEntry`'s real fields are `layer_id`, `state`,
+// `is_operational`, `reason`. `.layer` was never a real field on this
+// type — renamed to `.layer_id` to match the actual struct rather than
+// guessed at a second time.
 pub fn stable_layer_key(layer: &LayerHealthEntry) -> &str {
     &layer.layer_id
 }
