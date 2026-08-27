@@ -19,6 +19,20 @@
 // backwards or forgets it entirely. Added `OraclePrice::is_valid()` as
 // the single canonical implementation of that check.
 //
+// ## Clippy fix: too_many_arguments on PositionSnapshot::new (8/7)
+//
+// `cargo clippy --workspace --all-targets -- -D warnings` fails on this
+// constructor: it took 8 positional parameters, over clippy's default
+// threshold of 7. Rather than `#[allow(clippy::too_many_arguments)]`,
+// the three USD/bps financial fields (`collateral_usd_e18`,
+// `debt_usd_e18`, `liquidation_bonus_bps`) are grouped into a new
+// `PositionFinancials` struct — they're already a natural unit (the
+// numbers a caller reads off one lending-protocol query, e.g. Aave's
+// `getUserAccountData`), so this also makes call sites slightly more
+// self-documenting, not just quieter under lint. `PositionSnapshot`'s
+// own field layout and every other type/method in this file is
+// unchanged.
+//
 // Spec references:
 //   §7   — dual-component gas model: FeeSnapshot fields
 //   §11  — LA tier classification: PositionSnapshot health factor
@@ -128,6 +142,23 @@ impl LaTier {
 // PositionSnapshot
 // ─────────────────────────────────────────────────────────────────────────────
 
+/// Grouped financial inputs for `PositionSnapshot::new` — the values a
+/// caller typically reads off a single lending-protocol account query
+/// (e.g. Aave v3 `getUserAccountData`) in one shot. Grouped into a
+/// struct so `PositionSnapshot::new` stays under clippy's
+/// too-many-arguments threshold; see this file's own header comment.
+#[derive(Debug, Clone, Copy)]
+pub struct PositionFinancials {
+    /// Total collateral value in USD × 10^18.
+    pub collateral_usd_e18: U256,
+
+    /// Total debt value in USD × 10^18.
+    pub debt_usd_e18: U256,
+
+    /// Liquidation bonus in basis points (e.g. 500 = 5%).
+    pub liquidation_bonus_bps: u16,
+}
+
 /// Snapshot of a single lending position for LA scoring (§11).
 ///
 /// Produced by omega-oracle from on-chain position data (Aave v3
@@ -198,6 +229,48 @@ impl PositionSnapshot {
     pub fn is_liquidatable(&self) -> bool {
         const E18: u128 = 1_000_000_000_000_000_000;
         self.hf_e18 < U256::from(E18)
+    }
+
+    /// Construct a functional PositionSnapshot from oracle-observed data.
+    ///
+    /// The monitoring tier is derived directly from `hf_e18` at
+    /// construction time, ensuring the snapshot cannot carry a tier
+    /// inconsistent with its health factor.
+    ///
+    /// `financials` bundles the three USD/bps values a caller normally
+    /// reads off one lending-protocol account query in a single shot
+    /// (see `PositionFinancials`'s own doc comment).
+    ///
+    /// All numeric values use the same fixed-point conventions as the
+    /// PositionSnapshot fields:
+    ///   - hf_e18: health factor × 10^18
+    ///   - financials.collateral_usd_e18: USD × 10^18
+    ///   - financials.debt_usd_e18: USD × 10^18
+    ///   - financials.liquidation_bonus_bps: basis points
+    ///
+    /// `block_number` identifies the chain block from which the position
+    /// data was observed. `state_version` identifies the corresponding
+    /// EIL state version.
+    #[inline]
+    pub fn new(
+        borrower: Address,
+        protocol: Address,
+        hf_e18: U256,
+        financials: PositionFinancials,
+        block_number: u64,
+        state_version: u64,
+    ) -> Self {
+        Self {
+            borrower,
+            protocol,
+            hf_e18,
+            collateral_usd_e18: financials.collateral_usd_e18,
+            debt_usd_e18: financials.debt_usd_e18,
+            liquidation_bonus_bps: financials.liquidation_bonus_bps,
+            tier: LaTier::from_hf_e18(hf_e18),
+            block_number,
+            state_version,
+        }
     }
 }
 

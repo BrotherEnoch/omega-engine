@@ -1,195 +1,36 @@
 # Cargo.toml — Root package + workspace manifest for OmegaEngine v12.
 #
-# ## Audit note (this revision)
+# Notes on non-obvious decisions (see git history for full context):
 #
-# `dashmap`, `serde_json`, and `uuid` were requested as additions to
-# `[workspace.dependencies]` for idempotency tracking (dashmap),
-# structured logging / client order IDs (serde_json, uuid). All three
-# were already present below — no change needed here. A proposed
-# `clippy = { version = "0.1", optional = true }` line was dropped
-# entirely: clippy is a rustup component invoked via `cargo clippy`, not
-# a crate dependency, and adding it as one does nothing useful.
+# - alloy-primitives is pinned to "0.8" to match what alloy 0.3.6
+#   actually requires internally (confirmed via
+#   `cargo tree -i -p alloy-primitives`). If you ever see two versions
+#   of alloy-primitives in the tree, don't re-guess the pin direction —
+#   run `cargo update -p alloy-primitives --precise 0.8.26` or delete
+#   Cargo.lock and rebuild, then re-check with `cargo tree -i`.
+# - crates/omega-manifest-gen's own Cargo.toml still pins
+#   alloy-primitives to "0.7" directly instead of `{ workspace = true }`.
+#   Should probably switch to workspace = true, but verify with a real
+#   build before changing it.
+# - Cargo aliases go in .cargo/config.toml's [alias] section, not here —
+#   a [alias] table in this file does nothing.
+# - Per-crate lint enforcement (unsafe_code, unwrap_used, expect_used,
+#   float_cmp, panic) lives in individual crate manifests
+#   (omega-hot-path, omega-risk), not here.
+# - [profile.dev] uses debug = 1 (line tables only) instead of the
+#   default full debug info, to avoid exhausting disk space when
+#   `cargo test --workspace` links a separate debug binary per crate.
+#   If failures persist, run `cargo clean` or move target-dir to a
+#   drive with more space via .cargo/config.toml.
 #
-# Per-crate lint enforcement (unsafe_code, unwrap_used, expect_used,
-# float_cmp, panic) lives in the individual crate manifests
-# (crates/omega-hot-path/Cargo.toml, crates/omega-risk/Cargo.toml) per
-# the request that introduced it, rather than here at the workspace
-# level — see those files' own audit notes for why unwrap_used/
-# expect_used are set to "warn" rather than "deny" for now.
-#
-# ## Audit note (this revision, 2): added crates/omega-execution
-#
-# New workspace member — see ExecutionPipelineSpecification.md and
-# crates/omega-execution/src/lib.rs's own module doc comment for what it
-# is and, just as importantly, what it deliberately does not implement
-# yet (raw transaction signing, flashloan-provider resolution — both
-# fail closed rather than being fabricated).
-#
-# ## Fix (this revision, 3): E0433 `omega_risk` not found in scope
-#
-# `src/main.rs` has `use omega_risk::context::OracleSnapshot;` — used to
-# type `HotPathRequest::oracle` and to build snapshots in
-# `build_oracle_snapshot()`. `omega-risk` was already listed under
-# `[workspace].members`, but the omega-engine BINARY package's own
-# `[dependencies]` table below never listed it. Fixed by adding the same
-# `{ path = "crates/omega-risk" }` pattern already used for every
-# sibling crate below.
-#
-# ## Fix (this revision, 4): E0308 duplicate `alloy_primitives::Address` types
-#
-# ATTEMPTED, WRONG DIAGNOSIS — kept here so the mistake isn't silently
-# erased. This revision raised `alloy-primitives` to `"0.8"`, reasoning
-# that every crate writing `alloy-primitives = { workspace = true }`
-# would then resolve to the same 0.8.x line "alloy-core already forces
-# in transitively." That assumption was never actually checked against
-# what `alloy` 0.3.x itself depends on, and it was wrong: `alloy` (the
-# full umbrella crate, pinned to "0.3" below) has its OWN fixed internal
-# dependency on `alloy-primitives`, baked into `alloy` 0.3.6's own
-# already-published Cargo.toml — confirmed via the compiler's own error
-# text (`cargo test --workspace` output, checked this session) to be
-# `alloy-primitives-0.7.7`. A workspace.dependencies override cannot
-# change what an already-published crate requires internally. Raising
-# the DIRECT `alloy-primitives` dependency to "0.8" didn't unify
-# anything — 0.8.x and alloy's internal `^0.7` requirement are
-# semver-incompatible (pre-1.0 crates: every minor bump is breaking, per
-# Cargo's caret-version rules), so Cargo kept BOTH versions in the
-# graph instead of collapsing them into one. That's the literal cause of
-# the "multiple different versions of crate `alloy_primitives`" the
-# compiler reports: any type that arrives via `alloy::primitives::*`
-# (omega-rpc/src/chainlink_agg.rs, e.g. `fetch_chainlink_round`'s `feed:
-# Address` parameter — it has to stay on alloy's internal version
-# because it's passed straight into `TransactionRequest::with_to`,
-# which alloy 0.3.6 requires its own Address type for) is structurally
-# a different Rust type than one obtained via the direct
-# `alloy-primitives = { workspace = true }` dependency (omega-core,
-# omega-oracle, and omega-rpc's own boundary types), even though both
-# ultimately wrap the same 20 bytes.
-#
-# ## Fix (this revision, 6): ATTEMPTED, WRONG DIRECTION — kept here,
-# not erased
-#
-# This revision downgraded the version above from "0.8" to "0.7",
-# reasoning (WITHOUT checking `cargo tree -i`, purely from the ordering
-# of paths in the compiler's error text) that `alloy` 0.3.6 must
-# internally require 0.7.7. That reasoning was backwards and was
-# corrected the same session once real evidence was checked — see
-# revision 7 immediately below. Left in the history rather than quietly
-# rewritten, per this file's own convention of narrating fix attempts
-# honestly, including wrong ones.
-#
-# ## Fix (this revision, 7): confirmed via `cargo tree -i
-# -p alloy-primitives@<version>` (both versions, run this session,
-# real output, not inferred) — revision 6 was backwards; reverting to 0.8
-#
-# `cargo tree -i -p alloy-primitives@0.8.26` shows EVERY real sub-crate
-# of `alloy` 0.3.6 — alloy-core, alloy-consensus, alloy-provider,
-# alloy-network, alloy-contract, alloy-json-abi, alloy-sol-types, and
-# more — depending on alloy-primitives 0.8.26. None of them depend on
-# 0.7.7 anywhere in that tree.
-#
-# `cargo tree -i -p alloy-primitives@0.7.7` shows a SINGLE root:
-# omega-core. Every other crate appearing in that tree is there only
-# because it transitively depends on omega-core — there is no
-# independent 0.7.7 requirement anywhere else in the graph. The entire
-# 0.7.7 subtree exists solely because of this workspace's own pin
-# choice, not because anything in the `alloy` ecosystem needs it.
-#
-# So revision 6 was backwards: it moved omega-core (and, transitively,
-# nearly the entire workspace — omega-oracle, omega-rpc, omega-risk,
-# omega-hot-path, omega-strategies, and more, per the tree output) AWAY
-# from the version `alloy` actually requires, not toward it. Reverted
-# to "0.8" here, matching what the tree output actually shows `alloy`
-# 0.3.6 needs.
-#
-# IMPORTANT — a version bump in this file alone may not be sufficient.
-# The original "revision 4" attempt already set this same value ("0.8")
-# once before, and the workspace still built with a version conflict
-# afterward — most likely because an existing `Cargo.lock` entry for
-# omega-core's alloy-primitives edge was left over from whatever pin
-# preceded revision 4, and a manifest edit alone doesn't always force
-# Cargo to re-resolve an edge if the lock is still being read as
-# compatible. To avoid repeating that outcome a third time, after
-# applying this change run one of:
-#     cargo update -p alloy-primitives --precise 0.8.26
-# or, if that doesn't fully clear it:
-#     rm Cargo.lock && cargo build --workspace
-# and confirm with `cargo tree -i -p alloy-primitives` (should list only
-# ONE version, or the ambiguous-spec error should stop occurring at
-# all) before trusting the manifest change alone.
-#
-# ## Cleanup (this revision, 3): removed invalid `[alias]` table
-#
-# `[alias]` is not a `Cargo.toml` table — cargo aliases belong in
-# `.cargo/config.toml`'s own `[alias]` section. Removed here; restore
-# `cargo check-modules` by adding
-#     [alias]
-#     check-modules = "run --package module-check --"
-# to `.cargo/config.toml` at the repo root instead.
-#
-# ## C1 (this revision, 5): Integration wiring foundation — add
-# omega-relay, omega-security, omega-execution as binary dependencies
-#
-# `src/main.rs` is being wired (see PROGRESS.md / ExecutionPipelineSpec)
-# to construct a fail-closed `ExecutionPipeline` at startup: a
-# `KillSwitchRegistry` (omega-risk::kill_switch — already a dependency
-# via the omega-risk fix above, no new line needed there), an empty
-# `IntegrityRegistry` (omega-security), a `MultiRelayClient` with zero
-# live relay clients (omega-relay), an `UnconfiguredSigner`, and
-# `ExecutionPipeline::new(...)` itself (omega-execution). All four
-# crates were already `[workspace].members` (per the "added
-# crates/omega-execution" note above and the pre-existing workspace
-# list) and already compile standalone, but — same class of gap as the
-# omega-risk E0433 fix above — none of them were listed in the BINARY
-# package's own `[dependencies]` table, only in `[workspace].members`.
-# `omega-security` and `omega-relay` were not previously binary
-# dependencies at all (nothing in main.rs referenced them before this
-# revision). Fixed by adding all three (omega-relay, omega-security,
-# omega-execution) below, following the exact `{ path = "crates/..." }`
-# pattern every existing sibling entry already uses. This is
-# dependency-graph wiring only — see src/main.rs's own C1 doc comment
-# for the actual object construction and for what is deliberately left
-# fail-closed / unconstructed (real signer, real relay endpoints, real
-# deployment manifest, real kill-switch thresholds).
-#
-# ## Fix (this revision, 8): added crates/omega-manifest-gen to
-# [workspace].members
-#
-# `crates/omega-manifest-gen/Cargo.toml` (the C4-A tooling crate —
-# `gen-manifest`, a standalone binary producing a real, chain-verified
-# `config/deployment_manifest.toml` via `eth_getCode` + keccak256, never
-# a fabricated one) already existed on disk but was never added to this
-# file's `members` list below — `cargo build --workspace` silently
-# excludes any crate directory not listed here, same class of "exists
-# on disk but not wired into the workspace" gap as every other fix in
-# this file's history. This is a MECHANICAL addition only: one line, in
-# the same alphabetical-ish position as its sibling `crates/omega-*`
-# entries. It does NOT touch that crate's own `Cargo.toml` (its
-# dependency versions — alloy-primitives, clap, serde, etc. — are
-# flagged as unverified against this workspace's real `Cargo.lock` in
-# that file's own header comment and need a real `cargo build`/`cargo
-# update` pass to resolve, not a guess made here), and it does NOT
-# verify `gen-manifest`'s assumptions about
-# `omega_security::DeploymentManifest`'s real field shape (see that
-# crate's own module-level "UNVERIFIED ASSUMPTION" doc comment) — both
-# of those need a real compiler run against the actual tree, which this
-# file alone cannot provide.
-#
-# ## C9 (this revision): hex — direct binary dependency for VAULT_ADDRESS/PROFIT_TOKEN parsing
-#
-# src/main.rs now reads two new required env vars, VAULT_ADDRESS and
-# PROFIT_TOKEN, and hex-decodes them into `[u8; 20]` — needed to compute
-# the real publicInputsHash every ZK proof must bind to (see
-# omega_zk::binding's own doc comment). `hex` was already a dependency
-# of omega-zk, omega-relay, omega-risk, omega-security, and omega-core
-# (each pinning it directly at "0.4", not via `[workspace.dependencies]`
-# — hex isn't listed there at all, so each crate that needs it pins its
-# own copy, an existing convention this follows rather than invents) —
-# but never previously by the omega-engine BINARY package itself, since
-# nothing in main.rs called into the hex crate by name before this
-# revision. Same class of fix as every `{ path = "crates/..." }` /
-# direct-dependency gap already documented in this file's history: a
-# crate main.rs uses directly must be listed in ITS OWN [dependencies]
-# table, not just present transitively somewhere in the graph.
+# omega-engine's own [dependencies] table must separately list any
+# crate main.rs uses directly (chrono, hex, omega-risk, omega-security,
+# omega-relay, omega-execution, etc.) — being a [workspace].members
+# entry alone isn't enough for the binary package to see it.
+
+[profile.dev]
+debug       = 1
+incremental = true
 
 [package]
 name        = "omega-engine"
@@ -202,14 +43,6 @@ name = "omega-engine"
 path = "src/main.rs"
 
 [dependencies]
-# C2: chrono — main.rs now calls chrono::Utc::now() directly in
-# score_and_admit (see that file's own "C2" doc comment on
-# current_block_timestamp_secs). chrono is already a
-# [workspace.dependencies] entry (used transitively via omega-risk and
-# others); this adds it as a direct binary dependency, matching the
-# same class of fix as the earlier omega-risk E0433 note above — a
-# crate main.rs actually uses by name must be listed in ITS OWN
-# [dependencies] table, not just present somewhere in the workspace.
 chrono             = { workspace = true }
 tokio              = { workspace = true }
 anyhow             = { workspace = true }
@@ -217,7 +50,6 @@ tracing            = { workspace = true }
 tracing-subscriber = { workspace = true }
 toml               = "0.8"
 reqwest            = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
-# C9 (this revision): see this file's own "C9" doc comment above.
 hex                = "0.4"
 
 omega-core          = { path = "crates/omega-core" }
@@ -232,10 +64,6 @@ omega-strategies    = { path = "crates/omega-strategies" }
 omega-observability = { path = "crates/omega-observability" }
 omega-relay         = { path = "crates/omega-relay" }
 omega-flashloan     = { path = "crates/omega-flashloan" }
-# C1: newly added binary dependencies — see this file's own "C1" doc
-# comment above. omega-relay was moved up next to its pre-existing spot
-# in this list (it was already present, used only transitively before
-# this revision — now used directly in main.rs for MultiRelayClient).
 omega-security      = { path = "crates/omega-security" }
 omega-execution     = { path = "crates/omega-execution" }
 
@@ -268,10 +96,6 @@ members = [
     "crates/omega-testnet",
     "crates/omega-control-contracts",
     "crates/omega-frontend",
-    # Fix (this revision, 8): newly added — see this file's own note
-    # above. Standalone C4-A tooling binary (`gen-manifest`); not a
-    # dependency of the omega-engine binary itself, so it has no entry
-    # in the [dependencies] table above, only here.
     "crates/omega-manifest-gen",
     "ops/control-plane",
     "ops/shadow",
@@ -286,32 +110,10 @@ futures            = "0.3"
 async-trait        = "0.1"
 tokio-stream       = "0.1"
 
-# alloy 0.3 — do NOT set default-features = false.
-# Setting it suppresses transport-ws/pubsub from crate-level feature
-# declarations in omega-rpc, causing "No transports enabled" or
-# "invalid URL scheme: wss" at runtime.
-# pubsub is listed here explicitly so it is guaranteed present for
-# ProviderBuilder::on_builtin to resolve wss:// correctly.
+# alloy 0.3 — do NOT set default-features = false; it suppresses
+# transport-ws/pubsub feature declarations in omega-rpc, causing
+# "No transports enabled" / "invalid URL scheme: wss" at runtime.
 alloy              = { version = "0.3", features = ["serde", "providers", "transport-ws", "pubsub", "rpc-types", "rpc-types-eth"] }
-# Pinned to 0.8, matching what `alloy` 0.3.6 actually requires
-# internally — confirmed via `cargo tree -i -p alloy-primitives@0.8.26`
-# this session (real output, see this file's own "Fix (this revision,
-# 7)" note above), not inferred. A prior revision of this file (6)
-# guessed the opposite direction without that evidence and was wrong;
-# see that note for the correction history. If you still see two
-# versions of alloy-primitives after pulling this change, run
-# `cargo update -p alloy-primitives --precise 0.8.26` (or delete
-# Cargo.lock) rather than re-guessing the pin direction again.
-#
-# NOTE for crates/omega-manifest-gen's own Cargo.toml (Fix, this
-# revision, 8): that crate's alloy-primitives entry is currently pinned
-# to "0.7" directly rather than `{ workspace = true }`, flagged in its
-# own header as unverified against this pin. It should very likely be
-# switched to `{ workspace = true }` to resolve to 0.8 like every other
-# workspace member, but that edit belongs in that crate's own
-# Cargo.toml, and confirming it's correct needs the same real
-# `cargo build`/`cargo tree -i` verification called for throughout this
-# file's history — not assumed here.
 alloy-primitives   = { version = "0.8", features = ["serde"] }
 alloy-sol-types    = { version = "0.8" }
 revm               = { version = "8",   features = ["serde"] }
