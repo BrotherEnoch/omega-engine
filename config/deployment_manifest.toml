@@ -1,56 +1,29 @@
-# config/deployment_manifest.toml
-# Gap 6 / C4-A — IntegrityRegistry deployment manifest
-#
-# Loaded at startup by src/main.rs via load_deployment_manifest(DEPLOYMENT_MANIFEST_PATH).
-# Parsed as omega_security::DeploymentManifest { strategies: Vec<StrategyDeployment> }.
-#
-# Rules enforced by strategy_entries_from_manifest():
-#   - bytecode_hash: 32 bytes hex (optional 0x), MUST NOT be all-zero
-#   - contract_address: 20 bytes hex (optional 0x), MUST NOT be all-zero
-#   - malformed hex / wrong length / zero → startup HALTS (fail closed)
-#   - only entries with min_phase <= active_phase are registered
-#
-# DO NOT commit placeholder/zero data. Generate this file with:
-#   cargo run -p omega-manifest-gen -- \
-#     --forge-broadcast broadcast/Deploy.s.sol/42161/run-latest.json \
-#     --strategy-map strategy-map.json \
-#     --output config/deployment_manifest.toml
-# or:
-#   cargo run -p omega-manifest-gen -- \
-#     --manual strategies.toml --output config/deployment_manifest.toml
-#
-# Related (different format, used by Foundry RegisterStrategies.s.sol):
-#   config/deployment/arbitrum.toml  — NOT this file
+[[strategies]]
+strategy_id = "CNRY"
+bytecode_hash = "0x793138164060ac16fd2f9366fcd874da8ef61346904a3f17d0ef203d1661cb92"
+contract_address = "0xB7f8BC63BbcaD18155201308C8f3540b07f84F5e"
+min_phase = 0
 
-strategies = [
-  # {
-  #   strategy_id      = "CNRY"   # "SA" | "MSA" | "LA" | "MEV" | "CNRY"
-  #   bytecode_hash    = "0x..."  # keccak256 of runtime bytecode (64 hex chars)
-  #   contract_address = "0x..."  # deployed implementation (40 hex chars)
-  #   min_phase        = 0        # u8; phase at which strategy becomes active
-  # },
-  # {
-  #   strategy_id      = "SA"
-  #   bytecode_hash    = "0x..."
-  #   contract_address = "0x..."
-  #   min_phase        = 1
-  # },
-  # {
-  #   strategy_id      = "MSA"
-  #   bytecode_hash    = "0x..."
-  #   contract_address = "0x..."
-  #   min_phase        = 2
-  # },
-  # {
-  #   strategy_id      = "LA"
-  #   bytecode_hash    = "0x..."
-  #   contract_address = "0x..."
-  #   min_phase        = 3
-  # },
-  # {
-  #   strategy_id      = "MEV"
-  #   bytecode_hash    = "0x..."
-  #   contract_address = "0x..."
-  #   min_phase        = 4
-  # },
-]
+[[strategies]]
+strategy_id = "SA"
+bytecode_hash = "0xbcb9a4a15eb63df192b2e2fbb1ca527cf9f02c4a0c871aa2d173b78405189938"
+contract_address = "0x610178dA211FEF7D417bC0e6FeD39F05609AD788"
+min_phase = 1
+
+[[strategies]]
+strategy_id = "MSA"
+bytecode_hash = "0x9a96fcaea07fa6e4a0a8a94e3874f2c5eb5d689d8351c4e778834d7674443bfb"
+contract_address = "0x0DCd1Bf9A1b36cE34237eEaFef220932846BCD82"
+min_phase = 2
+
+[[strategies]]
+strategy_id = "LA"
+bytecode_hash = "0x57aeeb759921b817c4bf6c9d25b85b4b698e5393530e1ec634c61d4d01f1e7da"
+contract_address = "0xA51c1fc2f0D1a1b8494Ed1FE312d7C3a78Ed91C0"
+min_phase = 3
+
+[[strategies]]
+strategy_id = "MEV"
+bytecode_hash = "0x1f1be6a697bd8caba06b6c8bff9b947f0c0955672a6d645c97aa8d469ed7f470"
+contract_address = "0x9A676e781A523b5d0C0e43731313A708CB607508"
+min_phase = 4

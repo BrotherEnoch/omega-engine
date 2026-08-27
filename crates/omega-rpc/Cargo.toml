@@ -16,7 +16,33 @@ omega-health = { path = "../omega-health" }
 #
 # Required features:
 #   providers      — Provider trait, ProviderBuilder
-#   transport-ws   — WsConnect WebSocket transport
+#   provider-ws    — FIX (this revision): wires WS support INTO
+#                     ProviderBuilder itself (ProviderBuilder::on_ws,
+#                     and alloy::providers::WsConnect re-exported from
+#                     alloy-provider's own `ws` feature). Distinct from
+#                     `transport-ws` below, despite the similar name —
+#                     confirmed directly against this workspace's pinned
+#                     alloy 0.3.6 source: `transport-ws` only enables the
+#                     umbrella's `alloy::transports::ws` re-export of the
+#                     standalone `alloy_transport_ws` crate; it does NOT
+#                     forward into alloy-provider's own `ws` feature,
+#                     which is what actually gates
+#                     `pub async fn on_ws(...)` and
+#                     `pub use alloy_rpc_client::WsConnect;` inside
+#                     alloy-provider-0.3.6/src/{builder,lib}.rs. Without
+#                     this feature, `ProviderBuilder::on_ws` and
+#                     `alloy::providers::WsConnect` do not exist at all
+#                     (E0599 / E0432) — this was the root cause of
+#                     client.rs's WS-connect failure this session, not a
+#                     bug in client.rs's own code once this feature is
+#                     enabled.
+#   transport-ws   — WsConnect WebSocket transport (standalone
+#                     alloy_transport_ws re-export at
+#                     alloy::transports::ws — kept alongside
+#                     provider-ws since other code in this crate may
+#                     reference the transport module directly; not
+#                     itself sufficient for ProviderBuilder::on_ws, see
+#                     provider-ws above)
 #   pubsub         — PubSubFrontend for eth_subscribe streams
 #   rpc-types      — Block, Transaction, Filter, Log structs
 #   rpc-types-eth  — Ethereum-specific types (eth_call, eth_blockNumber)
@@ -24,6 +50,7 @@ omega-health = { path = "../omega-health" }
 # ─────────────────────────────────────────────────────────────────
 alloy = { workspace = true, features = [
     "providers",
+    "provider-ws",
     "transport-ws",
     "pubsub",
     "rpc-types",

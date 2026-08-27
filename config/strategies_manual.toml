@@ -1,9 +1,13 @@
 # config/strategies_manual.toml
 # Input for: cargo run -p omega-manifest-gen -- --manual config/strategies_manual.toml
 #
-# Source: local Anvil deploy (chain id 31337) via DeployStrategies.s.sol --broadcast
+# Source: fresh local Anvil deploy (chain id 31337) via DeployCore.s.sol +
+# DeployStrategies.s.sol --broadcast, this session (prior Anvil instance's addresses
+# are stale -- that process exited and its state is gone).
 # RPC: http://127.0.0.1:8545
-# NOT Arbitrum mainnet — do not use these addresses against any other chain/RPC.
+# NOT Arbitrum mainnet -- do not use these addresses against any other chain/RPC.
+#
+# Orchestrator (for reference, not read by gen-manifest): 0xa513E6E4b8f2a923D98304ec87F64353C4D5C853
 #
 # Rules:
 # - strategy_id: SA | MSA | LA | MEV (uppercase); CNRY needs --allow-unknown-strategy-id
@@ -12,28 +16,34 @@
 # - no duplicate strategy_id
 #
 # CNRY min_phase = 0 (phase 0.5 canary), matching DeployStrategies / integrity sample order.
+#
+# NOTE: MultiStepArb/MevOfa addresses below were cross-checked directly against
+# broadcast/DeployStrategies.s.sol/31337/run-latest.json's raw contractName/contractAddress
+# pairs this session, after forge's own console summary ("Contract: X / Contract Address: Y"
+# lines) printed a mismatched pairing relative to the earlier "X deployed: Y" log lines and
+# the raw JSON -- the JSON was treated as authoritative, not either printed summary.
 
 [[entries]]
 strategy_id = "CNRY"
-contract_address = "0x610178dA211FEF7D417bC0e6FeD39F05609AD788"
+contract_address = "0xB7f8BC63BbcaD18155201308C8f3540b07f84F5e"
 min_phase = 0
 
 [[entries]]
 strategy_id = "SA"
-contract_address = "0x8A791620dd6260079BF849Dc5567aDC3F2FdC318"
+contract_address = "0x610178dA211FEF7D417bC0e6FeD39F05609AD788"
 min_phase = 1
 
 [[entries]]
 strategy_id = "MSA"
-contract_address = "0xA51c1fc2f0D1a1b8494Ed1FE312d7C3a78Ed91C0"
+contract_address = "0x0DCd1Bf9A1b36cE34237eEaFef220932846BCD82"
 min_phase = 2
 
 [[entries]]
 strategy_id = "LA"
-contract_address = "0xB7f8BC63BbcaD18155201308C8f3540b07f84F5e"
+contract_address = "0xA51c1fc2f0D1a1b8494Ed1FE312d7C3a78Ed91C0"
 min_phase = 3
 
 [[entries]]
 strategy_id = "MEV"
-contract_address = "0x0DCd1Bf9A1b36cE34237eEaFef220932846BCD82"
+contract_address = "0x9A676e781A523b5d0C0e43731313A708CB607508"
 min_phase = 4

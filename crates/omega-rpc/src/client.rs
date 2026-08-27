@@ -113,41 +113,47 @@
 // parameter mechanism — no need to name `Transaction`/`Header`
 // explicitly.
 //
-// ## Fix (this revision): WS connect failing with "invalid URL scheme:
-// ws; expected `http` or `https`"
+// ## Fix (this revision): WS connect failing — root cause was a missing
+// Cargo feature, not this file's code
 //
-// `open_provider` previously called `ProviderBuilder::new().on_builtin(ws_url)`
-// — alloy's generic "sniff the transport from the URL scheme" helper.
-// In this workspace's pinned alloy version/feature set, `on_builtin`'s
-// dispatch does not actually reach a WS-capable branch for `ws://`/
-// `wss://` URLs; it falls into an HTTP-only code path that then rejects
-// the very scheme `validate_ws_scheme` (net.rs) requires the caller to
-// pass. The two checks were flatly incompatible: no URL string could
-// satisfy both the outer scheme validator and `on_builtin`'s actual
-// runtime behavior simultaneously — confirmed by reproducing both error
-// messages this session (`must start with ws:// or wss://` from the
-// outer validator when given `http://`; `invalid URL scheme: ws;
-// expected http or https` from `on_builtin` itself when given `ws://`).
+// `open_provider` previously called
+// `ProviderBuilder::new().on_builtin(ws_url)` — alloy's generic
+// "sniff the transport from the URL scheme" helper. That failed for
+// every `ws://`/`wss://` URL in this workspace's pinned alloy version
+// (0.3.6) with "invalid URL scheme: ws; expected `http` or `https`".
 //
-// Fixed by connecting via alloy's dedicated WS connector explicitly
-// (`alloy::providers::WsConnect` + `ProviderBuilder::on_ws`) instead of
-// relying on `on_builtin`'s scheme-sniffing. This makes the transport
-// selection explicit and matches what `validate_ws_scheme` already
-// requires the caller to supply, rather than asking a generic helper to
-// re-derive it and disagreeing with itself.
+// Traced this session directly against alloy-provider-0.3.6's real
+// source (not guessed): `ProviderBuilder::on_ws` and
+// `alloy::providers::WsConnect` both exist and are exactly the right
+// API for this — but both are gated behind alloy-provider's own `ws`
+// Cargo feature (`#[cfg(feature = "ws")]` on both the method in
+// builder.rs and the re-export in lib.rs). This workspace's
+// `omega-rpc/Cargo.toml` had `transport-ws` enabled on the umbrella
+// `alloy` dependency, but NOT `provider-ws` — two distinct umbrella
+// features despite the similar name. `transport-ws` only enables the
+// umbrella's standalone `alloy::transports::ws` re-export of the
+// `alloy_transport_ws` crate; per the umbrella's own `full` feature
+// definition (`alloy-0.3.6/Cargo.toml`), `provider-ws` is the separate
+// feature that forwards into alloy-provider's `ws` feature and is what
+// actually makes `ProviderBuilder::on_ws` / `alloy::providers::WsConnect`
+// exist at all. Fixed at the Cargo.toml level (added `"provider-ws"` to
+// this crate's `alloy` feature list) — see that file's own comment on
+// the `alloy` dependency line for the full trace.
 //
-// NOT independently re-verified against a real `cargo check` in this
-// session (no Rust toolchain / this workspace available here this
-// pass) — flagged, not asserted. If `WsConnect` resolves at a different
-// path in this workspace's pinned alloy version (e.g.
-// `alloy::transports::ws::WsConnect` rather than
-// `alloy::providers::WsConnect`), or if the `alloy` dependency in this
-// crate's `Cargo.toml` needs a `ws` feature flag enabled that isn't
-// already on, `cargo check -p omega-rpc` will report exactly that and
-// the import path/feature flag should be corrected to match — the
-// underlying fix (stop using `on_builtin`, connect via the explicit WS
-// connector) is the part that should not need to change.
-
+// One further fix was needed once that feature was on and `on_ws`/
+// `WsConnect` actually resolved: `on_ws(...)` returns a provider generic
+// over `PubSubFrontend` (`RootProvider<PubSubFrontend, Ethereum>`), which
+// is a DIFFERENT `Provider<T, N>` trait instantiation from the default
+// generic parameters (`Provider<BoxTransport, Ethereum>`) that this
+// file's own `type SharedProvider = Arc<dyn Provider>` implicitly uses —
+// confirmed via a real `cargo check` producing E0277 on exactly this
+// mismatch. Fixed by calling `.boxed()` (`RootProvider::boxed`, root.rs —
+// confirmed against this workspace's real alloy-provider 0.3.6 source)
+// on the connected provider before wrapping it in `Arc`, which re-types
+// it to `RootProvider<BoxTransport, Ethereum>` — the instantiation that
+// DOES implement plain `Provider` under this file's default-generic
+// usage. See `open_provider`'s own comment below for where this is
+// applied.
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -780,30 +786,38 @@ impl OmegaRpcClient {
 
 /// Opens a provider connection over WebSocket.
 ///
-/// FIX (this revision): previously used `ProviderBuilder::new().on_builtin(ws_url)`,
-/// alloy's generic scheme-sniffing helper. In this workspace's pinned alloy
-/// version/feature set, `on_builtin` does not actually route a `ws://`/`wss://`
-/// URL to a WS-capable transport — it falls into an HTTP-only path that then
-/// rejects the very scheme `validate_ws_scheme` (net.rs) requires the caller to
-/// pass, producing "invalid URL scheme: ws; expected `http` or `https`" for
-/// EVERY `ws://`/`wss://` URL, with no URL string able to satisfy both that
-/// check and the outer scheme validator at once. Fixed by connecting via
-/// alloy's dedicated WS connector (`WsConnect` + `ProviderBuilder::on_ws`)
-/// explicitly, instead of asking a generic scheme-sniffing helper to
-/// re-derive a transport this crate already knows must be WS.
-///
-/// NOT independently re-verified against a real `cargo check` in this
-/// session — if `WsConnect`'s import path differs in this workspace's pinned
-/// alloy version, or a `ws` feature flag needs enabling on the `alloy`
-/// dependency in this crate's `Cargo.toml`, `cargo check -p omega-rpc` will
-/// report exactly that; the fix is in the import path/feature flag, not in
-/// reverting to `on_builtin`.
+/// See this file's module-level "Fix (this revision): WS connect
+/// failing — root cause was a missing Cargo feature, not this file's
+/// code" comment for the full trace. `WsConnect::new(ws_url)` +
+/// `ProviderBuilder::on_ws` is the real, confirmed-against-source API
+/// for this in alloy-provider-0.3.6 (builder.rs's own
+/// `pub async fn on_ws(self, connect: alloy_transport_ws::WsConnect)`),
+/// gated behind alloy-provider's `ws` feature — enabled via this
+/// crate's `Cargo.toml` `provider-ws` entry on the umbrella `alloy`
+/// dependency.
 async fn open_provider(ws_url: &str) -> Result<Arc<dyn Provider>, RpcClientError> {
     let ws = WsConnect::new(ws_url);
     let provider = ProviderBuilder::new()
         .on_ws(ws)
         .await
         .map_err(|e| RpcClientError::ConnectFailed(format!("WS connect: {e}")))?;
+    // FIX (this revision): `.on_ws(...)` returns a provider generic over
+    // `PubSubFrontend` (`RootProvider<PubSubFrontend, Ethereum>`), which
+    // implements `Provider<PubSubFrontend, Ethereum>` — a DIFFERENT trait
+    // instantiation from `Provider`'s own default type parameters
+    // (`Provider<BoxTransport, Ethereum>`, per alloy-provider's own
+    // `pub trait Provider<T: Transport + Clone = BoxTransport, N: Network
+    // = Ethereum>` declaration in provider/trait.rs). `type SharedProvider
+    // = Arc<dyn Provider>` above implicitly means the BoxTransport-typed
+    // trait object, so casting an `Arc<RootProvider<PubSubFrontend, _>>`
+    // into it fails (E0277) without first erasing the concrete transport
+    // type. `RootProvider::boxed(self) -> RootProvider<BoxTransport, N>`
+    // (root.rs — confirmed against this workspace's real alloy-provider
+    // 0.3.6 source, not guessed) does exactly that re-typing, and its
+    // result DOES implement `Provider<BoxTransport, Ethereum>` — i.e.
+    // plain `Provider` under this file's default-generic usage — so the
+    // subsequent `Arc::new(...)` cast to `Arc<dyn Provider>` succeeds.
+    let provider = provider.boxed();
     Ok(Arc::new(provider))
 }
 
