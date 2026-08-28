@@ -33,6 +33,39 @@
 // own field layout and every other type/method in this file is
 // unchanged.
 //
+// ## Debt/collateral token fields (this revision)
+//
+// `PositionSnapshot` previously carried no ERC20 token identity at
+// all — `debt_usd_e18`/`collateral_usd_e18` are aggregate USD values,
+// not asset addresses. This blocked `omega-strategies::la.rs`'s
+// `build_blueprint` from ever populating `ExecutionBlueprint::
+// flashloan_token` (LA's own explicit guard there refuses to build
+// rather than fabricate a token address — see that file's "Known
+// incomplete: flashloan_token" comment) and, separately, blocks
+// encoding `LiquidationArb.execute()`'s real calldata layout, which
+// requires both `collateral` and `debt` token addresses.
+//
+// Added `debt_token: Address` / `collateral_token: Address` directly on
+// `PositionSnapshot`, sourced via a new `PositionTokens` grouping
+// struct passed into `PositionSnapshot::new`.
+//
+// DELIBERATELY NOT folded into `PositionFinancials`: that struct's own
+// doc comment specifically scopes it to "the values a caller typically
+// reads off one lending-protocol account query in one shot" (e.g. Aave
+// v3 `getUserAccountData`) — an aggregate, USD-denominated,
+// no-per-asset-detail call. Token addresses do NOT come from that same
+// call; per real Aave/Compound/Morpho interfaces, identifying which
+// specific reserve/asset a borrower's debt sits in requires either a
+// separate per-reserve read or comes from the Borrow/Supply event that
+// flagged the position as a candidate in the first place. Merging the
+// two into one struct would misrepresent where this data actually
+// originates, and risks a caller assuming both groups can be filled
+// from the same query when they cannot.
+//
+// `PositionSnapshot::new`'s parameter count goes from 6 to 7 with this
+// change (still under clippy's too-many-arguments threshold of 7 — see
+// the clippy-fix note above for why that threshold matters here).
+//
 // Spec references:
 //   §7   — dual-component gas model: FeeSnapshot fields
 //   §11  — LA tier classification: PositionSnapshot health factor
@@ -159,6 +192,29 @@ pub struct PositionFinancials {
     pub liquidation_bonus_bps: u16,
 }
 
+/// Grouped token-identity inputs for `PositionSnapshot::new` — the
+/// ERC20 addresses this position's debt and collateral are denominated
+/// in. See this file's own header comment ("Debt/collateral token
+/// fields") for why this is a separate struct from `PositionFinancials`
+/// rather than folded into it: the two groups come from genuinely
+/// different real-world data sources (an aggregate account-level query
+/// vs. per-reserve/event-level asset identification), and collapsing
+/// them would misrepresent that.
+#[derive(Debug, Clone, Copy)]
+pub struct PositionTokens {
+    /// ERC20 address the borrower's debt is denominated in. This is
+    /// the token a flashloan must be denominated in to repay the debt
+    /// on liquidation (see `omega_core::types::blueprint::
+    /// ExecutionBlueprint::flashloan_token`), and the `debt` field
+    /// `LiquidationArb.execute()` expects in its ABI-encoded calldata.
+    pub debt_token: Address,
+
+    /// ERC20 address of the collateral asset to be seized on
+    /// liquidation. Corresponds to `LiquidationArb.execute()`'s
+    /// `collateral` calldata field.
+    pub collateral_token: Address,
+}
+
 /// Snapshot of a single lending position for LA scoring (§11).
 ///
 /// Produced by omega-oracle from on-chain position data (Aave v3
@@ -191,6 +247,16 @@ pub struct PositionSnapshot {
 
     /// Liquidation bonus in basis points (e.g. 500 = 5%).
     pub liquidation_bonus_bps: u16,
+
+    /// ERC20 address the borrower's debt is denominated in (this
+    /// revision). See `PositionTokens::debt_token`'s doc comment for
+    /// what this feeds downstream.
+    pub debt_token: Address,
+
+    /// ERC20 address of the collateral asset to be seized on
+    /// liquidation (this revision). See
+    /// `PositionTokens::collateral_token`'s doc comment.
+    pub collateral_token: Address,
 
     /// Monitoring tier derived from `hf_e18` at snapshot time (§11.1).
     pub tier: LaTier,
@@ -239,7 +305,10 @@ impl PositionSnapshot {
     ///
     /// `financials` bundles the three USD/bps values a caller normally
     /// reads off one lending-protocol account query in a single shot
-    /// (see `PositionFinancials`'s own doc comment).
+    /// (see `PositionFinancials`'s own doc comment). `tokens` bundles
+    /// the debt/collateral token addresses — a DIFFERENT real-world data
+    /// source from `financials` (see `PositionTokens`'s own doc comment
+    /// and this file's header comment for why these are not merged).
     ///
     /// All numeric values use the same fixed-point conventions as the
     /// PositionSnapshot fields:
@@ -257,6 +326,7 @@ impl PositionSnapshot {
         protocol: Address,
         hf_e18: U256,
         financials: PositionFinancials,
+        tokens: PositionTokens,
         block_number: u64,
         state_version: u64,
     ) -> Self {
@@ -267,6 +337,8 @@ impl PositionSnapshot {
             collateral_usd_e18: financials.collateral_usd_e18,
             debt_usd_e18: financials.debt_usd_e18,
             liquidation_bonus_bps: financials.liquidation_bonus_bps,
+            debt_token: tokens.debt_token,
+            collateral_token: tokens.collateral_token,
             tier: LaTier::from_hf_e18(hf_e18),
             block_number,
             state_version,
@@ -316,6 +388,11 @@ mod tests {
             collateral_usd_e18: U256::from(2_000_000_000_000_000_000u128),
             debt_usd_e18: U256::from(1_000_000_000_000_000_000u128),
             liquidation_bonus_bps: 500,
+            // Non-zero, distinct test values — chosen so a test that
+            // checks "not the zero address" or "debt_token !=
+            // collateral_token" isn't trivially true by coincidence.
+            debt_token: Address::from([0x22u8; 20]),
+            collateral_token: Address::from([0x33u8; 20]),
             tier: LaTier::Hot,
             block_number: 1,
             state_version: 1,
@@ -384,5 +461,55 @@ mod tests {
 
         p1.protocol = Address::from([0x22u8; 20]);
         assert_ne!(p1.dedup_key(), p2.dedup_key());
+    }
+
+    // ── Debt/collateral token fields (this revision) ──────────────────────
+
+    #[test]
+    fn new_populates_token_fields_from_position_tokens() {
+        let debt_token = Address::from([0xAAu8; 20]);
+        let collateral_token = Address::from([0xBBu8; 20]);
+        let snap = PositionSnapshot::new(
+            Address::from([0x01u8; 20]),
+            Address::from([0x02u8; 20]),
+            U256::from(1_000_000_000_000_000_000u128 - 1), // liquidatable
+            PositionFinancials {
+                collateral_usd_e18: U256::from(2_000_000_000_000_000_000u128),
+                debt_usd_e18: U256::from(1_000_000_000_000_000_000u128),
+                liquidation_bonus_bps: 500,
+            },
+            PositionTokens {
+                debt_token,
+                collateral_token,
+            },
+            12_345,
+            7,
+        );
+        assert_eq!(snap.debt_token, debt_token);
+        assert_eq!(snap.collateral_token, collateral_token);
+    }
+
+    #[test]
+    fn new_still_derives_tier_from_hf_e18_with_tokens_present() {
+        // Regression guard: adding PositionTokens must not disturb the
+        // existing tier-derivation invariant documented on `new()`.
+        const E18: u128 = 1_000_000_000_000_000_000;
+        let snap = PositionSnapshot::new(
+            Address::ZERO,
+            Address::from([0x11u8; 20]),
+            U256::from(E18 + E18 / 100), // 1.01e18 -> Warm
+            PositionFinancials {
+                collateral_usd_e18: U256::ZERO,
+                debt_usd_e18: U256::ZERO,
+                liquidation_bonus_bps: 0,
+            },
+            PositionTokens {
+                debt_token: Address::from([0x44u8; 20]),
+                collateral_token: Address::from([0x55u8; 20]),
+            },
+            1,
+            1,
+        );
+        assert_eq!(snap.tier, LaTier::Warm);
     }
 }

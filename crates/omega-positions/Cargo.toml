@@ -1,0 +1,45 @@
+# crates/omega-positions/Cargo.toml
+[package]
+name    = "omega-positions"
+version = "12.0.0"
+edition = "2021"
+
+# omega-positions provides:
+#   PositionRegistry — a concurrent, chain-scoped registry of live
+#   lending-position snapshots (PositionSnapshot, omega-core), written by
+#   omega-oracle background tasks from real on-chain position reads and
+#   read synchronously by LA's blueprint construction path (§11).
+#
+# Mirrors omega-flashloan::LiquidityRegistry's shape (DashMap-backed,
+# Arc-shared, no I/O performed inside this crate) for a distinct domain:
+# per-position lending health, not flashloan provider liquidity/premiums.
+# See this crate's lib.rs module doc comment for the full reasoning on
+# why this is a separate crate from omega-flashloan rather than folded
+# into it, despite both ultimately serving spec §11.
+#
+# Dependency graph (§22.1):
+#   omega-positions  ← omega-core
+#   omega-oracle     ← omega-positions   (writer — real on-chain position reads)
+#   omega-strategies ← omega-positions   (reader — LA blueprint construction)
+#
+# NOTE: this crate is not yet added to the workspace `members` list —
+# that file was not available when this crate was authored. Add
+# "crates/omega-positions" to the workspace Cargo.toml's `members`
+# array before this will build as part of the workspace.
+#
+# tokio is NOT required. Same "no I/O inside this crate" rule as
+# omega-flashloan — see that crate's own Cargo.toml comment. Position
+# data arrives via `PositionRegistry::update`, called by omega-oracle;
+# this crate performs no reads of its own.
+
+[dependencies]
+omega-core = { path = "../omega-core" }
+
+# EVM primitive types — Address keys
+alloy-primitives = { workspace = true }
+
+# Telemetry
+tracing = { workspace = true }
+
+# Concurrent position map — updated by oracle, read by strategies
+dashmap = { workspace = true }
