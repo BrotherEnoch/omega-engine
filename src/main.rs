@@ -28,6 +28,32 @@
 //
 // ## Changelog (most recent first within each item; see VCS for full history)
 //
+// - C8: LA registered alongside CNRY in the L13 strategy registry (this revision).
+//   LaStrategy::new's constructor signature gained `position_registry:
+//   Arc<PositionRegistry>` in an earlier omega-strategies revision; main() now
+//   constructs that registry and threads it through. LA's bytecode_hash/contract_addr
+//   are sourced ONLY from IntegrityRegistry::snapshot()'s "LA" entry (the same,
+//   already-loaded deployment-manifest data Stage 2b and resolve_strategy_bytecode_hash
+//   already read) — never a placeholder or guessed address. No manifest, or a manifest
+//   with no "LA" entry, means LA is simply not registered this run; this mirrors the
+//   fail-closed posture Stage 2b already applies to any strategy_id IntegrityRegistry
+//   doesn't know about, rather than registering LA against an invented address.
+//   ASSUMPTION FLAGGED, NOT VERIFIED: this assumes IntegrityRegistry's manifest-entry
+//   type exposes a `contract_address` field alongside the already-confirmed
+//   `bytecode_hash` field (only the latter was previously read, by
+//   resolve_strategy_bytecode_hash). Confirm the real field name/type in
+//   crates/omega-security's entry struct before relying on this in production — adjust
+//   the `.contract_address` access and the `.into()` conversions below if they differ
+//   (e.g. if it's already an `Address` rather than raw `[u8; 20]`).
+//   STILL OPEN, NOT ADDRESSED BY THIS REVISION: registering LA does not make it
+//   FUNCTIONAL — `PositionRegistry` has no writer anywhere in this codebase yet (no
+//   omega-oracle component populates it from live chain data), so
+//   `LaStrategy::select_position()` will return `None` and `score()` will report 0.0
+//   every cycle regardless of registration. Separately, even with a real position,
+//   `debt_amount_wei` still has no price source (see omega-strategies/src/la.rs's own
+//   module-level comment) and `build_blueprint` will keep refusing on that gap. This
+//   revision closes the "LA is never constructed" gap only, not either of those two.
+//
 // - C7: startup validation of hardcoded flashloan/liquidity contract addresses
 //   (omega_rpc::validate_deployed_contracts, backed by omega-rpc's flashloan_liq.rs —
 //   see that file's own header for what AAVE_V3_POOL/AAVE_PROTOCOL_DATA_PROVIDER/
@@ -115,9 +141,9 @@
 //   only relabel which address is recorded against a successful update — they do not
 //   redirect what fetch_aave_available/fetch_balancer_available query on-chain (baked into
 //   omega-rpc; both are now real, see omega-rpc/src/flashloan_liq.rs and the C7 item
-//   above). LA is STILL not registered in the strategy registry below (see L13), and
-//   LaStrategy::build_blueprint still has no flashloan_token source — this poll loop
-//   doesn't touch either gap.
+//   above). LA is now registered in the strategy registry below (see C8 item above), though
+//   LaStrategy::build_blueprint still has no flashloan_token pricing source — this poll
+//   loop doesn't touch that gap.
 //
 // - Real risk-score formula (build_check_context) — equal-weighted (0.25 each,
 //   RISK_WEIGHT_* — a policy default, not derived from spec) over gas-volatility risk
@@ -135,10 +161,11 @@
 //
 // - Flashloan integration status (checked directly against source, not re-guessed):
 //   omega-flashloan itself (provider registry, premium math, ABI encoding) is complete
-//   and tested. LA is the only strategy calling select_provider(), is not yet registered
-//   in StrategyRegistryBuilder below, and its own build_blueprint still can't source
-//   flashloan_token — three separate, evidence-checked gaps, not one. SA/MSA/MEV
-//   correctly use flashloan_provider: Address::ZERO by design (no flashloan needed).
+//   and tested. LA is the only strategy calling select_provider(), and its own
+//   build_blueprint still can't source a priced flashloan_token amount (see C8 item
+//   above) — a currently-unpriceable-amount gap, not a registration gap anymore.
+//   SA/MSA/MEV correctly use flashloan_provider: Address::ZERO by design (no flashloan
+//   needed).
 //
 // - KillSwitchRegistry/IntegrityRegistry/MultiRelayClient/signer were C1's four
 //   fail-closed stand-ins; all four are now real (see items above). ExecutionPipeline is
@@ -202,12 +229,21 @@ use omega_security::{
     strategy_entries_from_manifest, AccountExposureTracker, BlueprintSigner, DeploymentManifest,
     IntegrityRegistry, KeyManager,
 };
-use omega_strategies::{registry::StrategyRegistryBuilder, CnryStrategy, StrategyRegistry};
+// C8: LaStrategy added — registered alongside CnryStrategy in the L13 block below.
+// ASSUMPTION FLAGGED, NOT VERIFIED: assumes LaStrategy is re-exported at
+// omega_strategies's crate root the same way CnryStrategy already is. Not confirmed
+// against crates/omega-strategies/src/lib.rs directly — if this re-export doesn't
+// exist, use `omega_strategies::la::LaStrategy` instead.
+use omega_strategies::{registry::StrategyRegistryBuilder, CnryStrategy, LaStrategy, StrategyRegistry};
 use omega_zk::{
     binding::compute_public_inputs_hash, config::ProverTierConfig, ProofQueue, ProofWorkerPool,
     ZkConfig, ZkVerifier,
 };
 use omega_flashloan::{FlashloanProvider, LiquidityRegistry};
+// C8: real, live lending-position registry LaStrategy now requires at construction.
+// Nothing in this codebase writes to it yet — see the C8 changelog entry above and the
+// warning logged at the L13 registration site below.
+use omega_positions::PositionRegistry;
 use std::collections::HashMap;
 
 /// Fallback chain ID (Arbitrum One) used only when OMEGA_CHAIN_ID is unset.
@@ -1299,12 +1335,66 @@ async fn main() -> Result<()> {
     );
 
     // ── L13: Strategy registry ────────────────────────────────────────────────
-    // Different registry from IntegrityRegistry above — this one only ever registers
-    // CnryStrategy; SA/MSA/LA/MEV are not registered here yet.
-    let registry = StrategyRegistryBuilder::new(active_phase)
+    // Different registry from IntegrityRegistry above. C8 (this revision): LA is now
+    // registered alongside CNRY; SA/MSA/MEV are still not registered here.
+
+    // Real, live lending-position registry LaStrategy requires at construction. NOTHING
+    // IN THIS CODEBASE WRITES TO IT YET — no omega-oracle component exists to populate
+    // it from live chain data (Aave/Compound/Morpho health-factor scanning). Constructed
+    // here so LA is reachable and so a future writer has somewhere real to write to;
+    // until that writer exists, LaStrategy::select_position() always returns None and LA
+    // scores 0.0 every cycle, same observable behavior as before this revision.
+    let position_registry = PositionRegistry::new();
+
+    let mut registry_builder = StrategyRegistryBuilder::new(active_phase)
         .register(CnryStrategy::new(chain_id, &config))
-        .expect("CNRY registration must succeed")
-        .build();
+        .expect("CNRY registration must succeed");
+
+    // LA's bytecode_hash/contract_addr are sourced ONLY from the same, already-loaded
+    // IntegrityRegistry manifest data resolve_strategy_bytecode_hash reads from above —
+    // never a placeholder or guessed address. No manifest, or a manifest with no "LA"
+    // entry, means LA is simply not registered this run: the same fail-closed posture
+    // Stage 2b already applies to any strategy_id IntegrityRegistry doesn't know about.
+    //
+    // ASSUMPTION FLAGGED, NOT VERIFIED: this assumes IntegrityRegistry::snapshot()'s
+    // entry type exposes a `contract_address` field alongside the already-confirmed
+    // `bytecode_hash` field. Only `bytecode_hash` has been read anywhere in this file
+    // before now (via resolve_strategy_bytecode_hash) — confirm the real field name/type
+    // in crates/omega-security's manifest entry struct before relying on this in
+    // production, and adjust the `.contract_address` access and `.into()` conversions
+    // below if they differ (e.g. if it's already an `Address` rather than `[u8; 20]`).
+    match integrity_registry
+        .snapshot()
+        .into_iter()
+        .find(|e| e.strategy_id == "LA")
+    {
+        Some(entry) => {
+            let la = LaStrategy::new(
+                chain_id,
+                entry.bytecode_hash.into(),
+                entry.contract_address.into(),
+                Arc::clone(&liquidity_registry),
+                Arc::clone(&position_registry),
+                &config,
+            );
+            registry_builder = registry_builder
+                .register(la)
+                .expect("LA registration must succeed");
+            tracing::info!("L13: LA registered from deployment manifest");
+        }
+        None => {
+            tracing::warn!(
+                path = DEPLOYMENT_MANIFEST_PATH,
+                "L13: no LA entry in IntegrityRegistry (manifest missing or has no LA \
+                 entry) — LA NOT registered this run. Registering it now would be inert \
+                 anyway: no live position data exists (PositionRegistry has no writer \
+                 yet) and build_blueprint refuses on missing debt-amount pricing \
+                 regardless (see omega-strategies/src/la.rs's own doc comments)."
+            );
+        }
+    }
+
+    let registry = registry_builder.build();
 
     tracing::info!(
         total = registry.len(),
@@ -2385,6 +2475,92 @@ mod hot_path_zk_provisioning_tests {
             "score_and_admit for a hot-path-eligible blueprint must not block on ZK proof \
              completion — it hung past the 5s bound instead, which would mean hot-path \
              admission has regressed back to being gated on the proof queue"
+        );
+    }
+}
+
+#[cfg(test)]
+mod la_registration_wiring_tests {
+    // C8 regression coverage: LA must be registered in the L13 strategy registry when
+    // (and only when) a real "LA" entry exists in IntegrityRegistry. This exercises the
+    // decision logic added to main()'s L13 block directly, without spinning up the full
+    // binary — the same style as this file's other #[cfg(test)] modules, which build
+    // only the real dependencies each unit under test actually needs.
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+
+    use super::*;
+    use omega_security::strategy_entries_from_manifest;
+
+    const TEST_CHAIN_ID: u64 = 42_161;
+
+    fn manifest_with_la() -> DeploymentManifest {
+        let toml_str = format!(
+            r#"
+                [[strategies]]
+                strategy_id = "LA"
+                bytecode_hash = "0x{}"
+                contract_address = "0x{}"
+                min_phase = 1
+            "#,
+            "22".repeat(32),
+            "33".repeat(20),
+        );
+        toml::from_str(&toml_str).expect("test manifest TOML must parse")
+    }
+
+    /// Regression guard: with a real "LA" entry loaded into IntegrityRegistry, the same
+    /// lookup main()'s L13 block performs (`snapshot().find(|e| e.strategy_id == "LA")`)
+    /// must find it, and LaStrategy::new must accept the resulting fields without
+    /// panicking. This does not spin up main() itself — it proves the lookup and
+    /// construction path in isolation.
+    #[test]
+    fn la_entry_present_in_manifest_is_found_and_constructs_la_strategy() {
+        let manifest = manifest_with_la();
+        let entries = strategy_entries_from_manifest(&manifest, 4)
+            .expect("valid LA entry must pass validation");
+
+        let integrity_registry = IntegrityRegistry::new();
+        integrity_registry.register_all(entries);
+
+        let found = integrity_registry
+            .snapshot()
+            .into_iter()
+            .find(|e| e.strategy_id == "LA");
+        assert!(
+            found.is_some(),
+            "L13's lookup must find a real 'LA' entry once one is registered"
+        );
+
+        let entry = found.unwrap();
+        let liquidity_registry = LiquidityRegistry::new();
+        let position_registry = PositionRegistry::new();
+
+        // Must not panic — proves LaStrategy::new accepts the field types L13 passes it
+        // (bytecode_hash/contract_address via .into()).
+        let _la = LaStrategy::new(
+            TEST_CHAIN_ID,
+            entry.bytecode_hash.into(),
+            entry.contract_address.into(),
+            liquidity_registry,
+            position_registry,
+            &OmegaConfig::default(),
+        );
+    }
+
+    /// Regression guard: an empty IntegrityRegistry (no manifest loaded, or a manifest
+    /// with no LA entry) must NOT be treated as a construction error — L13's match arm
+    /// must take the None branch and simply skip registering LA, exactly as it does for
+    /// SA/MSA/MEV today.
+    #[test]
+    fn no_la_entry_is_absent_not_an_error() {
+        let integrity_registry = IntegrityRegistry::new();
+        let found = integrity_registry
+            .snapshot()
+            .into_iter()
+            .find(|e| e.strategy_id == "LA");
+        assert!(
+            found.is_none(),
+            "an empty IntegrityRegistry must yield None for LA, not a fabricated entry"
         );
     }
 }

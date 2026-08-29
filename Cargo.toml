@@ -40,6 +40,18 @@
 # ← omega-positions` (writer), `omega-strategies ← omega-positions`
 # (reader)) rather than at the end of the list, to match this file's
 # existing loose grouping-by-layer ordering rather than breaking it.
+#
+# ## Fix (this revision, C8): omega-positions added to omega-engine's own
+# [dependencies] table
+#
+# main.rs now constructs `omega_positions::PositionRegistry` directly (to
+# thread it into `LaStrategy::new` when registering LA in the L13 strategy
+# registry). Being a [workspace].members entry (added under C7 above) is not
+# enough for the omega-engine BINARY crate to see the omega-positions crate —
+# per this file's own header note two paragraphs up — so it must also be
+# listed in [dependencies] below, same as omega-risk/omega-security/etc.
+# already are. Placed alphabetically adjacent to omega-oracle, mirroring the
+# ordering already used in [workspace].members for the same crate.
 
 [profile.dev]
 debug       = 1
@@ -69,6 +81,7 @@ omega-core          = { path = "crates/omega-core" }
 omega-health        = { path = "crates/omega-health" }
 omega-rpc           = { path = "crates/omega-rpc" }
 omega-oracle        = { path = "crates/omega-oracle" }
+omega-positions     = { path = "crates/omega-positions" }
 omega-risk          = { path = "crates/omega-risk" }
 omega-dag           = { path = "crates/omega-dag" }
 omega-zk            = { path = "crates/omega-zk" }
