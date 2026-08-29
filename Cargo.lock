@@ -4335,6 +4335,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "omega-positions"
+version = "12.0.0"
+dependencies = [
+ "alloy-primitives 0.8.26",
+ "dashmap 5.5.3",
+ "omega-core",
+ "tracing",
+]
+
+[[package]]
 name = "omega-prl"
 version = "1.0.0"
 dependencies = [
@@ -4524,6 +4534,7 @@ dependencies = [
  "omega-flashloan",
  "omega-gas-war",
  "omega-loss-attribution",
+ "omega-positions",
  "rand 0.8.6",
  "revm",
  "serde",

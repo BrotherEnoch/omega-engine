@@ -28,6 +28,22 @@
 //
 // ## Changelog (most recent first within each item; see VCS for full history)
 //
+// - C7: startup validation of hardcoded flashloan/liquidity contract addresses
+//   (omega_rpc::validate_deployed_contracts, backed by omega-rpc's flashloan_liq.rs —
+//   see that file's own header for what AAVE_V3_POOL/AAVE_PROTOCOL_DATA_PROVIDER/
+//   BALANCER_V2_VAULT/WETH/USDC_NATIVE are and how each was verified). Runs a real
+//   eth_getCode check against every one of those addresses right after the RPC client
+//   connects, BEFORE the L2d/L2e poll loops (or anything else) are spawned against
+//   them — a wrong or stale address now halts startup with a clear error instead of
+//   the L2e loop silently failing soft, cycle after cycle, forever, or worse, quietly
+//   returning a wrong-but-plausible-looking liquidity number from an unrelated
+//   contract that happens to share a `balanceOf`-shaped ABI. Scope is deliberately
+//   limited to "something is deployed here" (bytecode presence), not full ABI
+//   conformance — see `DeploymentValidationReport::all_ok`'s own doc comment.
+//   `fetch_aave_available`/`fetch_balancer_available` (now real, see the L2e item
+//   below) are themselves the closest thing to a live ABI check this system has, the
+//   first time the L2e loop actually calls them.
+//
 // - CHAIN_ID / AAVE_V3_POOL / BALANCER_V2_VAULT are no longer hardcoded to Arbitrum.
 //   `resolve_chain_id()` reads OMEGA_CHAIN_ID (default DEFAULT_CHAIN_ID); `chain_id` is
 //   threaded explicitly through every function that used to read a CHAIN_ID const. NOTE:
@@ -98,7 +114,8 @@
 //   pool exists for it the way AAVE_V3_POOL/BALANCER_V2_VAULT do. The tag-override env vars
 //   only relabel which address is recorded against a successful update — they do not
 //   redirect what fetch_aave_available/fetch_balancer_available query on-chain (baked into
-//   omega-rpc). LA is STILL not registered in the strategy registry below (see L13), and
+//   omega-rpc; both are now real, see omega-rpc/src/flashloan_liq.rs and the C7 item
+//   above). LA is STILL not registered in the strategy registry below (see L13), and
 //   LaStrategy::build_blueprint still has no flashloan_token source — this poll loop
 //   doesn't touch either gap.
 //
@@ -177,8 +194,9 @@ use omega_risk::context::{
 use omega_risk::kill_switch::{KillSwitchConfig, KillSwitchRegistry};
 use omega_rpc::{
     rate_limiter::RpcRateLimiter, run_dex_sync_stream, run_fee_oracle_stream,
-    run_lending_protocol_stream, run_mev_share_stream, run_pending_tx_stream, OmegaRpcClient,
-    RpcClientConfig, AAVE_V3_POOL, BALANCER_V2_VAULT, WETH,
+    run_lending_protocol_stream, run_mev_share_stream, run_pending_tx_stream,
+    validate_deployed_contracts, OmegaRpcClient, RpcClientConfig, AAVE_V3_POOL,
+    BALANCER_V2_VAULT, WETH,
 };
 use omega_security::{
     strategy_entries_from_manifest, AccountExposureTracker, BlueprintSigner, DeploymentManifest,
@@ -647,6 +665,38 @@ async fn main() -> Result<()> {
     .await
     .context("connecting to Arbitrum RPC endpoint")?
     .with_health(as_health(find_layer(&layers, LayerId::Rpc)));
+
+    // ── C7: validate hardcoded flashloan/liquidity addresses against the connected
+    // chain, BEFORE anything (L2d/L2e poll loops, block subscription, etc.) is spawned
+    // against them. A wrong or stale address is a fund-safety-adjacent bug class — see
+    // omega-rpc/src/flashloan_liq.rs's own header for the real transcription error this
+    // check caught during development of that file. Fail closed: refuse to start rather
+    // than degrade silently for the process's entire lifetime.
+    let address_validation = validate_deployed_contracts(&rpc, chain_id).await;
+    if !address_validation.all_ok() {
+        for r in &address_validation.results {
+            if !r.has_code || r.error.is_some() {
+                tracing::error!(
+                    label = r.label,
+                    address = %r.address,
+                    has_code = r.has_code,
+                    error = ?r.error,
+                    "C7 startup validation: hardcoded contract address failed on-chain check"
+                );
+            }
+        }
+        anyhow::bail!(
+            "C7 startup validation failed: one or more hardcoded flashloan/oracle \
+             addresses have no confirmed bytecode on chain {chain_id} (see error logs \
+             above) — refusing to start the L2d/L2e poll loops against unverified \
+             addresses"
+        );
+    }
+    tracing::info!(
+        chain_id,
+        checked = address_validation.results.len(),
+        "C7: all hardcoded contract addresses validated on-chain"
+    );
 
     {
         let r = rpc.clone();

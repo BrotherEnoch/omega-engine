@@ -87,6 +87,40 @@
 // `OmegaRpcClient` re-export below regardless of this module's own
 // visibility; no new `pub use` is needed since this module adds a
 // method to an existing public type rather than a new standalone type.
+//
+// ## Fix (this revision): flashloan_liq — C7 provider registry / address
+// resolution / snapshot generation / validation against actual deployed
+// contracts
+//
+// `flashloan_liq.rs` now contains the real implementation behind what
+// was previously just a set of re-exported constants:
+//   - `AAVE_V3_POOL`, `AAVE_PROTOCOL_DATA_PROVIDER`, `BALANCER_V2_VAULT`,
+//     `WETH`, `USDC_NATIVE` — real Arbitrum One addresses, each
+//     individually re-verified against a live source THIS session (see
+//     that file's own header) after an earlier, never-committed draft
+//     of this same module transcribed `BALANCER_V2_VAULT` wrong
+//     (truncated the trailing bytes) — caught by that verification
+//     pass, not by luck.
+//   - `resolve_liquidity_addresses` — the query-target-vs-recorded-label
+//     split `main.rs`'s `OMEGA_AAVE_V3_POOL_TAG_OVERRIDE` /
+//     `OMEGA_BALANCER_V2_VAULT_TAG_OVERRIDE` env vars already document,
+//     now with one real function backing it instead of the split logic
+//     living only in main.rs's own env-parsing code.
+//   - `OmegaRpcClient::fetch_aave_available` /
+//     `OmegaRpcClient::fetch_balancer_available` — real eth_call reads
+//     (previously these were referenced by main.rs's L2e poll loop but
+//     not shown to exist anywhere in this crate). Same non-dependency
+//     discipline as chainlink_agg/arb_gas_info: these return a plain
+//     `u128`, not a `LiquiditySnapshot` or any other
+//     `omega_flashloan`-owned type — that crate's `LiquidityRegistry`
+//     wraps the returned number into its own type on the `main.rs` side,
+//     where the dependency on omega_flashloan already exists.
+//   - `validate_deployed_contracts` — a real `eth_getCode` check (via
+//     the new `OmegaRpcClient::get_code`, client.rs) against every
+//     address above, run once at startup per `main.rs`'s own call site.
+//     Confirms bytecode presence, not full ABI conformance — see that
+//     function's own doc comment for the exact, deliberately-limited
+//     scope of what it checks.
 mod arb_gas_info;
 mod chainlink_agg;
 mod net;
@@ -113,5 +147,8 @@ pub use subscriptions::{
 };
 
 pub use flashloan_liq::{
-    AAVE_PROTOCOL_DATA_PROVIDER, AAVE_V3_POOL, BALANCER_V2_VAULT, USDC_NATIVE, WETH,
+    resolve_liquidity_addresses, validate_deployed_contracts, AddressValidation,
+    DeploymentValidationReport, LiquidityProtocol, ResolvedLiquidityAddress,
+    AAVE_PROTOCOL_DATA_PROVIDER, AAVE_V3_POOL, ARBITRUM_ONE_CHAIN_ID, BALANCER_V2_VAULT,
+    USDC_NATIVE, WETH,
 };

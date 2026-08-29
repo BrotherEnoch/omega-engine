@@ -4,7 +4,7 @@ name    = "omega-strategies"
 version = "12.0.0"
 edition = "2021"
 
-# ## Audit fix (this revision)
+# ## Audit fix (earlier revision)
 #
 # Added `uuid` — sa.rs/la.rs/msa.rs/mev.rs each generate a `signal_id`
 # via `Uuid::new_v4()` in `build_blueprint` now that
@@ -18,12 +18,28 @@ edition = "2021"
 # §22.1 "injected as trait objects" architecture note below — flagged
 # here rather than silently contradicting that note. See la.rs's own
 # module comment for the reasoning.
+#
+# ## Real position selection (this revision)
+#
+# Added `omega-positions` — `LaStrategy::new` now also takes an
+# `Arc<omega_positions::PositionRegistry>`, read directly (not injected
+# as a trait object) on every `score`/`build_blueprint` call to select
+# the current most-urgent liquidatable position. Same real, not-a-trait-
+# object dependency shape as `omega-flashloan` above, for the same
+# reason: `PositionRegistry` is a concrete, DashMap-backed shared
+# registry (mirroring `LiquidityRegistry`'s own shape — see that crate's
+# doc comment), not a domain abstraction that benefits from being
+# injected behind a trait the way the oracle/risk crates are. Same
+# deliberate departure from the §22.1 note below as `omega-flashloan`
+# already represents — not a new precedent, an extension of the one
+# already flagged.
 
 [dependencies]
 omega-core             = { path = "../omega-core" }
 omega-gas-war           = { path = "../omega-gas-war" }
 omega-loss-attribution  = { path = "../omega-loss-attribution" }
 omega-flashloan         = { path = "../omega-flashloan" }
+omega-positions         = { path = "../omega-positions" }
 
 # ARCHITECTURAL NOTE (§22.1):
 # omega-strategies depends on omega-core, omega-gas-war, and
@@ -32,9 +48,10 @@ omega-flashloan         = { path = "../omega-flashloan" }
 # stays compilable without the full dependency tree. omega-rpc is also
 # excluded — strategies never call RPC directly.
 #
-# omega-flashloan is now a real dependency (see audit-fix note above) —
-# this note is left in place rather than rewritten so the deviation from
-# the original §22.1 design is visible, not smoothed over.
+# omega-flashloan and omega-positions are now real dependencies (see
+# audit-fix notes above) — this note is left in place rather than
+# rewritten so the deviation from the original §22.1 design is visible,
+# not smoothed over.
 
 # EVM primitive types (shared with omega-core — no full alloy transport)
 alloy-primitives = { workspace = true }

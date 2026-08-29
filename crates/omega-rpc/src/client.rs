@@ -154,11 +154,38 @@
 // DOES implement plain `Provider` under this file's default-generic
 // usage. See `open_provider`'s own comment below for where this is
 // applied.
+//
+// ## Fix (this revision): get_code (C7 — validation against actual
+// deployed contracts)
+//
+// Added `OmegaRpcClient::get_code`, a plain `eth_getCode` wrapper
+// following the exact same shape as `fetch_fee_snapshot`/`fetch_logs`
+// above it (rate-limited as a read via `gated_read`, using the shared
+// connection via `get_or_connect`). This is deliberately a GENERIC
+// method on this file's core client rather than something private to
+// `flashloan_liq.rs` — `eth_getCode` is not flashloan-specific, and a
+// future validation need (e.g. confirming a strategy contract's
+// deployed bytecode from a different crate context) should be able to
+// reuse it without a new wrapper. `flashloan_liq::validate_deployed_contracts`
+// is this method's first real caller: it checks that every hardcoded
+// Aave/Balancer/WETH/USDC address in this crate actually has bytecode
+// deployed at it on the connected chain, at startup, rather than
+// trusting a transcribed address until the first real call against it
+// fails (or worse, silently returns a wrong/zero result against an EOA).
+//
+// `provider.get_code_at(address)` is alloy-provider 0.3.6's `Provider`
+// trait method for `eth_getCode` against the latest block — this
+// mirrors `fetch_fee_snapshot`'s and `fetch_logs`'s own direct use of
+// `Provider` trait methods (`get_block_by_number`, `get_logs`) just
+// above, but has NOT been independently re-confirmed against this
+// workspace's exact pinned alloy-provider source the way `on_ws`/
+// `WsConnect`/`.boxed()` were in the fix above — flagged rather than
+// silently presented as equally certain.
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use alloy::primitives::B256;
+use alloy::primitives::{Address, Bytes, B256};
 use alloy::providers::{Provider, ProviderBuilder, WsConnect};
 use alloy::rpc::types::{Block, Filter, Log};
 use futures::StreamExt;
@@ -472,9 +499,9 @@ impl OmegaRpcClient {
     ///
     /// This is the single place every RPC call in this client goes
     /// through to get a connection — `fetch_fee_snapshot`,
-    /// `fetch_logs`, `submit_raw_transaction`, and the block
-    /// subscription loop all share whatever connection is cached here,
-    /// rather than each independently opening its own.
+    /// `fetch_logs`, `get_code`, `submit_raw_transaction`, and the
+    /// block subscription loop all share whatever connection is cached
+    /// here, rather than each independently opening its own.
     pub async fn get_or_connect(&self) -> anyhow::Result<Arc<dyn Provider>> {
         self.get_or_connect_typed()
             .await
@@ -766,6 +793,36 @@ impl OmegaRpcClient {
     // together in one file. Defining it in both places is a duplicate
     // inherent method (E0592) — an earlier revision of this file did
     // exactly that; fixed by removing it here, not there.
+
+    // ── Contract introspection (C7) ─────────────────────────────────────────
+
+    /// Fetch the deployed bytecode at `address` on the connected chain
+    /// (`eth_getCode`, latest block), rate-limited as a read, using the
+    /// shared connection — same pattern as `fetch_fee_snapshot`/
+    /// `fetch_logs` just above.
+    ///
+    /// Returns empty `Bytes` for an address with no code (an EOA, or an
+    /// address nothing has ever deployed to) — this is a normal,
+    /// non-error RPC response, not a failure; distinguishing "no code"
+    /// from "the call itself failed" is the caller's job (see
+    /// `flashloan_liq::validate_deployed_contracts`, this method's
+    /// first real caller, for exactly that distinction).
+    ///
+    /// See this file's own module-level "Fix (this revision): get_code"
+    /// comment for the one open question on this method: `get_code_at`'s
+    /// exact signature/behavior has not been independently re-confirmed
+    /// against this workspace's pinned alloy-provider 0.3.6 source the
+    /// way `on_ws`/`.boxed()` were.
+    pub async fn get_code(&self, address: Address) -> anyhow::Result<Bytes> {
+        self.gated_read(None, || async move {
+            let provider = self.get_or_connect().await?;
+            provider
+                .get_code_at(address)
+                .await
+                .map_err(|e| anyhow::anyhow!("eth_getCode({address}) failed: {e}"))
+        })
+        .await
+    }
 
     // ── Telemetry ────────────────────────────────────────────────────────────
 

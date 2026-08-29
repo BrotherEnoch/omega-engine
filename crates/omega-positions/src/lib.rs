@@ -200,7 +200,12 @@ impl PositionRegistry {
             .filter(|snap| snap.is_liquidatable())
             .collect();
 
-        positions.sort_by(|a, b| a.hf_e18.cmp(&b.hf_e18));
+        // `sort_by_key` rather than `sort_by(|a, b| a.hf_e18.cmp(&b.hf_e18))` —
+        // `cargo clippy -D warnings` (clippy::unnecessary_sort_by) flagged the
+        // comparator form since it only ever compares a single field. `hf_e18` is
+        // `alloy_primitives::U256`, which is `Copy`, so extracting it as a key per
+        // element is cheap; no behavior change versus the comparator form.
+        positions.sort_by_key(|p| p.hf_e18);
         positions
     }
 

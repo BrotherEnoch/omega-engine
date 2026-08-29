@@ -27,6 +27,19 @@
 # crate main.rs uses directly (chrono, hex, omega-risk, omega-security,
 # omega-relay, omega-execution, etc.) — being a [workspace].members
 # entry alone isn't enough for the binary package to see it.
+#
+# ## Fix (this revision, C7): crates/omega-positions was missing from
+# [workspace].members
+#
+# Flagged in crates/omega-positions/Cargo.toml's own header comment
+# ("this crate is not yet added to the workspace `members` list — that
+# file was not available when this crate was authored") and confirmed
+# against this file directly this session: the entry was genuinely
+# absent. Added below, alphabetically adjacent to omega-oracle (its
+# real dependency-graph neighbor per that crate's own header: `omega-oracle
+# ← omega-positions` (writer), `omega-strategies ← omega-positions`
+# (reader)) rather than at the end of the list, to match this file's
+# existing loose grouping-by-layer ordering rather than breaking it.
 
 [profile.dev]
 debug       = 1
@@ -75,6 +88,7 @@ members = [
     "crates/omega-health",
     "crates/omega-rpc",
     "crates/omega-oracle",
+    "crates/omega-positions",
     "crates/omega-security",
     "crates/omega-compliance",
     "crates/omega-risk",
