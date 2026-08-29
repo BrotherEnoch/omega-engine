@@ -303,6 +303,7 @@ mod flashloan_tests {
         let err = FlashloanError::NoneAvailable {
             amount_wei: eth(1),
             chain_id: 42161,
+            asset: weth(),
             best_available_wei: U256::ZERO,
         };
         assert!(matches!(
@@ -311,6 +312,52 @@ mod flashloan_tests {
                 code: DropCode::MissFlashloan
             }
         ));
+    }
+
+    /// Regression test for the asset-blindness gap this revision fixes: with
+    /// multiple assets tracked, a `NoneAvailable` error must say WHICH asset
+    /// had no provider, not just how much was requested. Asserts the real
+    /// `Display` output (via `to_string()`), not just the field's presence on
+    /// the struct, so a future change that adds the field but forgets to
+    /// route it into the `#[error(...)]` format string would fail this test.
+    #[test]
+    fn none_available_error_message_names_the_asset() {
+        let reg = test_registry();
+        // Registry has WETH liquidity only — request USDC, which must fail
+        // and, critically, say "USDC" (well, its address) in the message,
+        // not "WETH" or nothing at all.
+        reg.update(
+            42161,
+            FlashloanProvider::AaveV3,
+            weth(),
+            addr(0xA0),
+            eth(1_000),
+            1,
+        );
+        let err = select_provider(&reg, 42161, usdc(), eth(1)).unwrap_err();
+        let msg = err.to_string();
+        let usdc_str = usdc().to_string();
+        assert!(
+            msg.contains(&usdc_str),
+            "NoneAvailable error message must name the requested asset; got: {msg}"
+        );
+    }
+
+    /// Companion sanity check: two different `NoneAvailable` errors for two
+    /// different assets against the same empty registry must not compare
+    /// equal — `asset` must actually participate in `PartialEq`, not just
+    /// exist as a field nobody compares. (`FlashloanError` derives `PartialEq`
+    /// via `#[derive(... PartialEq ...)]`, so this is a real behavioral
+    /// check, not a no-op.)
+    #[test]
+    fn none_available_errors_for_different_assets_are_not_equal() {
+        let reg = test_registry();
+        let err_weth = select_provider(&reg, 42161, weth(), eth(1)).unwrap_err();
+        let err_usdc = select_provider(&reg, 42161, usdc(), eth(1)).unwrap_err();
+        assert_ne!(
+            err_weth, err_usdc,
+            "NoneAvailable errors for different requested assets must be distinguishable"
+        );
     }
 
     #[test]

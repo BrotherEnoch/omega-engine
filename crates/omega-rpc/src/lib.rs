@@ -73,7 +73,7 @@
 // omega-oracle's `chainlink_poll.rs` instead, which already has this
 // crate as a dependency.
 //
-// ## Fix (this revision): arb_gas_info
+// ## Fix (prior revision): arb_gas_info
 //
 // Added `arb_gas_info` — the ArbGasInfo precompile `sol!` binding and
 // `OmegaRpcClient::fetch_l1_base_fee_estimate_gwei` (see that module's
@@ -88,7 +88,7 @@
 // visibility; no new `pub use` is needed since this module adds a
 // method to an existing public type rather than a new standalone type.
 //
-// ## Fix (this revision): flashloan_liq — C7 provider registry / address
+// ## Fix (prior revision): flashloan_liq — C7 provider registry / address
 // resolution / snapshot generation / validation against actual deployed
 // contracts
 //
@@ -121,6 +121,26 @@
 //     Confirms bytecode presence, not full ABI conformance — see that
 //     function's own doc comment for the exact, deliberately-limited
 //     scope of what it checks.
+//
+// ## Fix (this revision): flashloan_liq — C10 Uniswap V3 pool coverage
+//
+// `flashloan_liq.rs` gained `UNISWAP_V3_WETH_USDC_POOL` (a real, verified pool
+// address — see that constant's own doc comment for the two-different-pools trap its
+// verification caught) and `OmegaRpcClient::fetch_uniswap_v3_pool_balance`, extending
+// C7's `validate_deployed_contracts` from 5 to 6 checked addresses in the process.
+//
+// `UNISWAP_V3_WETH_USDC_POOL` is added to this file's `pub use flashloan_liq::{...}`
+// list below. THIS IS THE PART THAT WAS MISSED THE FIRST TIME THIS CONSTANT WAS
+// ADDED: `flashloan_liq.rs` defining a new `pub const` does not, by itself, make it
+// reachable as `omega_rpc::UNISWAP_V3_WETH_USDC_POOL` — this crate's re-exports are a
+// hand-maintained list, not a glob (`pub use flashloan_liq::*;` would auto-include new
+// items; this crate deliberately doesn't do that, presumably so the crate's public API
+// surface is an explicit, reviewable list rather than "whatever flashloan_liq.rs
+// happens to make pub"). A real `cargo build` caught the omission
+// (`E0432: unresolved import 'omega_rpc::UNISWAP_V3_WETH_USDC_POOL'`) across four
+// consecutive tool invocations (`build`, `check`, `test`, `clippy`) before this fix
+// landed — anyone adding a new symbol to `flashloan_liq.rs` in the future needs to
+// remember this file has its own separate list to update.
 mod arb_gas_info;
 mod chainlink_agg;
 mod net;
@@ -150,5 +170,5 @@ pub use flashloan_liq::{
     resolve_liquidity_addresses, validate_deployed_contracts, AddressValidation,
     DeploymentValidationReport, LiquidityProtocol, ResolvedLiquidityAddress,
     AAVE_PROTOCOL_DATA_PROVIDER, AAVE_V3_POOL, ARBITRUM_ONE_CHAIN_ID, BALANCER_V2_VAULT,
-    USDC_NATIVE, WETH,
+    UNISWAP_V3_WETH_USDC_POOL, USDC_NATIVE, WETH,
 };

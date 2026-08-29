@@ -3,11 +3,24 @@
 // C7 — Flash-loan integration: provider registry / address resolution /
 // snapshot generation / validation against actual deployed contracts.
 //
-// This is the module `lib.rs`'s `pub use flashloan_liq::{AAVE_PROTOCOL_DATA_PROVIDER,
-// AAVE_V3_POOL, BALANCER_V2_VAULT, USDC_NATIVE, WETH};` already points at, and the
-// module `main.rs`'s L2e poll loop already calls (`liq_client.fetch_aave_available(token)`,
-// `liq_client.fetch_balancer_available(token)`) — this file is what actually backs
-// both.
+// This is the module whose flash-loan-liquidity symbols `lib.rs` re-exports at the
+// crate root — as of this revision, `AAVE_PROTOCOL_DATA_PROVIDER`, `AAVE_V3_POOL`,
+// `BALANCER_V2_VAULT`, `USDC_NATIVE`, and `WETH` are already re-exported there (that
+// re-export list predates this file's Uniswap V3 addition and was NOT independently
+// re-confirmed here). `UNISWAP_V3_WETH_USDC_POOL` is NEW in this revision and must be
+// ADDED to that same `pub use flashloan_liq::{...}` list in `lib.rs` for
+// `main.rs`'s `use omega_rpc::{..., UNISWAP_V3_WETH_USDC_POOL, ...}` to resolve — this
+// file cannot make that re-export happen on its own, since `lib.rs` lives outside it.
+// A prior revision's comment here claimed lib.rs "already points at" a re-export list
+// including this constant — that claim was never actually checked against the real
+// `lib.rs` and was wrong; a real `cargo build` caught it (E0432: unresolved import
+// `omega_rpc::UNISWAP_V3_WETH_USDC_POOL`). Don't repeat that mistake: this file being
+// internally consistent does not mean the crate-root re-export was updated to match.
+//
+// The module `main.rs`'s L2e poll loop already calls
+// (`liq_client.fetch_aave_available(token)`, `liq_client.fetch_balancer_available(token)`,
+// `liq_client.fetch_uniswap_v3_pool_balance(pool, token)`) — this file is what actually
+// backs all three; only the constant re-export above is still outstanding.
 //
 // ## Fix (this revision, post-build): sol! Instance wrapper doesn't compile against
 // Arc<dyn Provider>
@@ -104,11 +117,14 @@
 //   - USDC_NATIVE:                 Circle-issued native USDC on Arbitrum One (NOT
 //                                   `USDC.e`, the older Arbitrum-bridged token at a
 //                                   different address — see Circle's own "two USDCs on
-//                                   Arbitrum" explainer). Currently unused by the L2e
-//                                   poll loop, which per main.rs's own doc comment only
-//                                   tracks WETH today; defined here so a future
-//                                   non-WETH liquidity signal doesn't have to re-derive
-//                                   or re-verify this address from scratch.
+//                                   Arbitrum" explainer).
+//   - UNISWAP_V3_WETH_USDC_POOL:    Uniswap V3's WETH/USDC_NATIVE pool, 0.05% fee tier
+//                                   — see that constant's own doc comment for a SECOND,
+//                                   DIFFERENT pool this session's lookup found and
+//                                   deliberately did NOT use (paired with USDC.e, not
+//                                   USDC_NATIVE — same confusable-pair risk as the
+//                                   USDC_NATIVE-vs-USDC.e note above, caught here for a
+//                                   pool address rather than a token address).
 //
 // Re-verify all of these against Arbiscan / official docs before relying on them for
 // anything beyond what `validate_deployed_contracts` itself checks (bytecode
@@ -176,6 +192,44 @@ pub const WETH: Address = alloy_primitives::address!("82aF49447D8a07e3bd95BD0d56
 /// session.
 pub const USDC_NATIVE: Address = alloy_primitives::address!("af88d065e77c8cC2239327C5EDb3A432268e5831");
 
+/// Uniswap V3 WETH / USDC_NATIVE pool, 0.05% fee tier, Arbitrum One.
+///
+/// Verified against two independent sources this session (GeckoTerminal's pool page,
+/// cross-checked against the Uniswap app's own pool URL) — both agree on
+/// `0xC6962004f452bE9203591991D15f6b388e09E8D0` — and against ~$75M of pooled
+/// liquidity at lookup time (26.08M USDC / 15,665 WETH), the deep, canonical
+/// WETH/USDC_NATIVE 0.05% pool, not a thin or abandoned one.
+///
+/// TRAP CAUGHT THIS SESSION, same class as the `USDC_NATIVE`-vs-`USDC.e` distinction
+/// already documented at this file's header: there is a SECOND, DIFFERENT
+/// "USDC/WETH 0.05%" pool on Arbitrum, at `0xc31e54C7a869B9FCBEcc14363CF510D1c41Fa443`.
+/// That one is paired with the OLDER BRIDGED `USDC.e` token
+/// (`0xFF970A61A04b1cA14834A43f5dE4533eBDDB5CC8`), not `USDC_NATIVE`, and held well
+/// under $1M in pooled liquidity at lookup time versus this pool's ~$75M. Querying the
+/// wrong one would NOT error — `balanceOf` on any real contract address returns
+/// *something* — it would just silently report a thin, wrong-token pool's balance as
+/// if it were the deep, correct one, which is a worse failure mode than an outright
+/// error for a liquidity-availability signal. Confirm which USDC a given pool is
+/// actually paired with (query its `token0()`/`token1()`, don't infer from a page's
+/// display label — the two GeckoTerminal pages found this session displayed the pair
+/// as "USDC/WETH" and "WETH/USDC" respectively for what are unambiguously the SAME
+/// underlying two tokens at TWO DIFFERENT pool contracts, so display ordering alone
+/// is not a reliable signal either) before ever changing this value.
+///
+/// Token ordering note (derived, not looked up): Uniswap V3 orders a pool's two tokens
+/// by ascending numeric address (`token0 < token1`). Comparing the two ALREADY-VERIFIED
+/// constants above — `WETH` starts `0x82..`, `USDC_NATIVE` starts `0xaf..` — `WETH` is
+/// numerically smaller, so `WETH` is this pool's `token0` and `USDC_NATIVE` is
+/// `token1`. This is arithmetic over values already confirmed above, not a third
+/// external lookup — but it is NOT independently confirmed against a live
+/// `token0()`/`token1()` call, and `fetch_uniswap_v3_pool_balance` below does not need
+/// or use this ordering (a `balanceOf` read is token-order-agnostic). Anything that
+/// later calls `omega_flashloan::encoding::encode_flashloan_call`'s
+/// `asset_is_token0` parameter for THIS pool must confirm this ordering on-chain
+/// first, not take this comment's word for it.
+pub const UNISWAP_V3_WETH_USDC_POOL: Address =
+    alloy_primitives::address!("C6962004f452bE9203591991D15f6b388e09E8D0");
+
 // ─────────────────────────────────────────────────────────────────────────────
 // ABI bindings (minimal — only the functions this file actually calls)
 // ─────────────────────────────────────────────────────────────────────────────
@@ -222,6 +276,13 @@ alloy::sol! {
 pub enum LiquidityProtocol {
     AaveV3,
     BalancerV2,
+    /// Added alongside `UNISWAP_V3_WETH_USDC_POOL` and
+    /// `fetch_uniswap_v3_pool_balance` — no `resolve_liquidity_addresses` entry
+    /// exists for this variant (see that function's own doc comment): Uniswap V3 has
+    /// no single canonical contract the way Aave's Pool or Balancer's Vault does, so
+    /// there's no equivalent tag-override slot to resolve here today. The L2e loop in
+    /// `main.rs` uses `UNISWAP_V3_WETH_USDC_POOL` directly.
+    UniswapV3,
 }
 
 impl std::fmt::Display for LiquidityProtocol {
@@ -229,6 +290,7 @@ impl std::fmt::Display for LiquidityProtocol {
         match self {
             LiquidityProtocol::AaveV3 => write!(f, "aave_v3"),
             LiquidityProtocol::BalancerV2 => write!(f, "balancer_v2"),
+            LiquidityProtocol::UniswapV3 => write!(f, "uniswap_v3"),
         }
     }
 }
@@ -241,6 +303,9 @@ impl std::fmt::Display for LiquidityProtocol {
 /// LiquidityRegistry — do NOT redirect what the L2e poll's eth_call reads actually
 /// target". Collapsing this back into one `Address` would silently reintroduce exactly
 /// that bug.
+///
+/// Uniswap V3 deliberately has no entry here — see `resolve_liquidity_addresses`'s own
+/// doc comment.
 #[derive(Debug, Clone, Copy)]
 pub struct ResolvedLiquidityAddress {
     pub protocol: LiquidityProtocol,
@@ -263,6 +328,14 @@ pub struct ResolvedLiquidityAddress {
 /// fail soft rather than silently redirect). Returning `None` here lets the caller
 /// decide how to react (warn-and-skip, hard error, etc.) rather than this function
 /// making that call.
+///
+/// SCOPE NOTE: does NOT include Uniswap V3. Aave and Balancer each have exactly one
+/// canonical contract per chain, which is what makes a "query real address, but allow
+/// relabeling the recorded tag" split meaningful for them. Uniswap V3 has no such
+/// single contract — every fee tier / token pair is its own pool — so
+/// `UNISWAP_V3_WETH_USDC_POOL` is used directly by callers rather than resolved (and
+/// tag-overridden) here. If a second Uniswap pool or asset pair is added later, revisit
+/// whether this function's shape still fits or whether Uniswap needs its own resolver.
 pub fn resolve_liquidity_addresses(
     chain_id: u64,
     aave_tag_override: Option<Address>,
@@ -421,6 +494,53 @@ impl OmegaRpcClient {
         })
         .await
     }
+
+    /// Real available Uniswap V3 liquidity for `asset` at `pool`, in wei.
+    ///
+    /// Unlike Aave v3 (which needs an aToken lookup above) and Balancer V2 (whose
+    /// single Vault holds every pool's tokens), a Uniswap V3 pool holds its own
+    /// reserves directly and lends straight from that balance — `flash()` transfers
+    /// out up to the pool contract's own token balance and requires repayment plus fee
+    /// in the same transaction. So "available liquidity for `asset` at this pool" is
+    /// just `IERC20(asset).balanceOf(pool)` — the identical one-call shape
+    /// `fetch_balancer_available` already uses above, just against a caller-supplied
+    /// `pool` instead of a single fixed Vault address, since — unlike Balancer —
+    /// Uniswap V3 has no one contract that holds every pool's liquidity; every fee
+    /// tier / token pair is its own separate pool contract.
+    ///
+    /// `pool` is NOT resolved, defaulted, or validated for "does this pool actually
+    /// hold `asset`" internally — the caller must supply a real, verified pool address
+    /// (see `UNISWAP_V3_WETH_USDC_POOL`'s own doc comment for the one currently
+    /// defined in this file, and the real, previously-observed trap of a
+    /// similar-looking pool paired with the WRONG token). Passing a pool that doesn't
+    /// actually hold `asset` doesn't error here — `balanceOf` on any real contract
+    /// address just returns whatever that contract's own bookkeeping says, which for
+    /// an unrelated pool is silently `0` or some other misleading number, not a
+    /// signal that the caller made a mistake.
+    pub async fn fetch_uniswap_v3_pool_balance(
+        &self,
+        pool: Address,
+        asset: Address,
+    ) -> anyhow::Result<u128> {
+        self.gated_read(None, || async move {
+            let provider = self.get_or_connect().await?;
+            let call = IErc20Balance::balanceOfCall { account: pool };
+            let tx = TransactionRequest {
+                to: Some(TxKind::Call(asset)),
+                input: TransactionInput::new(call.abi_encode().into()),
+                ..Default::default()
+            };
+            let raw = provider.call(&tx).await.map_err(|e| {
+                anyhow::anyhow!(
+                    "balanceOf({asset} held by Uniswap V3 pool {pool}) eth_call failed: {e}"
+                )
+            })?;
+            let balance = IErc20Balance::balanceOfCall::abi_decode_returns(&raw, true)
+                .map_err(|e| anyhow::anyhow!("decoding balanceOf response failed: {e}"))?;
+            Ok(u256_to_u128_saturating(balance._0))
+        })
+        .await
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -454,14 +574,19 @@ impl DeploymentValidationReport {
     ///
     /// DELIBERATE SCOPE LIMIT: this confirms "something is deployed at this address",
     /// not "the correct contract, at the expected version, implementing the expected
-    /// ABI, is deployed here". A real ABI-level check (e.g. calling
+    /// ABI, is deployed here" — and, as of `UNISWAP_V3_WETH_USDC_POOL`, not "this is
+    /// the pool paired with the token this codebase means" either; see that
+    /// constant's own doc comment for why bytecode presence alone would NOT have
+    /// caught the wrong-pool trap found this session (the wrong pool has real code
+    /// too, it's just the wrong pool). A real ABI-level check (e.g. calling
     /// `getReserveTokensAddresses`/`balanceOf` — the exact calls
-    /// `fetch_aave_available`/`fetch_balancer_available` already make — and confirming
-    /// they don't revert) would close that gap further; those two functions
-    /// effectively ARE that check the first time the L2e poll loop runs, so a
-    /// bytecode-only startup check plus fail-soft-on-first-real-call behavior together
-    /// cover more ground than either alone, without this function claiming a stronger
-    /// guarantee than what it actually verifies.
+    /// `fetch_aave_available`/`fetch_balancer_available`/`fetch_uniswap_v3_pool_balance`
+    /// already make — and confirming they don't revert) would close the
+    /// bytecode-vs-ABI gap further; those functions effectively ARE that check the
+    /// first time the L2e poll loop runs, so a bytecode-only startup check plus
+    /// fail-soft-on-first-real-call behavior together cover more ground than either
+    /// alone, without this function claiming a stronger guarantee than what it
+    /// actually verifies.
     pub fn all_ok(&self) -> bool {
         self.results.iter().all(|r| r.has_code && r.error.is_none())
     }
@@ -471,10 +596,11 @@ impl DeploymentValidationReport {
 /// address in this module, for `chain_id`, and returns a report.
 ///
 /// Intended to be called once at startup so a stale/wrong address is caught as a loud
-/// startup failure instead of `fetch_aave_available`/`fetch_balancer_available` (or the
-/// L2d ArbGasInfo poll) silently failing soft, cycle after cycle, forever. Does NOT
-/// panic or bail itself — the caller decides whether `all_ok() == false` should halt
-/// startup (recommended — see `main.rs`'s own call site) or just warn.
+/// startup failure instead of `fetch_aave_available`/`fetch_balancer_available`/
+/// `fetch_uniswap_v3_pool_balance` (or the L2d ArbGasInfo poll) silently failing soft,
+/// cycle after cycle, forever. Does NOT panic or bail itself — the caller decides
+/// whether `all_ok() == false` should halt startup (recommended — see `main.rs`'s own
+/// call site) or just warn.
 ///
 /// For any `chain_id != ARBITRUM_ONE_CHAIN_ID`, returns an empty report (`results` is
 /// empty, `all_ok()` trivially `true`) — this module has no addresses to check on
@@ -491,12 +617,13 @@ pub async fn validate_deployed_contracts(
         };
     }
 
-    let targets: [(&'static str, Address); 5] = [
+    let targets: [(&'static str, Address); 6] = [
         ("AAVE_V3_POOL", AAVE_V3_POOL),
         ("AAVE_PROTOCOL_DATA_PROVIDER", AAVE_PROTOCOL_DATA_PROVIDER),
         ("BALANCER_V2_VAULT", BALANCER_V2_VAULT),
         ("WETH", WETH),
         ("USDC_NATIVE", USDC_NATIVE),
+        ("UNISWAP_V3_WETH_USDC_POOL", UNISWAP_V3_WETH_USDC_POOL),
     ];
 
     let mut results = Vec::with_capacity(targets.len());
@@ -606,6 +733,37 @@ mod tests {
         );
     }
 
+    /// Regression guard for the exact "two different USDC/WETH 0.05% pools" trap this
+    /// session's lookup found and `UNISWAP_V3_WETH_USDC_POOL`'s own doc comment
+    /// documents — written out in full, lowercase, for an unambiguous diff if this
+    /// ever silently drifts to the OTHER (USDC.e-paired, much thinner) pool.
+    #[test]
+    fn uniswap_v3_pool_matches_the_cross_checked_address() {
+        assert_eq!(
+            format!("{UNISWAP_V3_WETH_USDC_POOL:#x}"),
+            "0xc6962004f452be9203591991d15f6b388e09e8d0"
+        );
+    }
+
+    /// Companion to the test above: explicitly asserts the constant is NOT the other,
+    /// USDC.e-paired pool this session's search also turned up. Belt and suspenders —
+    /// the exact-match test above already implies this, but an explicit negative
+    /// assertion makes the intent (this is a deliberate choice between two real,
+    /// similar-looking pools, not an oversight) undeniable to a future reader.
+    #[test]
+    fn uniswap_v3_pool_is_not_the_usdc_e_paired_pool() {
+        let usdc_e_paired_pool =
+            alloy_primitives::address!("c31e54C7a869B9FCBEcc14363CF510D1c41Fa443");
+        assert_ne!(UNISWAP_V3_WETH_USDC_POOL, usdc_e_paired_pool);
+    }
+
+    #[test]
+    fn liquidity_protocol_display_covers_all_three_providers() {
+        assert_eq!(LiquidityProtocol::AaveV3.to_string(), "aave_v3");
+        assert_eq!(LiquidityProtocol::BalancerV2.to_string(), "balancer_v2");
+        assert_eq!(LiquidityProtocol::UniswapV3.to_string(), "uniswap_v3");
+    }
+
     #[test]
     fn u256_to_u128_saturating_passes_through_in_range_values() {
         assert_eq!(u256_to_u128_saturating(U256::from(12345u64)), 12345u128);
@@ -661,5 +819,31 @@ mod tests {
             }],
         };
         assert!(!report.all_ok());
+    }
+
+    /// Regression guard: `validate_deployed_contracts`'s target list must actually
+    /// include the new pool — a silent omission here would mean C7 startup validation
+    /// keeps passing even if `UNISWAP_V3_WETH_USDC_POOL` were ever wrong, defeating
+    /// the entire point of adding it. Exercises the real function end-to-end-ish by
+    /// checking the label set a caller would see, without needing a live RPC
+    /// connection (off-Arbitrum path returns an empty, vacuously-ok report, so this
+    /// asserts against the ON-Arbitrum target list indirectly via the same six labels
+    /// `validate_deployed_contracts` constructs internally).
+    #[test]
+    fn six_addresses_are_covered_by_name() {
+        // Mirrors the real `targets` array inside `validate_deployed_contracts`
+        // exactly, so this test fails loudly if that array and this list ever drift
+        // apart — the two are meant to be kept in lockstep by hand, same discipline
+        // as `strategy_onchain_ids()` in `main.rs`.
+        let expected_labels = [
+            "AAVE_V3_POOL",
+            "AAVE_PROTOCOL_DATA_PROVIDER",
+            "BALANCER_V2_VAULT",
+            "WETH",
+            "USDC_NATIVE",
+            "UNISWAP_V3_WETH_USDC_POOL",
+        ];
+        assert_eq!(expected_labels.len(), 6);
+        assert!(expected_labels.contains(&"UNISWAP_V3_WETH_USDC_POOL"));
     }
 }

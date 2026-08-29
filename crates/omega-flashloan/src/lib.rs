@@ -53,6 +53,10 @@
 //   which token it means, the same posture this crate already takes on
 //   Uniswap's `asset_is_token0` in `encoding.rs`.
 //
+//   `FlashloanError::NoneAvailable` gained a matching `asset: Address` field for
+//   the same reason: a "no provider available" log line is not actionable once
+//   more than one asset is tracked, if it doesn't say which asset failed.
+//
 // ## Calldata encoding
 //
 //   Each provider has a distinct flash loan ABI.  `encode_flashloan_call`
@@ -151,15 +155,26 @@ impl std::fmt::Display for FlashloanProvider {
 
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum FlashloanError {
-    /// No registered provider has sufficient liquidity for `amount_wei`
-    /// on `chain_id`.  Records the best available amount for diagnostics.
+    /// No registered provider has sufficient liquidity for `amount_wei` of
+    /// `asset` on `chain_id`.  Records the best available amount for
+    /// diagnostics.
+    ///
+    /// `asset` was added alongside the registry's own asset-scoping (see
+    /// this module's top-level "CHANGE" note): before that change, a
+    /// `NoneAvailable` error gave no way to tell whether the caller had
+    /// asked for WETH, USDC, or something else — in a system tracking a
+    /// single asset that was implicit, but with multiple assets tracked it
+    /// became a real diagnostic gap (a log line reading "no provider
+    /// available for 50000000000000000000 wei" is not actionable on its
+    /// own once more than one token is in play).
     #[error(
-        "No flash loan provider available for {amount_wei} wei on chain \
+        "No flash loan provider available for {amount_wei} wei of {asset} on chain \
          {chain_id}: best available = {best_available_wei} wei"
     )]
     NoneAvailable {
         amount_wei: U256,
         chain_id: u64,
+        asset: Address,
         best_available_wei: U256,
     },
 
@@ -515,6 +530,7 @@ pub fn select_provider(
     Err(FlashloanError::NoneAvailable {
         amount_wei,
         chain_id,
+        asset,
         best_available_wei: best_available,
     })
 }

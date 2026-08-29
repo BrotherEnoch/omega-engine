@@ -28,6 +28,35 @@
 //
 // ## Changelog (most recent first within each item; see VCS for full history)
 //
+// - C10: L2e now also polls Uniswap V3 (previously the only provider written to
+//   omega-rpc's address list but never actually read from — see the C9 item below,
+//   "UniswapV3 is deliberately not written"). Uses a single, verified WETH/USDC_NATIVE
+//   0.05%-fee pool (`omega_rpc::UNISWAP_V3_WETH_USDC_POOL`) that covers both currently
+//   tracked assets, since a Uniswap V3 pool holds both its tokens' balances directly —
+//   "available liquidity" there is just `ERC20(asset).balanceOf(pool)`
+//   (`OmegaRpcClient::fetch_uniswap_v3_pool_balance`), no protocol-accounting layer to
+//   navigate the way Aave's aToken indirection needs. Verifying that pool address this
+//   session caught a real trap worth flagging here, not just in omega-rpc's own
+//   comments: Arbitrum has TWO different "USDC/WETH 0.05%" Uniswap V3 pools — one
+//   paired with `USDC_NATIVE` (~$75M pooled, the one used here) and one paired with
+//   the older bridged `USDC.e` (well under $1M pooled) — and nothing about querying
+//   the wrong one would have errored; it would have silently reported a thin,
+//   wrong-token pool's balance as this system's Uniswap V3 liquidity signal for every
+//   cycle, forever. `omega-rpc`'s own `UNISWAP_V3_WETH_USDC_POOL` doc comment carries
+//   the full verification trail. C7's `validate_deployed_contracts` now checks this
+//   pool's bytecode presence at startup alongside the other five addresses (6 total),
+//   though — same scope limit as always — bytecode presence would NOT by itself have
+//   caught the wrong-pool trap above (the wrong pool has real code too); the
+//   `balanceOf` read itself is the closest thing to a live check for "is this actually
+//   the pool we think it is," the same posture C7 already takes for Aave/Balancer.
+//   `select_provider` needed NO changes for this — `omega_flashloan`'s registry and
+//   selector were already fully provider- and asset-generic as of C9; UniswapV3 was
+//   dead purely because nothing ever wrote to it, not because of any gap in that
+//   crate. `omega_flashloan::FlashloanError::NoneAvailable` separately gained an
+//   `asset: Address` field this same session (independent of C10's Uniswap wiring) —
+//   with multiple assets tracked, a "no provider available" error that didn't say
+//   which asset it was about had become a real diagnostic gap.
+//
 // - C9: L2e now polls BOTH WETH and USDC_NATIVE into LiquidityRegistry (was: WETH
 //   only, despite USDC_NATIVE already being validated at startup by C7). This was
 //   deliberately NOT safe to do as a one-line addition: `LiquidityRegistry`'s key was
@@ -81,7 +110,9 @@
 // - C7: startup validation of hardcoded flashloan/liquidity contract addresses
 //   (omega_rpc::validate_deployed_contracts, backed by omega-rpc's flashloan_liq.rs —
 //   see that file's own header for what AAVE_V3_POOL/AAVE_PROTOCOL_DATA_PROVIDER/
-//   BALANCER_V2_VAULT/WETH/USDC_NATIVE are and how each was verified). Runs a real
+//   BALANCER_V2_VAULT/WETH/USDC_NATIVE/UNISWAP_V3_WETH_USDC_POOL are and how each was
+//   verified; the last of those was added by C10, extending this check from 5 to 6
+//   addresses). Runs a real
 //   eth_getCode check against every one of those addresses right after the RPC client
 //   connects, BEFORE the L2d/L2e poll loops (or anything else) are spawned against
 //   them — a wrong or stale address now halts startup with a clear error instead of
@@ -253,7 +284,7 @@ use omega_rpc::{
     rate_limiter::RpcRateLimiter, run_dex_sync_stream, run_fee_oracle_stream,
     run_lending_protocol_stream, run_mev_share_stream, run_pending_tx_stream,
     validate_deployed_contracts, OmegaRpcClient, RpcClientConfig, AAVE_V3_POOL,
-    BALANCER_V2_VAULT, USDC_NATIVE, WETH,
+    BALANCER_V2_VAULT, UNISWAP_V3_WETH_USDC_POOL, USDC_NATIVE, WETH,
 };
 use omega_security::{
     strategy_entries_from_manifest, AccountExposureTracker, BlueprintSigner, DeploymentManifest,
@@ -971,6 +1002,36 @@ async fn main() -> Result<()> {
                         );
                     }
 
+                    // C10: Uniswap V3, via the single WETH/USDC_NATIVE 0.05% pool —
+                    // covers both currently-tracked assets since a Uniswap V3 pool
+                    // holds both its tokens' balances. See UNISWAP_V3_WETH_USDC_POOL's
+                    // own doc comment (omega-rpc) for the wrong-pool trap this address
+                    // was deliberately verified against. Unlike Aave/Balancer, there is
+                    // no tag-override env var for this pool today — see
+                    // resolve_liquidity_addresses's own scope note in omega-rpc for why.
+                    let uniswap = liq_client
+                        .fetch_uniswap_v3_pool_balance(UNISWAP_V3_WETH_USDC_POOL, token)
+                        .await;
+                    if let Ok(available) = &uniswap {
+                        registry.update(
+                            chain_id_l2e,
+                            FlashloanProvider::UniswapV3,
+                            token,
+                            UNISWAP_V3_WETH_USDC_POOL,
+                            (*available)
+                                .try_into()
+                                .expect("u128 always fits in a 256-bit unsigned integer"),
+                            0,
+                        );
+                    } else if let Err(e) = &uniswap {
+                        tracing::warn!(
+                            error = %e,
+                            asset = %token,
+                            "Uniswap V3 pool balance read failed for this asset this cycle — \
+                             registry keeps its previous value for (UniswapV3, this asset)"
+                        );
+                    }
+
                     // Only WETH drives CheckContext.flashloan's single-scalar sanity
                     // signal — see FlashloanLiquidityState's own doc comment for why
                     // this stays asset-pinned rather than becoming asset-aware here.
@@ -1022,8 +1083,10 @@ async fn main() -> Result<()> {
         tracing::info!(
             interval_s = FLASHLOAN_LIQUIDITY_POLL_INTERVAL_S,
             assets = "WETH, USDC_NATIVE",
+            providers = "Aave V3, Balancer V2, Uniswap V3 (single WETH/USDC_NATIVE pool)",
             "L2e flashloan liquidity poll loop started (feeds LiquidityRegistry for both \
-             assets; CheckContext-facing watch channel remains WETH-only)"
+             assets across all three providers; CheckContext-facing watch channel \
+             remains Aave/Balancer-WETH-only — see C10 changelog item)"
         );
     }
 
