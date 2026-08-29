@@ -19,7 +19,7 @@
 // `flashloan_provider_type` / `provider_contract` on `ExecutionBlueprint`
 // are populated from the real `SelectionResult`.
 //
-// ## Real position selection + real flashloan_token (this revision)
+// ## Real position selection + real flashloan_token (earlier revision)
 //
 // LA now holds `Arc<omega_positions::PositionRegistry>` and, on every
 // `score`/`build_blueprint` call, selects the most urgent currently-
@@ -33,23 +33,37 @@
 // position, so `debt_token()` below is no longer an unconditional
 // `None` — see that function's own doc comment.
 //
-// KNOWN LIMITATION, new this revision, not previously possible to hit:
-// `score` and `build_blueprint` are two SEPARATE calls (per
-// `StrategyTrait`'s own documented execution flow) with no shared
-// state between them — each independently queries
-// `PositionRegistry::liquidatable_positions` and takes the current
-// front of that list. If the registry's contents change between the
-// two calls (a new poll cycle updates or evicts the position that was
-// scored), `build_blueprint` can end up building against a DIFFERENT
-// position than the one `score` evaluated. This is not a new class of
-// risk for this codebase (`SignalState` itself can already change
-// between the two calls for every strategy), but it's flagged
-// explicitly here since it's new to LA specifically with this
-// revision. Fixing it would need `StrategyTrait`'s signature to thread
-// the scored opportunity through to `build_blueprint` — the same
-// cross-strategy trait-change cost already avoided when
-// `PositionRegistry` was designed as a side-channel rather than a new
-// trait parameter (see that crate's own doc comment).
+// KNOWN LIMITATION, not previously possible to hit: `score` and
+// `build_blueprint` are two SEPARATE calls (per `StrategyTrait`'s own
+// documented execution flow) with no shared state between them — each
+// independently queries `PositionRegistry::liquidatable_positions` and
+// takes the current front of that list. If the registry's contents
+// change between the two calls (a new poll cycle updates or evicts the
+// position that was scored), `build_blueprint` can end up building
+// against a DIFFERENT position than the one `score` evaluated. This is
+// not a new class of risk for this codebase (`SignalState` itself can
+// already change between the two calls for every strategy), but it's
+// flagged explicitly here since it's specific to LA. Fixing it would
+// need `StrategyTrait`'s signature to thread the scored opportunity
+// through to `build_blueprint` — the same cross-strategy trait-change
+// cost already avoided when `PositionRegistry` was designed as a
+// side-channel rather than a new trait parameter (see that crate's own
+// doc comment).
+//
+// ## CHANGE — asset-scoped flashloan selection (this revision)
+//
+// `omega_flashloan::select_provider` gained a required `asset: Address`
+// parameter (see that crate's own module-level "CHANGE" note): the
+// underlying `LiquidityRegistry` is now keyed by `(chain_id, provider,
+// asset, contract)` instead of `(chain_id, provider, contract)`, because
+// Aave's Pool and Balancer's Vault are each a single contract serving
+// many tokens — tracking a second asset without an asset-scoped key
+// would have silently overwritten the first asset's liquidity snapshot.
+// `build_blueprint` already resolves `flashloan_token` (the real,
+// selected position's debt token) before this call — it is now passed
+// straight through as the `asset` argument, so LA borrows against
+// liquidity actually tracked for the debt token itself rather than
+// whatever token happened to be recorded last at that provider contract.
 //
 // ## STILL NOT RESOLVED: `flashloan_token`'s AMOUNT, `debt_amount_wei`
 //
@@ -65,13 +79,11 @@
 // why guessing here would be strictly worse than refusing (a real
 // selected position paired with a fabricated amount).
 //
-// PRACTICAL CONSEQUENCE OF THIS CHOICE: `score` now returns `0.0` for
-// EVERY liquidatable position tracked, until a real price source is
-// wired in — this is a deliberate, honest regression from the prior
-// revision's behavior (which always scored something nonzero off the
-// fake `LA_PROXY_DEBT_WEI` constant, real position or not). `LA_PROXY_
-// DEBT_WEI` itself is REMOVED this revision — it no longer has any
-// caller; real position debt sizing is the only path now, gated
+// PRACTICAL CONSEQUENCE OF THIS CHOICE: `score` returns `0.0` for EVERY
+// liquidatable position tracked, until a real price source is wired in
+// — this remains a deliberate, honest gap, unaffected by this
+// revision's asset-scoping change. `LA_PROXY_DEBT_WEI` no longer has
+// any caller; real position debt sizing is the only path now, gated
 // correctly rather than silently bypassed.
 //
 // ## `max_base_fee_gwei` (earlier revision)
@@ -90,9 +102,10 @@
 // `LiquidationArb.sol::execute(bytes,uint256)` ABI (which decodes
 // `(Protocol, collateral, debt, user, debtToCover, minProfit,
 // extraData)`). Flagged in this codebase's own investigation history;
-// not fixed here — this revision's scope is position/token sourcing,
-// not the calldata encoder. A resolved `debt_amount_wei` gap does NOT
-// make this blueprint's calldata correct against the real contract.
+// not fixed here — this revision's scope is asset-scoped flashloan
+// selection, not the calldata encoder. A resolved `debt_amount_wei` gap
+// does NOT make this blueprint's calldata correct against the real
+// contract.
 
 use std::sync::{
     atomic::{AtomicU64, Ordering},
@@ -143,9 +156,9 @@ pub struct LaStrategy {
     bytecode_hash: B256,
     contract_addr: Address,
     liquidity_registry: Arc<LiquidityRegistry>,
-    /// Real, live tracked lending-position registry (this revision) —
-    /// see `omega_positions::PositionRegistry`'s own doc comment. Read
-    /// on every `score`/`build_blueprint` call via
+    /// Real, live tracked lending-position registry — see
+    /// `omega_positions::PositionRegistry`'s own doc comment. Read on
+    /// every `score`/`build_blueprint` call via
     /// `liquidatable_positions(self.chain_id)`; nothing here writes to
     /// it (writer is an omega-oracle component not part of this crate).
     position_registry: Arc<PositionRegistry>,
@@ -153,13 +166,9 @@ pub struct LaStrategy {
 }
 
 impl LaStrategy {
-    /// CONSTRUCTOR SIGNATURE CHANGED (this revision): gains
-    /// `position_registry: Arc<PositionRegistry>`. Every call site
-    /// constructing `LaStrategy` must be updated — per earlier
-    /// verification in this codebase's own history, `main.rs` does not
-    /// currently construct LA at all (only CNRY is registered in
-    /// production), so this affects test helpers only, not live wiring,
-    /// as of this revision.
+    /// Every call site constructing `LaStrategy` must supply
+    /// `position_registry: Arc<PositionRegistry>` alongside the other
+    /// real, deployment-sourced fields.
     pub fn new(
         chain_id: u64,
         bytecode_hash: B256,
@@ -391,10 +400,9 @@ impl StrategyTrait for LaStrategy {
             )
         })?;
 
-        // GUARD: debt_token is now real (sourced from the selected
-        // position) — see debt_token's own doc comment for why this
-        // can still legitimately fail (a zero address on the upstream
-        // snapshot).
+        // GUARD: debt_token is real (sourced from the selected position)
+        // — see debt_token's own doc comment for why this can still
+        // legitimately fail (a zero address on the upstream snapshot).
         let flashloan_token = Self::debt_token(&position).ok_or_else(|| {
             anyhow::anyhow!(
                 "LA: selected position (borrower {:?}, protocol {:?}) has no valid \
@@ -430,10 +438,19 @@ impl StrategyTrait for LaStrategy {
             )
             .ok_or_else(|| anyhow::anyhow!("LA opportunity no longer profitable"))?;
 
-        // Real provider/pool selection — see module-level comment.
-        let selection =
-            omega_flashloan::select_provider(&self.liquidity_registry, self.chain_id, debt_wei)
-                .map_err(|e| anyhow::anyhow!("LA: flashloan selection failed: {e:?}"))?;
+        // Real provider/pool selection, scoped to the actual debt token —
+        // see module-level "CHANGE" note above and omega-flashloan's own
+        // module-level note for why `asset` is now required here. Passing
+        // anything other than `flashloan_token` would select liquidity for
+        // the WRONG token at whatever provider contract happened to have a
+        // stale/mismatched entry.
+        let selection = omega_flashloan::select_provider(
+            &self.liquidity_registry,
+            self.chain_id,
+            flashloan_token,
+            debt_wei,
+        )
+        .map_err(|e| anyhow::anyhow!("LA: flashloan selection failed: {e:?}"))?;
 
         let nonce = self.nonce.fetch_add(1, Ordering::Relaxed);
         let calldata = Self::encode_liquidation_calldata(self.contract_addr, debt_wei, net_profit);
@@ -558,10 +575,14 @@ mod tests {
         // Seeded even though these tests never reach flashloan selection
         // (they're all gated earlier, on position/pricing) — kept for
         // parity with the constructor's real requirements and in case a
-        // future test extends past those guards.
+        // future test extends past those guards. Asset is `addr(0xD0)` —
+        // the same debt_token `sample_position` above uses — since
+        // `select_provider` is now asset-scoped and a mismatched asset
+        // here would make that future test fail for the wrong reason.
         liquidity_registry.update(
             TEST_CHAIN_ID,
             omega_flashloan::FlashloanProvider::Balancer,
+            addr(0xD0),
             Address::from([0xB0; 20]),
             U256::from(1_000_000_000_000_000_000_000u128),
             1,
@@ -605,9 +626,9 @@ mod tests {
         assert!(s.hot_path_eligible());
     }
 
-    /// Regression guard for this revision: with no liquidatable position
-    /// tracked, score must report no opportunity — not fabricate one off
-    /// a fixed constant the way the prior revision did.
+    /// Regression guard: with no liquidatable position tracked, score
+    /// must report no opportunity — not fabricate one off a fixed
+    /// constant the way a much earlier revision did.
     #[tokio::test]
     async fn score_zero_when_no_liquidatable_position() {
         let op = make().score(&sig(5)).await.unwrap();
@@ -615,8 +636,8 @@ mod tests {
         assert_eq!(op.expected_profit, U256::ZERO);
     }
 
-    /// Regression guard for this revision: even with a real, liquidatable
-    /// position tracked, score must still report no opportunity while no
+    /// Regression guard: even with a real, liquidatable position
+    /// tracked, score must still report no opportunity while no
     /// debt-amount pricing source exists — this is the honest, current
     /// state (see `debt_amount_wei`'s own doc comment), not a bug.
     #[tokio::test]
@@ -631,8 +652,8 @@ mod tests {
         );
     }
 
-    /// Regression guard for this revision: build_blueprint must fail
-    /// cleanly, not panic, when no liquidatable position is tracked.
+    /// Regression guard: build_blueprint must fail cleanly, not panic,
+    /// when no liquidatable position is tracked.
     #[tokio::test]
     async fn build_blueprint_fails_without_liquidatable_position() {
         let bp_result = make().build_blueprint(&sig(5)).await;
@@ -644,11 +665,10 @@ mod tests {
         assert!(msg.contains("liquidatable position"), "error message: {msg}");
     }
 
-    /// Regression guard for this revision: build_blueprint must fail
-    /// cleanly (not panic, not fabricate an amount) while
-    /// debt_amount_wei has no real source — this is the expected,
-    /// current, honest state, now gated on PRICING rather than on the
-    /// token itself (the token is real as of this revision).
+    /// Regression guard: build_blueprint must fail cleanly (not panic,
+    /// not fabricate an amount) while debt_amount_wei has no real
+    /// source — this is the expected, current, honest state, gated on
+    /// PRICING rather than on the token itself (the token is real).
     #[tokio::test]
     async fn build_blueprint_fails_without_debt_amount_pricing_source() {
         let strat = make_with_positions(&[sample_position(1_000_000_000_000_000_000u128 - 1)]);

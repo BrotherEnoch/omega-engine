@@ -24,6 +24,18 @@ mod flashloan_tests {
         Address::from([b; 20])
     }
 
+    /// Fixed test asset addresses — distinct from provider/pool contract
+    /// addresses used elsewhere in this file (0x01.. / 0xAA.. / 0xBB.. etc.),
+    /// so a test bug that mixed up "asset" and "contract" args would produce
+    /// a visibly wrong address rather than an accidental match.
+    fn weth() -> Address {
+        addr(0xEE)
+    }
+
+    fn usdc() -> Address {
+        addr(0xFC)
+    }
+
     #[test]
     fn aave_premium_9bps() {
         let amount = eth(10);
@@ -63,8 +75,15 @@ mod flashloan_tests {
     #[test]
     fn update_and_snapshot_fresh() {
         let reg = test_registry();
-        reg.update(42161, FlashloanProvider::AaveV3, addr(0xAA), eth(50), 1_000);
-        let snap = reg.snapshot(42161, FlashloanProvider::AaveV3, addr(0xAA));
+        reg.update(
+            42161,
+            FlashloanProvider::AaveV3,
+            weth(),
+            addr(0xAA),
+            eth(50),
+            1_000,
+        );
+        let snap = reg.snapshot(42161, FlashloanProvider::AaveV3, weth(), addr(0xAA));
         assert!(snap.is_some());
         assert_eq!(snap.unwrap().available_wei, eth(50));
     }
@@ -72,17 +91,38 @@ mod flashloan_tests {
     #[test]
     fn unknown_provider_returns_none() {
         let reg = test_registry();
-        let snap = reg.snapshot(42161, FlashloanProvider::Balancer, addr(0xBB));
+        let snap = reg.snapshot(42161, FlashloanProvider::Balancer, weth(), addr(0xBB));
         assert!(snap.is_none());
     }
 
     #[test]
     fn available_contracts_sorted_by_liquidity() {
         let reg = test_registry();
-        reg.update(42161, FlashloanProvider::AaveV3, addr(0x01), eth(10), 1);
-        reg.update(42161, FlashloanProvider::AaveV3, addr(0x02), eth(50), 1);
-        reg.update(42161, FlashloanProvider::AaveV3, addr(0x03), eth(30), 1);
-        let contracts = reg.available_contracts(42161, FlashloanProvider::AaveV3);
+        reg.update(
+            42161,
+            FlashloanProvider::AaveV3,
+            weth(),
+            addr(0x01),
+            eth(10),
+            1,
+        );
+        reg.update(
+            42161,
+            FlashloanProvider::AaveV3,
+            weth(),
+            addr(0x02),
+            eth(50),
+            1,
+        );
+        reg.update(
+            42161,
+            FlashloanProvider::AaveV3,
+            weth(),
+            addr(0x03),
+            eth(30),
+            1,
+        );
+        let contracts = reg.available_contracts(42161, FlashloanProvider::AaveV3, weth());
         assert_eq!(contracts.len(), 3);
         assert_eq!(contracts[0].1.available_wei, eth(50));
         assert_eq!(contracts[1].1.available_wei, eth(30));
@@ -92,9 +132,23 @@ mod flashloan_tests {
     #[test]
     fn selects_balancer_over_aave_when_both_available() {
         let reg = test_registry();
-        reg.update(42161, FlashloanProvider::Balancer, addr(0xB0), eth(100), 1);
-        reg.update(42161, FlashloanProvider::AaveV3, addr(0xA0), eth(100), 1);
-        let result = select_provider(&reg, 42161, eth(50)).unwrap();
+        reg.update(
+            42161,
+            FlashloanProvider::Balancer,
+            weth(),
+            addr(0xB0),
+            eth(100),
+            1,
+        );
+        reg.update(
+            42161,
+            FlashloanProvider::AaveV3,
+            weth(),
+            addr(0xA0),
+            eth(100),
+            1,
+        );
+        let result = select_provider(&reg, 42161, weth(), eth(50)).unwrap();
         assert_eq!(
             result.provider,
             FlashloanProvider::Balancer,
@@ -106,17 +160,38 @@ mod flashloan_tests {
     #[test]
     fn falls_back_to_aave_when_balancer_insufficient() {
         let reg = test_registry();
-        reg.update(42161, FlashloanProvider::Balancer, addr(0xB0), eth(10), 1);
-        reg.update(42161, FlashloanProvider::AaveV3, addr(0xA0), eth(100), 1);
-        let result = select_provider(&reg, 42161, eth(50)).unwrap();
+        reg.update(
+            42161,
+            FlashloanProvider::Balancer,
+            weth(),
+            addr(0xB0),
+            eth(10),
+            1,
+        );
+        reg.update(
+            42161,
+            FlashloanProvider::AaveV3,
+            weth(),
+            addr(0xA0),
+            eth(100),
+            1,
+        );
+        let result = select_provider(&reg, 42161, weth(), eth(50)).unwrap();
         assert_eq!(result.provider, FlashloanProvider::AaveV3);
     }
 
     #[test]
     fn returns_none_available_when_all_insufficient() {
         let reg = test_registry();
-        reg.update(42161, FlashloanProvider::AaveV3, addr(0xA0), eth(5), 1);
-        let err = select_provider(&reg, 42161, eth(50)).unwrap_err();
+        reg.update(
+            42161,
+            FlashloanProvider::AaveV3,
+            weth(),
+            addr(0xA0),
+            eth(5),
+            1,
+        );
+        let err = select_provider(&reg, 42161, weth(), eth(50)).unwrap_err();
         assert!(matches!(err, FlashloanError::NoneAvailable { .. }));
         if let FlashloanError::NoneAvailable {
             best_available_wei, ..
@@ -133,7 +208,7 @@ mod flashloan_tests {
     #[test]
     fn empty_registry_returns_none_available() {
         let reg = test_registry();
-        let err = select_provider(&reg, 42161, eth(1)).unwrap_err();
+        let err = select_provider(&reg, 42161, weth(), eth(1)).unwrap_err();
         assert!(
             matches!(err, FlashloanError::NoneAvailable { best_available_wei: w, .. }
             if w == U256::ZERO)
@@ -144,9 +219,83 @@ mod flashloan_tests {
     fn selection_result_contract_addr_matches_registry() {
         let reg = test_registry();
         let provider = addr(0xCC);
-        reg.update(42161, FlashloanProvider::AaveV3, provider, eth(100), 1);
-        let result = select_provider(&reg, 42161, eth(50)).unwrap();
+        reg.update(
+            42161,
+            FlashloanProvider::AaveV3,
+            weth(),
+            provider,
+            eth(100),
+            1,
+        );
+        let result = select_provider(&reg, 42161, weth(), eth(50)).unwrap();
         assert_eq!(result.contract_addr, provider);
+    }
+
+    /// Regression test for the cross-asset overwrite bug this revision fixes:
+    /// before `ProviderKey` carried `asset`, tracking a second token (USDC) at
+    /// the SAME provider contract as WETH would have overwritten (or, post-fix
+    /// if the asset arg were ever dropped, been indistinguishable from) the
+    /// WETH snapshot. With the asset-scoped key, deep WETH liquidity at a pool
+    /// must never satisfy a USDC request against that same pool.
+    #[test]
+    fn different_assets_do_not_share_liquidity_at_the_same_contract() {
+        let reg = test_registry();
+        let shared_contract = addr(0xA0); // same Aave Pool address for both assets
+        reg.update(
+            42161,
+            FlashloanProvider::AaveV3,
+            weth(),
+            shared_contract,
+            eth(1_000),
+            1,
+        );
+        // Nothing registered for USDC at that same contract.
+        let err = select_provider(&reg, 42161, usdc(), eth(1)).unwrap_err();
+        assert!(
+            matches!(err, FlashloanError::NoneAvailable { best_available_wei, .. } if best_available_wei == U256::ZERO),
+            "WETH depth at a shared provider contract must never satisfy a USDC request"
+        );
+
+        // Sanity: the WETH reading itself is untouched and still selectable.
+        let weth_result = select_provider(&reg, 42161, weth(), eth(50)).unwrap();
+        assert_eq!(weth_result.contract_addr, shared_contract);
+        assert_eq!(weth_result.available_wei, eth(1_000));
+    }
+
+    /// Companion regression test: writing a USDC snapshot at the same
+    /// contract afterward must not perturb the existing WETH snapshot at
+    /// that contract (i.e. the two keys are genuinely independent, not just
+    /// independent at read time due to ordering).
+    #[test]
+    fn writing_second_asset_does_not_corrupt_first_assets_snapshot() {
+        let reg = test_registry();
+        let shared_contract = addr(0xA0);
+        reg.update(
+            42161,
+            FlashloanProvider::AaveV3,
+            weth(),
+            shared_contract,
+            eth(1_000),
+            1,
+        );
+        reg.update(
+            42161,
+            FlashloanProvider::AaveV3,
+            usdc(),
+            shared_contract,
+            eth(5_000),
+            2,
+        );
+
+        let weth_snap = reg
+            .snapshot(42161, FlashloanProvider::AaveV3, weth(), shared_contract)
+            .unwrap();
+        let usdc_snap = reg
+            .snapshot(42161, FlashloanProvider::AaveV3, usdc(), shared_contract)
+            .unwrap();
+
+        assert_eq!(weth_snap.available_wei, eth(1_000));
+        assert_eq!(usdc_snap.available_wei, eth(5_000));
     }
 
     #[test]

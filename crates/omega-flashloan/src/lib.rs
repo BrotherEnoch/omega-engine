@@ -7,9 +7,9 @@
 //   LA blueprints source capital via flash loans when the required
 //   liquidation amount exceeds on-hand capital.  This crate:
 //
-//   1. Tracks per-provider liquidity availability (`LiquidityRegistry`).
+//   1. Tracks per-provider, per-asset liquidity availability (`LiquidityRegistry`).
 //   2. Calculates the flash loan premium for each provider (`premium_wei`).
-//   3. Selects the cheapest available provider for a given amount and
+//   3. Selects the cheapest available provider for a given asset, amount, and
 //      chain (`select_provider`), returning `Err(FlashloanError::NoneAvailable)`
 //      when no provider can fill the request.
 //   4. Encodes provider-specific calldata for the flashloan callback ABI.
@@ -34,6 +34,24 @@
 //   (Supply, Withdraw, Borrow events).  Snapshots older than
 //   `LIQUIDITY_STALE_SECS` are not used — the selector falls through
 //   to the next provider rather than using stale data.
+//
+// ## CHANGE — asset-scoped registry keys (fixes a real cross-asset overwrite bug)
+//
+//   `ProviderKey` previously was `(chain_id, provider, contract)` — no asset
+//   field. Aave's Pool and Balancer's Vault are each a SINGLE contract that
+//   serves every token on that chain, so a second tracked asset (e.g. adding
+//   USDC alongside WETH) would have landed at the exact same key as the first
+//   and silently overwritten its snapshot — not a panic, not a stale-data
+//   warning, just a wrong number for whichever asset lost the race. This was
+//   never hit in production because only WETH was ever polled, but it made
+//   adding a second asset unsafe without this change.
+//
+//   `ProviderKey` now includes `asset: Address`, and `LiquidityRegistry::update`,
+//   `LiquidityRegistry::snapshot`, `LiquidityRegistry::available_contracts`, and
+//   `select_provider` all take an explicit `asset` parameter. There is
+//   deliberately no default or "primary asset" concept — every caller must say
+//   which token it means, the same posture this crate already takes on
+//   Uniswap's `asset_is_token0` in `encoding.rs`.
 //
 // ## Calldata encoding
 //
@@ -211,14 +229,22 @@ impl LiquiditySnapshot {
 // ProviderKey
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Composite key for the liquidity registry: (chain_id, provider, contract_addr).
+/// Composite key for the liquidity registry: (chain_id, provider, asset, contract).
+///
+/// `asset` was added because Aave's Pool and Balancer's Vault are each a
+/// single contract shared across every token they support — without an
+/// asset component in the key, tracking a second token at the same
+/// provider/contract would silently overwrite the first token's snapshot.
+/// See this module's top-level "CHANGE" note for the full history.
 ///
 /// Multiple pools of the same provider type can co-exist on a chain
-/// (e.g. multiple Uniswap v3 pools with different fee tiers).
+/// (e.g. multiple Uniswap v3 pools with different fee tiers for the same
+/// asset) — `contract` distinguishes those.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct ProviderKey {
     chain_id: u64,
     provider: FlashloanProvider,
+    asset: Address,
     contract: Address,
 }
 
@@ -226,7 +252,7 @@ struct ProviderKey {
 // LiquidityRegistry
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Concurrent map of per-provider, per-chain liquidity availability.
+/// Concurrent map of per-provider, per-asset, per-chain liquidity availability.
 ///
 /// Written by omega-oracle background tasks; read synchronously by the
 /// blueprint construction path.  All reads are O(1) and lock-free via
@@ -235,7 +261,7 @@ struct ProviderKey {
 /// Shared via `Arc<LiquidityRegistry>`.
 #[derive(Debug)]
 pub struct LiquidityRegistry {
-    /// (chain_id, provider, contract) → snapshot
+    /// (chain_id, provider, asset, contract) → snapshot
     snapshots: DashMap<ProviderKey, LiquiditySnapshot>,
 }
 
@@ -246,14 +272,21 @@ impl LiquidityRegistry {
         })
     }
 
-    /// Record a fresh liquidity snapshot.
+    /// Record a fresh liquidity snapshot for a specific `asset` at a
+    /// specific `(chain_id, provider, contract)`.
     ///
     /// Called by omega-oracle after processing a Supply/Withdraw/Borrow event
-    /// or after a periodic full-sync poll.
+    /// or after a periodic full-sync poll. `asset` must be the actual token
+    /// this reading is for — a shared-contract provider (Aave Pool, Balancer
+    /// Vault) can and will have multiple, independently-tracked assets at the
+    /// same `contract` address; passing the wrong `asset` here silently
+    /// corrupts that other asset's snapshot, same risk this key change was
+    /// made to eliminate at the type level for callers that get it right.
     pub fn update(
         &self,
         chain_id: u64,
         provider: FlashloanProvider,
+        asset: Address,
         contract: Address,
         available_wei: U256,
         block_number: u64,
@@ -261,6 +294,7 @@ impl LiquidityRegistry {
         let key = ProviderKey {
             chain_id,
             provider,
+            asset,
             contract,
         };
         let snap = LiquiditySnapshot {
@@ -273,25 +307,28 @@ impl LiquidityRegistry {
         tracing::debug!(
             provider      = %provider,
             chain_id,
+            asset         = %asset,
             available_eth = format!("{:.6}", u256_to_eth(available_wei)),
             block_number,
             "Flashloan liquidity updated",
         );
     }
 
-    /// Return the freshest liquidity snapshot for a (chain, provider, contract)
-    /// triplet.
+    /// Return the freshest liquidity snapshot for a (chain, provider, asset,
+    /// contract) quadruplet.
     ///
     /// Returns `None` when no snapshot exists or the snapshot is stale.
     pub fn snapshot(
         &self,
         chain_id: u64,
         provider: FlashloanProvider,
+        asset: Address,
         contract: Address,
     ) -> Option<LiquiditySnapshot> {
         let key = ProviderKey {
             chain_id,
             provider,
+            asset,
             contract,
         };
         let snap = self.snapshots.get(&key)?.clone();
@@ -302,17 +339,25 @@ impl LiquidityRegistry {
         }
     }
 
-    /// All registered contracts for a given (chain_id, provider), with fresh
-    /// snapshots, sorted descending by available liquidity.
+    /// All registered contracts for a given (chain_id, provider, asset), with
+    /// fresh snapshots, sorted descending by available liquidity.
+    ///
+    /// `asset` scopes the result to a single token — liquidity for a
+    /// different asset at the same contract is never mixed in here.
     pub fn available_contracts(
         &self,
         chain_id: u64,
         provider: FlashloanProvider,
+        asset: Address,
     ) -> Vec<(Address, LiquiditySnapshot)> {
         let mut entries: Vec<(Address, LiquiditySnapshot)> = self
             .snapshots
             .iter()
-            .filter(|e| e.key().chain_id == chain_id && e.key().provider == provider)
+            .filter(|e| {
+                e.key().chain_id == chain_id
+                    && e.key().provider == provider
+                    && e.key().asset == asset
+            })
             .filter(|e| e.value().is_fresh())
             .map(|e| (e.key().contract, e.value().clone()))
             .collect();
@@ -382,7 +427,7 @@ fn u256_to_eth(value_wei: U256) -> f64 {
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// The result of `select_provider` — the cheapest available provider that
-/// can fill the requested amount.
+/// can fill the requested amount of the requested asset.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SelectionResult {
     /// The selected provider.
@@ -401,16 +446,20 @@ pub struct SelectionResult {
 // Provider selector
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Select the cheapest flash loan provider that can fill `amount_wei` on
-/// `chain_id`.
+/// Select the cheapest flash loan provider that can fill `amount_wei` of
+/// `asset` on `chain_id`.
 ///
 /// ## Selection algorithm
 ///
 ///   1. For each provider in priority order (Balancer → AaveV3 → UniswapV3):
-///      a. Query `registry.available_contracts(chain_id, provider)`.
+///      a. Query `registry.available_contracts(chain_id, provider, asset)`.
 ///      b. Take the first contract with `available_wei ≥ amount_wei`.
 ///      c. Return `SelectionResult` for that contract.
 ///   2. If no provider can fill, return `Err(FlashloanError::NoneAvailable)`.
+///
+/// `asset` is required and not inferred — liquidity for a different token at
+/// the same provider contract is never substituted in, by construction of
+/// `LiquidityRegistry::available_contracts`'s asset filter.
 ///
 /// The caller (strategy blueprint construction) uses the `contract_addr`
 /// to populate `blueprint.flashloan_provider` and `premium_wei` to
@@ -418,6 +467,7 @@ pub struct SelectionResult {
 pub fn select_provider(
     registry: &LiquidityRegistry,
     chain_id: u64,
+    asset: Address,
     amount_wei: U256,
 ) -> Result<SelectionResult, FlashloanError> {
     let providers = [
@@ -429,7 +479,7 @@ pub fn select_provider(
     let mut best_available = U256::ZERO;
 
     for provider in providers {
-        let contracts = registry.available_contracts(chain_id, provider);
+        let contracts = registry.available_contracts(chain_id, provider, asset);
 
         for (contract, snap) in &contracts {
             // Track best available for diagnostics
@@ -444,6 +494,7 @@ pub fn select_provider(
                 tracing::debug!(
                     provider      = %provider,
                     contract      = %contract,
+                    asset         = %asset,
                     amount_eth    = format!("{:.6}", u256_to_eth(amount_wei)),
                     premium_eth   = format!("{:.9}", u256_to_eth(prem)),
                     available_eth = format!("{:.6}", u256_to_eth(snap.available_wei)),

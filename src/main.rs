@@ -28,6 +28,30 @@
 //
 // ## Changelog (most recent first within each item; see VCS for full history)
 //
+// - C9: L2e now polls BOTH WETH and USDC_NATIVE into LiquidityRegistry (was: WETH
+//   only, despite USDC_NATIVE already being validated at startup by C7). This was
+//   deliberately NOT safe to do as a one-line addition: `LiquidityRegistry`'s key was
+//   `(chain_id, provider, contract)` — no asset component — and Aave's Pool /
+//   Balancer's Vault are each a SINGLE contract shared across every token they
+//   support. Polling USDC into the old key would have silently overwritten whatever
+//   was last written for WETH at that same (chain_id, provider, contract) triple, or
+//   vice versa depending on poll ordering — not a panic, not a staleness warning, a
+//   quietly wrong liquidity number for one of the two assets. Fixed at the source:
+//   omega-flashloan's `ProviderKey`/`LiquidityRegistry::update`/`snapshot`/
+//   `available_contracts` and `select_provider` all now take an explicit `asset`
+//   parameter (see that crate's own module-level "CHANGE" note); `LaStrategy::
+//   build_blueprint` already resolves a real `flashloan_token` per position and now
+//   passes it straight through to `select_provider` instead of relying on an
+//   asset-agnostic global. The L2e loop below iterates `[WETH, USDC_NATIVE]` and
+//   writes a registry row per (provider, asset) pair each tick. The single-scalar
+//   `FlashloanLiquidityState` watch channel that feeds `CheckContext.flashloan`
+//   deliberately stays WETH-only — it's paired with `ORACLE_SNAPSHOT_TOKEN`, which is
+//   also WETH-only, and making that pairing asset-aware is a separate, larger change
+//   to `CheckContext`'s shape, not attempted here. STILL OPEN: Uniswap V3 remains
+//   unwritten for either asset (no single canonical pool per asset the way
+//   AAVE_V3_POOL/BALANCER_V2_VAULT are) — unchanged by this revision, same as the C1
+//   item below already noted for WETH.
+//
 // - C8: LA registered alongside CNRY in the L13 strategy registry (this revision).
 //   LaStrategy::new's constructor signature gained `position_registry:
 //   Arc<PositionRegistry>` in an earlier omega-strategies revision; main() now
@@ -68,7 +92,10 @@
 //   conformance — see `DeploymentValidationReport::all_ok`'s own doc comment.
 //   `fetch_aave_available`/`fetch_balancer_available` (now real, see the L2e item
 //   below) are themselves the closest thing to a live ABI check this system has, the
-//   first time the L2e loop actually calls them.
+//   first time the L2e loop actually calls them. NOTE: as of C7, USDC_NATIVE was
+//   already validated here even though it wasn't polled until C9 — see the C9 item
+//   above for why polling it earlier would have been unsafe without the registry
+//   key change C9 makes.
 //
 // - CHAIN_ID / AAVE_V3_POOL / BALANCER_V2_VAULT are no longer hardcoded to Arbitrum.
 //   `resolve_chain_id()` reads OMEGA_CHAIN_ID (default DEFAULT_CHAIN_ID); `chain_id` is
@@ -130,16 +157,19 @@
 //   previous value on read error rather than resetting to a worse one. Targets Arbitrum's
 //   fixed ArbGasInfo precompile address regardless of OMEGA_CHAIN_ID.
 //
-// - Real flashloan liquidity signal (L2e poll loop, Aave V3 + Balancer V2, WETH only) —
-//   closes CheckContext.flashloan's hardcoded-0. This is the MAX of the two providers'
-//   available liquidity, a pre-trade sanity signal only — NOT a guarantee that whichever
-//   provider a given blueprint's own select_provider() picks has this much. The same task
-//   is also LiquidityRegistry's real writer: every successful per-provider read now also
-//   calls liquidity_registry.update(...), so select_provider() has live data once a caller
-//   (LA) holds the registry. UniswapV3 is deliberately not written — no single canonical
-//   pool exists for it the way AAVE_V3_POOL/BALANCER_V2_VAULT do. The tag-override env vars
-//   only relabel which address is recorded against a successful update — they do not
-//   redirect what fetch_aave_available/fetch_balancer_available query on-chain (baked into
+// - Real flashloan liquidity signal (L2e poll loop, Aave V3 + Balancer V2) — closes
+//   CheckContext.flashloan's hardcoded-0. This is the MAX of the two providers'
+//   available liquidity for WETH, a pre-trade sanity signal only — NOT a guarantee
+//   that whichever provider a given blueprint's own select_provider() picks has this
+//   much. The same task is also LiquidityRegistry's real writer: every successful
+//   per-provider read now also calls liquidity_registry.update(...), so
+//   select_provider() has live data once a caller (LA) holds the registry. As of C9,
+//   this loop also writes USDC_NATIVE rows into the registry (asset-scoped, see the C9
+//   item above) — the CheckContext-feeding side of this loop remains WETH-only.
+//   UniswapV3 is deliberately not written — no single canonical pool exists for it the
+//   way AAVE_V3_POOL/BALANCER_V2_VAULT do. The tag-override env vars only relabel
+//   which address is recorded against a successful update — they do not redirect what
+//   fetch_aave_available/fetch_balancer_available query on-chain (baked into
 //   omega-rpc; both are now real, see omega-rpc/src/flashloan_liq.rs and the C7 item
 //   above). LA is now registered in the strategy registry below (see C8 item above), though
 //   LaStrategy::build_blueprint still has no flashloan_token pricing source — this poll
@@ -223,7 +253,7 @@ use omega_rpc::{
     rate_limiter::RpcRateLimiter, run_dex_sync_stream, run_fee_oracle_stream,
     run_lending_protocol_stream, run_mev_share_stream, run_pending_tx_stream,
     validate_deployed_contracts, OmegaRpcClient, RpcClientConfig, AAVE_V3_POOL,
-    BALANCER_V2_VAULT, WETH,
+    BALANCER_V2_VAULT, USDC_NATIVE, WETH,
 };
 use omega_security::{
     strategy_entries_from_manifest, AccountExposureTracker, BlueprintSigner, DeploymentManifest,
@@ -453,9 +483,18 @@ const ORACLE_SNAPSHOT_TOKEN: &str = "WETH";
 
 /// Live flashloan-liquidity snapshot for `CheckContext::flashloan`, populated by the L2e
 /// poll loop and read once per scoring cycle. `available_wei` is the MAX of Aave V3 /
-/// Balancer V2 available liquidity for the single tracked asset (WETH — must be kept
-/// manually in sync with `ORACLE_SNAPSHOT_TOKEN`, no shared source of truth for that
-/// pairing today).
+/// Balancer V2 available liquidity for the single tracked asset feeding this signal
+/// (WETH — must be kept manually in sync with `ORACLE_SNAPSHOT_TOKEN`, no shared source
+/// of truth for that pairing today).
+///
+/// AS OF C9: the L2e loop also polls USDC_NATIVE and writes it into
+/// `LiquidityRegistry` (asset-scoped — see that crate's own module-level note), but
+/// this specific struct/watch-channel stays WETH-only by design. It is a single scalar
+/// paired one-to-one with `ORACLE_SNAPSHOT_TOKEN` for `CheckContext.flashloan`'s
+/// pre-trade sanity check — making THIS asset-aware is a separate, larger change to
+/// `CheckContext`'s shape that C9 does not attempt. LA's own flashloan sizing does not
+/// go through this struct; it reads `LiquidityRegistry` directly via
+/// `omega_flashloan::select_provider`, which IS asset-scoped as of C9.
 ///
 /// KNOWN LIMITATION: this is a pre-trade sanity signal for check 10 (MissLiquidity), not a
 /// guarantee that whichever provider `select_provider` actually picks for a given
@@ -549,9 +588,9 @@ fn feed_block_event_to_reorg_guard(relay: &MultiRelayClient, event: &omega_rpc::
 /// `latest_blueprint_nonce` (C3), `strategy_bytecode_hash` (via
 /// `resolve_strategy_bytecode_hash`), `current_l1_gas_price_gwei` (ArbGasInfo poll),
 /// `risk_score` (real formula, one placeholder component), `current_account_exposure_wei`
-/// (AccountExposureTracker), `flashloan` (L2e poll). Still-placeholder fields:
-/// `competition_probability`/`max_competition_probability` (pinned, no real source),
-/// `rollout_tier` (no config exists, no check reads it).
+/// (AccountExposureTracker), `flashloan` (L2e poll, WETH-only — see C9 changelog item).
+/// Still-placeholder fields: `competition_probability`/`max_competition_probability`
+/// (pinned, no real source), `rollout_tier` (no config exists, no check reads it).
 #[allow(clippy::too_many_arguments)]
 fn build_check_context(
     chain_id: u64,
@@ -856,10 +895,20 @@ async fn main() -> Result<()> {
     }
 
     // ── L2e: flashloan liquidity polling ───────────────────────────────────────
-    // Real ingestion for CheckContext::flashloan.available AND the real writer for
-    // LiquidityRegistry (every successful per-provider read updates both the MAX-across-
-    // providers watch channel below and the per-provider registry entry). Tag overrides
-    // only relabel the recorded address, never redirect the eth_call target.
+    // Real ingestion for CheckContext::flashloan.available (WETH-only, see the
+    // FlashloanLiquidityState doc comment) AND the real, asset-scoped writer for
+    // LiquidityRegistry (every successful per-provider, per-asset read updates the
+    // registry; the WETH read additionally updates the MAX-across-providers watch
+    // channel below). Tag overrides only relabel the recorded address, never redirect
+    // the eth_call target.
+    //
+    // C9: now tracks both WETH and USDC_NATIVE. This is safe only because
+    // LiquidityRegistry::update/snapshot/available_contracts and
+    // omega_flashloan::select_provider are all asset-scoped as of this revision — see
+    // omega-flashloan's own module-level "CHANGE" note. Adding USDC_NATIVE here without
+    // that registry change would have silently overwritten whichever asset's snapshot
+    // was written last at the same (chain_id, provider, contract) key, since Aave's Pool
+    // and Balancer's Vault are each one contract shared across every token.
     let (flashloan_liq_tx, flashloan_liq_rx) =
         tokio::sync::watch::channel(FlashloanLiquidityState::default());
     // LiquidityRegistry::new() is assumed to return Arc<Self> already, matching every
@@ -874,88 +923,107 @@ async fn main() -> Result<()> {
         let aave_tag_l2e = aave_pool_tag;
         let balancer_tag_l2e = balancer_vault_tag;
         tokio::spawn(async move {
-            let token = WETH;
+            // Every asset this poll loop tracks. WETH remains the sole asset that feeds
+            // the CheckContext-facing watch channel below (see the `token != WETH`
+            // guard); USDC_NATIVE is written into the registry only, for LA's
+            // asset-scoped select_provider() to read directly.
+            let tracked_assets = [WETH, USDC_NATIVE];
             let mut ticker =
                 tokio::time::interval(Duration::from_secs(FLASHLOAN_LIQUIDITY_POLL_INTERVAL_S));
             ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             loop {
                 ticker.tick().await;
-                let aave = liq_client.fetch_aave_available(token).await;
-                let balancer = liq_client.fetch_balancer_available(token).await;
 
-                // block_number passed as 0 — no synchronous "current head" read is
-                // available off `rpc` today; LiquidityRegistry's staleness model is
-                // timestamp-driven, so this doesn't weaken it. `.try_into()` (not
-                // `.into()`): U256 has no infallible `From<u128>` in the resolved ruint
-                // version, only `TryFrom`. `.expect(...)` is safe — a u128 always fits in
-                // 256 bits; a panic here would only fire if that invariant were somehow
-                // violated, worth surfacing loudly rather than swallowing.
-                if let Ok(available) = &aave {
-                    registry.update(
-                        chain_id_l2e,
-                        FlashloanProvider::AaveV3,
-                        aave_tag_l2e,
-                        (*available)
-                            .try_into()
-                            .expect("u128 always fits in a 256-bit unsigned integer"),
-                        0,
-                    );
-                }
-                if let Ok(available) = &balancer {
-                    registry.update(
-                        chain_id_l2e,
-                        FlashloanProvider::Balancer,
-                        balancer_tag_l2e,
-                        (*available)
-                            .try_into()
-                            .expect("u128 always fits in a 256-bit unsigned integer"),
-                        0,
-                    );
-                }
+                for &token in &tracked_assets {
+                    let aave = liq_client.fetch_aave_available(token).await;
+                    let balancer = liq_client.fetch_balancer_available(token).await;
 
-                let candidate = match (aave, balancer) {
-                    (Ok(a), Ok(b)) if a >= b => Some((a, "aave".to_string())),
-                    (Ok(_), Ok(b)) => Some((b, "balancer".to_string())),
-                    (Ok(a), Err(e)) => {
-                        tracing::warn!(
-                            error = %e,
-                            "Balancer liquidity read failed — using Aave-only reading this cycle"
+                    // block_number passed as 0 — no synchronous "current head" read is
+                    // available off `rpc` today; LiquidityRegistry's staleness model is
+                    // timestamp-driven, so this doesn't weaken it. `.try_into()` (not
+                    // `.into()`): U256 has no infallible `From<u128>` in the resolved
+                    // ruint version, only `TryFrom`. `.expect(...)` is safe — a u128
+                    // always fits in 256 bits; a panic here would only fire if that
+                    // invariant were somehow violated, worth surfacing loudly rather
+                    // than swallowing.
+                    if let Ok(available) = &aave {
+                        registry.update(
+                            chain_id_l2e,
+                            FlashloanProvider::AaveV3,
+                            token,
+                            aave_tag_l2e,
+                            (*available)
+                                .try_into()
+                                .expect("u128 always fits in a 256-bit unsigned integer"),
+                            0,
                         );
-                        Some((a, "aave".to_string()))
                     }
-                    (Err(e), Ok(b)) => {
-                        tracing::warn!(
-                            error = %e,
-                            "Aave liquidity read failed — using Balancer-only reading this cycle"
+                    if let Ok(available) = &balancer {
+                        registry.update(
+                            chain_id_l2e,
+                            FlashloanProvider::Balancer,
+                            token,
+                            balancer_tag_l2e,
+                            (*available)
+                                .try_into()
+                                .expect("u128 always fits in a 256-bit unsigned integer"),
+                            0,
                         );
-                        Some((b, "balancer".to_string()))
                     }
-                    (Err(ea), Err(eb)) => {
-                        tracing::warn!(
-                            aave_error = %ea,
-                            balancer_error = %eb,
-                            "both flashloan liquidity reads failed — keeping previous value"
-                        );
-                        None
-                    }
-                };
 
-                if let Some((available_wei, protocol_id)) = candidate {
-                    tracing::debug!(
-                        available_wei,
-                        protocol_id = %protocol_id,
-                        "flashloan liquidity poll updated (registry + watch)"
-                    );
-                    let _ = liq_tx.send(FlashloanLiquidityState {
-                        available_wei,
-                        protocol_id,
-                    });
+                    // Only WETH drives CheckContext.flashloan's single-scalar sanity
+                    // signal — see FlashloanLiquidityState's own doc comment for why
+                    // this stays asset-pinned rather than becoming asset-aware here.
+                    if token != WETH {
+                        continue;
+                    }
+
+                    let candidate = match (aave, balancer) {
+                        (Ok(a), Ok(b)) if a >= b => Some((a, "aave".to_string())),
+                        (Ok(_), Ok(b)) => Some((b, "balancer".to_string())),
+                        (Ok(a), Err(e)) => {
+                            tracing::warn!(
+                                error = %e,
+                                "Balancer liquidity read failed — using Aave-only reading this cycle"
+                            );
+                            Some((a, "aave".to_string()))
+                        }
+                        (Err(e), Ok(b)) => {
+                            tracing::warn!(
+                                error = %e,
+                                "Aave liquidity read failed — using Balancer-only reading this cycle"
+                            );
+                            Some((b, "balancer".to_string()))
+                        }
+                        (Err(ea), Err(eb)) => {
+                            tracing::warn!(
+                                aave_error = %ea,
+                                balancer_error = %eb,
+                                "both flashloan liquidity reads failed — keeping previous value"
+                            );
+                            None
+                        }
+                    };
+
+                    if let Some((available_wei, protocol_id)) = candidate {
+                        tracing::debug!(
+                            available_wei,
+                            protocol_id = %protocol_id,
+                            "flashloan liquidity poll updated (registry + watch)"
+                        );
+                        let _ = liq_tx.send(FlashloanLiquidityState {
+                            available_wei,
+                            protocol_id,
+                        });
+                    }
                 }
             }
         });
         tracing::info!(
             interval_s = FLASHLOAN_LIQUIDITY_POLL_INTERVAL_S,
-            "L2e flashloan liquidity poll loop started (feeds LiquidityRegistry + CheckContext)"
+            assets = "WETH, USDC_NATIVE",
+            "L2e flashloan liquidity poll loop started (feeds LiquidityRegistry for both \
+             assets; CheckContext-facing watch channel remains WETH-only)"
         );
     }
 
@@ -1335,8 +1403,8 @@ async fn main() -> Result<()> {
     );
 
     // ── L13: Strategy registry ────────────────────────────────────────────────
-    // Different registry from IntegrityRegistry above. C8 (this revision): LA is now
-    // registered alongside CNRY; SA/MSA/MEV are still not registered here.
+    // Different registry from IntegrityRegistry above. C8: LA is registered alongside
+    // CNRY; SA/MSA/MEV are still not registered here.
 
     // Real, live lending-position registry LaStrategy requires at construction. NOTHING
     // IN THIS CODEBASE WRITES TO IT YET — no omega-oracle component exists to populate

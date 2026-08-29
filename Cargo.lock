@@ -4148,6 +4148,7 @@ dependencies = [
  "omega-hot-path",
  "omega-observability",
  "omega-oracle",
+ "omega-positions",
  "omega-relay",
  "omega-risk",
  "omega-rpc",
