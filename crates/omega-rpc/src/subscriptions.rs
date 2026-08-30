@@ -557,11 +557,64 @@ async fn run_fee_oracle_once(
 // MevShareStream — Phase 4 order-flow signal
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// A Flashbots MEV-Share bundle event.
+/// A Flashbots MEV-Share order-flow event (SSE `data:` JSON).
+///
+/// `payload` is the full JSON object. Parsed fields are best-effort extracts
+/// used by the competition / order-flow layer — missing keys do not drop the event.
 #[derive(Debug, Clone)]
 pub struct MevShareEvent {
     pub payload: serde_json::Value,
     pub received_at_unix_ms: u64,
+    /// Bundle / tx hash when present (`hash` field, 0x-hex).
+    pub hash: Option<[u8; 32]>,
+    /// True if `txs` is a non-empty array (competing execution path visible).
+    pub has_txs: bool,
+    /// True if `logs` is a non-empty array.
+    pub has_logs: bool,
+}
+
+impl MevShareEvent {
+    /// Build from raw SSE JSON, extracting known Flashbots MEV-Share fields.
+    pub fn from_payload(payload: serde_json::Value, received_at_unix_ms: u64) -> Self {
+        let hash = payload
+            .get("hash")
+            .and_then(|v| v.as_str())
+            .and_then(parse_b256_hex);
+        let has_txs = payload
+            .get("txs")
+            .and_then(|v| v.as_array())
+            .map(|a| !a.is_empty())
+            .unwrap_or(false);
+        let has_logs = payload
+            .get("logs")
+            .and_then(|v| v.as_array())
+            .map(|a| !a.is_empty())
+            .unwrap_or(false);
+        Self {
+            payload,
+            received_at_unix_ms,
+            hash,
+            has_txs,
+            has_logs,
+        }
+    }
+
+    /// Heuristic: event indicates active competing order flow.
+    pub fn indicates_competition(&self) -> bool {
+        self.has_txs || self.has_logs || self.hash.is_some()
+    }
+}
+
+fn parse_b256_hex(s: &str) -> Option<[u8; 32]> {
+    let s = s.trim().trim_start_matches("0x");
+    if s.len() != 64 {
+        return None;
+    }
+    let mut out = [0u8; 32];
+    for i in 0..32 {
+        out[i] = u8::from_str_radix(&s[i * 2..i * 2 + 2], 16).ok()?;
+    }
+    Some(out)
 }
 
 const MEV_SHARE_URL: &str = "https://mev-share.flashbots.net/api/v1/events";
@@ -660,10 +713,7 @@ async fn run_mev_share_once(
                     Ok(payload) => {
                         send_or_log(
                             tx,
-                            MevShareEvent {
-                                payload,
-                                received_at_unix_ms: now_unix_ms(),
-                            },
+                            MevShareEvent::from_payload(payload, now_unix_ms()),
                             "mev_share",
                         );
                     }
@@ -676,4 +726,31 @@ async fn run_mev_share_once(
     }
 
     Ok(())
+}
+
+
+#[cfg(test)]
+mod mev_share_parse_tests {
+    use super::*;
+
+    #[test]
+    fn mev_share_event_parses_hash_and_flags() {
+        let payload = serde_json::json!({
+            "hash": "0x1111111111111111111111111111111111111111111111111111111111111111",
+            "txs": ["0xabc"],
+            "logs": []
+        });
+        let ev = MevShareEvent::from_payload(payload, 1_700_000_000_000);
+        assert!(ev.hash.is_some());
+        assert!(ev.has_txs);
+        assert!(!ev.has_logs);
+        assert!(ev.indicates_competition());
+    }
+
+    #[test]
+    fn empty_payload_is_not_competition() {
+        let ev = MevShareEvent::from_payload(serde_json::json!({}), 0);
+        assert!(ev.hash.is_none());
+        assert!(!ev.indicates_competition());
+    }
 }

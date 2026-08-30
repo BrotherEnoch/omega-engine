@@ -69,7 +69,7 @@ pub use checks::{
     slippage_check, BlueprintFields, CheckResult,
 };
 pub use circuit_breakers::{BreakerDiagnostics, CircuitBreakerRegistry, CircuitState};
-pub use competition::{competition_probability, priority_fee_gwei, AssetTier};
+pub use competition::{competition_probability, competition_with_mev_share, priority_fee_gwei, AssetTier};
 pub use context::{CheckContext, FlashloanSnapshot, OracleSnapshot};
 pub use flash_crash::{FlashCrashGuard, FlashCrashResponse};
 pub use gas_model::{dynamic_min_profit, l1_adaptive_buffer, EXTRACTION_GAS, L2_EXEC_BUFFER};

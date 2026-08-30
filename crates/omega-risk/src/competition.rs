@@ -160,6 +160,23 @@ pub fn priority_fee_gwei(
     raw.clamp(2, 500)
 }
 
+
+/// Blend tier-based competition probability with recent MEV-Share order-flow intensity.
+///
+/// `mev_share_events_in_window` is the count of competition-indicating MEV-Share
+/// events observed in the last activity window (see main's MevShareActivityTracker).
+/// Each event adds a small bump (capped) so a quiet stream does not dominate the
+/// asset-tier model, while a burst of bundles pushes probability toward 0.99.
+pub fn competition_with_mev_share(
+    base_probability: f64,
+    mev_share_events_in_window: u32,
+) -> f64 {
+    const PER_EVENT_BUMP: f64 = 0.02;
+    const MAX_BUMP: f64 = 0.25;
+    let bump = (mev_share_events_in_window as f64 * PER_EVENT_BUMP).min(MAX_BUMP);
+    (base_probability + bump).clamp(0.0, 0.99)
+}
+
 #[cfg(test)]
 mod competition_tests {
     use super::*;
@@ -169,6 +186,14 @@ mod competition_tests {
     #[test]
     fn weth_is_major() {
         assert_eq!(AssetTier::from_symbol("WETH"), AssetTier::Major);
+    }
+
+    #[test]
+    fn mev_share_bump_caps_and_monotonic() {
+        let base = 0.70;
+        assert!((competition_with_mev_share(base, 0) - base).abs() < 1e-12);
+        assert!(competition_with_mev_share(base, 5) > base);
+        assert!((competition_with_mev_share(base, 100) - 0.95).abs() < 1e-9); // 0.70+0.25
     }
 
     #[test]
