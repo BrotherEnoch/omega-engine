@@ -743,6 +743,41 @@ impl OmegaRpcClient {
         send().await
     }
 
+    /// Sign-ready path for ZK `submitProof` (and any other pre-signed raw tx).
+    ///
+    /// Accepts `0x`-prefixed or bare hex RLP. Computes the tx hash, runs the
+    /// same dedup + write-rate-limit gate as `submit_raw_transaction`, then
+    /// `eth_sendRawTransaction` via the shared provider. Returns the 32-byte
+    /// transaction hash on success.
+    pub async fn submit_signed_raw_tx(&self, raw_tx_hex: &str) -> anyhow::Result<[u8; 32]> {
+        let raw = raw_tx_hex.trim().trim_start_matches("0x");
+        let raw_bytes = alloy::hex::decode(raw)
+            .map_err(|e| anyhow::anyhow!("submit_signed_raw_tx: invalid hex: {e}"))?;
+        if raw_bytes.is_empty() {
+            anyhow::bail!("submit_signed_raw_tx: empty transaction bytes");
+        }
+        let hash = alloy::primitives::keccak256(&raw_bytes);
+        let tx_hash = B256::from(hash);
+        let hash_arr: [u8; 32] = hash.into();
+
+        let raw_bytes_for_send = raw_bytes.clone();
+        self.submit_raw_transaction(tx_hash, None, || {
+            let this = self.clone();
+            let raw_bytes_for_send = raw_bytes_for_send;
+            async move {
+                let provider = this.get_or_connect().await?;
+                let _pending = provider
+                    .send_raw_transaction(raw_bytes_for_send.as_ref())
+                    .await
+                    .map_err(|e| anyhow::anyhow!("eth_sendRawTransaction failed: {e}"))?;
+                Ok(())
+            }
+        })
+        .await?;
+
+        Ok(hash_arr)
+    }
+
     // ── Fee oracle ───────────────────────────────────────────────────────────
 
     /// Fetch the current fee snapshot from the node, using the shared

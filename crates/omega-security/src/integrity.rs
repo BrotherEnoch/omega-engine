@@ -115,7 +115,34 @@ impl IntegrityRegistry {
     ///
     /// Called at startup for each strategy in the active phase, and after L3
     /// governance approves a new strategy deployment.
+    /// C4 fail-closed: refuse all-zero `bytecode_hash` or `contract_address`.
+    /// Manifest parsing already rejects these; this is defense-in-depth for any
+    /// programmatic `register` call that bypasses `strategy_entries_from_manifest`.
+    ///
+    /// Certora C7: also refuse registration when the strategy is already frozen —
+    /// freeze is permanent; a new deployment must use a new strategy id.
     pub fn register(&self, entry: StrategyEntry) {
+        if self.is_frozen(&entry.strategy_id) {
+            tracing::error!(
+                strategy = %entry.strategy_id,
+                "IntegrityRegistry::register refused — strategy is frozen (Certora C7)"
+            );
+            return;
+        }
+        if entry.bytecode_hash == [0u8; 32] {
+            tracing::error!(
+                strategy = %entry.strategy_id,
+                "IntegrityRegistry::register refused all-zero bytecode_hash (C4 fail closed)"
+            );
+            return;
+        }
+        if entry.contract_address == [0u8; 20] {
+            tracing::error!(
+                strategy = %entry.strategy_id,
+                "IntegrityRegistry::register refused all-zero contract_address (C4 fail closed)"
+            );
+            return;
+        }
         let id = entry.strategy_id.clone();
         tracing::info!(
             strategy       = %id,
@@ -195,12 +222,18 @@ impl IntegrityRegistry {
     /// Write-once: once frozen, cannot be unfrozen (spec C7 / Orchestrator.freezeStrategy).
     /// Requires DEFAULT_ADMIN_ROLE in the Orchestrator; here called by the L2
     /// governance handler after a signed freeze proposal.
+    /// Write-once freeze (Certora C7 / Orchestrator.freezeStrategy).
+    /// Idempotent: a second freeze of the same id does not double-count metrics.
     pub fn freeze(&self, strategy_id: &str) {
+        if self.frozen.contains(strategy_id) {
+            tracing::debug!(strategy = strategy_id, "strategy already frozen — no-op");
+            return;
+        }
         self.frozen.insert(strategy_id.to_string());
         metrics::STRATEGY_FREEZES.inc();
         tracing::warn!(
             strategy = strategy_id,
-            "strategy FROZEN — no further blueprints permitted"
+            "strategy FROZEN — no further blueprints permitted (governance only; not a startup step)"
         );
     }
 
@@ -447,6 +480,28 @@ mod integrity_tests {
         reg
     }
 
+    /// C4: programmatic register must not accept placeholder zero hashes.
+    #[test]
+    fn register_refuses_zero_bytecode_hash() {
+        let reg = IntegrityRegistry::new();
+        reg.register(StrategyEntry {
+            strategy_id: "SA".into(),
+            bytecode_hash: [0u8; 32],
+            contract_address: [0x01; 20],
+            min_phase: 1,
+        });
+        assert!(reg.snapshot().is_empty());
+    }
+
+    #[test]
+    fn freeze_is_idempotent() {
+        let reg = reg_with_sa();
+        reg.freeze("SA");
+        reg.freeze("SA");
+        assert!(reg.is_frozen("SA"));
+        assert_eq!(reg.frozen_ids().len(), 1);
+    }
+
     // ── Bytecode check (C4) ───────────────────────────────────────────────────
 
     #[test]
@@ -492,7 +547,24 @@ mod integrity_tests {
     }
 
     #[test]
+    fn register_refused_when_frozen() {
+        let reg = reg_with_sa();
+        reg.freeze("SA");
+        reg.register(StrategyEntry {
+            strategy_id: "SA".into(),
+            bytecode_hash: [0xbb; 32],
+            contract_address: [0x09; 20],
+            min_phase: 1,
+        });
+        // Entry must remain the original — re-register did not overwrite.
+        assert!(reg.check_bytecode("SA", &[0xaa; 32]).is_ok());
+        assert!(reg.check_bytecode("SA", &[0xbb; 32]).is_err());
+        assert!(reg.is_frozen("SA"));
+    }
+
+    #[test]
     fn freeze_is_permanent() {
+
         let reg = reg_with_sa();
         reg.freeze("SA");
         // Freeze again (idempotent) — still frozen

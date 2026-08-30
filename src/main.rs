@@ -1485,33 +1485,90 @@ async fn main() -> Result<()> {
         "L7 ZK: proof worker pool started, ZkVerifier + PendingProofBuffer ready"
     );
 
-    // Keeper: drain verified proofs into submitProof calldata. Does NOT broadcast —
-    // replace the body with KeyManagerTransactionSigner when the on-chain path is live.
+    // Keeper: drain verified proofs → encode submitProof → sign_call_gwei →
+    // OmegaRpcClient::submit_signed_raw_tx (dedup + eth_sendRawTransaction).
     {
         let buf = Arc::clone(&pending_proofs);
         let vault = vault_address;
+        let signer_bg = Arc::clone(&signer);
+        let rpc_bg = rpc.clone();
+        let chain_id_bg = chain_id;
+        let vault_nonce = std::sync::atomic::AtomicU64::new(
+            std::env::var("OMEGA_VAULT_SUBMIT_NONCE")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(0),
+        );
         tokio::spawn(async move {
+            use std::sync::atomic::Ordering;
+
             let mut ticker = tokio::time::interval(Duration::from_secs(5));
+            let gas_limit: u64 = std::env::var("OMEGA_VAULT_SUBMIT_GAS")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(800_000);
+            let priority_gwei: u64 = std::env::var("OMEGA_VAULT_SUBMIT_PRIORITY_GWEI")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(1);
+            let max_fee_gwei: u64 = std::env::var("OMEGA_VAULT_SUBMIT_MAX_FEE_GWEI")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(50);
+
             loop {
                 ticker.tick().await;
                 for sub in buf.drain(8) {
-                    match sub.encode_calldata() {
-                        Ok(data) => {
+                    let data = match sub.encode_calldata() {
+                        Ok(d) => d,
+                        Err(e) => {
+                            tracing::warn!(error = %e, "submitProof encode failed");
+                            continue;
+                        }
+                    };
+                    let nonce = vault_nonce.fetch_add(1, Ordering::SeqCst);
+
+                    let signed = match signer_bg.sign_call_gwei(
+                        chain_id_bg,
+                        nonce,
+                        vault,
+                        &data,
+                        gas_limit,
+                        priority_gwei,
+                        max_fee_gwei,
+                    ) {
+                        Ok(s) => s,
+                        Err(e) => {
+                            tracing::error!(
+                                blueprint = %hex::encode(sub.blueprint_hash),
+                                error = %e,
+                                "ZK submitProof signing failed — proof remains unposted"
+                            );
+                            continue;
+                        }
+                    };
+
+                    match rpc_bg.submit_signed_raw_tx(&signed.raw_tx_hex).await {
+                        Ok(tx_hash) => {
                             tracing::info!(
                                 blueprint = %hex::encode(sub.blueprint_hash),
-                                vault = %hex::encode(vault),
-                                calldata_len = data.len(),
-                                "ZK submitProof calldata ready — wire KeyManagerTransactionSigner to broadcast"
+                                tx_hash = %hex::encode(tx_hash),
+                                nonce,
+                                "ZK submitProof broadcast to OmegaVault"
                             );
-                            let _ = data;
                         }
                         Err(e) => {
-                            tracing::warn!(error = %e, "submitProof encode failed")
+                            tracing::error!(
+                                blueprint = %hex::encode(sub.blueprint_hash),
+                                error = %e,
+                                "ZK submitProof broadcast failed"
+                            );
                         }
                     }
                 }
             }
         });
+        tracing::info!("ZK submitProof keeper started (sign + broadcast to VAULT_ADDRESS)");
     }
 
     // ── L8: Hot-path ──────────────────────────────────────────────────────────

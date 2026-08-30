@@ -153,4 +153,16 @@ mod binding_tests {
     fn max_u128_net_profit_does_not_panic() {
         let _ = compute_public_inputs_hash([0x11; 20], [0x22; 32], u128::MAX, [0x33; 20]);
     }
+
+    /// Independent keccak oracle (Python Crypto.Hash.keccak over the same 160-byte
+    /// abi.encode layout). Pins the binding against a second implementation.
+    #[test]
+    fn matches_independent_keccak_oracle() {
+        let got = compute_public_inputs_hash([0x11; 20], [0x22; 32], 1_000, [0x33; 20]);
+        let expected = hex::decode(
+            "431f54a4255bab0ac74cc0b392917f879f655d25422afd0b9ca28dba931182a5",
+        )
+        .unwrap();
+        assert_eq!(got.as_slice(), expected.as_slice());
+    }
 }

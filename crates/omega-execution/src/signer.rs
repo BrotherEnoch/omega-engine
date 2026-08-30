@@ -1,4 +1,5 @@
 // crates/omega-execution/src/signer.rs
+// crates/omega-execution/src/signer.rs
 //
 // TransactionSigner — the genuinely missing piece identified in
 // ExecutionPipelineSpecification.md §8.
@@ -319,6 +320,28 @@
 // `ref detail` in each pattern instead of `detail`, so the match inspects
 // `err` by reference and never moves out of it, leaving `err` fully
 // intact for the subsequent `{err:?}` use.
+//
+// ## Build fix (this revision, 2): clippy::too_many_arguments on the new
+// ## sign_call / sign_call_gwei ZK-envelope helpers
+//
+// `cargo clippy --workspace --all-targets -- -D warnings` failed with
+// two `too_many_arguments` errors (8/7) on `sign_call` and
+// `sign_call_gwei`, added this revision to close the ZK gap
+// (`OmegaVault.submitProof` is a different call target than
+// `OmegaOrchestrator.execute`, so it needs its own gas-paying-envelope
+// signer entry point rather than reusing `sign_transaction`, which is
+// hardcoded to `self.orchestrator` and to blueprint-shaped calldata).
+// Both functions' argument lists are dictated by the same source
+// `encode_eip1559_unsigned`/`encode_eip1559_signed` already carry
+// `#[allow(clippy::too_many_arguments)]` for — see "Audit fix (carried
+// forward, 2)" above: `chain_id`, `nonce`, `to`, `data`, `gas_limit`, and
+// the fee pair are the minimum set EIP-1559 itself requires to build an
+// unsigned/signed envelope for an arbitrary call, and bundling them into
+// a params struct would obscure that direct correspondence rather than
+// simplify it, exactly as reasoned there for the RLP helpers. Fixed by
+// adding the same `#[allow(clippy::too_many_arguments)]` to both new
+// methods, consistent with the existing precedent in this same file
+// rather than inventing a different justification.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -552,6 +575,128 @@ impl KeyManagerTransactionSigner {
     /// exposing key material.
     pub fn active_address(&self) -> [u8; 20] {
         self.tx_key_manager.active_address()
+    }
+
+    /// Sign an EIP-1559 transaction to an arbitrary `to` with arbitrary calldata.
+    ///
+    /// Closes the ZK gap: `OmegaVault.submitProof` is not `Orchestrator.execute` —
+    /// this is the gas-paying envelope for verified proof broadcast. Fail closed if
+    /// no active tx key or empty calldata / zero `to`.
+    ///
+    /// `#[allow(clippy::too_many_arguments)]`: see this file's top doc
+    /// comment, "Build fix (this revision, 2)" — this argument list is
+    /// the minimum EIP-1559 itself requires to build an arbitrary-call
+    /// envelope, matching the precedent already set by
+    /// `encode_eip1559_unsigned`/`encode_eip1559_signed` below.
+    #[allow(clippy::too_many_arguments)]
+    pub fn sign_call(
+        &self,
+        chain_id: u64,
+        nonce: u64,
+        to: [u8; 20],
+        data: &[u8],
+        gas_limit: u64,
+        max_priority_fee_per_gas: U256,
+        max_fee_per_gas: U256,
+    ) -> Result<SignedTransaction, ExecutionError> {
+        let to = Address::from(to);
+        if to == Address::ZERO {
+            return Err(ExecutionError::SigningFailed {
+                detail: "sign_call: to address must not be zero (C6/ZK fail closed)".into(),
+            });
+        }
+        if data.is_empty() {
+            return Err(ExecutionError::SigningFailed {
+                detail: "sign_call: calldata must not be empty (C6/ZK fail closed)".into(),
+            });
+        }
+        if chain_id == 0 {
+            return Err(ExecutionError::SigningFailed {
+                detail: "sign_call: chain_id must be non-zero (C6/ZK fail closed)".into(),
+            });
+        }
+        if gas_limit == 0 {
+            return Err(ExecutionError::SigningFailed {
+                detail: "sign_call: gas_limit must be non-zero (C6/ZK fail closed)".into(),
+            });
+        }
+
+        let secret_key = self
+            .tx_key_manager
+            .active_secret_key()
+            .ok_or(ExecutionError::SigningFailed {
+                detail: "tx_key_manager has no active signing key".into(),
+            })?;
+
+        let unsigned_rlp = encode_eip1559_unsigned(
+            chain_id,
+            nonce,
+            max_priority_fee_per_gas,
+            max_fee_per_gas,
+            gas_limit,
+            to,
+            U256::ZERO,
+            data,
+        );
+
+        let digest = omega_security::keccak256(&unsigned_rlp);
+        let msg =
+            Message::from_digest_slice(&digest).map_err(|e| ExecutionError::SigningFailed {
+                detail: format!("invalid signing digest: {e}"),
+            })?;
+
+        let (recovery_id, compact) = self
+            .secp
+            .sign_ecdsa_recoverable(&msg, &secret_key)
+            .serialize_compact();
+        let y_parity = recovery_id.to_i32() as u8;
+
+        let signed_rlp = encode_eip1559_signed(
+            chain_id,
+            nonce,
+            max_priority_fee_per_gas,
+            max_fee_per_gas,
+            gas_limit,
+            to,
+            U256::ZERO,
+            data,
+            y_parity,
+            &compact[..32],
+            &compact[32..],
+        );
+
+        Ok(SignedTransaction {
+            raw_tx_hex: format!("0x{}", hex::encode(&signed_rlp)),
+        })
+    }
+
+    /// Convenience wrapper: fees in gwei (avoids pulling U256 into binary crates).
+    ///
+    /// `#[allow(clippy::too_many_arguments)]`: same reasoning as
+    /// `sign_call` above — this wrapper mirrors that method's argument
+    /// list one-for-one, substituting `u64` gwei values for the two
+    /// `U256` wei fee fields.
+    #[allow(clippy::too_many_arguments)]
+    pub fn sign_call_gwei(
+        &self,
+        chain_id: u64,
+        nonce: u64,
+        to: [u8; 20],
+        data: &[u8],
+        gas_limit: u64,
+        priority_fee_gwei: u64,
+        max_fee_gwei: u64,
+    ) -> Result<SignedTransaction, ExecutionError> {
+        let gwei = U256::from(1_000_000_000u64);
+        self.sign_call(
+            chain_id,
+            nonce,
+            to,
+            data,
+            gas_limit,
+            U256::from(priority_fee_gwei).saturating_mul(gwei),
+            U256::from(max_fee_gwei).saturating_mul(gwei),
+        )
     }
 
     /// C6 fail-closed pre-flight before any key material is used.
@@ -1235,6 +1380,28 @@ mod tests {
     }
 
     // ── Construction guard ────────────────────────────────────────────────
+
+    #[test]
+    fn sign_call_rejects_zero_to() {
+        let signer = KeyManagerTransactionSigner::new(
+            make_km(0x31),
+            Address::from([0x01; 20]),
+            empty_strategy_ids(),
+            make_blueprint_signer(0x31),
+        );
+        let err = signer
+            .sign_call(
+                42161,
+                0,
+                [0u8; 20],
+                &[0xab; 4],
+                100_000,
+                U256::from(1_000_000_000u64),
+                U256::from(50_000_000_000u64),
+            )
+            .unwrap_err();
+        assert!(matches!(err, ExecutionError::SigningFailed { .. }));
+    }
 
     #[test]
     #[should_panic(expected = "requires a real deployed OmegaOrchestrator address")]
