@@ -3,12 +3,15 @@
 // RelayClientFactory — Gap 2 in ExecutionPipelineSpecification's
 // production-integration-plan.md ("Relay Bootstrap").
 //
-// See that document for the full finding: `HttpRelayClient::new` is
-// fully implemented in `omega-relay/src/client.rs` and has ZERO
-// production call sites anywhere in the workspace, confirmed by
-// exhaustive grep across every `.rs` file including the backup copy.
-// Every `HashMap<String, Arc<dyn RelayClient>>` construction site found
-// is test or bench code building `MockRelayClient`s.
+// ## Status (C5)
+//
+// Production bootstrap now lives in `src/main.rs` (not in this factory):
+//   translate_relay_config → HttpRelayClient::new per phase-gated RelayName
+//   → MultiRelayClient::new → reorg block feed → reconciliation lifecycle.
+//
+// This trait remains the unit-test seam (`UnconfiguredRelayClientFactory` /
+// `MockRelayClientFactory`). The historical finding that
+// `HttpRelayClient::new` had zero production call sites is superseded by C5.
 //
 // This trait exists for exactly the same reason `TransactionSigner`
 // does (see signer.rs): it lets the rest of this crate depend on "a way

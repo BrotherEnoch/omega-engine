@@ -171,6 +171,8 @@
 //   check_context's strategy_bytecode_hash now reads IntegrityRegistry::snapshot()
 //   (resolve_strategy_bytecode_hash) instead of a hardcoded [0u8;32].
 //
+// - C5b: phase >= 1 with zero constructed relays is a hard startup failure (fail closed).
+//
 // - Real relay production bootstrap (HttpRelayClients replace the C1 zero-relay stub).
 //   Endpoints come only from OMEGA_RELAY_ENDPOINT_<NAME> — never hardcoded, since no
 //   verified Arbitrum-specific bundle endpoint exists in this codebase for any provider.
@@ -1285,14 +1287,24 @@ async fn main() -> Result<()> {
     }
 
     if relay_clients.is_empty() {
+        // C5 fail closed: phase 0 may run with zero relays (shadow / no submission).
+        // Phase 1+ requires at least one live HttpRelayClient — otherwise every
+        // submission would fail at the multi-relay layer with no recovery path.
+        if active_phase >= 1 {
+            anyhow::bail!(
+                "C5: zero relay clients constructed (no OMEGA_RELAY_ENDPOINT_* / auth keys)                  while active_phase={} — refusing to start rather than running a production                  phase that cannot submit bundles",
+                active_phase
+            );
+        }
         tracing::warn!(
             "zero relay clients constructed (no endpoints/secrets present in environment) — \
-             submissions will fail closed"
+             phase 0 only; submissions will fail closed if attempted"
         );
     } else {
         tracing::info!(
             relays = ?relay_clients.keys().collect::<Vec<_>>(),
-            "real relay clients constructed"
+            phase = active_phase,
+            "real relay clients constructed (C5)"
         );
     }
 
