@@ -526,7 +526,7 @@ impl<S: TransactionSigner> ExecutionPipeline<S> {
 /// nonce`. `bp.nonce` is a direct 1:1 copy, same as every other field
 /// below; no derivation or fallback needed.
 fn blueprint_to_check_fields(bp: &ExecutionBlueprint) -> Result<BlueprintFields, ExecutionError> {
-    let flashloan_provider_id = resolve_flashloan_provider_id(bp.flashloan_provider)?;
+    let flashloan_provider_id = resolve_flashloan_provider_id(bp)?;
 
     let expected_profit_net_wei: u128 =
         bp.expected_profit_net
@@ -580,16 +580,30 @@ fn blueprint_to_check_fields(bp: &ExecutionBlueprint) -> Result<BlueprintFields,
 /// but can never actually fire is more dangerous than a loud, blocking
 /// error, since it would silently defeat exactly the protection
 /// `check_flashloan_liquidity` exists to provide.
-fn resolve_flashloan_provider_id(addr: Address) -> Result<&'static str, ExecutionError> {
-    if addr == Address::ZERO {
-        // No flashloan used (ExecutionBlueprint's own doc comment: "Zero
-        // address signals no flashloan — capital sourced from PIL") —
-        // provider_id is genuinely irrelevant to the no-self-flash rule
-        // in this case, so "none" is accurate, not a placeholder.
+/// Map blueprint flashloan identity to the protocol_id string used by
+/// CheckContext / no-self-flash checks.
+///
+/// Prefers `flashloan_provider_type` (structured enum matching on-chain
+/// ordinals) over a non-existent address→name table. Legacy zero address
+/// with no type still maps to `"none"`.
+fn resolve_flashloan_provider_id(bp: &ExecutionBlueprint) -> Result<&'static str, ExecutionError> {
+    use omega_core::types::flashloan_provider::FlashloanProviderType;
+
+    // Zero address + no capital from a provider — PIL path.
+    if bp.flashloan_provider == Address::ZERO
+        && bp.provider_contract == Address::ZERO
+        && bp.flashloan_amount.is_zero()
+    {
         return Ok("none");
     }
-    Err(ExecutionError::UnknownFlashloanProvider {
-        address: format!("{addr:?}"),
+
+    // Control-point fix (C4): use the real enum rather than failing every
+    // non-zero address. Strings align with L2e watch-channel protocol_id
+    // labels ("aave" / "balancer" / "uniswap") used in main.rs.
+    Ok(match bp.flashloan_provider_type {
+        FlashloanProviderType::Balancer => "balancer",
+        FlashloanProviderType::AaveV3 => "aave",
+        FlashloanProviderType::UniswapV3 => "uniswap",
     })
 }
 
@@ -2008,82 +2022,92 @@ mod tests {
     }
 
     #[tokio::test]
-async fn property_integrity_freeze_prevents_all_relay_calls() {
-    // The integrity-freeze analogue of property_kill_switch_trip_prevents_all_relay_calls.
-    // That test proves the kill switch never reaches the relay; this proves the SAME
-    // property for Stage 2b (bytecode integrity / freeze) specifically. Structurally
-    // this should already be guaranteed — Stage 2b returns Err before Stage 5 is ever
-    // reached in execute_inner's straight-line control flow — but
-    // integrity_registry_freeze_mid_flight_never_lets_a_post_freeze_call_through only
-    // asserts on execute()'s Err variant, not on relay call count. This closes that gap
-    // with the same CountingRelay instrument used for the kill-switch version, so the
-    // "never reaches the relay" claim is asserted, not just implied by code inspection.
-    let dag = make_dag_with_capacity(16);
-    let kill_switches = make_kill_switches();
-    let integrity_registry = make_integrity_registry();
-    let counting_relay = Arc::new(CountingRelay::new());
-    let relay = make_relay_with(Arc::clone(&counting_relay) as Arc<dyn RelayClient>, 1000);
-    let pipeline = Arc::new(ExecutionPipeline::new(
-        kill_switches,
-        Arc::clone(&integrity_registry),
-        relay,
-        Arc::clone(&dag),
-        Arc::new(MockTransactionSigner { should_fail: false }),
-        42161,
-    ));
-
-    // Freeze completes fully before any execute() call starts — same deterministic
-    // framing as integrity_registry_freeze_mid_flight_never_lets_a_post_freeze_call_through
-    // and load_kill_switch_trip_during_burst_blocks_subsequent_calls: a genuinely
-    // straddling race isn't meaningfully assertable, so this asserts the property that
-    // IS deterministic — no call started strictly after a completed freeze may reach
-    // the relay.
-    integrity_registry.freeze("SA");
-
-    let mut handles = Vec::new();
-    for i in 80u8..90u8 {
-        let bp = sample_bp(i);
-        dag.lock().unwrap().admit(bp.clone(), &[]).unwrap();
-        let ctx = passing_ctx(bp.strategy_bytecode_hash.0);
-        let p = Arc::clone(&pipeline);
-        handles.push(tokio::spawn(async move {
-            p.execute(bp, 1, &ctx, 500, 1_700_000_000).await
-        }));
-    }
-
-    for h in handles {
-        assert!(matches!(
-            h.await.unwrap(),
-            Err(ExecutionError::IntegrityRegistryCheckFailed(
-                omega_security::SecurityError::StrategyFrozen { .. }
-            ))
+    async fn property_integrity_freeze_prevents_all_relay_calls() {
+        // The integrity-freeze analogue of property_kill_switch_trip_prevents_all_relay_calls.
+        // That test proves the kill switch never reaches the relay; this proves the SAME
+        // property for Stage 2b (bytecode integrity / freeze) specifically. Structurally
+        // this should already be guaranteed — Stage 2b returns Err before Stage 5 is ever
+        // reached in execute_inner's straight-line control flow — but
+        // integrity_registry_freeze_mid_flight_never_lets_a_post_freeze_call_through only
+        // asserts on execute()'s Err variant, not on relay call count. This closes that gap
+        // with the same CountingRelay instrument used for the kill-switch version, so the
+        // "never reaches the relay" claim is asserted, not just implied by code inspection.
+        let dag = make_dag_with_capacity(16);
+        let kill_switches = make_kill_switches();
+        let integrity_registry = make_integrity_registry();
+        let counting_relay = Arc::new(CountingRelay::new());
+        let relay = make_relay_with(Arc::clone(&counting_relay) as Arc<dyn RelayClient>, 1000);
+        let pipeline = Arc::new(ExecutionPipeline::new(
+            kill_switches,
+            Arc::clone(&integrity_registry),
+            relay,
+            Arc::clone(&dag),
+            Arc::new(MockTransactionSigner { should_fail: false }),
+            42161,
         ));
-    }
 
-    assert_eq!(
-        counting_relay.call_count(),
-        0,
-        "relay must never be called for any blueprint once the strategy is frozen \
-         (Stage 2b) — this is the C4 kill-shot invariant, not just the kill-switch one"
-    );
-}
+        // Freeze completes fully before any execute() call starts — same deterministic
+        // framing as integrity_registry_freeze_mid_flight_never_lets_a_post_freeze_call_through
+        // and load_kill_switch_trip_during_burst_blocks_subsequent_calls: a genuinely
+        // straddling race isn't meaningfully assertable, so this asserts the property that
+        // IS deterministic — no call started strictly after a completed freeze may reach
+        // the relay.
+        integrity_registry.freeze("SA");
+
+        let mut handles = Vec::new();
+        for i in 80u8..90u8 {
+            let bp = sample_bp(i);
+            dag.lock().unwrap().admit(bp.clone(), &[]).unwrap();
+            let ctx = passing_ctx(bp.strategy_bytecode_hash.0);
+            let p = Arc::clone(&pipeline);
+            handles.push(tokio::spawn(async move {
+                p.execute(bp, 1, &ctx, 500, 1_700_000_000).await
+            }));
+        }
+
+        for h in handles {
+            assert!(matches!(
+                h.await.unwrap(),
+                Err(ExecutionError::IntegrityRegistryCheckFailed(
+                    omega_security::SecurityError::StrategyFrozen { .. }
+                ))
+            ));
+        }
+
+        assert_eq!(
+            counting_relay.call_count(),
+            0,
+            "relay must never be called for any blueprint once the strategy is frozen \
+             (Stage 2b) — this is the C4 kill-shot invariant, not just the kill-switch one"
+        );
+    }
 
     // ── Flashloan provider resolution ─────────────────────────────────
 
     #[test]
-    fn zero_address_resolves_to_none() {
-        assert_eq!(
-            resolve_flashloan_provider_id(Address::ZERO).unwrap(),
-            "none"
-        );
+    fn zero_flashloan_amount_resolves_to_none() {
+        let mut bp = sample_bp(1);
+        bp.flashloan_amount = U256::ZERO;
+        assert_eq!(resolve_flashloan_provider_id(&bp).unwrap(), "none");
     }
 
     #[test]
-    fn nonzero_address_fails_closed() {
-        let result = resolve_flashloan_provider_id(Address::from([0x11u8; 20]));
-        assert!(matches!(
-            result,
-            Err(ExecutionError::UnknownFlashloanProvider { .. })
-        ));
+    fn aave_type_resolves_to_aave_label() {
+        use omega_core::types::flashloan_provider::FlashloanProviderType;
+        let mut bp = sample_bp(2);
+        bp.flashloan_amount = U256::from(1u64);
+        bp.flashloan_provider_type = FlashloanProviderType::AaveV3;
+        assert_eq!(resolve_flashloan_provider_id(&bp).unwrap(), "aave");
+    }
+
+    #[test]
+    fn balancer_and_uniswap_labels() {
+        use omega_core::types::flashloan_provider::FlashloanProviderType;
+        let mut bp = sample_bp(3);
+        bp.flashloan_amount = U256::from(1u64);
+        bp.flashloan_provider_type = FlashloanProviderType::Balancer;
+        assert_eq!(resolve_flashloan_provider_id(&bp).unwrap(), "balancer");
+        bp.flashloan_provider_type = FlashloanProviderType::UniswapV3;
+        assert_eq!(resolve_flashloan_provider_id(&bp).unwrap(), "uniswap");
     }
 }

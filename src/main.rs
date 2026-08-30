@@ -1,4 +1,5 @@
 // src/main.rs — OmegaEngine v12.0 Main Entry Point
+// src/main.rs — OmegaEngine v12.0 Main Entry Point
 //
 // Required env vars:
 //   ARBITRUM_RPC_URL         WebSocket RPC endpoint
@@ -281,6 +282,9 @@ use omega_core::{HealthState, LayerHealth, LayerId, OmegaConfig, StrategyId};
 use omega_dag::{DagConfig, ExecutionDag};
 use omega_execution::signer::KeyManagerTransactionSigner;
 use omega_execution::ExecutionPipeline;
+use omega_execution::{
+    run_idempotency_eviction_loop,
+};
 use omega_execution::config_translation::{translate_relay_config, RelayBootstrapInputs};
 use omega_health::{halt::HaltFlag, LayerHealthImpl};
 use omega_hot_path::{HotPathConfig, HotPathRequest, HotPathRunner, MICROTX_GAS_LIMIT};
@@ -1465,17 +1469,23 @@ async fn main() -> Result<()> {
     let (relay, reorg_event_rx) =
         MultiRelayClient::new(relay_clients, relay_metrics, blacklist, &relay_cfg, 0);
 
-    tokio::spawn(async move {
+    // C6: own LaReorgRiskEvent — feed kill switch (do not discard).
+    {
         let mut rx = reorg_event_rx;
-        while let Some(ev) = rx.recv().await {
-            tracing::debug!(
-                ?ev,
-                "LaReorgRiskEvent received (rescoring not wired to it yet — the block-hash \
-                 feed task below drives detection; consuming the rescore signal itself is a \
-                 separate, still-open piece)"
-            );
-        }
-    });
+        let ks = Arc::clone(&kill_switches);
+        tokio::spawn(async move {
+            while let Some(ev) = rx.recv().await {
+                tracing::warn!(
+                    orphaned_block = ev.orphaned_block,
+                    rescore_at = ev.rescore_at_block,
+                    "LaReorgRiskEvent — recording unsuccessful outcome on kill switch"
+                );
+                if let Some(reason) = ks.record_outcome("global", None, false) {
+                    tracing::error!(?reason, "kill switch tripped after reorg-risk event");
+                }
+            }
+        });
+    }
 
     // ── Real block-hash feed for the reorg guard ───────────────────────────────
     // Independent of every other task in this function — its own subscription, its own
@@ -1552,6 +1562,22 @@ async fn main() -> Result<()> {
         "ExecutionPipeline constructed"
     );
 
+    // C5 control point: bound the local idempotency cache so long-running
+    // processes do not retain keys forever (still process-local — not a
+    // multi-instance store).
+    {
+        let pipe = Arc::clone(&execution_pipeline);
+        tokio::spawn(async move {
+            run_idempotency_eviction_loop(
+                pipe,
+                Duration::from_secs(60),
+                chrono::Duration::hours(2),
+            )
+            .await;
+        });
+        tracing::info!("idempotency eviction loop started (60s tick, 2h max age)");
+    }
+
     // ── Reconciliation lifecycle ────────────────────────────────────────────────
     // Drives InclusionTracker::reconcile off the same oracle block-number stream
     // run_scoring_loop subscribes to — reconcile() only needs a block number, not the
@@ -1559,6 +1585,7 @@ async fn main() -> Result<()> {
     {
         let relay5 = Arc::clone(&relay);
         let oracle5 = Arc::clone(&oracle);
+        let ks5 = Arc::clone(&kill_switches);
         let mut rx = oracle5.subscribe();
         tokio::spawn(async move {
             loop {
@@ -1566,10 +1593,24 @@ async fn main() -> Result<()> {
                     Ok(_) => {
                         let current_block = oracle5.snapshot().fee.block_number;
                         let results = relay5.reconcile_inclusions(current_block).await;
+                        for r in &results {
+                            // C7: feed Stage-7 inclusion into kill switch. Profit is not
+                            // yet on ConfirmationResult — success tracks inclusion only;
+                            // unmeasured profit is None (does not invent P&L).
+                            if let Some(reason) =
+                                ks5.record_outcome("global", None, r.included)
+                            {
+                                tracing::error!(
+                                    ?reason,
+                                    included = r.included,
+                                    "kill switch tripped after inclusion reconciliation"
+                                );
+                            }
+                        }
                         if !results.is_empty() {
                             tracing::debug!(
                                 count = results.len(),
-                                "inclusion confirmations reconciled"
+                                "inclusion confirmations reconciled + kill-switch outcomes recorded"
                             );
                         }
                     }
@@ -1580,7 +1621,7 @@ async fn main() -> Result<()> {
                 }
             }
         });
-        tracing::info!("reconciliation lifecycle task started");
+        tracing::info!("reconciliation lifecycle task started (feeds kill switch)");
     }
 
     // ── L7: ZK ────────────────────────────────────────────────────────────────
