@@ -28,6 +28,11 @@
 //
 // ## Changelog (most recent first within each item; see VCS for full history)
 //
+// - C10b (this package): CheckContext WETH watch-channel MAX now includes Uniswap V3
+//   alongside Aave/Balancer (was registry-only for Uni). Fail closed when all three
+//   WETH reads fail (keep previous watch value). `fetch_uniswap_v3_pool_balance`
+//   rejects assets other than WETH/USDC_NATIVE when targeting the canonical pool.
+//
 // - C10: L2e now also polls Uniswap V3 (previously the only provider written to
 //   omega-rpc's address list but never actually read from — see the C9 item below,
 //   "UniswapV3 is deliberately not written"). Uses a single, verified WETH/USDC_NATIVE
@@ -526,6 +531,11 @@ const ORACLE_SNAPSHOT_TOKEN: &str = "WETH";
 /// `CheckContext`'s shape that C9 does not attempt. LA's own flashloan sizing does not
 /// go through this struct; it reads `LiquidityRegistry` directly via
 /// `omega_flashloan::select_provider`, which IS asset-scoped as of C9.
+///
+/// AS OF C10: the WETH MAX that feeds this watch channel includes Uniswap V3
+/// (`UNISWAP_V3_WETH_USDC_POOL` balanceOf) alongside Aave and Balancer. Registry
+/// rows for Uniswap V3 were already written for both WETH and USDC_NATIVE; the
+/// pre-trade sanity signal now uses the same three-provider set for WETH.
 ///
 /// KNOWN LIMITATION: this is a pre-trade sanity signal for check 10 (MissLiquidity), not a
 /// guarantee that whichever provider `select_provider` actually picks for a given
@@ -1039,28 +1049,52 @@ async fn main() -> Result<()> {
                         continue;
                     }
 
-                    let candidate = match (aave, balancer) {
-                        (Ok(a), Ok(b)) if a >= b => Some((a, "aave".to_string())),
-                        (Ok(_), Ok(b)) => Some((b, "balancer".to_string())),
-                        (Ok(a), Err(e)) => {
-                            tracing::warn!(
-                                error = %e,
-                                "Balancer liquidity read failed — using Aave-only reading this cycle"
-                            );
-                            Some((a, "aave".to_string()))
+                    // C10: include Uniswap V3 in the MAX across providers for the
+                    // CheckContext pre-trade sanity signal (was Aave/Balancer only).
+                    // Fail closed: if every read fails, keep the previous watch value
+                    // rather than publishing zero and looking "freshly measured empty".
+                    let mut best: Option<(u128, &'static str)> = None;
+                    match &aave {
+                        Ok(a) => best = Some((*a, "aave")),
+                        Err(e) => tracing::warn!(
+                            error = %e,
+                            "Aave liquidity read failed this cycle (WETH CheckContext path)"
+                        ),
+                    }
+                    match &balancer {
+                        Ok(b) => {
+                            best = match best {
+                                Some((prev, _)) if *b > prev => Some((*b, "balancer")),
+                                Some(x) => Some(x),
+                                None => Some((*b, "balancer")),
+                            };
                         }
-                        (Err(e), Ok(b)) => {
-                            tracing::warn!(
-                                error = %e,
-                                "Aave liquidity read failed — using Balancer-only reading this cycle"
-                            );
-                            Some((b, "balancer".to_string()))
+                        Err(e) => tracing::warn!(
+                            error = %e,
+                            "Balancer liquidity read failed this cycle (WETH CheckContext path)"
+                        ),
+                    }
+                    match &uniswap {
+                        Ok(u) => {
+                            best = match best {
+                                Some((prev, _)) if *u > prev => Some((*u, "uniswap_v3")),
+                                Some(x) => Some(x),
+                                None => Some((*u, "uniswap_v3")),
+                            };
                         }
-                        (Err(ea), Err(eb)) => {
+                        Err(e) => tracing::warn!(
+                            error = %e,
+                            "Uniswap V3 liquidity read failed this cycle (WETH CheckContext path)"
+                        ),
+                    }
+
+                    let candidate = match best {
+                        Some((available_wei, protocol_id)) => {
+                            Some((available_wei, protocol_id.to_string()))
+                        }
+                        None => {
                             tracing::warn!(
-                                aave_error = %ea,
-                                balancer_error = %eb,
-                                "both flashloan liquidity reads failed — keeping previous value"
+                                "all flashloan liquidity reads failed (Aave, Balancer, Uniswap V3)                                  — keeping previous CheckContext watch value (C10 fail closed)"
                             );
                             None
                         }
@@ -1085,8 +1119,8 @@ async fn main() -> Result<()> {
             assets = "WETH, USDC_NATIVE",
             providers = "Aave V3, Balancer V2, Uniswap V3 (single WETH/USDC_NATIVE pool)",
             "L2e flashloan liquidity poll loop started (feeds LiquidityRegistry for both \
-             assets across all three providers; CheckContext-facing watch channel \
-             remains Aave/Balancer-WETH-only — see C10 changelog item)"
+             assets across all three providers; CheckContext WETH watch channel MAX \
+             includes Aave, Balancer, and Uniswap V3 — C10)"
         );
     }
 

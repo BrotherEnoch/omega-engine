@@ -34,6 +34,29 @@
 //   The EIL double-buffer (`ArcSwap<EilSnapshot>`) holds the latest
 //   consistent snapshot.  Strategies read it lock-free on every oracle tick.
 //
+// ## C8 — Oracle freshness (this revision)
+//
+// Fail-closed guarantees for timestamps and prices:
+//
+//   * `validate_observation_timestamp` / `validate_price_usd` reject zero,
+//     non-finite, non-positive, and far-future observations at the **update**
+//     boundary (Chainlink / Pyth / TWAP caches). Bad data never overwrites a
+//     prior good cache entry.
+//   * `OraclePrice::is_fresh` requires both age < threshold **and** a valid
+//     positive finite price — zero/NaN/negative prices are treated as stale.
+//   * `resolve_price` re-validates the winning price and returns
+//     `MissOracle` rather than a tradable quote if anything slips through.
+//   * Missing cache entries must be represented by callers as
+//     `age_secs = u64::MAX` (see `build_oracle_snapshot` in main.rs).
+//
+// Update mechanisms (already present; documented here for C8 completeness):
+//
+//   * Chainlink: `run_chainlink_poll_loop` (15–20s) only refreshes
+//     `is_stale` feeds via `OmegaRpcClient::fetch_chainlink_round`.
+//   * TWAP: DexSync event stream → `TwapOracle::update` (per Sync log).
+//   * Pyth: still unfed in this binary (ingestion gap remains); until wired,
+//     Pyth ages as missing and resolution fails closed when CL+TWAP also stale.
+//
 // ## Fix (this revision): real Chainlink ingestion
 //
 // Added `chainlink_poll` — the polling loop that calls
@@ -71,7 +94,8 @@ pub use la_bonus::{LaBonusOracle, LendingProtocol};
 pub use per_chain::{EilSnapshot, PerChainOracle};
 pub use pyth::PythOracle;
 pub use resolution::{
-    resolve_price, OraclePrice, OracleSource, DIVERGENCE_THRESHOLD, PRIMARY_STALE_SECS,
+    resolve_price, validate_observation_timestamp, validate_price_usd, OraclePrice,
+    OracleSource, DIVERGENCE_THRESHOLD, MAX_FUTURE_SKEW_SECS, PRIMARY_STALE_SECS,
     TWAP_STALE_SECS,
 };
 pub use twap::TwapOracle;

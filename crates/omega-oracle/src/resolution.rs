@@ -59,6 +59,47 @@ pub const TWAP_STALE_SECS: u64 = 120;
 /// triggering MissOracleDiverge (0.4% = 40 bps).
 pub const DIVERGENCE_THRESHOLD: f64 = 0.004;
 
+/// Maximum acceptable clock skew for oracle timestamps into the future
+/// (seconds). Timestamps more than this ahead of local wall clock are
+/// rejected at the update boundary (fail closed) — protects against
+/// misconfigured RPC nodes, bad clock, or fabricated attestation times.
+pub const MAX_FUTURE_SKEW_SECS: u64 = 30;
+
+/// Validate an oracle observation timestamp at the update boundary.
+///
+/// Fail-closed rules (C8):
+///   - `ts == 0` → invalid (missing / unset `updatedAt` / `publishTime`)
+///   - `ts > now + MAX_FUTURE_SKEW_SECS` → invalid (future skew)
+///
+/// Returns `Ok(())` when the timestamp is usable for age computation.
+pub fn validate_observation_timestamp(ts: u64) -> Result<(), &'static str> {
+    if ts == 0 {
+        return Err("oracle timestamp is zero (missing/unset)");
+    }
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    if ts > now.saturating_add(MAX_FUTURE_SKEW_SECS) {
+        return Err("oracle timestamp is too far in the future");
+    }
+    Ok(())
+}
+
+/// Validate a USD price at the update / resolution boundary.
+///
+/// Fail-closed: non-finite or non-positive prices must never enter the
+/// cache or win tri-oracle resolution.
+pub fn validate_price_usd(price_usd: f64) -> Result<(), &'static str> {
+    if !price_usd.is_finite() {
+        return Err("oracle price is non-finite");
+    }
+    if price_usd <= 0.0 {
+        return Err("oracle price is non-positive");
+    }
+    Ok(())
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // OraclePrice
 // ─────────────────────────────────────────────────────────────────────────────
@@ -84,9 +125,20 @@ pub struct OraclePrice {
 }
 
 impl OraclePrice {
-    /// Returns `true` when this price is fresh enough to be trusted for
-    /// the given source type.
+    /// Returns `true` when this price is fresh enough **and** numerically
+    /// valid to be trusted for the given source type (C8 fail-closed).
+    ///
+    /// A price fails freshness when any of:
+    ///   - `age_secs` is at or past the source-specific staleness threshold
+    ///   - `price_usd` is non-finite or ≤ 0 (missing/garbage data)
+    ///
+    /// Missing cache entries should be represented by callers as
+    /// `age_secs = u64::MAX` (and typically `price_usd = 0.0`) so that
+    /// `is_fresh()` is false without inventing a plausible price.
     pub fn is_fresh(&self) -> bool {
+        if validate_price_usd(self.price_usd).is_err() {
+            return false;
+        }
         let threshold = match self.source {
             OracleSource::Chainlink => PRIMARY_STALE_SECS,
             OracleSource::Pyth => PRIMARY_STALE_SECS,
@@ -97,9 +149,12 @@ impl OraclePrice {
 
     /// Relative price divergence from another price: |a − b| / a.
     ///
-    /// Returns `f64::INFINITY` when `self.price_usd` is zero.
+    /// Returns `f64::INFINITY` when `self.price_usd` is zero or non-finite.
     pub fn divergence_from(&self, other: &OraclePrice) -> f64 {
-        if self.price_usd == 0.0 {
+        if !self.price_usd.is_finite() || self.price_usd == 0.0 {
+            return f64::INFINITY;
+        }
+        if !other.price_usd.is_finite() {
             return f64::INFINITY;
         }
         (self.price_usd - other.price_usd).abs() / self.price_usd
@@ -163,7 +218,16 @@ pub struct ResolvedPrice {
 ///   3. Chainlink fresh, Pyth stale   → Chainlink
 ///   4. Pyth fresh, Chainlink stale   → Pyth
 ///   5. Both stale, TWAP fresh        → TWAP
-///   6. All stale                     → `OmegaError::dropped(MissOracle)`
+///   6. All stale / missing / invalid → `OmegaError::dropped(MissOracle)`
+///
+/// ## C8 fail-closed guarantees
+///
+/// - `is_fresh()` already rejects non-positive / non-finite prices.
+/// - The winning price is re-validated before return; any residual
+///   invalid value yields `MissOracle` rather than a tradable quote.
+/// - Callers representing a missing cache entry should pass
+///   `age_secs = u64::MAX` (and typically `price_usd = 0.0`) so the
+///   source is treated as stale, never as a synthetic fresh zero.
 pub fn resolve_price(
     chainlink: &OraclePrice,
     pyth: &OraclePrice,
@@ -173,7 +237,7 @@ pub fn resolve_price(
     let py_ok = pyth.is_fresh();
     let tw_ok = twap.is_fresh();
 
-    match (cl_ok, py_ok) {
+    let result = match (cl_ok, py_ok) {
         // ── Both primaries fresh ──────────────────────────────────────────
         (true, true) => {
             let div = chainlink.divergence_from(pyth);
@@ -263,7 +327,20 @@ pub fn resolve_price(
                 Err(OmegaError::dropped(DropCode::MissOracle))
             }
         }
+    };
+
+    // Final fail-closed gate: never return a non-positive / non-finite winner.
+    if let Ok(ref resolved) = result {
+        if validate_price_usd(resolved.price_usd).is_err() {
+            tracing::error!(
+                price = resolved.price_usd,
+                source = %resolved.source,
+                "Tri-oracle: resolved price invalid → MissOracle (fail closed)",
+            );
+            return Err(OmegaError::dropped(DropCode::MissOracle));
+        }
     }
+    result
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -393,5 +470,80 @@ mod tests {
     fn twap_at_120_seconds_is_stale() {
         let err = resolve_price(&cl(1000.0, 50), &py(1000.0, 50), &tw(990.0, 120)).unwrap_err();
         assert_eq!(err.drop_code(), Some(DropCode::MissOracle));
+    }
+
+    // ── C8 fail-closed: missing / invalid prices ─────────────────────────
+
+    #[test]
+    fn zero_price_is_not_fresh() {
+        assert!(!cl(0.0, 5).is_fresh());
+        assert!(!py(0.0, 5).is_fresh());
+        assert!(!tw(0.0, 5).is_fresh());
+    }
+
+    #[test]
+    fn negative_price_is_not_fresh() {
+        assert!(!cl(-1.0, 5).is_fresh());
+    }
+
+    #[test]
+    fn nan_price_is_not_fresh() {
+        assert!(!cl(f64::NAN, 5).is_fresh());
+        assert!(!cl(f64::INFINITY, 5).is_fresh());
+    }
+
+    #[test]
+    fn missing_sentinel_age_is_not_fresh() {
+        // Callers representing absent cache entries use u64::MAX age.
+        assert!(!cl(1800.0, u64::MAX).is_fresh());
+    }
+
+    #[test]
+    fn all_zero_prices_fail_closed_miss_oracle() {
+        let err = resolve_price(&cl(0.0, 5), &py(0.0, 5), &tw(0.0, 5)).unwrap_err();
+        assert_eq!(err.drop_code(), Some(DropCode::MissOracle));
+    }
+
+    #[test]
+    fn zero_chainlink_with_fresh_pyth_uses_pyth() {
+        // Zero CL is not fresh → Pyth-only path.
+        let r = resolve_price(&cl(0.0, 5), &py(1800.0, 10), &tw(1790.0, 60)).unwrap();
+        assert!(matches!(r.source, OracleSource::Pyth));
+        assert!((r.price_usd - 1800.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn validate_observation_timestamp_rejects_zero() {
+        assert!(validate_observation_timestamp(0).is_err());
+    }
+
+    #[test]
+    fn validate_observation_timestamp_rejects_far_future() {
+        let far_future = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            + MAX_FUTURE_SKEW_SECS
+            + 60;
+        assert!(validate_observation_timestamp(far_future).is_err());
+    }
+
+    #[test]
+    fn validate_observation_timestamp_accepts_recent() {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        assert!(validate_observation_timestamp(now).is_ok());
+        assert!(validate_observation_timestamp(now.saturating_sub(10)).is_ok());
+    }
+
+    #[test]
+    fn validate_price_usd_rejects_bad() {
+        assert!(validate_price_usd(0.0).is_err());
+        assert!(validate_price_usd(-1.0).is_err());
+        assert!(validate_price_usd(f64::NAN).is_err());
+        assert!(validate_price_usd(f64::INFINITY).is_err());
+        assert!(validate_price_usd(1.0).is_ok());
     }
 }

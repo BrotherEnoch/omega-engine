@@ -37,7 +37,10 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use dashmap::DashMap;
 
-use crate::resolution::{OraclePrice, OracleSource, PRIMARY_STALE_SECS};
+use crate::resolution::{
+    validate_observation_timestamp, validate_price_usd, OraclePrice, OracleSource,
+    PRIMARY_STALE_SECS,
+};
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Constants
@@ -153,6 +156,28 @@ impl PythOracle {
         publish_time: u64,
         block_number: u64,
     ) {
+        // C8 fail-closed: never cache invalid price or missing/future timestamps.
+        if let Err(reason) = validate_price_usd(price_usd) {
+            tracing::warn!(
+                chain_id = self.chain_id,
+                token,
+                price_usd,
+                reason,
+                "Pyth update rejected (fail closed) — cache unchanged",
+            );
+            return;
+        }
+        if let Err(reason) = validate_observation_timestamp(publish_time) {
+            tracing::warn!(
+                chain_id = self.chain_id,
+                token,
+                publish_time,
+                reason,
+                "Pyth update rejected (fail closed) — cache unchanged",
+            );
+            return;
+        }
+
         let entry = CacheEntry {
             price_usd,
             confidence_usd,

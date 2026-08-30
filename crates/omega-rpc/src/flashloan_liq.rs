@@ -517,11 +517,32 @@ impl OmegaRpcClient {
     /// address just returns whatever that contract's own bookkeeping says, which for
     /// an unrelated pool is silently `0` or some other misleading number, not a
     /// signal that the caller made a mistake.
+    /// Read `ERC20(asset).balanceOf(pool)` — Uniswap V3 flashloan-available liquidity
+    /// for one side of a pool (C10).
+    ///
+    /// ## C10 fail-closed
+    ///
+    /// When `pool == UNISWAP_V3_WETH_USDC_POOL`, only `WETH` and `USDC_NATIVE` are
+    /// accepted as `asset`. Any other token is rejected before the eth_call — a
+    /// balanceOf against the wrong ERC20 would still "succeed" and return a number
+    /// that is not this system's tracked Uniswap V3 liquidity signal (same class of
+    /// silent wrong-data bug as the USDC.e wrong-pool trap documented on
+    /// `UNISWAP_V3_WETH_USDC_POOL`). Callers that intentionally target a different
+    /// pool must pass that pool's address explicitly; this guard is scoped to the
+    /// canonical constant only.
     pub async fn fetch_uniswap_v3_pool_balance(
         &self,
         pool: Address,
         asset: Address,
     ) -> anyhow::Result<u128> {
+        // Fail closed on asset/pool mismatch for the one pool this codebase treats
+        // as the Uniswap V3 liquidity oracle for WETH + USDC_NATIVE.
+        if pool == UNISWAP_V3_WETH_USDC_POOL && asset != WETH && asset != USDC_NATIVE {
+            return Err(anyhow::anyhow!(
+                "fetch_uniswap_v3_pool_balance: asset {asset} is not WETH or USDC_NATIVE;                  refusing to read balanceOf against canonical pool {pool} (C10 fail closed)"
+            ));
+        }
+
         self.gated_read(None, || async move {
             let provider = self.get_or_connect().await?;
             let call = IErc20Balance::balanceOfCall { account: pool };

@@ -102,7 +102,10 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use dashmap::DashMap;
 
-use crate::resolution::{OraclePrice, OracleSource, TWAP_STALE_SECS};
+use crate::resolution::{
+    validate_observation_timestamp, validate_price_usd, OraclePrice, OracleSource,
+    TWAP_STALE_SECS,
+};
 
 // â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 // Pool registry â€” Arbitrum One
@@ -312,12 +315,18 @@ impl TwapOracle {
     /// `block_time`:  Unix timestamp (seconds) of the Sync event's block.
     /// `block_number`: block number of the Sync event.
     pub fn update(&self, token: &str, price_usd: f64, block_time: u64, block_number: u64) {
-        if price_usd <= 0.0 || !price_usd.is_finite() {
-            tracing::warn!(token, price_usd, "TWAP rejected non-positive price");
+        // C8 fail-closed: reject invalid price or missing/future block timestamps.
+        if let Err(reason) = validate_price_usd(price_usd) {
+            tracing::warn!(token, price_usd, reason, "TWAP update rejected (fail closed)");
+            return;
+        }
+        if let Err(reason) = validate_observation_timestamp(block_time) {
+            tracing::warn!(token, block_time, reason, "TWAP update rejected (fail closed)");
             return;
         }
 
         self.cache.insert(
+
             token.to_owned(),
             TwapEntry {
                 price_usd,
