@@ -1,5 +1,4 @@
 // src/main.rs — OmegaEngine v12.0 Main Entry Point
-// src/main.rs — OmegaEngine v12.0 Main Entry Point
 //
 // Required env vars:
 //   ARBITRUM_RPC_URL         WebSocket RPC endpoint
@@ -238,7 +237,7 @@
 // - Real per-strategy account exposure cap (AccountExposureTracker, check 14).
 //   MAX_ACCOUNT_EXPOSURE_WEI_PLACEHOLDER (1 ETH) is a deliberately conservative,
 //   non-risk-approved starting cap — errs small, the opposite direction from the
-//   KillSwitchConfig placeholders below. In-memory only; resets on restart.
+//   KillSwitchConfig from OMEGA_KILL_* env (defaults: 1 ETH cum, 0.25 ETH/window, 5 consec). In-memory only; resets on restart.
 //
 // - Flashloan integration status (checked directly against source, not re-guessed):
 //   omega-flashloan itself (provider registry, premium math, ABI encoding) is complete
@@ -407,6 +406,48 @@ fn rollout_tier_from_env() -> f64 {
         .filter(|v| (0.0..=1.0).contains(v))
         .unwrap_or(1.0)
 }
+
+/// Production kill-switch thresholds (P8 residual).
+/// Env overrides; defaults are deliberately tight vs the prior u128::MAX placeholders.
+fn kill_switch_config_from_env() -> KillSwitchConfig {
+    fn parse_u128(name: &str, default: u128) -> u128 {
+        std::env::var(name)
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .filter(|&v| v > 0)
+            .unwrap_or(default)
+    }
+    fn parse_u32(name: &str, default: u32) -> u32 {
+        std::env::var(name)
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .filter(|&v| v > 0)
+            .unwrap_or(default)
+    }
+    fn parse_secs(name: &str, default: u64) -> Duration {
+        let secs = std::env::var(name)
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .filter(|&v: &u64| v > 0)
+            .unwrap_or(default);
+        Duration::from_secs(secs)
+    }
+    KillSwitchConfig {
+        // 1 ETH all-time cumulative loss
+        max_cumulative_loss_wei: parse_u128(
+            "OMEGA_KILL_MAX_CUMULATIVE_LOSS_WEI",
+            1_000_000_000_000_000_000,
+        ),
+        // 0.25 ETH per window
+        max_loss_per_window_wei: parse_u128(
+            "OMEGA_KILL_MAX_LOSS_PER_WINDOW_WEI",
+            250_000_000_000_000_000,
+        ),
+        loss_window: parse_secs("OMEGA_KILL_LOSS_WINDOW_SECS", 3600),
+        max_consecutive_failures: parse_u32("OMEGA_KILL_MAX_CONSECUTIVE_FAILURES", 5),
+    }
+}
+
 
 /// Matches L2c/L2d's cadence — a starting value, not measured against real chain behavior.
 const FLASHLOAN_LIQUIDITY_POLL_INTERVAL_S: u64 = 15;
@@ -1265,17 +1306,16 @@ async fn main() -> Result<()> {
     tracing::info!("L6 DAG initialised");
 
     // ── ExecutionPipeline construction ─────────────────────────────────────────
-    let kill_switch_cfg = KillSwitchConfig {
-        max_cumulative_loss_wei: u128::MAX / 4,
-        max_loss_per_window_wei: u128::MAX / 8,
-        loss_window: Duration::from_secs(3600),
-        max_consecutive_failures: 32,
-    };
+    let kill_switch_cfg = kill_switch_config_from_env();
+    tracing::info!(
+        max_cumulative_loss_wei = kill_switch_cfg.max_cumulative_loss_wei,
+        max_loss_per_window_wei = kill_switch_cfg.max_loss_per_window_wei,
+        loss_window_secs = kill_switch_cfg.loss_window.as_secs(),
+        max_consecutive_failures = kill_switch_cfg.max_consecutive_failures,
+        "KillSwitchRegistry thresholds (env OMEGA_KILL_* or production defaults)"
+    );
     let kill_switches =
         Arc::new(KillSwitchRegistry::new(kill_switch_cfg).context("KillSwitchRegistry::new")?);
-    tracing::warn!(
-        "KillSwitchRegistry constructed with non-production placeholder thresholds"
-    );
 
     // IntegrityRegistry — no longer unconditionally empty (see changelog).
     let integrity_registry = IntegrityRegistry::new();
