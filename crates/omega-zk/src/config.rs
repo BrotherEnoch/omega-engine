@@ -86,6 +86,12 @@ pub struct ZkConfig {
     /// Whether to skip ZK proof generation for Microtx blueprints during
     /// Phase 0 shadow mode (never skip in Phase 1+).
     pub allow_skip_in_shadow: bool,
+
+    /// Chain ID the proof AIR and verifier bind to. MUST match the process-wide
+    /// chain (e.g. 42161 Arbitrum One). Previously hardcoded inside
+    /// `ProofWorkerPool::start`; now explicit so a mis-set OMEGA_CHAIN_ID cannot
+    /// silently produce proofs for the wrong chain.
+    pub chain_id: u64,
 }
 
 impl Default for ZkConfig {
@@ -101,6 +107,7 @@ impl Default for ZkConfig {
             checkpoint_dir: "/var/omega/zk-checkpoints".into(),
             max_checkpoints: 64,
             allow_skip_in_shadow: true,
+            chain_id: 42_161,
         }
     }
 }
@@ -138,6 +145,7 @@ mod config_tests {
         assert_eq!(cfg.proof_queue_suspend, QUEUE_SUSPEND_DEPTH);
         assert_eq!(cfg.proof_queue_halt, QUEUE_HALT_DEPTH);
         assert_eq!(cfg.prover_tier, ProverTierConfig::T1Software);
+        assert_eq!(cfg.chain_id, 42_161);
     }
 
     #[test]

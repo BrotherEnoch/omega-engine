@@ -301,6 +301,24 @@
 // encoding helpers" section below), so a struct-of-params refactor would
 // obscure the correspondence to the spec this code deliberately
 // preserves, not simplify anything.
+//
+// ## Build fix (this revision): E0382 partial-move in two tests
+//
+// `cargo test --workspace` / `cargo clippy --workspace --all-targets -- -D
+// warnings` both failed to compile with two `E0382` "borrow of partially
+// moved value: `err`" errors, both in this module's test suite:
+// `sign_transaction_fails_closed_on_zero_chain_id` and
+// `resolve_strategy_id_rejects_all_zero_mapping`. Both tests did
+// `matches!(err, ExecutionError::SigningFailed { detail } if
+// detail.contains(...))` and then referenced `{err:?}` in the assertion
+// message on the next line. `SigningFailed { detail }`'s pattern binding
+// moves `detail: String` out of `err` (since `String` is not `Copy`), so
+// by the time the format string tries to borrow `err` again for `{err:?}`,
+// `err` has already been partially moved from and is no longer valid to
+// borrow as a whole. Fixed exactly as the compiler suggested: bind
+// `ref detail` in each pattern instead of `detail`, so the match inspects
+// `err` by reference and never moves out of it, leaving `err` fully
+// intact for the subsequent `{err:?}` use.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -536,6 +554,46 @@ impl KeyManagerTransactionSigner {
         self.tx_key_manager.active_address()
     }
 
+    /// C6 fail-closed pre-flight before any key material is used.
+    fn validate_blueprint_for_signing(
+        &self,
+        bp: &ExecutionBlueprint,
+        chain_id: u64,
+    ) -> Result<[u8; 32], ExecutionError> {
+        if chain_id == 0 {
+            return Err(ExecutionError::SigningFailed {
+                detail: "chain_id must be non-zero (C6 fail closed)".into(),
+            });
+        }
+        if bp.total_l2_gas_budget() == 0 {
+            return Err(ExecutionError::SigningFailed {
+                detail: "total_l2_gas_budget must be non-zero (C6 fail closed)".into(),
+            });
+        }
+        self.resolve_strategy_id(bp)
+    }
+
+    /// Resolve on-chain strategyId for `bp`, or fail closed (missing / all-zero).
+    fn resolve_strategy_id(&self, bp: &ExecutionBlueprint) -> Result<[u8; 32], ExecutionError> {
+        let strategy_key = bp.strategy_id.to_string();
+        let strategy_id_bytes: [u8; 32] = *self
+            .strategy_onchain_ids
+            .get(&strategy_key)
+            .ok_or_else(|| ExecutionError::SigningFailed {
+                detail: format!(
+                    "no on-chain strategyId configured for strategy_id {strategy_key:?} — this                      value is real deployment configuration (whatever bytes32 was passed to                      OmegaOrchestrator.registerStrategy() for this strategy on-chain), not                      something derivable from code. Wire it into                      KeyManagerTransactionSigner::new's strategy_onchain_ids map, sourced from                      real deployment records, never guessed at."
+                ),
+            })?;
+        if strategy_id_bytes == [0u8; 32] {
+            return Err(ExecutionError::SigningFailed {
+                detail: format!(
+                    "on-chain strategyId for {strategy_key:?} is all-zero — refusing to sign                      (C6 fail closed)"
+                ),
+            });
+        }
+        Ok(strategy_id_bytes)
+    }
+
     /// Build the real, ABI-encoded `blueprintCalldata` bytes for `bp` —
     /// see this file's top doc comment, items 1-4, for exactly what's
     /// confirmed here and against what evidence.
@@ -544,20 +602,7 @@ impl KeyManagerTransactionSigner {
     /// `strategy_onchain_ids` — everything else is a pure, infallible
     /// transformation of already-real `ExecutionBlueprint` fields.
     fn build_blueprint_calldata(&self, bp: &ExecutionBlueprint) -> Result<Vec<u8>, ExecutionError> {
-        let strategy_key = bp.strategy_id.to_string();
-        let strategy_id_bytes: [u8; 32] = *self
-            .strategy_onchain_ids
-            .get(&strategy_key)
-            .ok_or_else(|| ExecutionError::SigningFailed {
-                detail: format!(
-                    "no on-chain strategyId configured for strategy_id {strategy_key:?} — this \
-                     value is real deployment configuration (whatever bytes32 was passed to \
-                     OmegaOrchestrator.registerStrategy() for this strategy on-chain), not \
-                     something derivable from code. Wire it into \
-                     KeyManagerTransactionSigner::new's strategy_onchain_ids map, sourced from \
-                     real deployment records, never guessed at."
-                ),
-            })?;
+        let strategy_id_bytes = self.resolve_strategy_id(bp)?;
 
         // Solidity ABI-encodes an enum identically to its `uint8` ordinal.
         // `omega_core::types::flashloan_provider`'s own
@@ -667,6 +712,9 @@ impl TransactionSigner for KeyManagerTransactionSigner {
         bp: &ExecutionBlueprint,
         chain_id: u64,
     ) -> Result<SignedTransaction, ExecutionError> {
+        // C6: fail closed before any EIP-1559 RLP or secp256k1 work.
+        let _ = self.validate_blueprint_for_signing(bp, chain_id)?;
+
         let data = self.build_execute_calldata(bp, chain_id)?;
 
         let secret_key =
@@ -1197,6 +1245,38 @@ mod tests {
             Address::ZERO,
             empty_strategy_ids(),
             make_blueprint_signer(0x01),
+        );
+    }
+
+    #[tokio::test]
+    async fn sign_transaction_fails_closed_on_zero_chain_id() {
+        let signer = KeyManagerTransactionSigner::new(
+            make_km(0x21),
+            Address::from([0x01; 20]),
+            strategy_ids_with_sa(),
+            make_blueprint_signer(0x21),
+        );
+        let err = signer.sign_transaction(&sample_bp(), 0).await.unwrap_err();
+        assert!(
+            matches!(err, ExecutionError::SigningFailed { ref detail } if detail.contains("chain_id")),
+            "expected chain_id fail-closed, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn resolve_strategy_id_rejects_all_zero_mapping() {
+        let mut ids = strategy_ids_with_sa();
+        ids.insert("SA".into(), [0u8; 32]);
+        let signer = KeyManagerTransactionSigner::new(
+            make_km(0x22),
+            Address::from([0x01; 20]),
+            ids,
+            make_blueprint_signer(0x22),
+        );
+        let err = signer.build_blueprint_calldata(&sample_bp()).unwrap_err();
+        assert!(
+            matches!(err, ExecutionError::SigningFailed { ref detail } if detail.contains("all-zero")),
+            "expected all-zero strategyId fail-closed, got {err:?}"
         );
     }
 

@@ -504,4 +504,61 @@ mod flashloan_tests {
             UNISWAP_V3_PREMIUM_BPS
         );
     }
+
+    /// C9: zero asset must not create a registry row (fail closed).
+    #[test]
+    fn zero_asset_update_is_ignored() {
+        let reg = test_registry();
+        reg.update(
+            42161,
+            FlashloanProvider::AaveV3,
+            Address::ZERO,
+            addr(0xAA),
+            eth(50),
+            1_000,
+        );
+        assert!(reg
+            .snapshot(42161, FlashloanProvider::AaveV3, Address::ZERO, addr(0xAA))
+            .is_none());
+    }
+
+    /// C9: zero contract must not create a registry row (fail closed).
+    #[test]
+    fn zero_contract_update_is_ignored() {
+        let reg = test_registry();
+        reg.update(
+            42161,
+            FlashloanProvider::AaveV3,
+            weth(),
+            Address::ZERO,
+            eth(50),
+            1_000,
+        );
+        assert!(reg
+            .snapshot(42161, FlashloanProvider::AaveV3, weth(), Address::ZERO)
+            .is_none());
+    }
+
+    /// C9: select_provider refuses zero asset.
+    #[test]
+    fn select_provider_rejects_zero_asset() {
+        let reg = test_registry();
+        reg.update(
+            42161,
+            FlashloanProvider::AaveV3,
+            weth(),
+            addr(0xAA),
+            eth(100),
+            1_000,
+        );
+        let err = select_provider(&reg, 42161, Address::ZERO, eth(1)).unwrap_err();
+        assert!(matches!(
+            err,
+            FlashloanError::NoneAvailable {
+                best_available_wei,
+                ..
+            } if best_available_wei == U256::ZERO
+        ));
+    }
+
 }

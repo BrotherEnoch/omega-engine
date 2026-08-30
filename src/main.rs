@@ -302,8 +302,8 @@ use omega_security::{
 // exist, use `omega_strategies::la::LaStrategy` instead.
 use omega_strategies::{registry::StrategyRegistryBuilder, CnryStrategy, LaStrategy, StrategyRegistry};
 use omega_zk::{
-    binding::compute_public_inputs_hash, config::ProverTierConfig, ProofQueue, ProofWorkerPool,
-    ZkConfig, ZkVerifier,
+    binding::compute_public_inputs_hash, config::ProverTierConfig, PendingProofBuffer,
+    ProofQueue, ProofWorkerPool, VerifiedProofSubmission, ZkConfig, ZkVerifier,
 };
 use omega_flashloan::{FlashloanProvider, LiquidityRegistry};
 // C8: real, live lending-position registry LaStrategy now requires at construction.
@@ -1460,13 +1460,47 @@ async fn main() -> Result<()> {
         allow_skip_in_shadow: active_phase == 0,
         checkpoint_dir: config.ml.checkpoint_dir.clone(),
         max_checkpoints: config.ml.checkpoint_retention,
+        chain_id, // was hard-coded inside ProofWorkerPool::start
     };
     let proof_queue = ProofQueue::new(zk_cfg.clone());
     let _pool = ProofWorkerPool::start(zk_cfg, proof_queue.clone());
     // Stateless (holds only expected_chain_id) — a single Arc-wrapped instance is shared
     // across every scoring-loop task rather than reconstructed per call.
     let zk_verifier = Arc::new(ZkVerifier::new(chain_id));
-    tracing::info!("L7 ZK: proof worker pool started, ZkVerifier constructed");
+    // Verified proofs awaiting OmegaVault.submitProof (calldata only until a signer is wired).
+    let pending_proofs = Arc::new(PendingProofBuffer::new(256));
+    tracing::info!(
+        "L7 ZK: proof worker pool started, ZkVerifier + PendingProofBuffer ready"
+    );
+
+    // Keeper: drain verified proofs into submitProof calldata. Does NOT broadcast —
+    // replace the body with KeyManagerTransactionSigner when the on-chain path is live.
+    {
+        let buf = Arc::clone(&pending_proofs);
+        let vault = vault_address;
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(Duration::from_secs(5));
+            loop {
+                ticker.tick().await;
+                for sub in buf.drain(8) {
+                    match sub.encode_calldata() {
+                        Ok(data) => {
+                            tracing::info!(
+                                blueprint = %hex::encode(sub.blueprint_hash),
+                                vault = %hex::encode(vault),
+                                calldata_len = data.len(),
+                                "ZK submitProof calldata ready — wire KeyManagerTransactionSigner to broadcast"
+                            );
+                            let _ = data;
+                        }
+                        Err(e) => {
+                            tracing::warn!(error = %e, "submitProof encode failed")
+                        }
+                    }
+                }
+            }
+        });
+    }
 
     // ── L8: Hot-path ──────────────────────────────────────────────────────────
     let (hp_runner, hp_tx) = HotPathRunner::new(HotPathConfig {
@@ -1598,10 +1632,11 @@ async fn main() -> Result<()> {
         let va3 = vault_address;
         let pt3 = profit_token;
         let zv3 = Arc::clone(&zk_verifier);
+        let pp3 = Arc::clone(&pending_proofs);
         tokio::spawn(async move {
             run_scoring_loop(
                 reg, ora3, cl3, py3, tw3, dag2, tx, pq, halt3, ph, ep3, nr3, ir3, et3, fl3, cid3,
-                va3, pt3, zv3,
+                va3, pt3, zv3, pp3,
             )
             .await;
         });
@@ -1683,6 +1718,7 @@ async fn run_scoring_loop(
     vault_address: [u8; 20],
     profit_token: [u8; 20],
     zk_verifier: Arc<ZkVerifier>,
+    pending_proofs: Arc<PendingProofBuffer>,
 ) {
     let mut rx = oracle.subscribe();
     loop {
@@ -1730,10 +1766,11 @@ async fn run_scoring_loop(
                     let va2 = vault_address;
                     let pt2 = profit_token;
                     let zv2 = Arc::clone(&zk_verifier);
+                    let pp2 = Arc::clone(&pending_proofs);
                     tokio::spawn(async move {
                         score_and_admit(
                             strategy, s2, dag2, tx2, pq2, h2, ph, os2, ep2, nr2, ir2, gv2, et2,
-                            fl2, cid2, va2, pt2, zv2,
+                            fl2, cid2, va2, pt2, zv2, pp2,
                         )
                         .await;
                     });
@@ -1767,6 +1804,7 @@ async fn score_and_admit(
     vault_address: [u8; 20],
     profit_token: [u8; 20],
     zk_verifier: Arc<ZkVerifier>,
+    pending_proofs: Arc<PendingProofBuffer>,
 ) {
     if halt.is_halted() {
         return;
@@ -1835,6 +1873,7 @@ async fn score_and_admit(
                 Ok(proof_rx) => {
                     let hash_for_log = bp.blueprint_hash;
                     let zv_bg = Arc::clone(&zk_verifier);
+                    let pp_bg = Arc::clone(&pending_proofs);
                     tokio::spawn(async move {
                         match proof_rx.await {
                             Ok(Ok(proof)) => {
@@ -1846,11 +1885,29 @@ async fn score_and_admit(
                                          against expected publicInputsHash"
                                     );
                                 } else {
+                                    match VerifiedProofSubmission::from_verified_proof(&proof) {
+                                        Ok(sub) => {
+                                            if let Err(e) = pp_bg.push(sub) {
+                                                tracing::warn!(
+                                                    hash = %hash_for_log,
+                                                    error = %e,
+                                                    "verified ZK proof could not be buffered                                                      for on-chain submitProof"
+                                                );
+                                            }
+                                        }
+                                        Err(e) => {
+                                            tracing::error!(
+                                                hash = %hash_for_log,
+                                                error = %e,
+                                                "verified proof rejected at submission packaging                                                  — fail closed on buffer"
+                                            );
+                                        }
+                                    }
                                     tracing::debug!(
                                         hash = %hash_for_log,
                                         gen_ms = proof.generation_ms,
                                         "hot-path background ZK proof ready and verified \
-                                         (not yet submitted on-chain)"
+                                         (buffered for submitProof)"
                                     );
                                 }
                             }
@@ -1963,11 +2020,30 @@ async fn score_and_admit(
             return;
         }
 
+        match VerifiedProofSubmission::from_verified_proof(&proof) {
+            Ok(sub) => {
+                if let Err(e) = pending_proofs.push(sub) {
+                    tracing::warn!(
+                        hash = %bp.blueprint_hash,
+                        error = %e,
+                        "verified ZK proof could not be buffered for on-chain submitProof"
+                    );
+                }
+            }
+            Err(e) => {
+                tracing::error!(
+                    hash = %bp.blueprint_hash,
+                    error = %e,
+                    "verified proof rejected at submission packaging — fail closed on buffer"
+                );
+            }
+        }
+
         if active_phase >= 1 {
             tracing::info!(
                 hash   = %bp.blueprint_hash,
                 gen_ms = proof.generation_ms,
-                "ZK proof ready and verified",
+                "ZK proof ready and verified (buffered for submitProof)",
             );
         }
     }
@@ -2438,6 +2514,7 @@ mod hot_path_zk_provisioning_tests {
         AccountExposureTracker,
         tokio::sync::watch::Receiver<FlashloanLiquidityState>,
         Arc<ZkVerifier>,
+        Arc<PendingProofBuffer>,
     ) {
         let strategy: Arc<dyn StrategyTrait> = SaStrategy::new(
             TEST_CHAIN_ID,
@@ -2465,12 +2542,14 @@ mod hot_path_zk_provisioning_tests {
             allow_skip_in_shadow: true,
             checkpoint_dir: OmegaConfig::default().ml.checkpoint_dir.clone(),
             max_checkpoints: OmegaConfig::default().ml.checkpoint_retention,
+            chain_id: TEST_CHAIN_ID,
         };
         // Deliberately NOT starting a ProofWorkerPool — leaving the proof queue
         // permanently unserviced is the whole point of this test.
         let proof_queue = ProofQueue::new(zk_cfg);
 
         let zk_verifier = Arc::new(ZkVerifier::new(TEST_CHAIN_ID));
+        let pending_proofs = Arc::new(PendingProofBuffer::new(16));
 
         let kill_switch_cfg = KillSwitchConfig {
             max_cumulative_loss_wei: u128::MAX / 4,
@@ -2548,6 +2627,7 @@ mod hot_path_zk_provisioning_tests {
             exposure_tracker,
             flashloan_liq_rx,
             zk_verifier,
+            pending_proofs,
         )
     }
 
@@ -2578,6 +2658,7 @@ mod hot_path_zk_provisioning_tests {
             exposure_tracker,
             flashloan_liq_rx,
             zk_verifier,
+            pending_proofs,
         ) = build_harness().await;
 
         // SA is hot_path_eligible with gas_budget() == MICROTX_GAS_LIMIT — confirmed
@@ -2631,6 +2712,7 @@ mod hot_path_zk_provisioning_tests {
                 [0x11u8; 20],  // vault_address
                 [0x22u8; 20],  // profit_token
                 zk_verifier,
+                pending_proofs,
             ),
         )
         .await;

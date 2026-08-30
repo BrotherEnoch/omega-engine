@@ -297,6 +297,10 @@ impl LiquidityRegistry {
     /// same `contract` address; passing the wrong `asset` here silently
     /// corrupts that other asset's snapshot, same risk this key change was
     /// made to eliminate at the type level for callers that get it right.
+    /// C9 fail-closed: `asset == Address::ZERO` is refused — a zero asset key is
+    /// never a real ERC-20 and would only create a poison registry row that
+    /// `select_provider` could never legitimately match for LA debt tokens.
+    /// The previous snapshot for any real key is left untouched.
     pub fn update(
         &self,
         chain_id: u64,
@@ -306,6 +310,25 @@ impl LiquidityRegistry {
         available_wei: U256,
         block_number: u64,
     ) {
+        if asset.is_zero() {
+            tracing::warn!(
+                provider = %provider,
+                chain_id,
+                contract = %contract,
+                "LiquidityRegistry::update refused Address::ZERO asset (C9 fail closed)                  — cache unchanged"
+            );
+            return;
+        }
+        if contract.is_zero() {
+            tracing::warn!(
+                provider = %provider,
+                chain_id,
+                asset = %asset,
+                "LiquidityRegistry::update refused Address::ZERO contract (C9 fail closed)                  — cache unchanged"
+            );
+            return;
+        }
+
         let key = ProviderKey {
             chain_id,
             provider,
@@ -485,6 +508,16 @@ pub fn select_provider(
     asset: Address,
     amount_wei: U256,
 ) -> Result<SelectionResult, FlashloanError> {
+    // C9 fail closed: never select against a zero asset (not a real debt token).
+    if asset.is_zero() {
+        return Err(FlashloanError::NoneAvailable {
+            amount_wei,
+            chain_id,
+            asset,
+            best_available_wei: U256::ZERO,
+        });
+    }
+
     let providers = [
         FlashloanProvider::Balancer,
         FlashloanProvider::AaveV3,

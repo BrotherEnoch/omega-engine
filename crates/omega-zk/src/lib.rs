@@ -7,6 +7,12 @@
 // OmegaVault.computePublicInputsHash(). Required by prover.rs's BlueprintPublicInputs (now
 // commits public_inputs_hash_commitment alongside blueprint_hash) and by main.rs's new C9
 // real ZK-gate enforcement.
+//
+// ## ZK integration (submit pathway)
+//
+//   `submit` encodes OmegaVault.submitProof calldata and buffers verified
+//   proofs for an external signer/relayer. `ZkConfig.chain_id` is threaded into
+//   ProofWorkerPool (no more hard-coded 42161). See docs/ZK_Proof_Integration.md.
 
 pub mod binding;
 pub mod checkpoint;
@@ -18,6 +24,7 @@ pub mod prover;
 pub mod queue;
 pub mod verifier;
 pub mod worker;
+pub mod submit;
 
 pub use binding::{compute_public_inputs_hash, PUBLIC_INPUTS_VERSION};
 pub use checkpoint::ProofCheckpointManager;
@@ -28,3 +35,7 @@ pub use prover::{ProverTier, T1SoftwareProver, ZkProof};
 pub use queue::{ProofQueue, ProofRequest, ProofResponse, QueuePressure};
 pub use verifier::ZkVerifier;
 pub use worker::ProofWorkerPool;
+pub use submit::{
+    encode_submit_proof_calldata, submit_proof_selector, PendingProofBuffer,
+    VerifiedProofSubmission,
+};

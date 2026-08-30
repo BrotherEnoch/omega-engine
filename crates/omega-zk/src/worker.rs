@@ -56,9 +56,9 @@ impl ProofWorkerPool {
         metrics::register_all();
 
         let worker_count = cfg.worker_count;
-        let chain_id = 42161u64; // passed through cfg in production; hardcoded for now
+        let chain_id = cfg.chain_id;
 
-        tracing::info!(worker_count, "proof worker pool starting");
+        tracing::info!(worker_count, chain_id, "proof worker pool starting");
 
         let mut handles = Vec::with_capacity(worker_count);
 

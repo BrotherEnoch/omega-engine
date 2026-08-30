@@ -58,6 +58,10 @@ pub enum ZkError {
         detail: String,
     },
 
+    // ── On-chain submission buffer ────────────────────────────────────────────
+    #[error("Pending proof submission buffer full (capacity {capacity})")]
+    SubmissionBufferFull { capacity: usize },
+
     // ── Internal ──────────────────────────────────────────────────────────────
     #[error("Internal ZK error: {0}")]
     Internal(#[from] anyhow::Error),
