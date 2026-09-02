@@ -662,7 +662,10 @@ mod tests {
             "LA must refuse to build with no liquidatable position tracked"
         );
         let msg = bp_result.unwrap_err().to_string();
-        assert!(msg.contains("liquidatable position"), "error message: {msg}");
+        assert!(
+            msg.contains("liquidatable position"),
+            "error message: {msg}"
+        );
     }
 
     /// Regression guard: build_blueprint must fail cleanly (not panic,

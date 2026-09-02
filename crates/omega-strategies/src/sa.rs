@@ -20,13 +20,15 @@
 // for. `idempotency_key` is filled in the same way, via
 // `bp.compute_idempotency_key()`, after construction.
 //
-// ## Capital-path marker (this revision)
+// ## Capital path (Option B)
 //
-// `flashloan_provider`/`flashloan_amount` below are `Address::ZERO`/
-// `U256::ZERO` — see the inline TODO(capital-path) comment in
-// `build_blueprint` for the full status. Short version: this is a known,
-// currently-unexecutable state being called out explicitly rather than
-// left silent.
+// SA borrows via `omega_flashloan::select_provider`, same as LA/MSA.
+// `flashloan_token` is Arbitrum canonical WETH (must match Vault
+// `profit_token` on Orchestrator). `flashloan_amount` is `SA_SPREAD_WEI`
+// — the same notional already used as two-hop `amount_in` (interim sizing
+// until a real quote path exists). `build_blueprint` fails closed if
+// selection fails or token/amount is zero — Orchestrator reverts on
+// `flashloanToken == address(0)`.
 //
 // ## `max_base_fee_gwei` (this revision)
 //
@@ -35,24 +37,18 @@
 // caveat as la.rs/msa.rs/mev.rs — set as `base_fee_at_creation * 3`
 // pending confirmation of the field's real intended semantics.
 //
-// ## Fix (this revision, 2): flashloan identity fields for E0063
+// ## Audit fix (this revision, 2): mixed-case hex literal
 //
-// `ExecutionBlueprint` gained three additional fields —
-// `flashloan_provider_type`, `provider_contract`, `flashloan_token` —
-// at some point without this file being updated to match, producing
-// `error[E0063]: missing fields flashloan_provider_type, flashloan_token
-// and provider_contract in initializer of ExecutionBlueprint`. Fixed by
-// adding all three as inert placeholders (`FlashloanProviderType::
-// Balancer`, `Address::ZERO`, `Address::ZERO`) alongside the existing
-// `flashloan_provider: Address::ZERO` / no-flashloan path — the same
-// pattern `omega-execution/src/pipeline.rs`'s own test helper
-// (`tests::sample_bp`) already establishes for exactly this situation:
-// nothing in `ExecutionPipeline::execute`'s Stage 0-6 path reads any of
-// these three flashloan-identity fields when `flashloan_provider` is
-// `Address::ZERO`, so their concrete values are inert here, not a
-// product decision. See this file's own TODO(capital-path) comment
-// below for the still-open question of what SA's real flashloan path
-// (if any) should look like.
+// `cargo clippy --workspace --all-targets -- -D warnings` failed on
+// `clippy::mixed_case_hex_literals` at two of the individual byte
+// literals inside `ARBITRUM_WETH`'s array (`0xaF` and `0xBa` — each one
+// mixed upper/lower case within a single literal, which is the lint's
+// actual complaint; it does not care about case consistency ACROSS
+// literals). Fixed by lowercasing every hex digit in every byte of the
+// array. This changes only how the literals are spelled, not their
+// value — `0xaF` and `0xaf` are the identical `u8`, so `ARBITRUM_WETH`'s
+// address is byte-for-byte unchanged. (Same fix applied in msa.rs, which
+// defines the identical constant independently.)
 
 use std::sync::{
     atomic::{AtomicU64, Ordering},
@@ -65,10 +61,12 @@ use async_trait::async_trait;
 use uuid::Uuid;
 
 use omega_core::types::blueprint::{ExecutionBlueprint, StrategyId};
-use omega_core::types::flashloan_provider::FlashloanProviderType;
 use omega_core::types::lane::{Lane, Simulator};
 use omega_core::types::strategy::{OpScore, SignalState, SimResult};
 use omega_core::{GasConfig, OmegaConfig};
+use omega_flashloan::LiquidityRegistry;
+
+use crate::flashloan_select::to_blueprint_provider_type;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Constants
@@ -104,6 +102,13 @@ const SA_SPREAD_WEI: u128 = 200_000_000_000_000_000; // 0.2 ETH
 /// comment on this revision's `max_base_fee_gwei` addition.
 const MAX_BASE_FEE_HEADROOM_MULTIPLIER: u64 = 3;
 
+/// Canonical bridged WETH on Arbitrum One.
+/// Must match Vault `profit_token` and `omega_rpc::WETH`.
+const ARBITRUM_WETH: Address = Address::new([
+    0x82, 0xaf, 0x49, 0x44, 0x7d, 0x8a, 0x07, 0xe3, 0xbd, 0x95, 0xbd, 0x0d, 0x56, 0xf3, 0x52, 0x41,
+    0x52, 0x3f, 0xba, 0xb1,
+]);
+
 // ─────────────────────────────────────────────────────────────────────────────
 // SaStrategy
 // ─────────────────────────────────────────────────────────────────────────────
@@ -113,14 +118,18 @@ pub struct SaStrategy {
     nonce: AtomicU64,
     bytecode_hash: B256,
     contract_addr: Address,
+    liquidity_registry: Arc<LiquidityRegistry>,
     gas: GasConfig,
 }
 
 impl SaStrategy {
+    /// Construct SA from config, deployed strategy metadata, and the shared
+    /// flashloan liquidity registry (same handle L2e feeds and LA/MSA hold).
     pub fn new(
         chain_id: u64,
         bytecode_hash: B256,
         contract_addr: Address,
+        liquidity_registry: Arc<LiquidityRegistry>,
         config: &OmegaConfig,
     ) -> Arc<Self> {
         Arc::new(Self {
@@ -128,6 +137,7 @@ impl SaStrategy {
             nonce: AtomicU64::new(0),
             bytecode_hash,
             contract_addr,
+            liquidity_registry,
             gas: config.gas.clone(),
         })
     }
@@ -281,6 +291,20 @@ impl omega_core::types::strategy::StrategyTrait for SaStrategy {
             .saturating_mul(U256::from(SA_GAS_BUDGET))
             .saturating_mul(U256::from(1_000_000_000_u64));
 
+        // Option B: real flashloan selection (fail closed).
+        let flashloan_token = ARBITRUM_WETH;
+        let flashloan_amount = spread_wei;
+        if flashloan_amount.is_zero() {
+            anyhow::bail!("SA: refusing zero flashloan_amount");
+        }
+        let selection = omega_flashloan::select_provider(
+            &self.liquidity_registry,
+            self.chain_id,
+            flashloan_token,
+            flashloan_amount,
+        )
+        .map_err(|e| anyhow::anyhow!("SA: flashloan selection failed: {e:?}"))?;
+
         let mut bp = ExecutionBlueprint {
             blueprint_hash: B256::ZERO, // filled below via canonical compute_hash()
             chain_id: self.chain_id,
@@ -290,28 +314,12 @@ impl omega_core::types::strategy::StrategyTrait for SaStrategy {
             signal_state_hash: signal.state_hash,
             state_version: signal.state_version,
             signal_id,
-            // TODO(capital-path): flashloan_provider == Address::ZERO is documented on
-            // ExecutionBlueprint as "no flashloan — capital sourced from PIL (§7)", and
-            // omega-execution maps zero → Ok("none") in resolve_flashloan_provider_id.
-            // There is no Orchestrator branch and no strategy→PIL inventory path that
-            // makes this executable on-chain (execute() reverts ZeroAddress on
-            // flashloanToken == address(0); PilTreasury has deposit/redeem only, no
-            // strategy loan/allocate). Either wire omega_flashloan::select_provider
-            // (treat SA as incomplete flashloan strategy — Option B default) or
-            // implement a real no-flashloan path as a product feature. Do not encode
-            // or submit until one of those exists.
-            flashloan_provider: Address::ZERO,
-            flashloan_amount: U256::ZERO,
-            flashloan_available: U256::MAX,
-            // Fix (this revision, 2): inert placeholders — flashloan_provider
-            // is Address::ZERO (no flashloan), and omega-execution's pipeline
-            // never reads these three fields on that path. Same pattern
-            // pipeline.rs's own test helper (sample_bp) already uses for the
-            // identical case — see this file's module-level "Fix (this
-            // revision, 2)" note.
-            flashloan_provider_type: FlashloanProviderType::Balancer,
-            provider_contract: Address::ZERO,
-            flashloan_token: Address::ZERO,
+            flashloan_provider: selection.contract_addr,
+            flashloan_amount,
+            flashloan_available: selection.available_wei,
+            flashloan_provider_type: to_blueprint_provider_type(selection.provider),
+            provider_contract: selection.contract_addr,
+            flashloan_token,
             // PLACEHOLDER — see module-level comment on this revision's
             // max_base_fee_gwei addition.
             max_base_fee_gwei: signal
@@ -372,10 +380,20 @@ mod tests {
     use omega_core::OmegaConfig;
 
     fn make_strategy() -> Arc<SaStrategy> {
+        let liquidity_registry = LiquidityRegistry::new();
+        liquidity_registry.update(
+            42161,
+            omega_flashloan::FlashloanProvider::Balancer,
+            ARBITRUM_WETH,
+            Address::from([0xB0; 20]),
+            U256::from(10_000_000_000_000_000_000u128), // 10 ETH available
+            1,
+        );
         SaStrategy::new(
             42161,
             B256::from([0xAB; 32]),
             Address::ZERO,
+            liquidity_registry,
             &OmegaConfig::default(),
         )
     }
@@ -427,6 +445,11 @@ mod tests {
         assert!(bp.is_profitable());
         assert!(!bp.calldata.is_empty());
         assert_eq!(bp.confirmation_depth, SA_CONFIRMATION);
+        assert_ne!(bp.flashloan_token, Address::ZERO);
+        assert!(!bp.flashloan_amount.is_zero());
+        assert_ne!(bp.provider_contract, Address::ZERO);
+        assert_eq!(bp.flashloan_token, ARBITRUM_WETH);
+        assert_eq!(bp.flashloan_amount, U256::from(SA_SPREAD_WEI));
     }
 
     #[tokio::test]
@@ -493,6 +516,27 @@ mod tests {
         assert_ne!(
             bp1.signal_id, bp2.signal_id,
             "each build is a distinct signal generation"
+        );
+    }
+
+    #[tokio::test]
+    async fn build_blueprint_fails_closed_without_liquidity() {
+        let empty = LiquidityRegistry::new();
+        let s = SaStrategy::new(
+            42161,
+            B256::from([0xAB; 32]),
+            Address::ZERO,
+            empty,
+            &OmegaConfig::default(),
+        );
+        let err = s
+            .build_blueprint(&make_signal(5))
+            .await
+            .expect_err("empty registry must fail closed");
+        let msg = format!("{err:?}");
+        assert!(
+            msg.contains("flashloan selection failed") || msg.contains("NoneAvailable"),
+            "unexpected error: {msg}"
         );
     }
 
