@@ -148,6 +148,7 @@ mod flashloan_liq;
 
 pub mod client;
 pub mod rate_limiter;
+pub mod reconciliation;
 pub mod subscriptions;
 
 // ── Re-exports ────────────────────────────────────────────────────────────────
@@ -171,4 +172,8 @@ pub use flashloan_liq::{
     DeploymentValidationReport, LiquidityProtocol, ResolvedLiquidityAddress,
     AAVE_PROTOCOL_DATA_PROVIDER, AAVE_V3_POOL, ARBITRUM_ONE_CHAIN_ID, BALANCER_V2_VAULT,
     UNISWAP_V3_WETH_USDC_POOL, USDC_NATIVE, WETH,
+};
+
+pub use reconciliation::{
+    reconciler_for_providers, AtomicBalanceReconciler, ReconciliationConfig, ReconciliationError,
 };

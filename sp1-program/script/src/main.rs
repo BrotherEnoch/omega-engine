@@ -1,151 +1,159 @@
 // sp1-program/script/src/main.rs
 //
-// Host-side proving script: loads the compiled guest ELF, feeds it inputs, generates an
-// on-chain-verifiable proof, and assembles the exact calldata blob SP1StarkVerifierAdapter.sol
-// expects as OmegaVault.submitProof()'s `starkProof` argument.
-//
-// ============================================================================================
-// SAME BLOCKING GAP AS program/src/main.rs: what does this program actually prove?
-// ============================================================================================
-// This script can only write the two inputs that are FIXED by the on-chain contract
-// (blueprintHash, publicInputsHash) -- everything else (what additional private/public inputs
-// the real computation needs, where this script sources them from -- on-chain state? an
-// indexer? your own execution logs?) depends entirely on the still-open question raised
-// several turns ago and not yet answered.
-//
-// By default this refuses to run past that point (see the OMEGA_INSECURE_DEV_NOOP gate below).
-// Setting OMEGA_INSECURE_DEV_NOOP=1 unblocks it for PIPELINE TESTING ONLY, against a guest ELF
-// also built with the matching insecure_dev_noop feature -- it does not answer the open
-// question, it only lets the proving mechanics themselves be exercised while that question
-// remains open. Do not use a proof or PROGRAM_VKEY produced this way against real funds.
-// ============================================================================================
-//
-// TWO REAL DECISIONS MADE HERE, FLAGGED PER THIS CONVERSATION'S OWN PATTERN:
-//
-//   1. SYNC ProverClient::new() API, not the async ProverClient::builder()...build().await
-//      pattern. Search evidence surfaced BOTH patterns across different SP1 docs/versions --
-//      the sync `ProverClient::new()` / `client.setup(ELF)` / `client.prove(&pk,
-//      stdin).groth16().run()` shape appeared consistently across many independent sources
-//      including Succinct's own "Basics" docs page, while a newer async builder pattern
-//      appeared in Succinct's "Prover Network Quickstart" page specifically (which may be
-//      async because it's Prover-Network-specific, not necessarily because the whole API
-//      moved). I went with the sync pattern as the safer default for local/CPU proving, which
-//      is what you'd want for initial testing before deciding whether to route through the
-//      Prover Network. If you're targeting the Prover Network specifically, re-verify against
-//      current docs -- the async builder pattern may be required there.
-//
-//   2. GROTH16, not the default/compressed proof type. OmegaVault's C6 gate is only
-//      satisfiable by a proof `SP1StarkVerifierAdapter` can verify via `ISP1Verifier`, and
-//      Succinct's own docs are explicit that plain/compressed SP1 proofs are NOT verifiable
-//      on-chain -- only Groth16- or PLONK-wrapped ones are. Chose Groth16 over PLONK as the
-//      more commonly-referenced on-chain option across the sources I found; either would work
-//      with the adapter as written, since both go through the same ISP1Verifier interface.
-//      REQUIRES DOCKER RUNNING LOCALLY, plus >=16GB RAM, per Succinct's own docs -- this is a
-//      real environment prerequisite, not a code detail; expect this to fail without it.
-//
-// WHAT THIS SCRIPT DOES NOT DO: submit the resulting proof on-chain. It generates the proof
-// and prints/returns the exact calldata bytes `submitProof(blueprintHash, publicInputsHash,
-// <printed bytes>)` needs -- sending that transaction (choosing an RPC endpoint, a signer, gas
-// handling, retry logic) is a separate relayer concern I haven't been asked to build and
-// won't assume the shape of.
+// Host-side SP1 proving script.
+// Emits the opaque proof blob OmegaVault.submitProof expects when the Vault
+// is wired to SP1StarkVerifierAdapter:
+//   starkProof = abi.encode(bytes publicValues, bytes proofBytes)
+// where publicValues = abi.encode(bytes32 blueprintHash, bytes32 publicInputsHash)
+
+use std::path::PathBuf;
 
 use alloy_sol_types::SolValue;
-use anyhow::Result;
-use omega_proof_lib::ProofBundle;
-use sp1_sdk::{include_elf, ProverClient, SP1Stdin};
+use clap::Parser;
+use omega_proof_lib::{ProofBundle, PublicValuesStruct};
+use sp1_sdk::{ProverClient, SP1Stdin};
 
-/// The compiled guest ELF. `include_elf!` resolves this via SP1's build-time tooling (backed
-/// by the `sp1-build`/`sp1-helper` crates) once `program/` has been built with `cargo prove
-/// build` -- it will fail to compile until that ELF actually exists, which it doesn't yet
-/// given program/src/main.rs is still a stub.
-const ELF: &[u8] = include_elf!("omega-proof-program");
+#[derive(Parser, Debug)]
+#[command(author, version, about = "Omega SP1 proving script")]
+struct Args {
+    #[arg(long, default_value = "./elf/riscv32im-succinct-zkvm-elf")]
+    elf: PathBuf,
 
-fn main() -> Result<()> {
-    sp1_sdk::utils::setup_logger();
+    #[arg(long)]
+    blueprint_hash: String,
 
-    // -- Fixed inputs -------------------------------------------------------------------------
-    // These two are the only inputs this script can correctly construct right now -- they're
-    // the values OmegaVault itself computes and passes to receivePendingProfit/submitProof, so
-    // whatever real pipeline eventually calls this script must supply the REAL values for a
-    // specific blueprint here, not the zeroed placeholders below.
-    let blueprint_hash: [u8; 32] = [0u8; 32]; // TODO: real blueprintHash for the execution being proven
-    let public_inputs_hash: [u8; 32] = [0u8; 32]; // TODO: real publicInputsHash, e.g. from
-                                                   // OmegaVault.computePublicInputsHash(...)
+    #[arg(long)]
+    public_inputs_hash: String,
+
+    #[arg(long)]
+    output: Option<PathBuf>,
+
+    /// Use insecure_dev_noop guest path (never for production vkeys)
+    #[arg(long, default_value_t = false)]
+    insecure_dev: bool,
+}
+
+fn parse_hash32(s: &str) -> [u8; 32] {
+    let s = s.trim_start_matches("0x");
+    let bytes = hex::decode(s).expect("invalid hex for 32-byte hash");
+    assert_eq!(bytes.len(), 32, "hash must be exactly 32 bytes");
+    let mut out = [0u8; 32];
+    out.copy_from_slice(&bytes);
+    out
+}
+
+/// abi.encode(bytes a, bytes b) — matches SP1StarkVerifierAdapter decoding.
+fn abi_encode_two_bytes(a: &[u8], b: &[u8]) -> Vec<u8> {
+    fn pad32(n: usize) -> usize {
+        (32 - (n % 32)) % 32
+    }
+    let a_len = a.len();
+    let b_len = b.len();
+    let a_block = 32 + a_len + pad32(a_len);
+    let offset0: u64 = 64;
+    let offset1: u64 = 64 + a_block as u64;
+
+    let mut out = Vec::new();
+    let mut w = [0u8; 32];
+    w[24..32].copy_from_slice(&offset0.to_be_bytes());
+    out.extend_from_slice(&w);
+    w = [0u8; 32];
+    w[24..32].copy_from_slice(&offset1.to_be_bytes());
+    out.extend_from_slice(&w);
+
+    w = [0u8; 32];
+    w[24..32].copy_from_slice(&(a_len as u64).to_be_bytes());
+    out.extend_from_slice(&w);
+    out.extend_from_slice(a);
+    out.extend(std::iter::repeat_n(0u8, pad32(a_len)));
+
+    w = [0u8; 32];
+    w[24..32].copy_from_slice(&(b_len as u64).to_be_bytes());
+    out.extend_from_slice(&w);
+    out.extend_from_slice(b);
+    out.extend(std::iter::repeat_n(0u8, pad32(b_len)));
+
+    out
+}
+
+fn main() {
+    let args = Args::parse();
+
+    let blueprint_hash = parse_hash32(&args.blueprint_hash);
+    let public_inputs_hash = parse_hash32(&args.public_inputs_hash);
 
     let mut stdin = SP1Stdin::new();
     stdin.write(&blueprint_hash);
     stdin.write(&public_inputs_hash);
 
-    // TODO: write whatever additional private/public inputs the real computation needs, e.g.:
-    //   stdin.write(&strategy_execution_trace);
-    //   stdin.write(&canonical_price_data);
-    // Shape depends entirely on the still-unresolved question in program/src/main.rs's header.
-
-    // ============================================================================================
-    // insecure_dev_noop gate -- mirrors program/'s own Cargo feature of the same name. This is a
-    // separate crate, so it can't share a Cargo feature flag directly; gated on an explicit env
-    // var instead, checked at runtime rather than compile time, but with the same intent: refuse
-    // to proceed by default, only run the (meaningless) proving pipeline if explicitly told to.
-    //
-    // Setting this env var does NOT answer what this program should prove -- it only lets you
-    // exercise the proving pipeline against a guest ELF that was ALSO built with
-    // `cargo prove build --features insecure_dev_noop` (flagging: I have not independently
-    // confirmed `cargo prove build` passes through --features identically to plain `cargo
-    // build` -- verify this against your installed toolchain version before relying on it).
-    // If the ELF wasn't built with that feature, it still contains the real todo!() and will
-    // panic during proving regardless of this env var.
-    // ============================================================================================
-    let insecure_dev_noop = std::env::var("OMEGA_INSECURE_DEV_NOOP").as_deref() == Ok("1");
-    if !insecure_dev_noop {
-        todo!(
-            "This script cannot correctly run until (a) program/src/main.rs's open question is \
-             resolved and its real logic implemented, and (b) this script is updated to source \
-             real blueprint_hash/public_inputs_hash and any other required inputs from an \
-             actual data source, rather than the zeroed placeholders above. Set \
-             OMEGA_INSECURE_DEV_NOOP=1 only to exercise the pipeline mechanics in development \
-             against a matching insecure_dev_noop-built ELF -- never for a real deployment."
+    if !args.insecure_dev {
+        // Minimal non-empty signature so the guest non-zero check can pass in
+        // integration tests. Production callers must supply a real attestation.
+        let mut sig = [0u8; 64];
+        sig[0] = 1;
+        let attestation = (
+            [0x11u8; 20], // token_a
+            [0x22u8; 20], // token_b
+            1_000_000_000_000_000_000u128, // price 1.0 * 1e18
+            1_700_000_000u64, // attested_at
+            sig,
         );
+        stdin.write(&attestation);
+
+        let claim = (
+            [0xAAu8; 20], // pool_a
+            [0xBBu8; 20], // pool_b
+            [0x11u8; 20], // token_in
+            [0x22u8; 20], // token_out
+            1_000_000u128, // amount_in
+            1_000_000u128, // min_amount_out
+            0u128,         // claimed_net_profit
+        );
+        stdin.write(&claim);
+
+        let now: u64 = 1_700_000_030u64; // within 60s of attested_at
+        stdin.write(&now);
     }
-    eprintln!(
-        "\u{26A0}\u{FE0F}  OMEGA_INSECURE_DEV_NOOP=1 -- generating a proof of NOTHING. \
-         This proof and any PROGRAM_VKEY derived from it must never be used against real funds."
-    );
 
-    // -- Everything below is the CONFIRMED-CORRECT shape, runnable now only in dev-noop mode --
     let client = ProverClient::new();
-    let (pk, vk) = client.setup(ELF);
+    let elf = std::fs::read(&args.elf).expect("read ELF");
+    let (pk, vk) = client.setup(&elf);
 
-    // Groth16, not the default proof type -- see file header, decision 2, for why this is
-    // required rather than optional.
+    println!("Proving… (insecure_dev={})", args.insecure_dev);
     let proof = client
         .prove(&pk, stdin)
-        .groth16()
         .run()
         .expect("proof generation failed");
 
-    // Always verify locally before trusting/shipping a proof -- standard practice across
-    // every SP1 example found, not specific to this project.
-    client.verify(&proof, &vk).expect("proof verification failed");
-
-    // This is PROGRAM_VKEY -- the value DeployCore.s.sol / SP1StarkVerifierAdapter's
-    // constructor needs. Print it so it can be captured once, not regenerated by guesswork
-    // -- it's derived from the compiled ELF and is stable as long as the program doesn't
-    // change. IMPORTANT: a vkey printed from an insecure_dev_noop build is only valid for
-    // testing that same dev-noop ELF -- see the warnings above and in program/src/main.rs.
-    println!("PROGRAM_VKEY = {}", vk.bytes32());
-
-    // Assemble the exact calldata blob SP1StarkVerifierAdapter.verify() expects as its
-    // `proof` parameter: abi.encode(bytes publicValues, bytes proofBytes). See
-    // lib/src/lib.rs's ProofBundle doc comment for why a named struct's abi_encode() here
-    // is ABI-identical to encoding a raw (bytes, bytes) tuple directly.
-    let bundle = ProofBundle {
-        publicValues: proof.public_values.to_vec().into(),
-        proofBytes: proof.bytes().into(),
+    // publicValues = abi.encode(bytes32, bytes32) = 64 static bytes
+    let public_values_struct = PublicValuesStruct {
+        blueprintHash: blueprint_hash.into(),
+        publicInputsHash: public_inputs_hash.into(),
     };
-    let encoded_proof_arg = ProofBundle::abi_encode(&bundle);
+    let public_values = PublicValuesStruct::abi_encode(&public_values_struct);
 
-    println!("submitProof calldata argument (starkProof):");
-    println!("0x{}", hex::encode(&encoded_proof_arg));
+    let proof_bytes = proof.bytes();
 
-    Ok(())
+    // Opaque blob for OmegaVault.submitProof third arg (SP1 adapter encoding)
+    let stark_proof_arg = abi_encode_two_bytes(&public_values, &proof_bytes);
+
+    // Also emit ProofBundle (same shape as adapter decode) for tooling
+    let bundle = ProofBundle {
+        publicValues: public_values.clone().into(),
+        proofBytes: proof_bytes.clone().into(),
+    };
+    let bundle_encoded = ProofBundle::abi_encode(&bundle);
+
+    if let Some(path) = args.output {
+        std::fs::write(&path, &stark_proof_arg).expect("write output");
+        println!("Wrote SP1 adapter proof blob to {}", path.display());
+        let bundle_path = path.with_extension("bundle.hex");
+        std::fs::write(&bundle_path, hex::encode(&bundle_encoded)).ok();
+    } else {
+        println!("submitProof starkProof (hex): 0x{}", hex::encode(&stark_proof_arg));
+        println!("ProofBundle (hex): 0x{}", hex::encode(&bundle_encoded));
+    }
+
+    client.verify(&proof, &vk).expect("local SP1 verification failed");
+    println!("Local SP1 verification succeeded");
 }

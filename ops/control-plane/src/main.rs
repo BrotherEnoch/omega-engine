@@ -57,24 +57,49 @@
 //   governance actions (config reload, blacklist update, ...) and live
 //   trading telemetry (ProfitSplit, GasModelReverted, ...) on one stream.
 //
-// ## AppState — single shared source of truth
+// ## AppState / WsEvent — where they live
 //
-//   One `Arc<AppState>` is constructed here in `main`, then cloned into:
-//     - The Axum HTTP router (via `.with_state(state)`)
-//     - The tonic gRPC server (`grpc::serve`, via service constructors)
-//     - The WebSocket upgrade handler (`ws::events_handler`)
-//     - The obs_bridge task (reads EventRingBuffer, publishes WsEvent)
+//   `AppState` lives in `state.rs` — see that file's own module doc for
+//   the wiring model and the observability-bridge contract.
 //
-//   `AppState::layer(id)`, `AppState::subscribe_ws()`, and
-//   `AppState::publish(event)` are the shared helper methods every
-//   consumer above uses; `grpc.rs`'s ClearHalt RPC handler is currently
-//   the only call site for `layer(id).set_state(...)`, but any future
-//   engine crate that holds an `Arc<AppState>` (or an `Arc<LayerHealthImpl>`
-//   cloned from `state.health_layers`) can call `set_state` the same way.
+//   `WsEvent` is `omega_control_contracts::ws::WsEvent` — the real type
+//   shared with the frontend dashboard, NOT a locally-defined one (see
+//   state.rs's module-level FIX note for why an earlier local duplicate
+//   was wrong and got removed). Both are re-exported at the crate root
+//   below (`pub use state::AppState;` /
+//   `pub use omega_control_contracts::ws::{WsEvent, WS_CHANNEL_CAPACITY};`)
+//   so `crate::AppState`, `crate::WsEvent`, and `crate::WS_CHANNEL_CAPACITY`
+//   all resolve for `grpc.rs` and `ws.rs`, which reference them that way
+//   (`ws.rs`'s test module in particular does `use crate::WS_CHANNEL_CAPACITY;`).
 //
-// ## Audit fix (this revision): omega-control-contracts::rest shape changes
+// ## FIX (this revision): wire up state.rs, and fix the WsEvent split
 //
-// Two REST contract types changed in this same audit pass (see that
+//   Earlier revision: this file declared `mod grpc; mod obs_bridge; mod
+//   ws;` but NOT `mod state;`, while defining its own duplicate, stale
+//   inline `AppState` (using external `omega_control_contracts::ws::WsEvent`
+//   but a `LayerId` variant set that didn't match the real enum).
+//   `obs_bridge.rs`'s `use crate::state::{AppState, WsEvent};` failed
+//   with E0432 (no `state` module). Fixed at the time by declaring `mod
+//   state;` and re-exporting `state::{AppState, WsEvent}` — but
+//   `state.rs`'s own `WsEvent` turned out to be a second, independently
+//   wrong-shaped local enum (assumed `tag = "type", content = "payload"`;
+//   the real crate uses `tag = "kind"`, flattened), which `grpc.rs` and
+//   `ws.rs` never used — both already imported the real
+//   `omega_control_contracts::ws::WsEvent` directly. That split meant
+//   `AppState.ws_tx` (typed against the wrong local enum) and `grpc.rs`'s
+//   pattern matches / `state.publish()` calls (built against the real
+//   enum) were two genuinely different types.
+//
+//   Fixed this revision: `state.rs` no longer defines a local `WsEvent`
+//   — `AppState.ws_tx` now broadcasts `omega_control_contracts::ws::WsEvent`
+//   directly, and this file re-exports THAT type (plus its real
+//   `WS_CHANNEL_CAPACITY`) instead of anything from `state.rs`. See
+//   `state.rs` and `obs_bridge.rs`'s own module-level FIX notes for the
+//   full detail.
+//
+// ## Audit fix (earlier revision): omega-control-contracts::rest shape changes
+//
+// Two REST contract types changed in an earlier audit pass (see that
 // crate's own CHANGES notes in rest.rs):
 //   1. `LayerHealthEntry.layer` -> `.layer_id` (matches
 //      `proto::LayerHealth.layer_id` naming exactly), plus a new
@@ -103,12 +128,14 @@
 //     --blacklist-path config/builder_blacklist.toml \
 //     --api-token <token>
 
+mod state;
+
 mod grpc;
 mod obs_bridge;
 mod ws;
 
 use std::path::PathBuf;
-use std::sync::{atomic::AtomicBool, Arc};
+use std::sync::Arc;
 
 use anyhow::Result;
 use axum::{
@@ -119,20 +146,22 @@ use axum::{
     Json, Router,
 };
 use clap::Parser;
-use tokio::sync::{broadcast, RwLock};
 use tracing::Level;
 
 use omega_control_contracts::rest::{
     ApiError, BlacklistResponse, ConfigReloadRequest, DaoFeeResponse, HealthSnapshot,
     LayerHealthEntry, RevertResponse, OK,
 };
-use omega_control_contracts::ws::{WsEvent, WS_CHANNEL_CAPACITY};
-use omega_core::{LayerHealth, LayerId, OmegaConfig, VaultConfig};
-use omega_gas_war::BuilderBlacklist;
-use omega_health::LayerHealthImpl;
-use omega_loss_attribution::ceiling_escalation::CeilingEscalationTracker;
+use omega_core::{LayerHealth, OmegaConfig, VaultConfig};
 use omega_loss_attribution::checkpoint;
 use omega_observability::{EventRingBuffer, DEFAULT_CAPACITY};
+
+// AppState lives in state.rs; WsEvent/WS_CHANNEL_CAPACITY are the real,
+// frontend-shared types from omega_control_contracts::ws, NOT anything
+// local to this crate. See this file's module-level FIX note.
+pub use state::AppState;
+pub use omega_control_contracts::ws::{WsEvent, WS_CHANNEL_CAPACITY};
+use state::load_config;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // CLI
@@ -177,130 +206,39 @@ pub struct ControlPlaneArgs {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// AppState
+// AppState construction from CLI args
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Shared state injected into every Axum handler via `State<Arc<AppState>>`,
-/// every gRPC handler (see `grpc.rs`), and the `obs_bridge` task.
-pub struct AppState {
-    /// Current engine config.  RwLock so hot-reload (POST /api/v1/config)
-    /// can swap it without blocking readers.
-    pub config: RwLock<OmegaConfig>,
-    /// Path to the config file for hot-reload.
-    pub config_path: PathBuf,
-    /// Gas model checkpoint directory.
-    pub checkpoint_dir: PathBuf,
-    /// Hot-reloadable MEV-Boost builder blacklist.
-    pub blacklist: Arc<BuilderBlacklist>,
-    /// Health controllers for all 16 layers.
-    pub health_layers: Vec<Arc<LayerHealthImpl>>,
-    /// Gas model ceiling escalation tracker.
-    pub ceiling_tracker: RwLock<CeilingEscalationTracker>,
-    /// Whether the gas model is currently paused.
-    pub model_paused: AtomicBool,
-    /// Broadcast channel for frontend realtime sync.
-    pub ws_tx: broadcast::Sender<WsEvent>,
-    /// API bearer token.
-    pub api_token: String,
-    /// Shared ring buffer of raw `OmegaEvent`s, drained by `obs_bridge`
-    /// and republished onto `ws_tx` as mapped `WsEvent`s.
-    pub obs_buffer: Arc<EventRingBuffer>,
-}
+/// Builds `Arc<AppState>` from CLI args. Thin wrapper around
+/// `state::AppState::new` — `ControlPlaneArgs` (clap-specific) lives in
+/// this file, not state.rs, so state.rs's constructor takes plain,
+/// already-resolved values instead of the CLI type directly.
+fn build_app_state(args: &ControlPlaneArgs) -> Result<Arc<AppState>> {
+    let config = load_config(&args.config_path)?;
 
-impl AppState {
-    /// Build and initialise AppState from CLI args.
-    pub fn new(args: &ControlPlaneArgs) -> Result<Arc<Self>> {
-        let config = load_config(&args.config_path)?;
-
-        let blacklist = BuilderBlacklist::load(std::path::Path::new(&args.blacklist_path))?;
-
-        let layer_ids = [
-            LayerId::SystemHealth,
-            LayerId::ExternalData,
-            LayerId::Eil,
-            LayerId::Risk,
-            LayerId::Security,
-            LayerId::Oracle,
-            LayerId::Dag,
-            LayerId::Zk,
-            LayerId::HotPath,
-            LayerId::Strategy,
-            LayerId::Flashloan,
-            LayerId::Orchestrator,
-            LayerId::Relay,
-            LayerId::Vault,
-            LayerId::Observability,
-            LayerId::LossAttribution,
-        ];
-        let health_layers: Vec<Arc<LayerHealthImpl>> = layer_ids
-            .iter()
-            .map(|&id| LayerHealthImpl::new_bare(id))
-            .collect();
-
-        let ceiling_threshold = config.ml.ceiling_escalation_threshold;
-        let (ws_tx, _) = broadcast::channel(WS_CHANNEL_CAPACITY);
-        let obs_buffer = EventRingBuffer::new(DEFAULT_CAPACITY);
-
-        // Ensure checkpoint directory exists so list_checkpoints returns Ok([])
-        // rather than an I/O error when no checkpoints have been written yet.
-        let checkpoint_dir = PathBuf::from(&args.checkpoint_dir);
-        if !checkpoint_dir.exists() {
-            if let Err(e) = std::fs::create_dir_all(&checkpoint_dir) {
-                tracing::warn!(
-                    path = %checkpoint_dir.display(),
-                    error = %e,
-                    "Could not create checkpoint directory — checkpoint list will be empty"
-                );
-            }
+    // Ensure checkpoint directory exists so list_checkpoints returns Ok([])
+    // rather than an I/O error when no checkpoints have been written yet.
+    let checkpoint_dir = PathBuf::from(&args.checkpoint_dir);
+    if !checkpoint_dir.exists() {
+        if let Err(e) = std::fs::create_dir_all(&checkpoint_dir) {
+            tracing::warn!(
+                path = %checkpoint_dir.display(),
+                error = %e,
+                "Could not create checkpoint directory — checkpoint list will be empty"
+            );
         }
-
-        Ok(Arc::new(Self {
-            config: RwLock::new(config),
-            config_path: PathBuf::from(&args.config_path),
-            checkpoint_dir,
-            blacklist,
-            health_layers,
-            ceiling_tracker: RwLock::new(CeilingEscalationTracker::new(ceiling_threshold)),
-            model_paused: AtomicBool::new(false),
-            ws_tx,
-            api_token: args.api_token.clone(),
-            obs_buffer,
-        }))
     }
 
-    /// Look up the health controller for a single layer.
-    pub fn layer(&self, id: LayerId) -> Option<&Arc<LayerHealthImpl>> {
-        self.health_layers.iter().find(|l| l.layer_id() == id)
-    }
+    let obs_buffer = EventRingBuffer::new(DEFAULT_CAPACITY);
 
-    /// Subscribe a new receiver to the WsEvent broadcast channel.
-    pub fn subscribe_ws(&self) -> broadcast::Receiver<WsEvent> {
-        self.ws_tx.subscribe()
-    }
-
-    /// Publish an event to every subscriber.
-    pub fn publish(&self, event: WsEvent) {
-        let _ = self.ws_tx.send(event);
-    }
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Config helpers
-// ─────────────────────────────────────────────────────────────────────────────
-
-fn load_config(path: &str) -> Result<OmegaConfig> {
-    if !std::path::Path::new(path).exists() {
-        tracing::warn!(path, "Config file not found — using defaults");
-        return Ok(OmegaConfig::default());
-    }
-    let contents = std::fs::read_to_string(path)?;
-    let config: OmegaConfig =
-        toml::from_str(&contents).map_err(|e| anyhow::anyhow!("Config parse error: {e}"))?;
-    let errors = config.validate();
-    if !errors.is_empty() {
-        anyhow::bail!("Config validation failed:\n{}", errors.join("\n"));
-    }
-    Ok(config)
+    AppState::new(
+        config,
+        PathBuf::from(&args.config_path),
+        checkpoint_dir,
+        PathBuf::from(&args.blacklist_path),
+        args.api_token.clone(),
+        obs_buffer,
+    )
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -738,7 +676,7 @@ async fn main() -> Result<()> {
         .init();
 
     let args = ControlPlaneArgs::parse();
-    let state = AppState::new(&args)?;
+    let state = build_app_state(&args)?;
 
     let addr: std::net::SocketAddr = args
         .bind
@@ -867,7 +805,7 @@ mod tests {
             blacklist_path: tmp_blacklist.path().to_str().unwrap().into(),
             api_token: "test-token".into(),
         };
-        let state = AppState::new(&args).unwrap();
+        let state = build_app_state(&args).unwrap();
         let router = build_router(state);
 
         let resp = router
@@ -899,7 +837,7 @@ mod tests {
             blacklist_path: tmp_blacklist.path().to_str().unwrap().into(),
             api_token: "test-token".into(),
         };
-        let state = AppState::new(&args).unwrap();
+        let state = build_app_state(&args).unwrap();
         let router = build_router(state);
 
         let resp = router
@@ -938,7 +876,7 @@ mod tests {
             blacklist_path: tmp_blacklist.path().to_str().unwrap().into(),
             api_token: "test-token".into(),
         };
-        let state = AppState::new(&args).unwrap();
+        let state = build_app_state(&args).unwrap();
 
         for l in &state.health_layers {
             assert!(state.layer(l.layer_id()).is_some());
@@ -957,7 +895,7 @@ mod tests {
             blacklist_path: tmp_blacklist.path().to_str().unwrap().into(),
             api_token: "test-token".into(),
         };
-        let state = AppState::new(&args).unwrap();
+        let state = build_app_state(&args).unwrap();
 
         let mut rx = state.subscribe_ws();
         state.publish(WsEvent::ConfigReloaded {

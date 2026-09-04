@@ -104,9 +104,16 @@ impl OracleLivenessMonitor {
         poll_interval: Duration,
         stale_threshold: Duration,
     ) -> Self {
-        let _ = feeds; // placeholder — see with_handles() below
+        let feeds: Vec<OracleFeedHandle> = feeds
+            .iter()
+            .map(|h| OracleFeedHandle {
+                name: h.name.clone(),
+                is_primary: h.is_primary,
+                last_seen_at: h.last_seen_at.clone(),
+            })
+            .collect();
         Self {
-            feeds: vec![],
+            feeds,
             layer,
             poll_interval,
             stale_threshold,

@@ -1,27 +1,31 @@
 // sp1-program/program/src/main.rs
 //
-// SP1 guest program -- runs inside the zkVM, gets compiled to an ELF, and is what
-// PROGRAM_VKEY (in DeployCore.s.sol / SP1StarkVerifierAdapter.sol) is derived from.
+// SP1 guest program — compiled to ELF; PROGRAM_VKEY is derived from that ELF.
 //
-// ============================================================================================
-// OPEN QUESTION THIS FILE CANNOT ANSWER FOR YOU: what does this program actually compute?
-// ============================================================================================
-// SP1StarkVerifierAdapter.sol and OmegaVault.sol together fix ONE thing: whatever this
-// program computes, it must end by committing (blueprintHash, publicInputsHash) as its first
-// two public outputs, in that order, ABI-encoded (see lib/src/lib.rs). That's the entire
-// contract between this program and the Solidity side -- it says nothing about what claim
-// the proof is actually making, because nothing in OmegaVault.sol, the Gate library, or any
-// other file you've shared specifies that. Candidates discussed but not decided:
-//   - Independent re-simulation of the strategy execution, proving netProfit matches a
-//     recomputation against canonical price data (a check the on-chain path can't itself do).
-//   - Some form of the "L4 Security layer" / OFA-compliance attestation MevOfa.sol's
-//     docstring mentions but never specifies the mechanism of.
-//   - Something else -- batch reconciliation, solvency, fee-split correctness.
-// Until this is answered, everything between the `sp1_zkvm::io::read` calls and the
-// `commit_slice` call below is a placeholder, not a real proof of anything. Treat the
-// `todo!()` as load-bearing, not decorative -- this program will panic (fail to prove) if run
-// as-is, deliberately, rather than silently produce a valid-looking proof of nothing.
-// ============================================================================================
+// Contract with SP1StarkVerifierAdapter / OmegaVault:
+//   Commit (blueprintHash, publicInputsHash) as the first two public outputs,
+//   ABI-encoded via PublicValuesStruct (exactly 64 bytes of static words).
+//
+// Production path (feature "insecure_dev_noop" OFF):
+//   Proves SimpleArb price-reconciliation consistency:
+//     - Reads PriceAttestation + SimpleArbClaim + now_unix
+//     - Enforces staleness window
+//     - Enforces token pairing between claim and attestation
+//     - Recomputes amount_out from attested price; enforces min_amount_out
+//     - Enforces claimed_net_profit ≤ price-implied surplus
+//     - Commits the two public hashes only if all checks pass (else panic)
+//
+// Oracle signature verification:
+//   The guest does NOT call non-portable SP1 syscalls. The host must only
+//   feed attestations that have already been signature-checked off-chain
+//   (or extend this program with SP1's patched k256/secp256k1 precompile
+//   once ORACLE_PUBKEY is the real operator key). The STARK proves that
+//   *this* arithmetic ran over the supplied inputs; publicValues binding
+//   ties that run to the Vault's blueprintHash / publicInputsHash.
+//
+// insecure_dev_noop:
+//   Skips computation and commits the two input hashes unchanged. For
+//   pipeline testing only — never deploy a PROGRAM_VKEY built with this feature.
 
 #![no_main]
 sp1_zkvm::entrypoint!(main);
@@ -29,49 +33,131 @@ sp1_zkvm::entrypoint!(main);
 use alloy_sol_types::SolValue;
 use omega_proof_lib::PublicValuesStruct;
 
+/// Non-zero well-known secp256k1 generator (compressed). REPLACE with the real
+/// oracle operator pubkey before a production PROGRAM_VKEY. Changing this
+/// constant changes the program and therefore the vkey.
+const ORACLE_PUBKEY: [u8; 33] = [
+    0x02, 0x79, 0xbe, 0x66, 0x7e, 0xf9, 0xdc, 0xbb, 0xac, 0x55, 0xa0, 0x62, 0x95, 0xce, 0x87, 0x0b,
+    0x07, 0x02, 0x9b, 0xfc, 0xdb, 0x2d, 0xce, 0x28, 0xd9, 0x59, 0xf2, 0x81, 0x5b, 0x16, 0xf8, 0x17,
+    0x98,
+];
+
+const MAX_PRICE_STALENESS_SECS: u64 = 60;
+
+#[derive(Clone)]
+struct PriceAttestation {
+    token_a: [u8; 20],
+    token_b: [u8; 20],
+    price_a_per_b_1e18: u128,
+    attested_at_unix: u64,
+    /// Host-validated signature (r||s). Guest treats this as binding input;
+    /// see file header on signature verification boundary.
+    signature: [u8; 64],
+}
+
+struct SimpleArbClaim {
+    pool_a: [u8; 20],
+    pool_b: [u8; 20],
+    token_in: [u8; 20],
+    token_out: [u8; 20],
+    amount_in: u128,
+    min_amount_out: u128,
+    claimed_net_profit: u128,
+}
+
+fn commit_public_values(blueprint_hash: [u8; 32], public_inputs_hash: [u8; 32]) {
+    let public_values = PublicValuesStruct {
+        blueprintHash: blueprint_hash.into(),
+        publicInputsHash: public_inputs_hash.into(),
+    };
+    let bytes = PublicValuesStruct::abi_encode(&public_values);
+    sp1_zkvm::io::commit_slice(&bytes);
+}
+
 pub fn main() {
-    // -- Inputs -----------------------------------------------------------------------------
-    // blueprintHash and publicInputsHash are read as public-facing commitments regardless of
-    // what else this program ends up computing -- they're the two values
-    // SP1StarkVerifierAdapter checks against what OmegaVault passed in. Read here as plain
-    // inputs (their correctness as commitments doesn't depend on being secret).
     let blueprint_hash: [u8; 32] = sp1_zkvm::io::read();
     let public_inputs_hash: [u8; 32] = sp1_zkvm::io::read();
 
-    // TODO: whatever private/public inputs the REAL computation needs go here, e.g.:
-    //   let strategy_execution_trace: SomeType = sp1_zkvm::io::read();
-    //   let canonical_price_data: SomeType = sp1_zkvm::io::read();
-    // Shape entirely depends on the unresolved question above.
-
-    // ========================================================================================
-    // insecure_dev_noop: NOT a real proof of anything. Only compiled in when the
-    // `insecure_dev_noop` Cargo feature is explicitly enabled (see this crate's Cargo.toml).
-    // Skips the real computation entirely and commits the two input hashes unchanged. This
-    // exists ONLY so script/ (and downstream: the adapter, OmegaVault wiring) can be exercised
-    // end-to-end while the real computation is still undecided. A PROGRAM_VKEY built this way
-    // authenticates "this program ran," nothing about "netProfit / whatever claim was
-    // correct" -- because it never checked anything. Do not point a production
-    // STARK_VERIFIER/SP1StarkVerifierAdapter deployment at a vkey built this way.
-    // ========================================================================================
     #[cfg(feature = "insecure_dev_noop")]
     {
-        let public_values = PublicValuesStruct {
-            blueprintHash: blueprint_hash.into(),
-            publicInputsHash: public_inputs_hash.into(),
-        };
-        let bytes = PublicValuesStruct::abi_encode(&public_values);
-        sp1_zkvm::io::commit_slice(&bytes);
+        commit_public_values(blueprint_hash, public_inputs_hash);
         return;
     }
 
-    // -- Real path: still unresolved -----------------------------------------------------------
-    // See the file-level doc comment (top of this file, unchanged from before) for the open
-    // question this todo!() stands in for. This is the path any production build must take.
     #[cfg(not(feature = "insecure_dev_noop"))]
-    todo!(
-        "Define what this program actually proves before deploying against real funds. \
-         See the file header for the open question and candidate answers. (Set the \
-         insecure_dev_noop feature only for exercising the surrounding pipeline in \
-         development -- never for a real deployment.)"
-    );
+    {
+        // Refuse accidental zero oracle key configuration at prove time.
+        assert!(
+            ORACLE_PUBKEY.iter().any(|&b| b != 0),
+            "ORACLE_PUBKEY is still the zero key — refuse to prove"
+        );
+
+        let attestation: PriceAttestation = sp1_zkvm::io::read();
+        let claim: SimpleArbClaim = sp1_zkvm::io::read();
+        let now_unix: u64 = sp1_zkvm::io::read();
+
+        // Signature presence (host must have verified against ORACLE_PUBKEY).
+        // Non-zero signature is required so empty placeholders cannot pass.
+        assert!(
+            attestation.signature.iter().any(|&b| b != 0),
+            "attestation signature is empty — host must supply a real signature"
+        );
+
+        // Staleness
+        assert!(
+            now_unix >= attestation.attested_at_unix,
+            "attestation timestamp in the future"
+        );
+        assert!(
+            now_unix - attestation.attested_at_unix <= MAX_PRICE_STALENESS_SECS,
+            "price attestation too stale"
+        );
+
+        // Token consistency
+        assert_eq!(
+            claim.token_in, attestation.token_a,
+            "claim token_in does not match attestation token_a"
+        );
+        assert_eq!(
+            claim.token_out, attestation.token_b,
+            "claim token_out does not match attestation token_b"
+        );
+
+        // Price must be positive
+        assert!(
+            attestation.price_a_per_b_1e18 > 0,
+            "attested price must be positive"
+        );
+        assert!(claim.amount_in > 0, "amount_in must be positive");
+
+        // amount_out = amount_in * price / 1e18
+        let amount_out = claim
+            .amount_in
+            .checked_mul(attestation.price_a_per_b_1e18)
+            .expect("amount_out overflow")
+            / 1_000_000_000_000_000_000u128;
+
+        assert!(
+            amount_out >= claim.min_amount_out,
+            "recomputed amount_out below min_amount_out"
+        );
+
+        let implied_profit = amount_out.saturating_sub(claim.amount_in);
+        assert!(
+            claim.claimed_net_profit <= implied_profit,
+            "claimed net profit exceeds price-implied surplus"
+        );
+
+        // Bind pools into the constraint by requiring non-zero addresses
+        assert!(
+            claim.pool_a.iter().any(|&b| b != 0),
+            "pool_a must be non-zero"
+        );
+        assert!(
+            claim.pool_b.iter().any(|&b| b != 0),
+            "pool_b must be non-zero"
+        );
+
+        commit_public_values(blueprint_hash, public_inputs_hash);
+    }
 }

@@ -17,11 +17,65 @@
 //   Producers call `state.publish(event)`.  Each WebSocket connection
 //   subscribes via `state.subscribe_ws()`.
 //
-//   The `WsEvent` enum is serialised with `#[serde(tag = "type",
-//   content = "payload")]` so that the frontend's
-//   `omega-control-contracts::ws::WsEvent` (which uses the identical
-//   attribute) can deserialise every variant without a custom handler.
-//   Wire format: `{"type":"profit_split","payload":{…}}`.
+// ## FIX (this revision): WsEvent is now the real, shared crate type
+//
+//   This file previously defined its OWN local `WsEvent` enum and its
+//   own `WS_CHANNEL_CAPACITY` const, under the assumption that it was
+//   serialised as `#[serde(tag = "type", content = "payload", rename_all
+//   = "snake_case")]` — i.e. every event wrapped as
+//   `{"type":"...","payload":{...}}`.
+//
+//   That assumption was wrong, and it broke `grpc.rs` and `ws.rs`, both
+//   of which import `WsEvent` directly from
+//   `omega_control_contracts::ws` (the actual type shared with the
+//   frontend dashboard) rather than from this module. `grpc.rs`'s own
+//   comment confirms the real wire format against that crate's own test
+//   suite: `#[serde(tag = "kind", rename_all = "snake_case")]` — NO
+//   `content` wrapper, every field flattened alongside `"kind"` at the
+//   top level. Since `AppState.ws_tx` was typed as
+//   `broadcast::Sender<state::WsEvent>` (the local, wrong-shaped type),
+//   `grpc.rs`'s `watch_health` (`Ok(WsEvent::HealthTransition { .. }) =>
+//   ...` matched against the stream from `state.subscribe_ws()`) and
+//   `clear_halt` (`state.publish(WsEvent::HealthTransition { .. })`)
+//   both failed to typecheck — two genuinely different `WsEvent` types
+//   with the same name, not just a naming collision.
+//
+//   Fixed by dropping the local `WsEvent` enum and local
+//   `WS_CHANNEL_CAPACITY` const entirely and importing both from
+//   `omega_control_contracts::ws` instead, so `AppState.ws_tx` broadcasts
+//   the one real, frontend-shared type everywhere. The variant field
+//   shapes this file previously used (`HealthTransition { layer, from,
+//   to, reason, timestamp }`, `ConfigReloaded { timestamp }`,
+//   `ModelPauseChanged { paused, timestamp }`, `BlacklistReloaded
+//   { entry_count, timestamp }`, `ProfitSplit { .. }`, `GasModelReverted
+//   { .. }`) match exactly what `grpc.rs` and `ws.rs` already construct
+//   against the real crate type, so no field-shape changes were needed —
+//   only the import and the serialisation-format tests, which asserted
+//   the wrong (local) shape and have been removed; `ws.rs`'s own test
+//   module already carries the corrected assertions against the real
+//   `"kind"`-tagged, flattened format.
+//
+//   NOT INDEPENDENTLY CONFIRMED: whether
+//   `omega_control_contracts::ws::WsEvent` also has the
+//   `GasModelCeilingEscalation`, `EmergencyBundleSkipped`, `LaReorgRisk`,
+//   `SimulationError`, and `BlueprintConfirmed` variants that
+//   `obs_bridge.rs` constructs — those were only ever exercised against
+//   this file's old, local enum. If `cargo build` reports one of those
+//   as missing from the real crate, `obs_bridge.rs`'s `map_omega_event`
+//   needs adjusting (or that event simply has no display path yet, same
+//   as this file's old comment already noted for `BlueprintConfirmed`).
+//
+// ## FIX (this revision, 2): ALL_LAYER_IDS removed
+//
+//   `grpc.rs`'s own comment notes it stopped depending on this module's
+//   `ALL_LAYER_IDS` constant, iterating `omega_core::LayerId` via
+//   `strum::IntoEnumIterator` instead — "the old module-local
+//   ALL_LAYER_IDS constant... only ever lived in the dead state.rs".
+//   Since nothing else in this crate depends on `ALL_LAYER_IDS` either,
+//   it's removed here too, and `AppState::new`'s own health-layer
+//   construction now uses the same `LayerId::iter()` approach for
+//   consistency with `grpc.rs` rather than keeping two different ways to
+//   enumerate the same 16 layers.
 //
 // ## Observability bridge
 //
@@ -38,169 +92,16 @@
 use std::path::PathBuf;
 use std::sync::{atomic::AtomicBool, Arc};
 
-use chrono::{DateTime, Utc};
-use serde::Serialize;
 use tokio::sync::{broadcast, RwLock};
 
+use strum::IntoEnumIterator;
+
+use omega_control_contracts::ws::{WsEvent, WS_CHANNEL_CAPACITY};
 use omega_core::{LayerHealth, LayerId, OmegaConfig};
 use omega_gas_war::BuilderBlacklist;
 use omega_health::LayerHealthImpl;
 use omega_loss_attribution::ceiling_escalation::CeilingEscalationTracker;
 use omega_observability::EventRingBuffer;
-
-// ── WsEvent ───────────────────────────────────────────────────────────────────
-
-/// Structured event streamed to WebSocket clients (§17.1).
-///
-/// Serialised as `{"type":"<snake_case_variant>","payload":{…}}` to match
-/// the frontend's `omega-control-contracts::ws::WsEvent` which uses the
-/// identical `#[serde(tag = "type", content = "payload", rename_all =
-/// "snake_case")]` attribute.  Both sides must agree on this shape for
-/// `serde_json::from_str::<WsEvent>` in `ws_client.rs`'s `other =>`
-/// branch to succeed.
-///
-/// Field types must also match the frontend contracts exactly:
-///   - `emergency_fee_gwei: f64`  — obs_bridge casts the u64 OmegaEvent
-///     field to f64 before constructing this variant; the frontend's
-///     `EmergencyBundleSkippedEvent` declares it as u64, so the JSON
-///     value must be an integer-valued f64 (e.g. `9999.0` serialises as
-///     `9999` in serde_json, which deserialises cleanly into u64).
-///
-/// Variants not present in the frontend's WsEvent enum
-/// (`HealthTransition`, `ModelPauseChanged`, `BlacklistReloaded`,
-/// `ConfigReloaded`, `CeilingEscalation`) arrive in `ws_client.rs`'s
-/// `other =>` branch, fail `from_str::<WsEvent>`, and are logged at WARN
-/// then silently dropped — this is intentional; they are control-plane
-/// governance events, not trading telemetry, and the frontend has no
-/// display path for them.
-#[derive(Debug, Clone, Serialize)]
-#[serde(tag = "type", content = "payload", rename_all = "snake_case")]
-pub enum WsEvent {
-    // ── Control-plane governance events ──────────────────────────────────────
-    // These do not appear in the frontend's WsEvent enum. They arrive in
-    // ws_client.rs's `other =>` branch and are dropped after a WARN log.
-    // That is correct behaviour — the dashboard has no panel for them.
-
-    /// A layer's health state transitioned (§3).
-    HealthTransition {
-        layer:     String,
-        from:      String,
-        to:        String,
-        reason:    String,
-        timestamp: DateTime<Utc>,
-    },
-    /// The gas model pause state changed (§13.3).
-    ModelPauseChanged {
-        paused:    bool,
-        timestamp: DateTime<Utc>,
-    },
-    /// The builder blacklist was hot-reloaded (§12.3).
-    BlacklistReloaded {
-        entry_count: usize,
-        timestamp:   DateTime<Utc>,
-    },
-    /// The config was hot-reloaded (§5, L1).
-    ConfigReloaded {
-        timestamp: DateTime<Utc>,
-    },
-    /// Snapshot of the gas model ceiling escalation state (§13.3).
-    CeilingEscalation {
-        consecutive_hits: u64,
-        paused:           bool,
-        timestamp:        DateTime<Utc>,
-    },
-
-    // ── Trading engine telemetry ──────────────────────────────────────────────
-    // These variants match the frontend's WsEvent enum exactly (same variant
-    // names in snake_case, same field names, same field types). The frontend's
-    // `record_obs_event` routes each one into the ObservabilityLog ring buffer
-    // which drives the telemetry panel counters and event stream.
-
-    /// Gas model reverted to a checkpoint after holdout degradation (§13, §16).
-    GasModelReverted {
-        checkpoint_version: u64,
-        win_rate:           f64,
-        sample_count:       u64,
-        timestamp:          DateTime<Utc>,
-    },
-    /// Gas model ceiling escalation — model paused (§13.3, §16).
-    GasModelCeilingEscalation {
-        feature_key:       String,
-        ceiling_hit_count: u64,
-        timestamp:         DateTime<Utc>,
-    },
-    /// Emergency bundle skipped — profit check failed (§12.1, §16).
-    ///
-    /// `emergency_fee_gwei` is f64 here because `obs_bridge` converts the
-    /// u64 `OmegaEvent` field via `as f64`.  serde_json serialises integer-
-    /// valued f64s without a decimal point (e.g. `9999.0` → `9999`), so the
-    /// frontend's `EmergencyBundleSkippedEvent { emergency_fee_gwei: u64 }`
-    /// deserialises it correctly.
-    EmergencyBundleSkipped {
-        blueprint_hash:     String,
-        emergency_fee_gwei: f64,
-        reason:             String,
-        timestamp:          DateTime<Utc>,
-    },
-    /// Profit released from Vault with DAO fee split (§15.1, §16).
-    ProfitSplit {
-        blueprint_hash: String,
-        pil_share_wei:  String,
-        dao_fee_wei:    String,
-        timestamp:      DateTime<Utc>,
-    },
-    /// Sequencer reorg risk detected on a submitted blueprint (§11.4, §16).
-    LaReorgRisk {
-        tx_hash:        String,
-        orphaned_block: u64,
-        reorg_depth:    u32,
-        timestamp:      DateTime<Utc>,
-    },
-    /// Simulation discrepancy detected (§16).
-    SimulationError {
-        blueprint_hash: String,
-        sub_code:       String,
-        timestamp:      DateTime<Utc>,
-    },
-    /// Blueprint confirmed on-chain with profit (§13, §16).
-    ///
-    /// Not yet present in the frontend's WsEvent enum; arrives in
-    /// `ws_client.rs`'s `other =>` branch and is silently dropped.
-    /// Add to `omega-control-contracts::ws::WsEvent` and
-    /// `observability.rs`'s no-op arm when a display path is needed.
-    BlueprintConfirmed {
-        blueprint_hash: String,
-        strategy_id:    String,
-        block_number:   u64,
-        profit_net_eth: f64,
-        timestamp:      DateTime<Utc>,
-    },
-}
-
-/// Broadcast channel capacity for WebSocket events.
-pub const WS_CHANNEL_CAPACITY: usize = 512;
-
-// ── ALL_LAYER_IDS ─────────────────────────────────────────────────────────────
-
-/// All 16 canonical layer IDs in L0–L15 order.
-pub const ALL_LAYER_IDS: &[LayerId] = &[
-    LayerId::Health,
-    LayerId::Rpc,
-    LayerId::Oracle,
-    LayerId::Security,
-    LayerId::Compliance,
-    LayerId::Risk,
-    LayerId::Dag,
-    LayerId::Zk,
-    LayerId::FlashLoan,
-    LayerId::Relay,
-    LayerId::GasWar,
-    LayerId::LossAttribution,
-    LayerId::AddressRotation,
-    LayerId::Strategies,
-    LayerId::HotPath,
-    LayerId::Observability,
-];
 
 // ── AppState ──────────────────────────────────────────────────────────────────
 
@@ -221,6 +122,9 @@ pub struct AppState {
     pub health_layers:   Vec<Arc<LayerHealthImpl>>,
 
     // ── WebSocket broadcast ───────────────────────────────────────────────────
+    /// Broadcasts `omega_control_contracts::ws::WsEvent` — the real type
+    /// shared with the frontend dashboard (see this file's module-level
+    /// FIX note). NOT a locally-defined type.
     pub ws_tx:           broadcast::Sender<WsEvent>,
 
     // ── Observability bridge ──────────────────────────────────────────────────
@@ -243,9 +147,10 @@ impl AppState {
     ) -> anyhow::Result<Arc<Self>> {
         let blacklist = BuilderBlacklist::load(&blacklist_path)?;
 
-        let health_layers: Vec<Arc<LayerHealthImpl>> = ALL_LAYER_IDS
-            .iter()
-            .map(|&id| LayerHealthImpl::new_bare(id))
+        // Same enumeration approach grpc.rs already uses — see this
+        // file's module-level FIX note, 2.
+        let health_layers: Vec<Arc<LayerHealthImpl>> = LayerId::iter()
+            .map(LayerHealthImpl::new_bare)
             .collect();
 
         let ceiling_threshold = config.ml.ceiling_escalation_threshold;
@@ -300,194 +205,213 @@ pub fn load_config(path: &str) -> anyhow::Result<OmegaConfig> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use strum::IntoEnumIterator;
-    use omega_core::LayerId;
 
-    #[test]
-    fn all_layer_ids_has_exactly_16_entries() {
-        assert_eq!(ALL_LAYER_IDS.len(), 16);
+    /// Builds a real AppState against tempfiles, same pattern main.rs's
+    /// own test module uses — kept local to this module so state.rs's
+    /// tests don't depend on main.rs's test helpers or vice versa.
+    fn test_app_state() -> Arc<AppState> {
+        let tmp_blacklist = tempfile::NamedTempFile::new().unwrap();
+        let tmp_config = tempfile::NamedTempFile::new().unwrap();
+        let obs_buffer = EventRingBuffer::new(omega_observability::DEFAULT_CAPACITY);
+
+        AppState::new(
+            OmegaConfig::default(),
+            tmp_config.path().to_path_buf(),
+            std::env::temp_dir(),
+            tmp_blacklist.path().to_path_buf(),
+            "test-token".into(),
+            obs_buffer,
+        )
+        .unwrap()
     }
 
     #[test]
-    fn all_layer_ids_are_unique() {
-        let mut seen = std::collections::HashSet::new();
-        for &id in ALL_LAYER_IDS {
-            assert!(seen.insert(id), "duplicate LayerId in ALL_LAYER_IDS: {id:?}");
+    fn health_layers_covers_all_16_canonical_layer_ids() {
+        // Replaces the old ALL_LAYER_IDS-specific tests (see this file's
+        // module-level FIX note, 2) — the same guarantee (every
+        // LayerId variant present exactly once), now checked directly
+        // against what AppState::new actually builds.
+        let state = test_app_state();
+        assert_eq!(state.health_layers.len(), 16);
+
+        let canonical: std::collections::HashSet<LayerId> = LayerId::iter().collect();
+        let built: std::collections::HashSet<LayerId> =
+            state.health_layers.iter().map(|l| l.layer_id()).collect();
+        assert_eq!(canonical, built);
+    }
+
+    #[test]
+    fn layer_lookup_finds_every_layer() {
+        let state = test_app_state();
+        for l in &state.health_layers {
+            assert!(state.layer(l.layer_id()).is_some());
         }
     }
 
     #[test]
-    fn all_layer_ids_covers_every_canonical_variant() {
-        let canonical: std::collections::HashSet<LayerId> = LayerId::iter().collect();
-        let listed:    std::collections::HashSet<LayerId> = ALL_LAYER_IDS.iter().copied().collect();
-        assert_eq!(
-            canonical, listed,
-            "ALL_LAYER_IDS does not match the full set of LayerId variants.\n\
-             Missing: {:?}\n\
-             Extra:   {:?}",
-            canonical.difference(&listed).collect::<Vec<_>>(),
-            listed.difference(&canonical).collect::<Vec<_>>(),
+    fn layer_lookup_returns_none_for_nothing_missing() {
+        // There is no "unregistered" LayerId to test against directly
+        // (every canonical variant is always registered by
+        // AppState::new), so this instead confirms layer() doesn't
+        // panic and returns a real, matching entry for a lookup done
+        // twice — a basic sanity check on the Option/find plumbing.
+        let state = test_app_state();
+        let first = state.health_layers[0].layer_id();
+        assert_eq!(state.layer(first).unwrap().layer_id(), first);
+    }
+
+    #[tokio::test]
+    async fn publish_reaches_subscriber_with_real_wsevent_type() {
+        // Confirms `ws_tx` really is `broadcast::Sender<WsEvent>` where
+        // `WsEvent` is `omega_control_contracts::ws::WsEvent` — this
+        // would fail to compile at all if the import in this file
+        // regressed back to a local, incompatible type (see this file's
+        // module-level FIX note).
+        let state = test_app_state();
+        let mut rx = state.subscribe_ws();
+
+        state.publish(WsEvent::ConfigReloaded {
+            timestamp: chrono::Utc::now(),
+        });
+
+        let received = rx.try_recv();
+        assert!(received.is_ok(), "publish() must reach an active subscriber");
+    }
+
+    // ── Coverage for the 5 variants obs_bridge.rs constructs but that
+    // were never independently confirmed against the real crate (see
+    // this file's and obs_bridge.rs's module-level FIX notes) ──────────
+    //
+    // These don't re-guess the wire format — `omega_control_contracts::ws::WsEvent`
+    // is a single enum with one `#[serde(tag = "kind", rename_all =
+    // "snake_case")]` attribute covering every variant, and that
+    // attribute is already confirmed (via grpc.rs/ws.rs, cross-checked
+    // against the crate's own test suite) for ConfigReloaded,
+    // ModelPauseChanged, BlacklistReloaded, HealthTransition,
+    // ProfitSplit, and GasModelReverted. An enum-level serde attribute
+    // applies uniformly to every variant, so the same "kind"-tagged,
+    // flattened shape necessarily applies here too — what these tests
+    // actually establish is narrower and more useful than re-deriving
+    // the format: that GasModelCeilingEscalation, EmergencyBundleSkipped,
+    // LaReorgRisk, SimulationError, and BlueprintConfirmed genuinely
+    // EXIST on the real enum with the field names obs_bridge.rs assumes.
+    // If any of them don't, this file fails to COMPILE — turning a
+    // documented assumption into a build-time guarantee instead of a
+    // runtime surprise.
+
+    #[test]
+    fn gas_model_ceiling_escalation_exists_and_serialises_flat() {
+        let event = WsEvent::GasModelCeilingEscalation {
+            feature_key: "ARBITRUM_LA".into(),
+            ceiling_hit_count: 101,
+            timestamp: chrono::Utc::now(),
+        };
+        let json = serde_json::to_string(&event).unwrap();
+        assert!(
+            json.contains("\"kind\":\"gas_model_ceiling_escalation\""),
+            "wrong or missing kind tag: {json}"
+        );
+        assert!(
+            json.contains("\"ceiling_hit_count\":101"),
+            "ceiling_hit_count missing (should be flattened at top level): {json}"
         );
     }
 
-    // ── Serialisation contract tests ──────────────────────────────────────────
-    //
-    // Every assertion checks the "type" + "payload" shape that
-    // `ws_client.rs`'s `other =>` branch hands to
-    // `serde_json::from_str::<omega_control_contracts::ws::WsEvent>`.
-    // If these strings change, the frontend silently stops recording events.
-
     #[test]
-    fn profit_split_serialises_with_type_and_payload() {
-        let ev = WsEvent::ProfitSplit {
-            blueprint_hash: "0xabc".into(),
-            pil_share_wei:  "1000000000000000000".into(),
-            dao_fee_wei:    "50000000000000000".into(),
-            timestamp:      chrono::Utc::now(),
-        };
-        let json = serde_json::to_string(&ev).unwrap();
-        assert!(json.contains("\"type\":\"profit_split\""),
-            "wrong type tag: {json}");
-        assert!(json.contains("\"payload\":{"),
-            "missing payload wrapper: {json}");
-        assert!(json.contains("\"blueprint_hash\":\"0xabc\""),
-            "blueprint_hash missing from payload: {json}");
-        assert!(json.contains("\"pil_share_wei\":\"1000000000000000000\""),
-            "pil_share_wei missing: {json}");
-    }
-
-    #[test]
-    fn gas_model_reverted_serialises_with_type_and_payload() {
-        let ev = WsEvent::GasModelReverted {
-            checkpoint_version: 7,
-            win_rate:           0.72,
-            sample_count:       7000,
-            timestamp:          chrono::Utc::now(),
-        };
-        let json = serde_json::to_string(&ev).unwrap();
-        assert!(json.contains("\"type\":\"gas_model_reverted\""),
-            "wrong type tag: {json}");
-        assert!(json.contains("\"payload\":{"),
-            "missing payload wrapper: {json}");
-        assert!(json.contains("\"checkpoint_version\":7"),
-            "checkpoint_version missing: {json}");
-        assert!(json.contains("\"win_rate\":0.72"),
-            "win_rate missing: {json}");
-    }
-
-    #[test]
-    fn gas_model_ceiling_escalation_serialises_with_type_and_payload() {
-        let ev = WsEvent::GasModelCeilingEscalation {
-            feature_key:       "ARBITRUM_LA".into(),
-            ceiling_hit_count: 101,
-            timestamp:         chrono::Utc::now(),
-        };
-        let json = serde_json::to_string(&ev).unwrap();
-        assert!(json.contains("\"type\":\"gas_model_ceiling_escalation\""),
-            "wrong type tag: {json}");
-        assert!(json.contains("\"payload\":{"), "missing payload wrapper: {json}");
-        assert!(json.contains("\"ceiling_hit_count\":101"), "hit count missing: {json}");
-    }
-
-    #[test]
-    fn emergency_bundle_skipped_serialises_fee_as_number() {
-        // emergency_fee_gwei is f64 on the wire; serde_json serialises
-        // integer-valued f64s without decimal point so the frontend's
-        // u64 field deserialises cleanly.
-        let ev = WsEvent::EmergencyBundleSkipped {
-            blueprint_hash:     "0xdeadbeef".into(),
+    fn emergency_bundle_skipped_exists_and_serialises_flat() {
+        let event = WsEvent::EmergencyBundleSkipped {
+            blueprint_hash: "0xdeadbeef".into(),
             emergency_fee_gwei: 9999.0,
-            reason:             "fee_cap_exceeded".into(),
-            timestamp:          chrono::Utc::now(),
-        };
-        let json = serde_json::to_string(&ev).unwrap();
-        assert!(json.contains("\"type\":\"emergency_bundle_skipped\""),
-            "wrong type tag: {json}");
-        assert!(json.contains("\"payload\":{"), "missing payload wrapper: {json}");
-        // Must not have "9999.0" — serde_json drops the trailing zero for
-        // integer-valued f64, producing "9999", which u64 accepts.
-        assert!(json.contains("\"emergency_fee_gwei\":9999"),
-            "fee gwei wrong format: {json}");
-        assert!(!json.contains("9999."),
-            "f64 serialised with decimal point — u64 deserialization on frontend will fail: {json}");
-    }
-
-    #[test]
-    fn la_reorg_risk_serialises_with_type_and_payload() {
-        let ev = WsEvent::LaReorgRisk {
-            tx_hash:        "0x1234".into(),
-            orphaned_block: 19_000_000,
-            reorg_depth:    2,
-            timestamp:      chrono::Utc::now(),
-        };
-        let json = serde_json::to_string(&ev).unwrap();
-        assert!(json.contains("\"type\":\"la_reorg_risk\""),
-            "wrong type tag: {json}");
-        assert!(json.contains("\"payload\":{"), "missing payload wrapper: {json}");
-    }
-
-    #[test]
-    fn simulation_error_serialises_with_type_and_payload() {
-        let ev = WsEvent::SimulationError {
-            blueprint_hash: "0x9999".into(),
-            sub_code:       "STATE_MISMATCH".into(),
-            timestamp:      chrono::Utc::now(),
-        };
-        let json = serde_json::to_string(&ev).unwrap();
-        assert!(json.contains("\"type\":\"simulation_error\""),
-            "wrong type tag: {json}");
-        assert!(json.contains("\"payload\":{"), "missing payload wrapper: {json}");
-        assert!(json.contains("\"sub_code\":\"STATE_MISMATCH\""),
-            "sub_code missing: {json}");
-    }
-
-    #[test]
-    fn blueprint_confirmed_serialises_with_type_and_payload() {
-        let ev = WsEvent::BlueprintConfirmed {
-            blueprint_hash: "0x1234".into(),
-            strategy_id:    "LA".into(),
-            block_number:   19_000_000,
-            profit_net_eth: 0.042,
-            timestamp:      chrono::Utc::now(),
-        };
-        let json = serde_json::to_string(&ev).unwrap();
-        assert!(json.contains("\"type\":\"blueprint_confirmed\""),
-            "wrong type tag: {json}");
-        assert!(json.contains("\"payload\":{"), "missing payload wrapper: {json}");
-    }
-
-    #[test]
-    fn governance_events_serialise_with_type_and_payload() {
-        // Governance events are not consumed by the frontend's WsEvent
-        // deserialiser, but they must still serialise correctly so the
-        // WebSocket handler doesn't drop them before sending.
-        let config_reloaded = WsEvent::ConfigReloaded { timestamp: chrono::Utc::now() };
-        let json = serde_json::to_string(&config_reloaded).unwrap();
-        assert!(json.contains("\"type\":\"config_reloaded\""),
-            "config_reloaded wrong type tag: {json}");
-        assert!(json.contains("\"payload\":{"),
-            "config_reloaded missing payload wrapper: {json}");
-
-        let model_pause = WsEvent::ModelPauseChanged { paused: true, timestamp: chrono::Utc::now() };
-        let json = serde_json::to_string(&model_pause).unwrap();
-        assert!(json.contains("\"type\":\"model_pause_changed\""),
-            "model_pause_changed wrong type tag: {json}");
-        assert!(json.contains("\"paused\":true"), "paused field missing: {json}");
-
-        let blacklist = WsEvent::BlacklistReloaded { entry_count: 42, timestamp: chrono::Utc::now() };
-        let json = serde_json::to_string(&blacklist).unwrap();
-        assert!(json.contains("\"type\":\"blacklist_reloaded\""),
-            "blacklist_reloaded wrong type tag: {json}");
-        assert!(json.contains("\"entry_count\":42"), "entry_count missing: {json}");
-
-        let health = WsEvent::HealthTransition {
-            layer: "relay".into(), from: "HEALTHY".into(),
-            to: "DEGRADED".into(), reason: "test".into(),
+            reason: "fee_cap_exceeded".into(),
             timestamp: chrono::Utc::now(),
         };
-        let json = serde_json::to_string(&health).unwrap();
-        assert!(json.contains("\"type\":\"health_transition\""),
-            "health_transition wrong type tag: {json}");
-        assert!(json.contains("\"layer\":\"relay\""), "layer field missing: {json}");
+        let json = serde_json::to_string(&event).unwrap();
+        assert!(
+            json.contains("\"kind\":\"emergency_bundle_skipped\""),
+            "wrong or missing kind tag: {json}"
+        );
+        assert!(
+            json.contains("\"blueprint_hash\":\"0xdeadbeef\""),
+            "blueprint_hash missing (should be flattened at top level): {json}"
+        );
+        // FIX (confirmed by a real test run, not guessed): this crate's
+        // serde_json ALWAYS serialises f64 with a decimal point, including
+        // integer-valued ones — `emergency_fee_gwei: 9999.0` serialises as
+        // `9999.0`, never bare `9999`. The previous version of this test
+        // asserted the opposite ("integer-valued f64 drops the decimal
+        // point") — an assumption inherited from obs_bridge.rs's own
+        // comment, itself never verified against a real run until this
+        // test actually failed with the JSON shown right here.
+        //
+        // REAL OPEN QUESTION, NOT FIXABLE FROM THIS CRATE: if the
+        // frontend's `EmergencyBundleSkippedEvent.emergency_fee_gwei` is
+        // typed as `u64` (as obs_bridge.rs's original comment assumed),
+        // serde's default u64 deserialisation rejects a JSON float token
+        // like `9999.0` outright — "invalid type: floating point number,
+        // expected u64". That's a real cross-crate risk this test can't
+        // resolve: either the frontend field needs to be f64 (matching
+        // what's actually sent), or obs_bridge.rs needs to send a true
+        // integer (drop the `as f64` cast) rather than a float. Neither
+        // change belongs in this crate's own serialisation test — this
+        // test's job is only to confirm what THIS crate actually puts on
+        // the wire, which is now correctly asserted below.
+        assert!(
+            json.contains("\"emergency_fee_gwei\":9999.0"),
+            "fee gwei wrong format: {json}"
+        );
+    }
+
+    #[test]
+    fn la_reorg_risk_exists_and_serialises_flat() {
+        let event = WsEvent::LaReorgRisk {
+            tx_hash: "0x1234".into(),
+            orphaned_block: 19_000_000,
+            reorg_depth: 0,
+            timestamp: chrono::Utc::now(),
+        };
+        let json = serde_json::to_string(&event).unwrap();
+        assert!(
+            json.contains("\"kind\":\"la_reorg_risk\""),
+            "wrong or missing kind tag: {json}"
+        );
+        assert!(
+            json.contains("\"orphaned_block\":19000000"),
+            "orphaned_block missing (should be flattened at top level): {json}"
+        );
+    }
+
+    // NOTE: there is no `simulation_error_exists_and_serialises_flat` test
+    // here. `SimulationError` was in the original, wrong local `WsEvent`
+    // enum this file used to define, but rustc has now confirmed the real
+    // `omega_control_contracts::ws::WsEvent` has no such variant — the
+    // dashboard genuinely has no display path for that event. Removed
+    // rather than "fixed", since there's nothing real to test against.
+
+    #[test]
+    fn blueprint_confirmed_exists_and_serialises_flat() {
+        // FIX (confirmed by rustc): the real field is `profit_net_wei`, not
+        // `profit_net_eth` — see obs_bridge.rs's module-level FIX note for
+        // the same correction and the type caveat (assumed String, matching
+        // this enum's ProfitSplit precedent; NOT independently confirmed).
+        let event = WsEvent::BlueprintConfirmed {
+            blueprint_hash: "0x1234".into(),
+            strategy_id: "LA".into(),
+            block_number: 19_000_000,
+            profit_net_wei: "42000000000000000".into(),
+            timestamp: chrono::Utc::now(),
+        };
+        let json = serde_json::to_string(&event).unwrap();
+        assert!(
+            json.contains("\"kind\":\"blueprint_confirmed\""),
+            "wrong or missing kind tag: {json}"
+        );
+        assert!(
+            json.contains("\"strategy_id\":\"LA\""),
+            "strategy_id missing (should be flattened at top level): {json}"
+        );
+        assert!(
+            json.contains("\"profit_net_wei\":\"42000000000000000\""),
+            "profit_net_wei missing or wrong shape (should be flattened at top level): {json}"
+        );
     }
 }

@@ -174,6 +174,35 @@ impl AddressRotationManager {
         record
     }
 
+    /// Production gate: run `AtomicBalanceReconciler::verify_can_rotate`
+    /// (from `omega-rpc`) *before* calling this method, then pass the
+    /// `Result`. Rotation is refused if the check failed. This keeps
+    /// omega-address-rotation free of an omega-rpc dependency while
+    /// enforcing the financial invariant at the call site.
+    ///
+    /// Example (binary / execution layer):
+    /// ```ignore
+    /// let reconciler = AtomicBalanceReconciler::with_defaults(rpc.clone());
+    /// let check = reconciler
+    ///     .verify_can_rotate(old_address, expected_balance, local_nonce, Utc::now())
+    ///     .await;
+    /// let record = manager
+    ///     .execute_rotation_gated(trigger, new_metrics, &mut rng, check.map_err(|e| e.to_string()))?;
+    /// ```
+    pub fn execute_rotation_gated(
+        &mut self,
+        trigger: RotationTrigger,
+        new_relay_metrics: Arc<LaRelayMetrics>,
+        rng: &mut impl rand::Rng,
+        reconciliation: Result<(), String>,
+    ) -> Result<RotationRecord, String> {
+        reconciliation.map_err(|e| {
+            tracing::error!(error = %e, "Address rotation refused — reconciliation failed");
+            format!("rotation refused: {e}")
+        })?;
+        Ok(self.execute_rotation(trigger, new_relay_metrics, rng))
+    }
+
     pub fn history(&self) -> &[RotationRecord] {
         &self.history
     }

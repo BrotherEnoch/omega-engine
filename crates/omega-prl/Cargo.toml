@@ -22,7 +22,7 @@ arc-swap    = { workspace = true }
 dashmap     = { workspace = true }
 crossbeam   = { version = "0.8" }
 parking_lot = { version = "0.12" }
-rayon       = { version = "1" }             # parallel replay across domain shards
+rayon       = { version = "1" }
 
 # ── Serialisation / WAL ───────────────────────────────────────────────────────
 bincode   = { workspace = true }
@@ -30,16 +30,18 @@ serde     = { workspace = true }
 zstd      = { version = "0.13" }
 crc32fast = { version = "1" }
 
+# ── Hashing (model integrity) ─────────────────────────────────────────────────
+sha2 = { version = "0.10" }
+
 # ── SIMD / numerics ───────────────────────────────────────────────────────────
 wide          = { version = "0.7" }
-ndarray       = { version = "0.15" }         # ONNX input tensor construction
+ndarray       = { version = "0.15" }
 packed_simd_2 = { version = "0.3", optional = true }
 
 # ── ML inference ─────────────────────────────────────────────────────────────
 ort = { version = "2.0.0-rc.12", optional = true }
 
 # ── Collections ───────────────────────────────────────────────────────────────
-# serde feature enables Serialize/Deserialize for SmallVec (§8.2 PatternSignature)
 smallvec = { version = "1", features = ["const_generics", "serde"] }
 arrayvec = { version = "0.7" }
 
@@ -73,5 +75,3 @@ criterion = { version = "0.5", features = ["html_reports"] }
 [[bench]]
 name    = "prl_throughput"
 harness = false
-
-# NOTE: [profile.*] blocks belong in the workspace root Cargo.toml only.

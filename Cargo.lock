@@ -4370,6 +4370,7 @@ dependencies = [
  "quanta",
  "rayon",
  "serde",
+ "sha2",
  "smallvec",
  "thiserror 1.0.69",
  "tokio",
