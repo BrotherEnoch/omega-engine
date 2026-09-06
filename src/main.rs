@@ -51,6 +51,16 @@
 //   closed on flashloan selection before ever reaching the hot-path branch this test
 //   exists to exercise.
 //
+// - C10e (this package, patch): OraclePrice::is_fresh() no longer takes a staleness
+//   argument (omega-oracle's own resolution.rs derives the threshold from the price's
+//   own `source` internally) — OracleTokenPriceLookup::price_usd_and_decimals below was
+//   still calling it with an explicit PRIMARY_STALE_SECS argument (E0061). Fixed to
+//   call is_fresh() with no arguments; PRIMARY_STALE_SECS and the unused
+//   omega_strategies::TokenPriceLookup import (referenced only via its full path below)
+//   were dropped accordingly. Also normalised the hardcoded Arbitrum token-address byte
+//   arrays (WETH/USDC/USDC_E/USDT) to consistent lowercase hex to satisfy
+//   clippy::mixed_case_hex_literals under -D warnings — values unchanged, formatting only.
+//
 // - C10b: CheckContext WETH watch-channel MAX now includes Uniswap V3
 //   alongside Aave/Balancer (was registry-only for Uni). Fail closed when all three
 //   WETH reads fail (keep previous watch value). `fetch_uniswap_v3_pool_balance`
@@ -667,10 +677,15 @@ fn build_check_context(
         1.0
     };
 
+    // Connect rollout_tier into composite risk_score (was dead control point).
+    // Tier ∈ [0,1], 1.0 = full production; lower elevates MissRisk pressure.
+    let rollout_risk = (1.0 - rollout_tier.clamp(0.0, 1.0)).clamp(0.0, 1.0);
+
     let risk_score = (RISK_WEIGHT_GAS_VOLATILITY * gas_volatility_risk
         + RISK_WEIGHT_ORACLE_FRESHNESS * oracle_freshness_risk
         + RISK_WEIGHT_COMPETITION * competition_risk
-        + RISK_WEIGHT_LIQUIDITY * liquidity_risk)
+        + RISK_WEIGHT_LIQUIDITY * liquidity_risk
+        + 0.10 * rollout_risk)
         .clamp(0.0, 1.0);
 
     CheckContext {
@@ -698,7 +713,7 @@ fn build_check_context(
         strategy_max_gas,
         // check 9 — max_slippage_bps_for(strategy)
         max_slippage_bps,
-        // S19 — env OMEGA_ROLLOUT_TIER (no check reads yet)
+        // S19 — env OMEGA_ROLLOUT_TIER (feeds composite risk_score via rollout_risk)
         rollout_tier,
         // check 4 — IntegrityRegistry snapshot
         strategy_bytecode_hash,
@@ -1703,6 +1718,71 @@ async fn main() -> Result<()> {
     // scores 0.0 every cycle, same observable behavior as before this revision.
     let position_registry = PositionRegistry::new();
 
+    
+// ── LA debt-token price lookup (TokenPriceLookup) ─────────────────────────────
+// Maps well-known Arbitrum debt tokens → Chainlink/Pyth symbol reads.
+// Fail-closed: unknown token or missing/stale oracle → None → LA refuses blueprint.
+
+struct OracleTokenPriceLookup {
+    chainlink: Arc<omega_oracle::ChainlinkOracle>,
+    pyth: Arc<omega_oracle::PythOracle>,
+}
+
+fn arbitrum_token_symbol(token: alloy_primitives::Address) -> Option<(&'static str, u8)> {
+    // (symbol, decimals)
+    const WETH: [u8; 20] = [
+        0x82, 0xaf, 0x49, 0x44, 0x7d, 0x8a, 0x07, 0xe3, 0xbd, 0x95, 0xbd, 0x0d, 0x56, 0xf3,
+        0x52, 0x41, 0x52, 0x3f, 0xba, 0xb1,
+    ];
+    const USDC: [u8; 20] = [
+        0xaf, 0x88, 0xd0, 0x65, 0xe7, 0x7c, 0x8c, 0xc2, 0x23, 0x93, 0x27, 0xc5, 0xed, 0xb3,
+        0xa4, 0x32, 0x26, 0x8e, 0x58, 0x31,
+    ];
+    const USDC_E: [u8; 20] = [
+        0xff, 0x97, 0x0a, 0x61, 0xa0, 0x4b, 0x1c, 0xa1, 0x48, 0x34, 0xa4, 0x3f, 0x5d, 0xe4,
+        0x53, 0x3e, 0xbd, 0xdb, 0x5c, 0xc8,
+    ];
+    const USDT: [u8; 20] = [
+        0xfd, 0x08, 0x6b, 0xc7, 0xcd, 0x5c, 0x48, 0x1d, 0xcc, 0x9c, 0x85, 0xeb, 0xe4, 0x78,
+        0xa1, 0xc0, 0xb6, 0x9f, 0xcb, 0xb9,
+    ];
+    let b: [u8; 20] = token.into();
+    if b == WETH {
+        Some(("WETH", 18))
+    } else if b == USDC || b == USDC_E {
+        Some(("USDC", 6))
+    } else if b == USDT {
+        Some(("USDT", 6))
+    } else {
+        None
+    }
+}
+
+impl omega_strategies::TokenPriceLookup for OracleTokenPriceLookup {
+    fn price_usd_and_decimals(&self, token: alloy_primitives::Address) -> Option<(f64, u8)> {
+        let (symbol, decimals) = arbitrum_token_symbol(token)?;
+        // Prefer Chainlink; fall back to Pyth. Both caches already enforce freshness
+        // at update time; is_fresh re-checks at read.
+        if let Some(p) = self.chainlink.read(symbol) {
+            if p.is_fresh() {
+                return Some((p.price_usd, decimals));
+            }
+        }
+        if let Some(p) = self.pyth.read(symbol) {
+            if p.is_fresh() {
+                return Some((p.price_usd, decimals));
+            }
+        }
+        None
+    }
+}
+
+
+    let la_price_lookup: Arc<dyn omega_strategies::TokenPriceLookup> = Arc::new(OracleTokenPriceLookup {
+        chainlink: Arc::clone(&chainlink_oracle),
+        pyth: Arc::clone(&pyth_oracle),
+    });
+
     let mut registry_builder = StrategyRegistryBuilder::new(active_phase)
         .register(CnryStrategy::new(chain_id, &config))
         .expect("CNRY registration must succeed");
@@ -1757,6 +1837,7 @@ async fn main() -> Result<()> {
             Arc::clone(&liquidity_registry),
             Arc::clone(&position_registry),
             &config,
+            Some(la_price_lookup.clone()),
         );
         registry_builder = registry_builder
             .register(la)
@@ -3052,6 +3133,7 @@ mod la_registration_wiring_tests {
             liquidity_registry,
             position_registry,
             &OmegaConfig::default(),
+            None,
         );
     }
 

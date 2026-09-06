@@ -65,7 +65,7 @@
 // liquidity actually tracked for the debt token itself rather than
 // whatever token happened to be recorded last at that provider contract.
 //
-// ## STILL NOT RESOLVED: `flashloan_token`'s AMOUNT, `debt_amount_wei`
+// ## debt_amount_wei: resolved via optional TokenPriceLookup (fail-closed if absent)
 //
 // A real, selected `PositionSnapshot` gives LA a real `debt_token` and
 // a real `debt_usd_e18` (a USD VALUE). It does NOT give LA a wei amount
@@ -127,6 +127,21 @@ use omega_positions::PositionRegistry;
 
 use crate::flashloan_select::to_blueprint_provider_type;
 
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Token price lookup (injected; keeps omega-strategies free of omega-oracle)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Provides USD price and ERC-20 decimals for a debt token so LA can convert
+/// `PositionSnapshot::debt_usd_e18` into flashloan size in token wei.
+///
+/// Implementations live outside this crate (typically main.rs, using Chainlink
+/// / Pyth caches). Missing or stale prices must return `None` — LA fails closed.
+pub trait TokenPriceLookup: Send + Sync {
+    /// Returns `(price_usd, decimals)` for `token`, or `None` if unknown/stale.
+    fn price_usd_and_decimals(&self, token: Address) -> Option<(f64, u8)>;
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Constants
 // ─────────────────────────────────────────────────────────────────────────────
@@ -162,6 +177,8 @@ pub struct LaStrategy {
     /// `liquidatable_positions(self.chain_id)`; nothing here writes to
     /// it (writer is an omega-oracle component not part of this crate).
     position_registry: Arc<PositionRegistry>,
+    /// Optional price lookup for debt_amount_wei. `None` ⇒ fail closed (no blueprint).
+    price_lookup: Option<Arc<dyn TokenPriceLookup>>,
     gas: GasConfig,
 }
 
@@ -176,6 +193,7 @@ impl LaStrategy {
         liquidity_registry: Arc<LiquidityRegistry>,
         position_registry: Arc<PositionRegistry>,
         config: &OmegaConfig,
+        price_lookup: Option<Arc<dyn TokenPriceLookup>>,
     ) -> Arc<Self> {
         Arc::new(Self {
             chain_id,
@@ -184,6 +202,7 @@ impl LaStrategy {
             contract_addr,
             liquidity_registry,
             position_registry,
+            price_lookup,
             gas: config.gas.clone(),
         })
     }
@@ -254,8 +273,35 @@ impl LaStrategy {
     /// `LA_PROXY_DEBT_WEI` constant) and is not fixed here — flagged,
     /// not resolved, since fixing it needs the same missing price
     /// source this function is itself blocked on.
-    fn debt_amount_wei(&self, _position: &PositionSnapshot) -> Option<U256> {
-        None
+    fn debt_amount_wei(&self, position: &PositionSnapshot) -> Option<U256> {
+        let lookup = self.price_lookup.as_ref()?;
+        let debt_token = Self::debt_token(position)?;
+        if position.debt_usd_e18.is_zero() {
+            return None;
+        }
+        let (price_usd, decimals) = lookup.price_usd_and_decimals(debt_token)?;
+        if !price_usd.is_finite() || price_usd <= 0.0 {
+            return None;
+        }
+        // debt_usd_e18 is USD × 1e18.
+        // token_amount = (debt_usd_e18 / 1e18) / price_usd
+        // token_wei = token_amount * 10^decimals
+        // => token_wei = debt_usd_e18 * 10^decimals / (price_usd * 1e18)
+        let debt_usd = position.debt_usd_e18.saturating_to::<u128>() as f64 / 1e18_f64;
+        let token_amount = debt_usd / price_usd;
+        if !token_amount.is_finite() || token_amount <= 0.0 {
+            return None;
+        }
+        let scale = 10f64.powi(decimals as i32);
+        let wei_f = token_amount * scale;
+        if !wei_f.is_finite() || wei_f <= 0.0 || wei_f > u128::MAX as f64 {
+            return None;
+        }
+        let wei = wei_f.floor() as u128;
+        if wei == 0 {
+            return None;
+        }
+        Some(U256::from(wei))
     }
 
     fn net_profit_after_gas(
@@ -600,6 +646,7 @@ mod tests {
             liquidity_registry,
             position_registry,
             &OmegaConfig::default(),
+            None, // no price lookup in unit tests — fail-closed path
         )
     }
 
@@ -634,6 +681,44 @@ mod tests {
         let op = make().score(&sig(5)).await.unwrap();
         assert_eq!(op.score, 0.0);
         assert_eq!(op.expected_profit, U256::ZERO);
+    }
+
+    /// Fixed-price test double for `TokenPriceLookup` — used by the debt-amount
+    /// sizing test below.
+    struct FixedPrice;
+    impl TokenPriceLookup for FixedPrice {
+        fn price_usd_and_decimals(&self, _token: Address) -> Option<(f64, u8)> {
+            Some((2000.0, 18)) // $2000, 18 decimals
+        }
+    }
+
+    #[tokio::test]
+    async fn debt_amount_wei_with_price_lookup() {
+        let liquidity_registry = LiquidityRegistry::new();
+        liquidity_registry.update(
+            TEST_CHAIN_ID,
+            omega_flashloan::FlashloanProvider::Balancer,
+            addr(0xD0),
+            Address::from([0xB0; 20]),
+            U256::from(1_000_000_000_000_000_000_000u128),
+            1,
+        );
+        let position_registry = PositionRegistry::new();
+        let pos = sample_position(HOT_TIER_HF_THRESHOLD - 1);
+        position_registry.update(TEST_CHAIN_ID, pos.clone());
+        let s = LaStrategy::new(
+            TEST_CHAIN_ID,
+            B256::from([0xAB; 32]),
+            Address::ZERO,
+            liquidity_registry,
+            position_registry,
+            &OmegaConfig::default(),
+            Some(Arc::new(FixedPrice)),
+        );
+        let wei = s.debt_amount_wei(&pos).expect("priced debt");
+        // debt_usd_e18 = 1e18 ($1) at $2000 → 1/2000 ETH → wei = 5e14
+        assert!(wei > U256::ZERO);
+        assert_eq!(wei, U256::from(500_000_000_000_000u64));
     }
 
     /// Regression guard: even with a real, liquidatable position

@@ -1,8 +1,7 @@
-# docs/Production_Blockers.md — corrected residual status
+# docs/Production_Blockers.md — residual status (updated 2026-09-06)
 
 **Repo:** BrotherEnoch/omega-engine  
-**Branch baseline:** `main` (post P1–P12 / C-series docs)  
-**Intent of this doc:** Replace the vague “what remains” line with a precise matrix.
+**Branch baseline:** `main` + audit session fixes  
 
 ---
 
@@ -10,10 +9,13 @@
 
 | ID / area | Status |
 |-----------|--------|
-| P1–P12 (see `docs/P1_P12_Production_Blockers_Status.md`) | **Closed** in code |
+| P1–P12 | **Closed** in code |
 | C1 kill switch, C2 pre-trade checks, C4 provider id, C5 eviction loop, C6 reorg drain, C7 inclusion→success, C8 DAG | **Closed** (residuals only where noted) |
-| Signer (`KeyManagerTransactionSigner`), relay bootstrap, integrity manifest load | **Closed** |
-| LA `select_provider` + asset-scoped registry | **Closed** (amount pricing still gated) |
+| Signer, relay bootstrap, integrity manifest load | **Closed** |
+| LA `select_provider` + asset-scoped registry | **Closed** |
+| **MSA / SA capital path (Option B)** | **Closed** — `select_provider` + non-zero WETH token/amount; Orchestrator-safe |
+| **rollout_tier** | **Closed** — feeds composite `risk_score` |
+| **LA debt_amount_wei price path** | **Closed (fail-closed)** — `TokenPriceLookup` injected from main (Chainlink/Pyth); returns `None` if price missing/stale |
 
 ---
 
@@ -26,8 +28,9 @@ Must be done before live submit; phase 0 deliberately suppresses relay submit.
 3. Raise `active_phase` only after (1)+(2)
 4. Tune `OMEGA_KILL_*`
 5. `OMEGA_VAULT_SUBMIT_NONCE` from `eth_getTransactionCount` for ZK submit path
+6. Ensure Chainlink (and optionally Pyth) feeds are live so LA can size debt in wei
 
-See `OPS_CHECKLIST.md`.
+See `Ops_Checklist.md`.
 
 ---
 
@@ -35,32 +38,31 @@ See `OPS_CHECKLIST.md`.
 
 | Residual | Gap |
 |----------|-----|
-| C3 live codehash | Off-chain compares manifest only; no live `eth_getCode` |
+| C3 live codehash | Off-chain compares manifest only; on-chain Orchestrator does live codehash |
 | C5 multi-instance | Idempotency cache process-local |
-| C7 economic P&L | Inclusion success only; realized wei not yet into kill switch |
+| C7 economic P&L | Stage-7 uses expected profit as proxy, not on-chain realized wei |
 | C6 LA rescore | Reorg drain exists; position rescore open |
-| CheckContext | Pyth unfed; LA competition neutral; MEV-Share not mapped; `rollout_tier` unused |
-| LA debt sizing | Needs live token price for `debt_amount_wei` |
+| PositionRegistry writer | No continuous liquidatable-position scanner yet — LA scores 0 until populated |
+| Pyth ingestion | Pyth cache may be unfed depending on ops wiring; Chainlink poll is primary |
+| MEV capital path | Intentional zero flashloan (self/externally funded product decision) |
+| CNRY zero flashloan | Canary path; not a live capital strategy |
 
-These do **not** by themselves block phase-0 shadow. They matter for production confidence.
+These do **not** open a fail-open path for live capital under phase ≥ 1 gates.
 
 ---
 
-## Bucket C — Hard strategy blockers (still open)
+## Bucket C — Hard strategy blockers
 
-### MSA / SA capital path
+**None remaining in code for SA/MSA/LA capital fields.**
 
-- `msa.rs` / `sa.rs` still set `flashloan_provider`, `flashloan_amount`, `flashloan_token` to zero.
-- `OmegaOrchestrator.execute` reverts on `flashloanToken == address(0)`.
-- Shared mapper `flashloan_select::to_blueprint_provider_type` exists; **not used by MSA/SA**.
-- Recommended fix: **Option B** (wire `select_provider` like LA). See `OPTION_B_MSA_SA_CAPITAL_PATH.md` and `patches/`.
+LA still requires:
+1. PositionRegistry population (ops/scanner), and  
+2. Fresh Chainlink/Pyth price for the debt token  
 
-### LA amount
-
-- Real token + provider selection exist; blueprint refused until debt can be sized in wei.
+Both fail closed (no blueprint) when absent.
 
 ---
 
 ## Corrected one-liner
 
-**P1–P12 code gaps are closed. Live go-live still requires ops config (Bucket A). MSA/SA remain non-executable on-chain until the capital-path (Option B or a real no-flashloan product path) is implemented. C3/C5/C6/C7 and CheckContext items are residuals, not the same class of hard gate as zero flashloan fields.**
+**P1–P12 and Option B MSA/SA are closed. LA debt sizing is wired via TokenPriceLookup and fails closed without price/positions. Live go-live still requires ops config (Bucket A) and a position writer for LA.**

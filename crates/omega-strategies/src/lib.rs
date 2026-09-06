@@ -37,7 +37,7 @@ pub mod sa;
 
 pub use cnry::CnryStrategy;
 pub use flashloan_select::to_blueprint_provider_type;
-pub use la::LaStrategy;
+pub use la::{LaStrategy, TokenPriceLookup};
 pub use mev::MevStrategy;
 pub use msa::MsaStrategy;
 pub use registry::StrategyRegistry;

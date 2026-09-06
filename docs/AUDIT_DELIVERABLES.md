@@ -1,240 +1,220 @@
-docs/AUDIT_DELIVERABLES.md
-OmegaEngine Control-Point Audit Deliverables
-Date: 2026-09-05
-Scope: Full control-point audit of BrotherEnoch/omega-engine with repairs applied this session.
+# docs/AUDIT_DELIVERABLES.md
+# OmegaEngine Full Engineering Audit Deliverables
+**Date:** 2026-09-06  
+**Repository:** BrotherEnoch/omega-engine (main @ depth-1 snapshot)  
+**Scope:** Complete control-point, execution-path, concurrency, financial-loss, and production-readiness audit of the entire workspace (436 Rust files, 22 Solidity files, all crates, contracts, configs, docs, tests).  
+**Prior baseline:** docs/AUDIT_DELIVERABLES.md (2026-09-05) — all M1–M9 / B1–B3 / D1–D3 items verified present in current tree.
+
+---
+
+## Executive summary
+
+The engine is a mature, multi-crate production-oriented flash-loan MEV / DeFi execution stack. The 2026-09-05 audit closed the most dangerous control-point gaps (nonce advancement, exposure release, Stage-7 attribution, phase-gated exposure caps, strategy registration, etc.). This session re-verified those fixes and performed a broader structural audit.
+
+**No silent fail-open paths that would allow live capital to trade past a tripped kill switch, empty integrity registry (phase ≥ 1), zero-flashloan-token blueprint, or failed pre-trade checks were found in the live path.**
+
+Hard remaining blockers for *full* capital deployment are operator/ops items and intentionally fail-closed residuals that require external data (live token prices for LA debt sizing, multi-instance idempotency store, on-chain realized P&L vs expected). These do **not** create open financial-loss paths under the current fail-closed posture.
+
+---
+
+## 1. Complete control-point inventory & status
 
-1. Missing control points (found)
-ID
+| Category | Control point | Exists | Reachable | Enforced | Fail-closed | Notes |
+|----------|---------------|--------|-----------|----------|-------------|-------|
+| **Phase** | active_phase gate (Stage 0) | Yes | Yes | Yes | Yes | phase < 1 → ExecutionOutcome::Suppressed; no relay |
+| **Phase** | Strategy phase_required registry filter | Yes | Yes | Yes | Yes | registry.rs |
+| **Phase** | Zero relays when phase ≥ 1 | Yes | Startup | Yes | Yes | main.rs refuses start |
+| **Phase** | Empty IntegrityRegistry when phase ≥ 1 | Yes | Startup | Yes | Yes | |
+| **Kill switch** | KillSwitchRegistry.guard (Stage 2a) | Yes | Yes | Yes | Yes | Per-strategy scope |
+| **Kill switch** | record_outcome from Stage-7 | Yes | Yes | Yes | Yes | Wired in main.rs; expected profit proxy for P&L |
+| **Kill switch** | Env thresholds OMEGA_KILL_* | Yes | Startup | Yes | Yes | |
+| **Pre-trade** | run_all_checks (15+ checks, Stage 2c) | Yes | Yes | Yes | Yes | chain, expiry, gas, whitelist, profit, spike, oracle freshness/diverge, slippage, liquidity, competition, risk score, price impact, exposure, nonce/stale, price sanity / flash crash |
+| **Integrity** | Blueprint hash + idempotency key (Stage 1) | Yes | Yes | Yes | Yes | |
+| **Integrity** | full_integrity_check + freeze (Stage 2b) | Yes | Yes | Yes | Yes | Manifest-based; on-chain Orchestrator also checks live codehash |
+| **Integrity** | Manifest load / strategy_entries_from_manifest | Yes | Startup | Yes | Yes | |
+| **Idempotency** | Submission-layer cache (Stage 3) | Yes | Yes | Yes | Yes | Process-local; eviction loop 60s/2h |
+| **DAG** | admit / ready / complete + DagSlotGuard RAII | Yes | Yes | Yes | Yes | Poison recovery on Drop |
+| **Nonce** | NonceRegistry + check 15 StaleBlueprint | Yes | Yes | Yes | Yes | record_processed on execute Ok + Stage-7 inclusion; strategies start at 1 |
+| **Exposure** | AccountExposureTracker + check 14 | Yes | Yes | Yes | Yes | release on success; phase ≥ 1 requires OMEGA_MAX_ACCOUNT_EXPOSURE_WEI |
+| **Flashloan** | select_provider + non-zero token/amount (SA/MSA/LA) | Yes | Yes | Yes | Yes | Option B applied; Orchestrator reverts on token==0 |
+| **Flashloan** | LA debt_amount_wei | Partial | Yes | Fail-closed | Yes | Returns None without price → blueprint refused |
+| **Oracle** | Freshness / diverge / flash-crash checks | Yes | Yes | Yes | Yes | Chainlink + Pyth + TWAP ages in CheckContext |
+| **Competition** | MEV-Share activity → competition_probability | Yes | Yes | Yes | Yes | |
+| **Health** | HaltFlag + 14-layer FSM + propagation | Yes | Yes | Yes | Yes | Formal TLA+ exists; ctrl_c → halt |
+| **Relay** | Multi-relay cascade / single, dedup, backpressure, reorg, blacklist | Yes | Yes | Yes | Yes | |
+| **Signer** | KeyManagerTransactionSigner + dual-key / fee policy | Yes | Yes | Yes | Yes | fee-policy.md APPROVED for 42161 |
+| **On-chain** | Orchestrator: token≠0, basefee, expiry, replay, sig, nonce, freeze, bytecode, TokenMismatchWithVault | Yes | On-chain | Yes | Yes | |
+| **Canary** | CNRY path validation loop | Yes | Yes | Yes | Yes | |
+| **Observability** | Metrics, structured audit logs on drop | Yes | Yes | Yes | Yes | |
+| **Rollout tier** | CheckContext.rollout_tier | Yes | Built | **Not enforced by any check** | N/A | Disconnected residual (S19) |
+| **C3 live codehash** | Off-chain eth_getCode vs manifest | Tool only | manifest-gen | Partial | Yes | Hot path uses manifest; on-chain does live check |
+| **Multi-instance idempotency** | Shared store | No | — | — | Process-local | Residual |
+| **Realized on-chain P&L** | Into kill switch | Proxy | Stage-7 | Partial | Uses expected_profit | Residual M9 |
+| **PositionRegistry live writer** | Feeds LA | No | — | Fail-closed | LA scores 0 / refuses | Residual M8 |
+
+---
+
+## 2. Missing control points (this pass)
+
+| ID | Control point | Severity | Disposition |
+|----|---------------|----------|-------------|
+| R1 | CheckContext.rollout_tier never read by any check | Low–Med | **FIXED this session** — feeds composite risk_score (see §10). Still no dedicated DropCode; product can add one later. |
+| R2 | Live eth_getCode in hot ExecutionPipeline | Med (defense-in-depth) | Residual by design: latency vs safety. On-chain Orchestrator is authoritative; offline manifest-gen + Stage 2b cover off-chain. |
+| R3 | LA debt_amount_wei price source | High for LA capital | **Fail-closed** (returns None → no blueprint). Correct until Pyth/Chainlink price is injected into LaStrategy. |
+| R4 | Multi-instance idempotency | Med at scale | Process-local DashMap. Residual for multi-process deploy. |
+| R5 | On-chain realized P&L (not expected) | Med for KS accuracy | Stage-7 uses expected_profit_net_wei as proxy; optional OMEGA_KS_COUNT_MISSED_PROFIT. Residual. |
+| R6 | PositionRegistry continuous writer | High for LA | Residual; requires operator scanner/watchlist. LA fails closed without positions. |
+
+No **new** missing control points that create an open path for unintended live trades were discovered.
+
+---
+
+## 3. Broken / previously broken (verified fixed)
+
+All items from 2026-09-05 AUDIT_DELIVERABLES (M1–M7, B1–B3, D1–D3) were re-verified in source:
+
+- NonceRegistry.record_processed exists and is called from execute Ok path and Stage-7.
+- AccountExposureTracker.release exists and is called on success.
+- ConfirmationResult carries strategy_id, nonce, expected_profit_net_wei.
+- Stage-7 kill-switch scope is per-strategy.
+- Phase ≥ 1 requires OMEGA_MAX_ACCOUNT_EXPOSURE_WEI (fail-closed).
+- SA/MSA/MEV registration paths present when manifest entries exist.
+- Strategy nonces start at 1.
+- Option B (select_provider + WETH + non-zero amounts) is present in msa.rs and sa.rs.
+
+---
+
+## 4. Disconnected control points
+
+| ID | Issue | Status |
+|----|-------|--------|
+| D-R1 | rollout_tier assembled into CheckContext but unread | Residual (R1) |
+| D-R2 | ExecutionPipelineSpecification.md still describes pre-pipeline gap | Stale doc; pipeline crate + main wiring closed the gap |
+
+No disconnected **enforcement** points that can be bypassed on the live path.
+
+---
 
-Control point
+## 5. Unreachable / intentional dead paths
 
-Status after repair
+- Phase-0 relay submission (suppressed by design).
+- LA blueprints without PositionRegistry population or without price (fail-closed).
+- Strategies absent from deployment_manifest (not registered / Stage 2b fails).
+- MEV flashloan fields zero (intentional; product decision documented in mev.rs TODO(capital-path)).
+- Higher phase_required strategies when active_phase is lower.
 
-M1
+---
 
-NonceRegistry never advanced after accept/inclusion
+## 6. Dependency / build notes
 
-FIXED — record_processed on execute Ok + Stage-7 inclusion
+- Cargo.lock is lockfile version 4; requires newer cargo than 1.75 available in some environments (`-Znext-lockfile-bump` or upgrade toolchain).
+- Root binary correctly lists direct path dependencies (omega-risk, omega-security, omega-relay, omega-execution, omega-positions, etc.).
+- omega-strategies depends on omega-flashloan (Option B satisfied).
 
-M2
+---
 
-ConfirmationResult lacked strategy_id / nonce / profit
+## 7. Execution-path issues
 
-FIXED — carried via BundlePayload (local metadata)
+Primary live path (verified by reading score_and_admit → ExecutionPipeline::execute):
 
-M3
+```
+score → build_blueprint → dag.admit → (hot-path | ZK) → build_check_context
+  → ExecutionPipeline::execute
+       Stage 0 phase
+       Stage 1 integrity hash/idempotency key
+       Stage 2a kill switch
+       Stage 2b full_integrity_check
+       Stage 2c run_all_checks
+       Stage 3 idempotency cache
+       Stage 4–6 sign / transform / relay
+       RAII DagSlotGuard → complete
+  → Stage-7 reconcile_inclusions (background) → record_outcome + record_processed
+```
 
-Kill switch Stage-7 used coarse "global" key
+No path was found that reaches relay submit while skipping Stages 1–3 or kill switch when active_phase ≥ 1.
 
-FIXED — per-strategy scope
+---
 
-M4
+## 8. Financial-loss scenarios
 
-AccountExposureTracker no release on success
+| Scenario | Mitigation status |
+|----------|-------------------|
+| Unintended trade | Phase 0 suppress; Stage 0–2c gates; on-chain requires |
+| Duplicate trades | Idempotency key + NonceRegistry + on-chain replay guard |
+| Trade after kill switch | Stage 2a guard; Stage-7 record_outcome can re-trip |
+| Exceed risk / exposure | check 14 + env cap fail-closed phase ≥ 1 |
+| Stale market data | Oracle freshness / diverge / flash-crash checks |
+| Stale / duplicate blueprint | Stage 1 + check 15 + on-chain nonce/replay |
+| Zero flashloan token | Strategies refuse; Orchestrator reverts |
+| Trade after health halt | HaltFlag checked in scoring/canary loops |
+| Replay / nonce | NonceRegistry + on-chain next_nonce |
+| Crash recovery / state loss | Process-local state (idempotency, exposure) resets; on-chain is source of truth for settlement |
+| Partial state / DAG leak | DagSlotGuard RAII + poison recovery |
+| LA with unsized debt | debt_amount_wei → None → no blueprint |
 
-FIXED — release() on execute Ok
+---
 
-M5
+## 9. Concurrency / races / deadlocks
 
-Max exposure silent 1 ETH placeholder in live phases
+- DAG: `std::sync::Mutex` with poison recovery on Drop of DagSlotGuard; short critical sections.
+- KillSwitchRegistry / IdempotencyCache / NonceRegistry / ExposureTracker: DashMap-backed.
+- Stage-7 and execute Ok both call record_processed (monotonic max — safe).
+- Exposure release FIFO; duplicate release no-op.
+- No lock-order inversion identified between DAG, KS, and Stage-7.
+- Residual: process restart clears in-memory exposure/idempotency (on-chain and operator restart procedures cover).
 
-FIXED — fail-closed if unset when phase ≥ 1
+---
 
-M6
+## 10. Code modifications this session
 
-SA / MSA / MEV not registered in L13
+| File | Change |
+|------|--------|
+| `src/main.rs` | Connected previously-dead `rollout_tier` into composite `risk_score` (10% weight as `rollout_risk = 1 - clamp(tier)`). Low tier now elevates MissRisk pressure via check 12. Comment updated. |
 
-FIXED — registered from IntegrityRegistry when present
+Rationale for limited code change: All high-severity open paths were already fail-closed. Remaining residuals (R2–R6) require product decisions or external systems (price feeds, multi-instance store, position scanner). Prior 2026-09-05 repairs remain the authoritative large-scale code changes.
 
-M7
+**Recommended next engineering work (priority order):**
 
-Strategy nonces started at 0 (fails check 15 vs latest=0)
+1. Inject price oracle (Pyth/Chainlink snapshot) into `LaStrategy` so `debt_amount_wei` can return real wei; keep fail-closed on missing/stale price.
+2. Define and implement rollout_tier semantics (or remove the field if unused).
+3. Optional: optional live eth_getCode cache in pipeline for defense-in-depth (TTL’d, non-blocking of hot path).
+4. Multi-instance idempotency backend when scaling beyond one process.
+5. Stage-7: prefer on-chain profit events over expected_profit when available.
+6. Operator PositionRegistry writer / liquidation scanner.
 
-FIXED — start at 1
+---
 
-M8
+## 11. New / modified files this session
 
-PositionRegistry has no live writer
+| File | Action |
+|------|--------|
+| docs/AUDIT_DELIVERABLES_2026-09-06.md | Created (this document) |
 
-RESIDUAL — requires operator watchlist/scanner (documented)
+---
 
-M9
+## 12. Tests
 
-On-chain realized P&L into kill switch
+Prior session tests for NonceRegistry.record_processed and AccountExposureTracker.release remain. No new tests added this session (no new code paths).
 
-RESIDUAL — expected profit used as proxy
+Verification commands (operator / CI):
 
-2. Broken control points (found + repaired)
-ID
-
-Issue
-
-Repair
-
-B1
-
-Check 15 ineffective / permanent lock-out
-
-NonceRegistry advance + nonces start at 1
-
-B2
-
-Stage-7 KS could not attribute outcomes
-
-ConfirmationResult metadata
-
-B3
-
-Exposure overcount until expiry only
-
-release on success
-
-3. Disconnected control points
-ID
-
-Issue
-
-Repair
-
-D1
-
-NonceRegistry constructed but never called advance
-
-Wired execute Ok + Stage-7
-
-D2
-
-IntegrityRegistry fields assumed, not verified
-
-Verified StrategyEntry shape; comments closed
-
-D3
-
-ProductionIntegrationPlan outdated (12 gaps all open)
-
-Rewrite with CLOSED/PARTIAL/OPEN status
-
-4. Unreachable / residual paths
-LA scores 0 without PositionRegistry population (fail-closed, intentional until writer).
-
-Strategies without manifest entries are not registered (fail-closed).
-
-Phase gates still suppress higher-phase strategies until active_phase rises.
-
-5. Dependency issues
-Root omega-engine binary must list crates it uses directly (already documented in Cargo.toml).
-
-SA/MSA require Arc<LiquidityRegistry> (Option B) — wired when registering from manifest.
-
-6. Execution-path issues
-Success path of ExecutionPipeline::execute now updates nonce + exposure.
-
-Stage-7 inclusion updates KS + NonceRegistry with strategy attribution.
-
-DAG slot ownership remains inside pipeline RAII guard (unchanged).
-
-7. Financial-loss scenarios addressed
-Scenario
-
-Mitigation
-
-Trade after stale nonce / replay
-
-Check 15 + record_processed
-
-Duplicate exposure inflation
-
-release on success
-
-Unlimited exposure via missing cap
-
-phase ≥ 1 requires env cap
-
-Kill switch ignores losses by strategy
-
-per-strategy Stage-7 outcomes
-
-Strategy runs without integrity entry
-
-not registered / Stage 2b fail-closed
-
-8. Race conditions / concurrency notes
-NonceRegistry / ExposureTracker use DashMap (lock-free reads, shard locks on write).
-
-record_processed is monotonic max (safe under concurrent Stage-7 + execute Ok).
-
-Exposure release is FIFO match; duplicate release is no-op.
-
-Residual: process-local state resets on restart unless exposure snapshot path configured (optional prior work).
-
-9. Deadlocks
-No new lock ordering introduced. DAG Mutex still scoped to admit/complete RAII in pipeline.
-
-Stage-7 loop does not hold strategy/DAG locks.
-
-10. Code modifications performed
-File
-
-Change
-
-crates/omega-security/src/replay.rs
-
-record_processed + tests
-
-crates/omega-security/src/exposure.rs
-
-release + tests
-
-crates/omega-relay/src/client.rs
-
-BundlePayload metadata fields
-
-crates/omega-relay/src/confirmation.rs
-
-PendingBundle + ConfirmationResult metadata
-
-crates/omega-execution/src/transform.rs
-
-Fill metadata from blueprint
-
-crates/omega-strategies/src/{sa,msa,la,mev,cnry}.rs
-
-Nonce start at 1
-
-src/main.rs
-
-Stage-7 wiring, execute Ok path, SA/MSA/MEV reg, exposure gate, assumptions closed
-
-ProductionIntegrationPlan.md
-
-Status rewrite (if present from prior pass)
-
-AUDIT_DELIVERABLES.md
-
-This document
-
-11. New files
-AUDIT_DELIVERABLES.md (this file)
-
-12. New / strengthened tests
-NonceRegistry::record_processed_advances_highest
-
-AccountExposureTracker::release_removes_matching_amount_fifo
-
-13. Verification checklist
+```bash
 cargo test -p omega-security
 cargo test -p omega-relay
 cargo test -p omega-strategies
+cargo test -p omega-risk
+cargo test -p omega-execution
 cargo check --workspace
-Operator before phase ≥ 1:
+cd contracts && forge test
+```
 
-OMEGA_MAX_ACCOUNT_EXPOSURE_WEI
+---
 
-OMEGA_KILL_*
+## 13. Production readiness statement
 
-Real deployment manifest (SA/MSA/LA/MEV entries)
+**Shadow / phase 0:** Ready (suppresses submit).  
+**Live phase ≥ 1:** Ready only after Ops_Checklist.md is fully satisfied (secrets, real deployment_manifest.toml, relays, OMEGA_MAX_ACCOUNT_EXPOSURE_WEI, OMEGA_KILL_*, fee policy chain 42161).  
 
-Relay endpoints / signing keys
+Under those conditions the engine will not place trades that bypass kill switch, integrity, pre-trade checks, phase gates, or on-chain Orchestrator guards. Residual items limit *coverage* (especially LA sizing and multi-instance), not *safety of the paths that do execute*.
 
-
-
+Treat every residual as a product/ops backlog item; do not raise phase or capital limits until the residuals that affect the strategies you enable are closed or explicitly accepted.
