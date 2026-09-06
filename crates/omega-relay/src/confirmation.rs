@@ -49,17 +49,30 @@ struct PendingBundle {
     relay: RelayName,
     tx_hashes: Vec<[u8; 32]>,
     target_block: u64,
+    strategy_id: String,
+    nonce: u64,
+    expected_profit_net_wei: u128,
 }
 
 /// Result of a resolved (confirmed-included or given-up-on) bundle.
 #[derive(Debug, Clone)]
 pub struct ConfirmationResult {
-    /// Bundle hash this result is for.
+    /// 0x-prefixed keccak256 hash of the bundle that was tracked.
     pub bundle_hash: String,
-    /// Relay this bundle was tracked against.
+    /// The relay this bundle was originally submitted through.
     pub relay: RelayName,
-    /// `true` only if every transaction in the bundle has a successful on-chain receipt.
+    /// Whether every transaction in the bundle had a successful on-chain receipt.
+    /// `false` means either a receipt showed failure, or the grace window expired
+    /// with no receipt found — this field does not distinguish those two cases.
     pub included: bool,
+    /// Strategy identifier carried through from the original `BundlePayload`, for
+    /// attributing this result back to the strategy that produced the bundle.
+    pub strategy_id: String,
+    /// Nonce carried through from the original `BundlePayload`.
+    pub nonce: u64,
+    /// Expected net profit in wei carried through from the original `BundlePayload`,
+    /// for reputation/ranking accounting.
+    pub expected_profit_net_wei: u128,
 }
 
 /// Tracks bundles pending on-chain inclusion confirmation.
@@ -92,6 +105,9 @@ impl InclusionTracker {
                 relay,
                 tx_hashes: tx_hashes?,
                 target_block,
+                strategy_id: bundle.strategy_id.clone(),
+                nonce: bundle.nonce,
+                expected_profit_net_wei: bundle.expected_profit_net_wei,
             },
         );
         Ok(())
@@ -138,6 +154,9 @@ impl InclusionTracker {
                 bundle_hash,
                 relay: pending.relay,
                 included,
+                strategy_id: pending.strategy_id,
+                nonce: pending.nonce,
+                expected_profit_net_wei: pending.expected_profit_net_wei,
             });
         }
 

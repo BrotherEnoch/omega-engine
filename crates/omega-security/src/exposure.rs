@@ -115,6 +115,19 @@ impl AccountExposureTracker {
             });
     }
 
+    /// Release one outstanding exposure matching amount (FIFO). Call on
+    /// successful pipeline execute so submitted capital is not double-counted.
+    pub fn release(&self, scope: &str, amount_wei: u128) {
+        if amount_wei == 0 {
+            return;
+        }
+        if let Some(mut entries) = self.entries.get_mut(scope) {
+            if let Some(idx) = entries.iter().position(|e| e.amount_wei == amount_wei) {
+                entries.remove(idx);
+            }
+        }
+    }
+
     /// Current outstanding exposure for `scope`, in wei — the value
     /// `CheckContext::current_account_exposure_wei` should be set to.
     ///
@@ -242,5 +255,16 @@ mod tests {
         // Read again, well past expiry, with no intervening record() —
         // confirms pruning happens at READ time, not only on write.
         assert_eq!(t.current_exposure_wei("SA", 500), 0);
+    }
+
+    #[test]
+    fn release_removes_matching_amount_fifo() {
+        let tracker = AccountExposureTracker::new();
+        tracker.record("LA", 1_000, 200);
+        tracker.record("LA", 2_000, 200);
+        tracker.release("LA", 1_000);
+        assert_eq!(tracker.current_exposure_wei("LA", 100), 2_000);
+        tracker.release("LA", 2_000);
+        assert_eq!(tracker.current_exposure_wei("LA", 100), 0);
     }
 }

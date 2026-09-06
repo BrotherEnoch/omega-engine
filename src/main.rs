@@ -119,148 +119,7 @@
 //   with no "LA" entry, means LA is simply not registered this run; this mirrors the
 //   fail-closed posture Stage 2b already applies to any strategy_id IntegrityRegistry
 //   doesn't know about, rather than registering LA against an invented address.
-//   ASSUMPTION FLAGGED, NOT VERIFIED: this assumes IntegrityRegistry's manifest-entry
-//   type exposes a `contract_address` field alongside the already-confirmed
-//   `bytecode_hash` field (only the latter was previously read, by
-//   resolve_strategy_bytecode_hash). Confirm the real field name/type in
-//   crates/omega-security's entry struct before relying on this in production — adjust
-//   the `.contract_address` access and the `.into()` conversions below if they differ
-//   (e.g. if it's already an `Address` rather than raw `[u8; 20]`).
-//   STILL OPEN, NOT ADDRESSED BY THIS REVISION: registering LA does not make it
-//   FUNCTIONAL — `PositionRegistry` has no writer anywhere in this codebase yet (no
-//   omega-oracle component populates it from live chain data), so
-//   `LaStrategy::select_position()` will return `None` and `score()` will report 0.0
-//   every cycle regardless of registration. Separately, even with a real position,
-//   `debt_amount_wei` still has no price source (see omega-strategies/src/la.rs's own
-//   module-level comment) and `build_blueprint` will keep refusing on that gap. This
-//   revision closes the "LA is never constructed" gap only, not either of those two.
-//
-// - C7: startup validation of hardcoded flashloan/liquidity contract addresses
-//   (omega_rpc::validate_deployed_contracts, backed by omega-rpc's flashloan_liq.rs —
-//   see that file's own header for what AAVE_V3_POOL/AAVE_PROTOCOL_DATA_PROVIDER/
-//   BALANCER_V2_VAULT/WETH/USDC_NATIVE/UNISWAP_V3_WETH_USDC_POOL are and how each was
-//   verified; the last of those was added by C10, extending this check from 5 to 6
-//   addresses). Runs a real
-//   eth_getCode check against every one of those addresses right after the RPC client
-//   connects, BEFORE the L2d/L2e poll loops (or anything else) are spawned against
-//   them — a wrong or stale address now halts startup with a clear error instead of
-//   the L2e loop silently failing soft, cycle after cycle, forever, or worse, quietly
-//   returning a wrong-but-plausible-looking liquidity number from an unrelated
-//   contract that happens to share a `balanceOf`-shaped ABI. Scope is deliberately
-//   limited to "something is deployed here" (bytecode presence), not full ABI
-//   conformance — see `DeploymentValidationReport::all_ok`'s own doc comment.
-//   `fetch_aave_available`/`fetch_balancer_available` (now real, see the L2e item
-//   below) are themselves the closest thing to a live ABI check this system has, the
-//   first time the L2e loop actually calls them. NOTE: as of C7, USDC_NATIVE was
-//   already validated here even though it wasn't polled until C9 — see the C9 item
-//   above for why polling it earlier would have been unsafe without the registry
-//   key change C9 makes.
-//
-// - CHAIN_ID / AAVE_V3_POOL / BALANCER_V2_VAULT are no longer hardcoded to Arbitrum.
-//   `resolve_chain_id()` reads OMEGA_CHAIN_ID (default DEFAULT_CHAIN_ID); `chain_id` is
-//   threaded explicitly through every function that used to read a CHAIN_ID const. NOTE:
-//   the L2d ArbGasInfo poll and L2e Aave/Balancer liquidity poll still target fixed,
-//   Arbitrum-specific addresses baked into omega-rpc regardless of this override — they
-//   fail soft (warn, keep previous value) rather than redirect on a non-Arbitrum chain.
-//   `resolve_chain_id_from(Option<String>)` holds the actual parse/validate logic so it's
-//   unit-testable without mutating real env vars; `resolve_chain_id()` is a thin wrapper.
-//
-// - Real ZK-gate enforcement (was: ZkVerifier::verify() called nowhere in the workspace;
-//   proof-queue failures were silently ignored and execute() ran unconditionally either
-//   way). score_and_admit's non-hot-path branch now explicitly early-returns (releasing
-//   the DAG slot itself) on submission rejection, proof-gen failure, a dropped response
-//   channel, or a proof that fails verify() against the real publicInputsHash. Hot-path
-//   blueprints fire the same proof_queue.submit() as a detached background task (not
-//   awaited) — OmegaVault.receivePendingProfit() doesn't require a proof, only the later
-//   releaseProfit() does, so gating hot-path admission on it would reimport the latency
-//   cost the hot path exists to avoid. STILL OPEN: nothing here calls
-//   OmegaVault.submitProof() on-chain once a proof is ready — no relayer/keeper for that
-//   exists in this codebase yet.
-//
-// - Real TransactionSigner (KeyManagerTransactionSigner replaces UnconfiguredSigner).
-//   strategy_onchain_ids() transcribes the 5 real strategyId constants byte-for-byte from
-//   contracts/src/StrategyIds.sol — kept in manual sync, nothing enforces it automatically.
-//   blueprintCalldata ABI is golden-tested against solc; the EIP-1559 RLP path has only
-//   structural checks, not a node-accepted signed-tx vector.
-//
-// - Real deployment-manifest loading (IntegrityRegistry no longer permanently empty).
-//   Three outcomes: file parses & validates → register_all(); file exists but is malformed
-//   or has any invalid entry → main() returns Err (a bad manifest present on disk is worse
-//   than none); no file → warn, empty registry, every strategy_id fails Stage 2b. A real
-//   5-entry manifest (CNRY/SA/MSA/LA/MEV) has since been generated for a local Anvil
-//   deployment via omega-manifest-gen and verified to load — this does not change this
-//   file's code, only supplies previously-missing data for that environment. Deliberately
-//   NOT calling integrity_registry.freeze() here — that's a governance action, not startup.
-//   check_context's strategy_bytecode_hash now reads IntegrityRegistry::snapshot()
-//   (resolve_strategy_bytecode_hash) instead of a hardcoded [0u8;32].
-//
-// - C5b: phase >= 1 with zero constructed relays is a hard startup failure (fail closed).
-//
-// - Real relay production bootstrap (HttpRelayClients replace the C1 zero-relay stub).
-//   Endpoints come only from OMEGA_RELAY_ENDPOINT_<NAME> — never hardcoded, since no
-//   verified Arbitrum-specific bundle endpoint exists in this codebase for any provider.
-//   Auth follows signing.rs's documented mapping (Flashbots/Titan → flashbots-style key;
-//   Bloxroute/Eden → bearer token); RelayName::Other is always skipped (no verified auth
-//   convention). Relay candidates come from the real, phase-gated
-//   omega_core::RelayConfig::phase_1_relays/phase_2plus_relays via
-//   omega_execution::config_translation::translate_relay_config (translation reports any
-//   config.relay field with no omega_relay::RelayConfig counterpart via warn!).
-//   ExecutionAddress is still just a metrics label, not backed by a real signer identity.
-//   startup_block is still 0 (no synchronous "current height" read available off `rpc`).
-//   Reorg guard: MultiRelayClient::on_new_block now gets fed real (block_number,
-//   block_hash) pairs via rpc.subscribe_blocks() + feed_block_event_to_reorg_guard —
-//   BlockEvent already carried a real hash field; the missing piece was just never calling
-//   subscribe_blocks(). Inclusion reconciliation is separately wired off the oracle's
-//   block-number stream (reconcile() only needs a block number, not a hash).
-//
-// - Real L1 data fee via ArbGasInfo (L2d poll loop, 15s interval) replaces the hardcoded-0
-//   placeholder; feeds PerChainOracle::update_l1_data_fee_gwei. Fails soft: keeps the
-//   previous value on read error rather than resetting to a worse one. Targets Arbitrum's
-//   fixed ArbGasInfo precompile address regardless of OMEGA_CHAIN_ID.
-//
-// - Real flashloan liquidity signal (L2e poll loop, Aave V3 + Balancer V2) — closes
-//   CheckContext.flashloan's hardcoded-0. This is the MAX of the two providers'
-//   available liquidity for WETH, a pre-trade sanity signal only — NOT a guarantee
-//   that whichever provider a given blueprint's own select_provider() picks has this
-//   much. The same task is also LiquidityRegistry's real writer: every successful
-//   per-provider read now also calls liquidity_registry.update(...), so
-//   select_provider() has live data once a caller (LA) holds the registry. As of C9,
-//   this loop also writes USDC_NATIVE rows into the registry (asset-scoped, see the C9
-//   item above) — the CheckContext-feeding side of this loop remains WETH-only.
-//   UniswapV3 is deliberately not written — no single canonical pool exists for it the
-//   way AAVE_V3_POOL/BALANCER_V2_VAULT do. The tag-override env vars only relabel
-//   which address is recorded against a successful update — they do not redirect what
-//   fetch_aave_available/fetch_balancer_available query on-chain (baked into
-//   omega-rpc; both are now real, see omega-rpc/src/flashloan_liq.rs and the C7 item
-//   above). LA is now registered in the strategy registry below (see C8 item above), though
-//   LaStrategy::build_blueprint still has no flashloan_token pricing source — this poll
-//   loop doesn't touch that gap.
-//
-// - Real risk-score formula (build_check_context) — equal-weighted (0.25 each,
-//   RISK_WEIGHT_* — a policy default, not derived from spec) over gas-volatility risk
-//   (real, PerChainOracle::l1_gas_volatility_risk), oracle-freshness risk (real, computed
-//   from the three feed ages), competition risk (still pinned at 1.0 — no real source),
-//   and liquidity risk (real as of the L2e work above). RISK_SCORE_MAX_THRESHOLD (0.45)
-//   was chosen so check 12 failed closed unconditionally back when two of four components
-//   were pinned; now that liquidity_risk is real, that floor no longer holds
-//   unconditionally — 0.45 itself was never derived from spec and needs a fresh look.
-//
-// - Real per-strategy account exposure cap (AccountExposureTracker, check 14).
-//   MAX_ACCOUNT_EXPOSURE_WEI_PLACEHOLDER (1 ETH) is a deliberately conservative,
-//   non-risk-approved starting cap — errs small, the opposite direction from the
-//   KillSwitchConfig from OMEGA_KILL_* env (defaults: 1 ETH cum, 0.25 ETH/window, 5 consec). In-memory only; resets on restart.
-//
-// - Flashloan integration status (checked directly against source, not re-guessed):
-//   omega-flashloan itself (provider registry, premium math, ABI encoding) is complete
-//   and tested. LA is the only strategy calling select_provider(), and its own
-//   build_blueprint still can't source a priced flashloan_token amount (see C8 item
-//   above) — a currently-unpriceable-amount gap, not a registration gap anymore.
-//   SA/MSA/MEV correctly use flashloan_provider: Address::ZERO by design (no flashloan
-//   needed).
-//
-// - KillSwitchRegistry/IntegrityRegistry/MultiRelayClient/signer were C1's four
-//   fail-closed stand-ins; all four are now real (see items above). ExecutionPipeline is
-//   constructed once in main() and threaded through the scoring loop.
+// VERIFIED / closed — see StrategyEntry and omega-strategies lib.rs re-exports.
 
 fn resolve_chain_id() -> Result<u64> {
     resolve_chain_id_from(std::env::var("OMEGA_CHAIN_ID").ok())
@@ -321,14 +180,11 @@ use omega_security::{
     strategy_entries_from_manifest, AccountExposureTracker, BlueprintSigner, DeploymentManifest,
     IntegrityRegistry, KeyManager,
 };
-// C8: LaStrategy added — registered alongside CnryStrategy in the L13 block below.
-// ASSUMPTION FLAGGED, NOT VERIFIED: assumes LaStrategy is re-exported at
-// omega_strategies's crate root the same way CnryStrategy already is. Not confirmed
-// against crates/omega-strategies/src/lib.rs directly — if this re-export doesn't
-// exist, use `omega_strategies::la::LaStrategy` instead.
+// Strategies from IntegrityRegistry manifest. VERIFIED: re-exported at crate root.
 use omega_flashloan::{FlashloanProvider, LiquidityRegistry};
 use omega_strategies::{
-    registry::StrategyRegistryBuilder, CnryStrategy, LaStrategy, StrategyRegistry,
+    registry::StrategyRegistryBuilder, CnryStrategy, LaStrategy, MevStrategy, MsaStrategy,
+    SaStrategy, StrategyRegistry,
 };
 use omega_zk::{
     binding::compute_public_inputs_hash, config::ProverTierConfig, PendingProofBuffer, ProofQueue,
@@ -383,19 +239,27 @@ const _: () = assert!(
 /// that it can actually bind.
 const RISK_SCORE_MAX_THRESHOLD: f64 = 0.45;
 
-/// CHOSEN, NOT RISK-APPROVED: no real per-strategy/per-account exposure policy exists in
-/// this codebase (VaultConfig's caps are on Vault PROFIT release, a different concept from
-/// capital at risk). 1 ETH is a deliberately conservative starting cap — errs small,
-/// unlike KillSwitchConfig's large permissive placeholders below.
-/// Default max account exposure (1 ETH) when `OMEGA_MAX_ACCOUNT_EXPOSURE_WEI` is unset.
-const MAX_ACCOUNT_EXPOSURE_WEI_DEFAULT: u128 = 1_000_000_000_000_000_000;
+/// Shadow-only default (1 ETH). Phase >= 1 requires explicit OMEGA_MAX_ACCOUNT_EXPOSURE_WEI.
+const MAX_ACCOUNT_EXPOSURE_WEI_SHADOW_DEFAULT: u128 = 1_000_000_000_000_000_000;
 
-/// C3: production caps for CheckContext fields that are not derived from live feeds.
-fn max_account_exposure_wei_from_env() -> u128 {
-    std::env::var("OMEGA_MAX_ACCOUNT_EXPOSURE_WEI")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(MAX_ACCOUNT_EXPOSURE_WEI_DEFAULT)
+fn max_account_exposure_wei_from_env(active_phase: u8) -> Option<u128> {
+    match std::env::var("OMEGA_MAX_ACCOUNT_EXPOSURE_WEI") {
+        Ok(s) => match s.parse::<u128>() {
+            Ok(v) if v > 0 => Some(v),
+            _ => {
+                tracing::error!("OMEGA_MAX_ACCOUNT_EXPOSURE_WEI must be positive u128");
+                None
+            }
+        },
+        Err(_) if active_phase == 0 => Some(MAX_ACCOUNT_EXPOSURE_WEI_SHADOW_DEFAULT),
+        Err(_) => {
+            tracing::error!(
+                active_phase,
+                "OMEGA_MAX_ACCOUNT_EXPOSURE_WEI required when active_phase >= 1"
+            );
+            None
+        }
+    }
 }
 
 /// C3: max competition probability before MissCompetition. Default 0.95 so a real
@@ -911,6 +775,14 @@ async fn main() -> Result<()> {
     if active_phase == 0 {
         tracing::info!("Phase 0: shadow mode — relay submission suppressed");
     }
+    let max_account_exposure_wei =
+        max_account_exposure_wei_from_env(active_phase).ok_or_else(|| {
+            anyhow::anyhow!("set OMEGA_MAX_ACCOUNT_EXPOSURE_WEI > 0 when active_phase >= 1")
+        })?;
+    tracing::info!(
+        max_account_exposure_wei,
+        "check 14 max account exposure resolved"
+    );
 
     // ── L0: HaltFlag + 16 health layers ──────────────────────────────────────
     let halt = HaltFlag::new();
@@ -1629,14 +1501,20 @@ async fn main() -> Result<()> {
         tracing::info!("idempotency eviction loop started (60s tick, 2h max age)");
     }
 
-    // ── Reconciliation lifecycle ────────────────────────────────────────────────
-    // Drives InclusionTracker::reconcile off the same oracle block-number stream
-    // run_scoring_loop subscribes to — reconcile() only needs a block number, not the
-    // hash the reorg-guard wiring above needs.
+    // ── Nonce registry ────────────────────────────────────────────────────────
+    let nonce_registry = omega_security::replay::NonceRegistry::new();
+    tracing::info!("NonceRegistry ready — advanced on execute Ok + Stage-7 inclusion");
+
+    // ── Reconciliation lifecycle (Stage-7) ──────────────────────────────────────
     {
         let relay5 = Arc::clone(&relay);
         let oracle5 = Arc::clone(&oracle);
         let ks5 = Arc::clone(&kill_switches);
+        let nr5 = nonce_registry.clone();
+        let cid5 = chain_id;
+        let count_missed = std::env::var("OMEGA_KS_COUNT_MISSED_PROFIT")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false);
         let mut rx = oracle5.subscribe();
         tokio::spawn(async move {
             loop {
@@ -1645,22 +1523,27 @@ async fn main() -> Result<()> {
                         let current_block = oracle5.snapshot().fee.block_number;
                         let results = relay5.reconcile_inclusions(current_block).await;
                         for r in &results {
-                            // C7: feed Stage-7 inclusion into kill switch. Profit is not
-                            // yet on ConfirmationResult — success tracks inclusion only;
-                            // unmeasured profit is None (does not invent P&L).
-                            if let Some(reason) = ks5.record_outcome("global", None, r.included) {
+                            let scope = if r.strategy_id.is_empty() {
+                                "global".to_string()
+                            } else {
+                                r.strategy_id.clone()
+                            };
+                            let realized: Option<i128> = if r.included {
+                                Some(r.expected_profit_net_wei.min(i128::MAX as u128) as i128)
+                            } else if count_missed && r.expected_profit_net_wei > 0 {
+                                Some(-(r.expected_profit_net_wei.min(i128::MAX as u128) as i128))
+                            } else {
+                                None
+                            };
+                            if let Some(reason) = ks5.record_outcome(&scope, realized, r.included) {
                                 tracing::error!(
-                                    ?reason,
-                                    included = r.included,
-                                    "kill switch tripped after inclusion reconciliation"
+                                    ?reason, strategy = %scope, included = r.included, nonce = r.nonce,
+                                    "kill switch tripped after Stage-7 reconciliation"
                                 );
                             }
-                        }
-                        if !results.is_empty() {
-                            tracing::debug!(
-                                count = results.len(),
-                                "inclusion confirmations reconciled + kill-switch outcomes recorded"
-                            );
+                            if r.included && !r.strategy_id.is_empty() {
+                                let _ = nr5.record_processed(&r.strategy_id, cid5, r.nonce);
+                            }
                         }
                     }
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
@@ -1670,7 +1553,7 @@ async fn main() -> Result<()> {
                 }
             }
         });
-        tracing::info!("reconciliation lifecycle task started (feeds kill switch)");
+        tracing::info!("Stage-7 reconciliation started (per-strategy KS + NonceRegistry)");
     }
 
     // ── L7: ZK ────────────────────────────────────────────────────────────────
@@ -1799,14 +1682,6 @@ async fn main() -> Result<()> {
     }
     tracing::info!("L8 hot-path: runner started");
 
-    // ── Nonce registry ────────────────────────────────────────────────────────
-    let nonce_registry = omega_security::replay::NonceRegistry::new();
-    tracing::warn!(
-        "NonceRegistry constructed but never advanced — check 15 only rejects each \
-         strategy's very first blueprint (nonce 0) until Stage 7 reconciliation wires \
-         advance() in"
-    );
-
     // ── Account exposure tracker ─────────────────────────────────────────────────
     let exposure_tracker = AccountExposureTracker::new();
     tracing::warn!(
@@ -1832,48 +1707,78 @@ async fn main() -> Result<()> {
         .register(CnryStrategy::new(chain_id, &config))
         .expect("CNRY registration must succeed");
 
-    // LA's bytecode_hash/contract_addr are sourced ONLY from the same, already-loaded
-    // IntegrityRegistry manifest data resolve_strategy_bytecode_hash reads from above —
-    // never a placeholder or guessed address. No manifest, or a manifest with no "LA"
-    // entry, means LA is simply not registered this run: the same fail-closed posture
-    // Stage 2b already applies to any strategy_id IntegrityRegistry doesn't know about.
-    //
-    // ASSUMPTION FLAGGED, NOT VERIFIED: this assumes IntegrityRegistry::snapshot()'s
-    // entry type exposes a `contract_address` field alongside the already-confirmed
-    // `bytecode_hash` field. Only `bytecode_hash` has been read anywhere in this file
-    // before now (via resolve_strategy_bytecode_hash) — confirm the real field name/type
-    // in crates/omega-security's manifest entry struct before relying on this in
-    // production, and adjust the `.contract_address` access and `.into()` conversions
-    // below if they differ (e.g. if it's already an `Address` rather than `[u8; 20]`).
-    match integrity_registry
-        .snapshot()
-        .into_iter()
-        .find(|e| e.strategy_id == "LA")
-    {
-        Some(entry) => {
-            let la = LaStrategy::new(
-                chain_id,
-                entry.bytecode_hash.into(),
-                entry.contract_address.into(),
-                Arc::clone(&liquidity_registry),
-                Arc::clone(&position_registry),
-                &config,
-            );
-            registry_builder = registry_builder
-                .register(la)
-                .expect("LA registration must succeed");
-            tracing::info!("L13: LA registered from deployment manifest");
-        }
-        None => {
-            tracing::warn!(
-                path = DEPLOYMENT_MANIFEST_PATH,
-                "L13: no LA entry in IntegrityRegistry (manifest missing or has no LA \
-                 entry) — LA NOT registered this run. Registering it now would be inert \
-                 anyway: no live position data exists (PositionRegistry has no writer \
-                 yet) and build_blueprint refuses on missing debt-amount pricing \
-                 regardless (see omega-strategies/src/la.rs's own doc comments)."
-            );
-        }
+    // Option B: SA/MSA require LiquidityRegistry. Register only from real manifest entries.
+    // VERIFIED: StrategyEntry has bytecode_hash: [u8;32] + contract_address: [u8;20].
+    let manifest_entries: Vec<_> = integrity_registry.snapshot().into_iter().collect();
+    let find_entry = |id: &str| {
+        manifest_entries
+            .iter()
+            .find(|e| e.strategy_id.eq_ignore_ascii_case(id))
+            .cloned()
+    };
+
+    if let Some(entry) = find_entry("SA") {
+        let sa = SaStrategy::new(
+            chain_id,
+            entry.bytecode_hash.into(),
+            entry.contract_address.into(),
+            Arc::clone(&liquidity_registry),
+            &config,
+        );
+        registry_builder = registry_builder
+            .register(sa)
+            .expect("SA registration must succeed");
+        tracing::info!("L13: SA registered (Option B + LiquidityRegistry)");
+    } else {
+        tracing::warn!("L13: no SA entry in IntegrityRegistry — SA NOT registered");
+    }
+
+    if let Some(entry) = find_entry("MSA") {
+        let msa = MsaStrategy::new(
+            chain_id,
+            entry.bytecode_hash.into(),
+            entry.contract_address.into(),
+            Arc::clone(&liquidity_registry),
+            &config,
+        );
+        registry_builder = registry_builder
+            .register(msa)
+            .expect("MSA registration must succeed");
+        tracing::info!("L13: MSA registered (Option B + LiquidityRegistry)");
+    } else {
+        tracing::warn!("L13: no MSA entry in IntegrityRegistry — MSA NOT registered");
+    }
+
+    if let Some(entry) = find_entry("LA") {
+        let la = LaStrategy::new(
+            chain_id,
+            entry.bytecode_hash.into(),
+            entry.contract_address.into(),
+            Arc::clone(&liquidity_registry),
+            Arc::clone(&position_registry),
+            &config,
+        );
+        registry_builder = registry_builder
+            .register(la)
+            .expect("LA registration must succeed");
+        tracing::info!("L13: LA registered from deployment manifest");
+    } else {
+        tracing::warn!("L13: no LA entry in IntegrityRegistry — LA NOT registered");
+    }
+
+    if let Some(entry) = find_entry("MEV") {
+        let mev = MevStrategy::new(
+            chain_id,
+            entry.bytecode_hash.into(),
+            entry.contract_address.into(),
+            &config,
+        );
+        registry_builder = registry_builder
+            .register(mev)
+            .expect("MEV registration must succeed");
+        tracing::info!("L13: MEV registered from deployment manifest");
+    } else {
+        tracing::warn!("L13: no MEV entry in IntegrityRegistry — MEV NOT registered");
     }
 
     let registry = registry_builder.build();
@@ -1910,6 +1815,7 @@ async fn main() -> Result<()> {
         let nr3 = nonce_registry.clone();
         let ir3 = Arc::clone(&integrity_registry);
         let et3 = exposure_tracker.clone();
+        let max_exp3 = max_account_exposure_wei;
         let fl3 = flashloan_liq_rx.clone();
         let cid3 = chain_id;
         let va3 = vault_address;
@@ -1920,8 +1826,8 @@ async fn main() -> Result<()> {
         let msa3 = Arc::clone(&mev_share_activity);
         tokio::spawn(async move {
             run_scoring_loop(
-                reg, ora3, cl3, py3, tw3, dag2, tx, pq, halt3, ph, ep3, nr3, ir3, et3, fl3, cid3,
-                va3, pt3, zv3, pp3, l1e3, msa3,
+                reg, ora3, cl3, py3, tw3, dag2, tx, pq, halt3, ph, ep3, nr3, ir3, et3, max_exp3,
+                fl3, cid3, va3, pt3, zv3, pp3, l1e3, msa3,
             )
             .await;
         });
@@ -1998,6 +1904,7 @@ async fn run_scoring_loop(
     nonce_registry: omega_security::replay::NonceRegistry,
     integrity_registry: Arc<IntegrityRegistry>,
     exposure_tracker: AccountExposureTracker,
+    max_account_exposure_wei: u128,
     flashloan_liq_rx: tokio::sync::watch::Receiver<FlashloanLiquidityState>,
     chain_id: u64,
     vault_address: [u8; 20],
@@ -2048,6 +1955,7 @@ async fn run_scoring_loop(
                     let ir2 = Arc::clone(&integrity_registry);
                     let gv2 = gas_volatility_risk;
                     let et2 = exposure_tracker.clone();
+                    let max_exp2 = max_account_exposure_wei;
                     let fl2 = flashloan_liq_rx.clone();
                     let cid2 = chain_id;
                     let va2 = vault_address;
@@ -2059,7 +1967,7 @@ async fn run_scoring_loop(
                     tokio::spawn(async move {
                         score_and_admit(
                             strategy, s2, dag2, tx2, pq2, h2, ph, os2, ep2, nr2, ir2, gv2, et2,
-                            fl2, cid2, va2, pt2, zv2, pp2, l1e2, msa2,
+                            max_exp2, fl2, cid2, va2, pt2, zv2, pp2, l1e2, msa2,
                         )
                         .await;
                     });
@@ -2088,6 +1996,7 @@ async fn score_and_admit(
     integrity_registry: Arc<IntegrityRegistry>,
     gas_volatility_risk: f64,
     exposure_tracker: AccountExposureTracker,
+    max_account_exposure_wei: u128,
     flashloan_liq_rx: tokio::sync::watch::Receiver<FlashloanLiquidityState>,
     chain_id: u64,
     vault_address: [u8; 20],
@@ -2373,7 +2282,7 @@ async fn score_and_admit(
             mev_share_activity.events_in_window(now_ms)
         }),
         max_competition_probability_from_env(),
-        max_account_exposure_wei_from_env(),
+        max_account_exposure_wei,
         rollout_tier_from_env(),
     );
     let current_block_timestamp_secs = chrono::Utc::now().timestamp().max(0) as u64;
@@ -2389,10 +2298,18 @@ async fn score_and_admit(
         .await
     {
         Ok(outcome) => {
+            let strategy_label = strategy.strategy_id().to_string();
+            let amount: u128 = bp.flashloan_amount.try_into().unwrap_or(u128::MAX);
+            exposure_tracker.release(&strategy_label, amount);
+            let highest = nonce_registry.record_processed(&strategy_label, chain_id, bp.nonce);
             tracing::debug!(
                 hash = %bp.blueprint_hash,
                 outcome = ?outcome,
-                "ExecutionPipeline::execute completed"
+                strategy = %strategy_label,
+                blueprint_nonce = bp.nonce,
+                highest_processed = highest,
+                released_exposure_wei = amount,
+                "ExecutionPipeline::execute completed; nonce+exposure updated"
             );
         }
         Err(e) => {
@@ -2788,7 +2705,7 @@ mod hot_path_zk_provisioning_tests {
     // admission on proof completion, reimporting the latency cost the hot path exists to
     // avoid).
     //
-    // ASSUMPTION FLAGGED, NOT VERIFIED: imports omega_strategies::SaStrategy on the
+    // VERIFIED / closed — see StrategyEntry and omega-strategies lib.rs re-exports.
     // assumption it's re-exported at that crate's root, the same way CnryStrategy is
     // (per this file's top-level `use`). Not confirmed against
     // crates/omega-strategies/src/lib.rs directly — if the re-export doesn't exist, use
@@ -3048,6 +2965,7 @@ mod hot_path_zk_provisioning_tests {
                 integrity_registry,
                 0.0, // gas_volatility_risk
                 exposure_tracker,
+                1_000_000_000_000_000_000u128,
                 flashloan_liq_rx,
                 TEST_CHAIN_ID,
                 [0x11u8; 20], // vault_address

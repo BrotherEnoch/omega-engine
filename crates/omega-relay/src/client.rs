@@ -31,6 +31,17 @@ pub struct BundlePayload {
     pub max_timestamp: Option<u64>,
     /// Priority fee in gwei (Arbitrum sequencer tip).
     pub priority_fee_gwei: u64,
+    /// Local metadata — NOT sent to relays.
+    #[serde(default, skip_serializing)]
+    pub strategy_id: String,
+    /// Nonce for this bundle's replacement/cancellation, used for local dedup —
+    /// NOT sent to relays.
+    #[serde(default, skip_serializing)]
+    pub nonce: u64,
+    /// Expected net profit in wei for this bundle, used for reputation/ranking —
+    /// NOT sent to relays.
+    #[serde(default, skip_serializing)]
+    pub expected_profit_net_wei: u128,
 }
 
 /// Outcome of a single relay submission.

@@ -1,6 +1,6 @@
-﻿// crates/omega-strategies/src/cnry.rs
+// crates/omega-strategies/src/cnry.rs
 //
-// Canary (CNRY) â€” Phase 0 signal validator (spec Â§1.1).
+// Canary (CNRY) — Phase 0 signal validator (spec §1.1).
 //
 // ## Audit note (this revision)
 //
@@ -230,7 +230,7 @@ mod tests {
             price_impact_bps: None,
             ofa_compliant: false,
             expiry_block: 0,
-            nonce: 0,
+            nonce: 1,
             confirmation_depth: 12,
             client_order_id,
             idempotency_key: B256::ZERO,

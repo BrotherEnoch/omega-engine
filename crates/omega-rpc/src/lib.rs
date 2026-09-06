@@ -145,6 +145,7 @@ mod arb_gas_info;
 mod chainlink_agg;
 mod net;
 mod flashloan_liq;
+mod aave_positions;
 
 pub mod client;
 pub mod rate_limiter;
@@ -166,6 +167,8 @@ pub use subscriptions::{
     run_pending_tx_stream, DexSyncEvent, FeeOracleEvent, LendingProtocol, LendingProtocolEvent,
     MevShareEvent, PendingTxEvent,
 };
+
+pub use aave_positions::AaveUserAccountData;
 
 pub use flashloan_liq::{
     resolve_liquidity_addresses, validate_deployed_contracts, AddressValidation,

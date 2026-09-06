@@ -4137,6 +4137,7 @@ dependencies = [
 name = "omega-engine"
 version = "12.0.0"
 dependencies = [
+ "alloy-primitives 0.8.26",
  "anyhow",
  "chrono",
  "hex",

@@ -263,6 +263,7 @@ impl NonceRegistry {
     }
 
     /// Advance the nonce for `(strategy_id, chain_id)` after on-chain confirmation.
+    /// Prefer `record_processed` when the actual blueprint nonce is known.
     pub fn advance(&self, strategy_id: &str, chain_id: u64) -> Result<u64, SecurityError> {
         let key = nonce_map_key(strategy_id, chain_id);
         let mut entry = self.nonces.entry(key).or_insert_with(|| NonceState {
@@ -279,6 +280,34 @@ impl NonceRegistry {
             })?;
         entry.next_nonce = next;
         Ok(next)
+    }
+
+    /// Record that blueprint nonce `processed_nonce` was accepted (pipeline) or
+    /// confirmed on-chain (Stage-7). Sets tracked value to max(current, processed).
+    pub fn record_processed(
+        &self,
+        strategy_id: &str,
+        chain_id: u64,
+        processed_nonce: u64,
+    ) -> u64 {
+        let key = nonce_map_key(strategy_id, chain_id);
+        let mut entry = self.nonces.entry(key).or_insert_with(|| NonceState {
+            next_nonce: 0,
+            chain_id,
+            strategy_id: strategy_id.to_string(),
+        });
+        if processed_nonce > entry.next_nonce {
+            entry.next_nonce = processed_nonce;
+        }
+        let highest = entry.next_nonce;
+        tracing::debug!(
+            strategy = strategy_id,
+            chain_id,
+            processed_nonce,
+            highest,
+            "NonceRegistry::record_processed"
+        );
+        highest
     }
 
     /// Sync the expected nonce from the on-chain value (called on startup and
@@ -430,6 +459,18 @@ mod replay_tests {
         assert_eq!(r.next_nonce("MSA", 42161), 1);
         r.on_chain_nonce_sync("MSA", 42161, 99);
         assert_eq!(r.next_nonce("MSA", 42161), 99);
+    }
+
+    #[test]
+    fn record_processed_advances_highest() {
+        let r = NonceRegistry::new();
+        assert_eq!(r.next_nonce("LA", 42161), 0);
+        r.record_processed("LA", 42161, 1);
+        assert_eq!(r.next_nonce("LA", 42161), 1);
+        r.record_processed("LA", 42161, 3);
+        assert_eq!(r.next_nonce("LA", 42161), 3);
+        r.record_processed("LA", 42161, 2);
+        assert_eq!(r.next_nonce("LA", 42161), 3);
     }
 
     #[test]

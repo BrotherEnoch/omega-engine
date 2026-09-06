@@ -179,7 +179,7 @@ impl LaStrategy {
     ) -> Arc<Self> {
         Arc::new(Self {
             chain_id,
-            nonce: AtomicU64::new(0),
+            nonce: AtomicU64::new(1),
             bytecode_hash,
             contract_addr,
             liquidity_registry,
