@@ -760,10 +760,16 @@ mod tests {
         assert!(check_auth(&h, "secret").is_err());
     }
 
-    #[test]
+        #[test]
     fn load_config_missing_file_returns_defaults() {
         let cfg = load_config("/tmp/omega_nonexistent_xyz.toml").unwrap();
-        assert_eq!(cfg.active_phase, 0);
+        assert_eq!(
+            cfg.active_phase,
+            4,
+            "missing config file falls back to OmegaConfig::default(), which is \
+             active_phase 4 (full production) by design — see omega-core's \
+             defaults::active_phase() doc comment"
+        );
     }
 
     #[test]
