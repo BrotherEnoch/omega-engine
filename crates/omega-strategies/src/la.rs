@@ -127,7 +127,6 @@ use omega_positions::PositionRegistry;
 
 use crate::flashloan_select::to_blueprint_provider_type;
 
-
 // ─────────────────────────────────────────────────────────────────────────────
 // Token price lookup (injected; keeps omega-strategies free of omega-oracle)
 // ─────────────────────────────────────────────────────────────────────────────

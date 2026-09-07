@@ -21,7 +21,19 @@ export FLASHBOTS_AUTH_KEY=...
 - Prefer generating via `omega-manifest-gen` against live `eth_getCode`
 - Confirm strategy id strings match what IntegrityRegistry / Stage 2b expect (`SA`, `MSA`, `LA`, `MEV`, …)
 
-## 3. Kill switch
+## 3. Kill switch (Gap 5 — REQUIRED when active_phase ≥ 1)
+
+All four variables **must be set explicitly** before raising `active_phase` above 0.
+Silent defaults are refused at phase ≥ 1.
+
+```bash
+export OMEGA_KILL_MAX_CUMULATIVE_LOSS_WEI=1000000000000000000   # 1 ETH example
+export OMEGA_KILL_MAX_LOSS_PER_WINDOW_WEI=250000000000000000    # 0.25 ETH
+export OMEGA_KILL_LOSS_WINDOW_SECS=3600
+export OMEGA_KILL_MAX_CONSECUTIVE_FAILURES=5
+```
+
+## 3b. Kill switch (reference defaults for shadow phase 0 only)
 
 Defaults (from P8 residual package):
 

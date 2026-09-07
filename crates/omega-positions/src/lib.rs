@@ -228,6 +228,21 @@ impl PositionRegistry {
         };
         self.snapshots.remove(&key);
     }
+
+    /// Drop every tracked position for `chain_id` (LA reorg rescore path).
+    pub fn invalidate_chain(&self, chain_id: u64) -> usize {
+        let keys: Vec<PositionKey> = self
+            .snapshots
+            .iter()
+            .filter(|e| e.key().chain_id == chain_id)
+            .map(|e| e.key().clone())
+            .collect();
+        let n = keys.len();
+        for k in keys {
+            self.snapshots.remove(&k);
+        }
+        n
+    }
 }
 
 impl Default for PositionRegistry {
@@ -371,4 +386,15 @@ mod tests {
         let reg = PositionRegistry::new();
         reg.remove(42161, addr(0x99), addr(0x98)); // must not panic
     }
+
+    #[test]
+    fn invalidate_chain_removes_only_matching_chain() {
+        let reg = PositionRegistry::new();
+        reg.update(42161, sample_snapshot(0x01, 0x02, E18 - 1));
+        reg.update(1, sample_snapshot(0x03, 0x04, E18 - 1));
+        assert_eq!(reg.invalidate_chain(42161), 1);
+        assert_eq!(reg.liquidatable_positions(42161).len(), 0);
+        assert_eq!(reg.liquidatable_positions(1).len(), 1);
+    }
+
 }

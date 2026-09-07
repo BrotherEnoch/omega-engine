@@ -28,6 +28,16 @@
 //
 // ## Changelog (most recent first within each item; see VCS for full history)
 //
+// - C10f (this package, patch): fixed the `-D warnings` clippy failure —
+//   `use std::collections::{HashMap, HashSet};` triggered `unused_imports` on
+//   `HashSet` because the only `HashSet` usage in this file (the Gap 6 manifest
+//   completeness check below) already spells it out via the fully-qualified
+//   `std::collections::HashSet` path rather than the bare imported name. Fixed by
+//   importing only `HashMap`; behavior is unchanged, this is formatting/import-hygiene
+//   only. `cargo test --workspace` and `cargo check --workspace` already passed before
+//   this fix — only `cargo clippy --workspace --all-targets -- -D warnings` (and
+//   consequently the "test" target build under clippy) was failing on it.
+//
 // - C10c (this package, patch): fixed pyth_ratio in build_check_context's oracle
 //   freshness calculation — it was dividing Pyth's age by CHAINLINK_STALENESS_SECS
 //   instead of PYTH_STALENESS_SECS (a copy-paste bug from the adjacent cl_ratio line).
@@ -204,6 +214,10 @@ use omega_zk::{
 // Nothing in this codebase writes to it yet — see the C8 changelog entry above and the
 // warning logged at the L13 registration site below.
 use omega_positions::PositionRegistry;
+// C10f: HashSet dropped from this import — its only use in this file (the Gap 6
+// manifest-completeness check below) already spells it out as the fully-qualified
+// `std::collections::HashSet`, so importing the bare name here was unused and tripped
+// `-D warnings` under clippy.
 use std::collections::HashMap;
 
 /// Fallback chain ID (Arbitrum One) used only when OMEGA_CHAIN_ID is unset.
@@ -294,43 +308,74 @@ fn rollout_tier_from_env() -> f64 {
 
 /// Production kill-switch thresholds (P8 residual).
 /// Env overrides; defaults are deliberately tight vs the prior u128::MAX placeholders.
-fn kill_switch_config_from_env() -> KillSwitchConfig {
-    fn parse_u128(name: &str, default: u128) -> u128 {
-        std::env::var(name)
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .filter(|&v| v > 0)
-            .unwrap_or(default)
+/// Load kill-switch thresholds from env.
+///
+/// Threshold evaluation (cumulative / window / consecutive failures) is
+/// implemented in `omega_risk::kill_switch`. This loads the caps only.
+///
+/// Phase 0 may use defaults. Phase ≥ 1 requires every `OMEGA_KILL_*` set
+/// explicitly (no silent live defaults).
+fn kill_switch_config_from_env(active_phase: u8) -> anyhow::Result<KillSwitchConfig> {
+    const DEFAULT_CUMULATIVE: u128 = 1_000_000_000_000_000_000;
+    const DEFAULT_WINDOW_LOSS: u128 = 250_000_000_000_000_000;
+    const DEFAULT_WINDOW_SECS: u64 = 3600;
+    const DEFAULT_CONSEC: u32 = 5;
+
+    fn req_u128(key: &str, default: u128, require: bool) -> anyhow::Result<u128> {
+        match std::env::var(key) {
+            Ok(s) => s.parse().map_err(|e| anyhow::anyhow!("{key}={s:?}: {e}")),
+            Err(_) if require => Err(anyhow::anyhow!(
+                "{key} must be set when active_phase >= 1 (no silent kill defaults)"
+            )),
+            Err(_) => Ok(default),
+        }
     }
-    fn parse_u32(name: &str, default: u32) -> u32 {
-        std::env::var(name)
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .filter(|&v| v > 0)
-            .unwrap_or(default)
+    fn req_u32(key: &str, default: u32, require: bool) -> anyhow::Result<u32> {
+        match std::env::var(key) {
+            Ok(s) => s.parse().map_err(|e| anyhow::anyhow!("{key}={s:?}: {e}")),
+            Err(_) if require => Err(anyhow::anyhow!(
+                "{key} must be set when active_phase >= 1 (no silent kill defaults)"
+            )),
+            Err(_) => Ok(default),
+        }
     }
-    fn parse_secs(name: &str, default: u64) -> Duration {
-        let secs = std::env::var(name)
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .filter(|&v: &u64| v > 0)
-            .unwrap_or(default);
-        Duration::from_secs(secs)
+    fn req_secs(key: &str, default: u64, require: bool) -> anyhow::Result<Duration> {
+        let v = match std::env::var(key) {
+            Ok(s) => {
+                let secs: u64 = s.parse().map_err(|e| anyhow::anyhow!("{key}={s:?}: {e}"))?;
+                if secs == 0 {
+                    return Err(anyhow::anyhow!("{key} must be > 0"));
+                }
+                secs
+            }
+            Err(_) if require => {
+                return Err(anyhow::anyhow!(
+                    "{key} must be set when active_phase >= 1 (no silent kill defaults)"
+                ));
+            }
+            Err(_) => default,
+        };
+        Ok(Duration::from_secs(v))
     }
-    KillSwitchConfig {
-        // 1 ETH all-time cumulative loss
-        max_cumulative_loss_wei: parse_u128(
+    let require = active_phase >= 1;
+    Ok(KillSwitchConfig {
+        max_cumulative_loss_wei: req_u128(
             "OMEGA_KILL_MAX_CUMULATIVE_LOSS_WEI",
-            1_000_000_000_000_000_000,
-        ),
-        // 0.25 ETH per window
-        max_loss_per_window_wei: parse_u128(
+            DEFAULT_CUMULATIVE,
+            require,
+        )?,
+        max_loss_per_window_wei: req_u128(
             "OMEGA_KILL_MAX_LOSS_PER_WINDOW_WEI",
-            250_000_000_000_000_000,
-        ),
-        loss_window: parse_secs("OMEGA_KILL_LOSS_WINDOW_SECS", 3600),
-        max_consecutive_failures: parse_u32("OMEGA_KILL_MAX_CONSECUTIVE_FAILURES", 5),
-    }
+            DEFAULT_WINDOW_LOSS,
+            require,
+        )?,
+        loss_window: req_secs("OMEGA_KILL_LOSS_WINDOW_SECS", DEFAULT_WINDOW_SECS, require)?,
+        max_consecutive_failures: req_u32(
+            "OMEGA_KILL_MAX_CONSECUTIVE_FAILURES",
+            DEFAULT_CONSEC,
+            require,
+        )?,
+    })
 }
 
 /// Matches L2c/L2d's cadence — a starting value, not measured against real chain behavior.
@@ -1203,7 +1248,8 @@ async fn main() -> Result<()> {
     tracing::info!("L6 DAG initialised");
 
     // ── ExecutionPipeline construction ─────────────────────────────────────────
-    let kill_switch_cfg = kill_switch_config_from_env();
+    let kill_switch_cfg =
+        kill_switch_config_from_env(active_phase).context("kill switch config")?;
     tracing::info!(
         max_cumulative_loss_wei = kill_switch_cfg.max_cumulative_loss_wei,
         max_loss_per_window_wei = kill_switch_cfg.max_loss_per_window_wei,
@@ -1234,14 +1280,34 @@ async fn main() -> Result<()> {
                 active_phase,
                 "Real deployment manifest loaded — strategies registered in IntegrityRegistry"
             );
+            // Gap 6: phase ≥ 1 requires strategies whose min_phase ≤ active_phase.
+            if active_phase >= 1 {
+                const REQUIRED: &[(&str, u8)] =
+                    &[("CNRY", 0), ("SA", 1), ("MSA", 2), ("LA", 3), ("MEV", 4)];
+                let present: std::collections::HashSet<String> =
+                    ids.iter().map(|s| s.to_ascii_uppercase()).collect();
+                let missing: Vec<String> = REQUIRED
+                    .iter()
+                    .filter(|(id, mp)| *mp <= active_phase && !present.contains(*id))
+                    .map(|(id, mp)| format!("{id} (min_phase={mp})"))
+                    .collect();
+                if !missing.is_empty() {
+                    anyhow::bail!(
+                        "Gap 6: manifest incomplete for active_phase={active_phase}: missing {}",
+                        missing.join(", ")
+                    );
+                }
+            }
         }
         None => {
+            if active_phase >= 1 {
+                anyhow::bail!(
+                    "Gap 6: no deployment manifest at {DEPLOYMENT_MANIFEST_PATH} while                      active_phase={active_phase}. Phase ≥ 1 requires CNRY/SA/MSA/LA/MEV entries."
+                );
+            }
             tracing::warn!(
                 path = DEPLOYMENT_MANIFEST_PATH,
-                "No deployment manifest found at the conventional path — IntegrityRegistry \
-                 empty, every strategy_id will fail Stage 2b as StrategyUnknown until a real \
-                 manifest (forge deploy output or an on-chain eth_getCode read — never \
-                 fabricated) is placed here"
+                "No deployment manifest — IntegrityRegistry empty (shadow phase 0 only)"
             );
         }
     }
@@ -1403,23 +1469,36 @@ async fn main() -> Result<()> {
         BuilderBlacklist::load(BUILDER_BLACKLIST_PATH).context("BuilderBlacklist::load")?;
 
     // startup_block: still 0 — no synchronous "current height" read available off `rpc`.
+    // Before reorg consumer (Gap 12): LA rescore invalidate needs this handle.
+    let position_registry = PositionRegistry::new();
+    tracing::info!("PositionRegistry ready for LA + reorg invalidate");
+
     let (relay, reorg_event_rx) =
         MultiRelayClient::new(relay_clients, relay_metrics, blacklist, &relay_cfg, 0);
 
-    // C6: own LaReorgRiskEvent — feed kill switch (do not discard).
+    // Gap 12 CLOSED: LaReorgRiskEvent → kill switch + LA position invalidate.
     {
         let mut rx = reorg_event_rx;
         let ks = Arc::clone(&kill_switches);
+        let positions = Arc::clone(&position_registry);
+        let cid = chain_id;
         tokio::spawn(async move {
             while let Some(ev) = rx.recv().await {
                 tracing::warn!(
                     orphaned_block = ev.orphaned_block,
                     rescore_at = ev.rescore_at_block,
-                    "LaReorgRiskEvent — recording unsuccessful outcome on kill switch"
+                    tx = %ev.tx_hash.0,
+                    "LaReorgRiskEvent — KS outcome + position invalidate"
                 );
                 if let Some(reason) = ks.record_outcome("global", None, false) {
                     tracing::error!(?reason, "kill switch tripped after reorg-risk event");
                 }
+                let removed = positions.invalidate_chain(cid);
+                tracing::info!(
+                    removed,
+                    chain_id = cid,
+                    "PositionRegistry invalidated for LA rescore after reorg"
+                );
             }
         });
     }
@@ -1710,78 +1789,69 @@ async fn main() -> Result<()> {
     // Different registry from IntegrityRegistry above. C8: LA is registered alongside
     // CNRY; SA/MSA/MEV are still not registered here.
 
-    // Real, live lending-position registry LaStrategy requires at construction. NOTHING
-    // IN THIS CODEBASE WRITES TO IT YET — no omega-oracle component exists to populate
-    // it from live chain data (Aave/Compound/Morpho health-factor scanning). Constructed
-    // here so LA is reachable and so a future writer has somewhere real to write to;
-    // until that writer exists, LaStrategy::select_position() always returns None and LA
-    // scores 0.0 every cycle, same observable behavior as before this revision.
-    let position_registry = PositionRegistry::new();
+    // ── LA debt-token price lookup (TokenPriceLookup) ─────────────────────────────
+    // Maps well-known Arbitrum debt tokens → Chainlink/Pyth symbol reads.
+    // Fail-closed: unknown token or missing/stale oracle → None → LA refuses blueprint.
 
-    
-// ── LA debt-token price lookup (TokenPriceLookup) ─────────────────────────────
-// Maps well-known Arbitrum debt tokens → Chainlink/Pyth symbol reads.
-// Fail-closed: unknown token or missing/stale oracle → None → LA refuses blueprint.
-
-struct OracleTokenPriceLookup {
-    chainlink: Arc<omega_oracle::ChainlinkOracle>,
-    pyth: Arc<omega_oracle::PythOracle>,
-}
-
-fn arbitrum_token_symbol(token: alloy_primitives::Address) -> Option<(&'static str, u8)> {
-    // (symbol, decimals)
-    const WETH: [u8; 20] = [
-        0x82, 0xaf, 0x49, 0x44, 0x7d, 0x8a, 0x07, 0xe3, 0xbd, 0x95, 0xbd, 0x0d, 0x56, 0xf3,
-        0x52, 0x41, 0x52, 0x3f, 0xba, 0xb1,
-    ];
-    const USDC: [u8; 20] = [
-        0xaf, 0x88, 0xd0, 0x65, 0xe7, 0x7c, 0x8c, 0xc2, 0x23, 0x93, 0x27, 0xc5, 0xed, 0xb3,
-        0xa4, 0x32, 0x26, 0x8e, 0x58, 0x31,
-    ];
-    const USDC_E: [u8; 20] = [
-        0xff, 0x97, 0x0a, 0x61, 0xa0, 0x4b, 0x1c, 0xa1, 0x48, 0x34, 0xa4, 0x3f, 0x5d, 0xe4,
-        0x53, 0x3e, 0xbd, 0xdb, 0x5c, 0xc8,
-    ];
-    const USDT: [u8; 20] = [
-        0xfd, 0x08, 0x6b, 0xc7, 0xcd, 0x5c, 0x48, 0x1d, 0xcc, 0x9c, 0x85, 0xeb, 0xe4, 0x78,
-        0xa1, 0xc0, 0xb6, 0x9f, 0xcb, 0xb9,
-    ];
-    let b: [u8; 20] = token.into();
-    if b == WETH {
-        Some(("WETH", 18))
-    } else if b == USDC || b == USDC_E {
-        Some(("USDC", 6))
-    } else if b == USDT {
-        Some(("USDT", 6))
-    } else {
-        None
+    struct OracleTokenPriceLookup {
+        chainlink: Arc<omega_oracle::ChainlinkOracle>,
+        pyth: Arc<omega_oracle::PythOracle>,
     }
-}
 
-impl omega_strategies::TokenPriceLookup for OracleTokenPriceLookup {
-    fn price_usd_and_decimals(&self, token: alloy_primitives::Address) -> Option<(f64, u8)> {
-        let (symbol, decimals) = arbitrum_token_symbol(token)?;
-        // Prefer Chainlink; fall back to Pyth. Both caches already enforce freshness
-        // at update time; is_fresh re-checks at read.
-        if let Some(p) = self.chainlink.read(symbol) {
-            if p.is_fresh() {
-                return Some((p.price_usd, decimals));
-            }
+    fn arbitrum_token_symbol(token: alloy_primitives::Address) -> Option<(&'static str, u8)> {
+        // (symbol, decimals)
+        const WETH: [u8; 20] = [
+            0x82, 0xaf, 0x49, 0x44, 0x7d, 0x8a, 0x07, 0xe3, 0xbd, 0x95, 0xbd, 0x0d, 0x56, 0xf3,
+            0x52, 0x41, 0x52, 0x3f, 0xba, 0xb1,
+        ];
+        const USDC: [u8; 20] = [
+            0xaf, 0x88, 0xd0, 0x65, 0xe7, 0x7c, 0x8c, 0xc2, 0x23, 0x93, 0x27, 0xc5, 0xed, 0xb3,
+            0xa4, 0x32, 0x26, 0x8e, 0x58, 0x31,
+        ];
+        const USDC_E: [u8; 20] = [
+            0xff, 0x97, 0x0a, 0x61, 0xa0, 0x4b, 0x1c, 0xa1, 0x48, 0x34, 0xa4, 0x3f, 0x5d, 0xe4,
+            0x53, 0x3e, 0xbd, 0xdb, 0x5c, 0xc8,
+        ];
+        const USDT: [u8; 20] = [
+            0xfd, 0x08, 0x6b, 0xc7, 0xcd, 0x5c, 0x48, 0x1d, 0xcc, 0x9c, 0x85, 0xeb, 0xe4, 0x78,
+            0xa1, 0xc0, 0xb6, 0x9f, 0xcb, 0xb9,
+        ];
+        let b: [u8; 20] = token.into();
+        if b == WETH {
+            Some(("WETH", 18))
+        } else if b == USDC || b == USDC_E {
+            Some(("USDC", 6))
+        } else if b == USDT {
+            Some(("USDT", 6))
+        } else {
+            None
         }
-        if let Some(p) = self.pyth.read(symbol) {
-            if p.is_fresh() {
-                return Some((p.price_usd, decimals));
-            }
-        }
-        None
     }
-}
 
+    impl omega_strategies::TokenPriceLookup for OracleTokenPriceLookup {
+        fn price_usd_and_decimals(&self, token: alloy_primitives::Address) -> Option<(f64, u8)> {
+            let (symbol, decimals) = arbitrum_token_symbol(token)?;
+            // Prefer Chainlink; fall back to Pyth. Both caches already enforce freshness
+            // at update time; is_fresh re-checks at read.
+            if let Some(p) = self.chainlink.read(symbol) {
+                if p.is_fresh() {
+                    return Some((p.price_usd, decimals));
+                }
+            }
+            if let Some(p) = self.pyth.read(symbol) {
+                if p.is_fresh() {
+                    return Some((p.price_usd, decimals));
+                }
+            }
+            None
+        }
+    }
 
-    let la_price_lookup: Arc<dyn omega_strategies::TokenPriceLookup> = Arc::new(OracleTokenPriceLookup {
-        chainlink: Arc::clone(&chainlink_oracle),
-        pyth: Arc::clone(&pyth_oracle),
-    });
+    let la_price_lookup: Arc<dyn omega_strategies::TokenPriceLookup> =
+        Arc::new(OracleTokenPriceLookup {
+            chainlink: Arc::clone(&chainlink_oracle),
+            pyth: Arc::clone(&pyth_oracle),
+        });
 
     let mut registry_builder = StrategyRegistryBuilder::new(active_phase)
         .register(CnryStrategy::new(chain_id, &config))
@@ -2062,6 +2132,23 @@ async fn run_scoring_loop(
     }
 }
 
+/// Release a DAG slot without panicking on a poisoned mutex (matches
+/// DagSlotGuard's recovery posture in omega-execution).
+fn dag_complete_slot(dag: &Arc<Mutex<ExecutionDag>>, hash: alloy_primitives::B256) {
+    match dag.lock() {
+        Ok(mut g) => {
+            g.complete(hash);
+        }
+        Err(poisoned) => {
+            tracing::error!(
+                blueprint_hash = %hash,
+                "DAG mutex poisoned — recovering guard and completing slot"
+            );
+            poisoned.into_inner().complete(hash);
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn score_and_admit(
     strategy: Arc<dyn omega_core::StrategyTrait>,
@@ -2261,7 +2348,7 @@ async fn score_and_admit(
                     error = %e,
                     "ZK proof submission rejected by queue — dropping blueprint, NOT executing"
                 );
-                dag.lock().unwrap().complete(bp.blueprint_hash);
+                dag_complete_slot(&dag, bp.blueprint_hash);
                 return;
             }
         };
@@ -2274,7 +2361,7 @@ async fn score_and_admit(
                     error = %zk_error,
                     "ZK proof generation failed — dropping blueprint, NOT executing"
                 );
-                dag.lock().unwrap().complete(bp.blueprint_hash);
+                dag_complete_slot(&dag, bp.blueprint_hash);
                 return;
             }
             Err(_recv_error) => {
@@ -2283,7 +2370,7 @@ async fn score_and_admit(
                     "ZK proof response channel closed before a result arrived (worker \
                      crashed or shut down?) — dropping blueprint, NOT executing"
                 );
-                dag.lock().unwrap().complete(bp.blueprint_hash);
+                dag_complete_slot(&dag, bp.blueprint_hash);
                 return;
             }
         };
@@ -2297,7 +2384,7 @@ async fn score_and_admit(
                  here most likely signals a vault_address/profit_token configuration bug, or \
                  something worse."
             );
-            dag.lock().unwrap().complete(bp.blueprint_hash);
+            dag_complete_slot(&dag, bp.blueprint_hash);
             return;
         }
 
