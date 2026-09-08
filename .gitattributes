@@ -1,0 +1,31 @@
+﻿# Normalize line endings to LF for all text files, regardless of platform
+# or which editor/tool last touched them. Prevents CRLF/LF diff noise like
+# the ~175-line diff churn a single-character encoding fix produced this
+# session, purely from a Windows tool round-tripping line endings.
+* text=auto eol=lf
+
+# Rust source — explicit, since this is a Rust workspace and config.rs
+# specifically has already caused two encoding/line-ending incidents.
+*.rs text eol=lf
+
+# Other source and config files worth pinning explicitly
+*.toml text eol=lf
+*.md   text eol=lf
+*.yml  text eol=lf
+*.yaml text eol=lf
+*.json text eol=lf
+*.sh   text eol=lf
+*.proto text eol=lf
+
+# Windows-specific scripts should keep CRLF (batch files expect it)
+*.bat  text eol=crlf
+*.ps1  text eol=crlf
+
+# Binary files — never touch these
+*.png  binary
+*.jpg  binary
+*.jpeg binary
+*.gif  binary
+*.ico  binary
+*.woff binary
+*.woff2 binary
