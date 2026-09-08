@@ -2,16 +2,11 @@
 //
 // ExecutionPipeline — implements Stages 0-6 of
 // ExecutionPipelineSpecification.md. Stage 7 (confirmation reconciliation)
-// is deliberately NOT part of this type — it's already fully implemented
-// as omega_relay::MultiRelayClient::reconcile_inclusions and only needs a
-// periodic caller-owned interval loop (same shape as main.rs's existing
-// run_health_monitor), which belongs in the binary that constructs
-// everything else, not in this library crate. Wiring reconcile_inclusions'
-// output into KillSwitchRegistry::record_outcome additionally requires
-// confirming ConfirmationResult's exact field set (does it carry
-// strategy_id / realized_profit_wei, or only relay/included?) —
-// confirmation.rs was not read in the investigation that produced this
-// crate, so that wiring is left undone here rather than guessed at.
+// is deliberately NOT part of this type: inclusion I/O lives in
+// `omega_relay::MultiRelayClient::reconcile_inclusions`, and the driver +
+// kill-switch / NonceRegistry side-effects live in `crate::stage7`. The
+// binary starts `run_stage7_reconciliation_loop` with the same
+// `Arc<KillSwitchRegistry>` this pipeline uses for Stage 2a.
 //
 // ## Resolutions to ExecutionPipelineSpecification.md §12's open questions
 //

@@ -27,13 +27,10 @@
 //   the workspace; `pipeline::resolve_flashloan_provider_id` fails closed
 //   for any non-zero flashloan address rather than silently defeating
 //   that safety check with an unmatchable placeholder string.
-// - Stage 7 (confirmation reconciliation). Already fully implemented as
-//   `omega_relay::MultiRelayClient::reconcile_inclusions` — this crate
-//   doesn't wrap it, since it just needs a periodic caller-owned
-//   `tokio::time::interval` loop (belongs in the binary), and because
-//   wiring its output into `KillSwitchRegistry::record_outcome` requires
-//   confirming `ConfirmationResult`'s exact field set against
-//   `confirmation.rs`, which was not read while building this crate.
+// - Stage 7 *chain I/O* (`MultiRelayClient::reconcile_inclusions`) lives in
+//   omega-relay. This crate owns the driver + side-effects in `stage7`
+//   (kill-switch outcomes, NonceRegistry advance, audit logging). See
+//   `stage7.rs` for the provisional realized-P&L policy.
 // - Construction of `KillSwitchRegistry` / `MultiRelayClient` /
 //   `ExecutionDag` with real production values — those require real
 //   deployment configuration (relay endpoints + auth, kill-switch
@@ -52,6 +49,7 @@ pub mod idempotency;
 pub mod pipeline;
 pub mod relay_factory;
 pub mod signer;
+pub mod stage7;
 pub mod transform;
 
 pub use background_tasks::{run_idempotency_eviction_loop, run_reorg_event_drain_loop};
@@ -63,4 +61,8 @@ pub use idempotency::IdempotencyCache;
 pub use pipeline::{ExecutionOutcome, ExecutionPipeline};
 pub use relay_factory::{RelayClientFactory, UnconfiguredRelayClientFactory};
 pub use signer::{SignedTransaction, TransactionSigner, UnconfiguredSigner};
+pub use stage7::{
+    process_confirmation_results, run_stage7_interval_loop, run_stage7_reconciliation_loop,
+    ProcessedConfirmation, Stage7Config,
+};
 pub use transform::{build_bundle_payload, ARBITRUM_BLOCK_TIME_MS};

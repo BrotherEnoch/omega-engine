@@ -172,7 +172,9 @@ use omega_dag::{DagConfig, ExecutionDag};
 use omega_execution::config_translation::{translate_relay_config, RelayBootstrapInputs};
 use omega_execution::run_idempotency_eviction_loop;
 use omega_execution::signer::KeyManagerTransactionSigner;
-use omega_execution::ExecutionPipeline;
+use omega_execution::{
+    process_confirmation_results, ExecutionPipeline, Stage7Config,
+};
 use omega_health::{halt::HaltFlag, LayerHealthImpl};
 use omega_hot_path::{HotPathConfig, HotPathRequest, HotPathRunner, MICROTX_GAS_LIMIT};
 use omega_observability::{
@@ -1599,55 +1601,42 @@ async fn main() -> Result<()> {
     let nonce_registry = omega_security::replay::NonceRegistry::new();
     tracing::info!("NonceRegistry ready — advanced on execute Ok + Stage-7 inclusion");
 
-    // ── Reconciliation lifecycle (Stage-7) ──────────────────────────────────────
+    // ── Stage 7: confirmation reconciliation ───────────────────────────────────
+    // Inclusion I/O: MultiRelayClient::reconcile_inclusions.
+    // Side-effects (kill switch, NonceRegistry, audit log): process_confirmation_results.
+    // Shares the same KillSwitchRegistry Arc as ExecutionPipeline Stage 2a.
+    // Realized P&L is provisional (expected) until vault pending_profit is
+    // queried — see omega_execution::stage7 module docs.
     {
-        let relay5 = Arc::clone(&relay);
-        let oracle5 = Arc::clone(&oracle);
-        let ks5 = Arc::clone(&kill_switches);
-        let nr5 = nonce_registry.clone();
-        let cid5 = chain_id;
-        let count_missed = std::env::var("OMEGA_KS_COUNT_MISSED_PROFIT")
-            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-            .unwrap_or(false);
-        let mut rx = oracle5.subscribe();
+        let relay7 = Arc::clone(&relay);
+        let oracle7 = Arc::clone(&oracle);
+        let ks7 = Arc::clone(&kill_switches);
+        let nr7 = nonce_registry.clone();
+        let stage7_cfg = Stage7Config::from_env(chain_id);
+        let mut rx = oracle7.subscribe();
         tokio::spawn(async move {
             loop {
                 match rx.recv().await {
                     Ok(_) => {
-                        let current_block = oracle5.snapshot().fee.block_number;
-                        let results = relay5.reconcile_inclusions(current_block).await;
-                        for r in &results {
-                            let scope = if r.strategy_id.is_empty() {
-                                "global".to_string()
-                            } else {
-                                r.strategy_id.clone()
-                            };
-                            let realized: Option<i128> = if r.included {
-                                Some(r.expected_profit_net_wei.min(i128::MAX as u128) as i128)
-                            } else if count_missed && r.expected_profit_net_wei > 0 {
-                                Some(-(r.expected_profit_net_wei.min(i128::MAX as u128) as i128))
-                            } else {
-                                None
-                            };
-                            if let Some(reason) = ks5.record_outcome(&scope, realized, r.included) {
-                                tracing::error!(
-                                    ?reason, strategy = %scope, included = r.included, nonce = r.nonce,
-                                    "kill switch tripped after Stage-7 reconciliation"
-                                );
-                            }
-                            if r.included && !r.strategy_id.is_empty() {
-                                let _ = nr5.record_processed(&r.strategy_id, cid5, r.nonce);
-                            }
+                        let current_block = oracle7.snapshot().fee.block_number;
+                        let results = relay7.reconcile_inclusions(current_block).await;
+                        if !results.is_empty() {
+                            let _ = process_confirmation_results(
+                                &results,
+                                ks7.as_ref(),
+                                &nr7,
+                                &stage7_cfg,
+                            );
                         }
                     }
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
-                        tracing::warn!(skipped = n, "reconciliation loop lagged");
+                        tracing::warn!(skipped = n, "Stage-7 reconciliation loop lagged");
                     }
                     Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
                 }
             }
         });
-        tracing::info!("Stage-7 reconciliation started (per-strategy KS + NonceRegistry)");
+        tracing::info!("Stage-7 reconciliation started (omega_execution::stage7)");
     }
 
     // ── L7: ZK ────────────────────────────────────────────────────────────────
