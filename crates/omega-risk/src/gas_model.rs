@@ -254,7 +254,10 @@ mod gas_model_tests {
         );
         // Explicitly guard the fractional l2 component's rounding
         // direction, which is what this test is actually about.
-        assert!(expected_l2 >= 4, "l2 component must round 3.3 up to 4, not truncate to 3");
+        assert!(
+            expected_l2 >= 4,
+            "l2 component must round 3.3 up to 4, not truncate to 3"
+        );
     }
 
     #[test]

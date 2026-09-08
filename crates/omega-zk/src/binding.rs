@@ -89,7 +89,11 @@ pub fn compute_public_inputs_hash(
     token_word[12..32].copy_from_slice(&profit_token);
     buf.extend_from_slice(&token_word);
 
-    debug_assert_eq!(buf.len(), 160, "five 32-byte words must total exactly 160 bytes");
+    debug_assert_eq!(
+        buf.len(),
+        160,
+        "five 32-byte words must total exactly 160 bytes"
+    );
 
     let mut hasher = Keccak256::new();
     hasher.update(&buf);
@@ -159,10 +163,9 @@ mod binding_tests {
     #[test]
     fn matches_independent_keccak_oracle() {
         let got = compute_public_inputs_hash([0x11; 20], [0x22; 32], 1_000, [0x33; 20]);
-        let expected = hex::decode(
-            "431f54a4255bab0ac74cc0b392917f879f655d25422afd0b9ca28dba931182a5",
-        )
-        .unwrap();
+        let expected =
+            hex::decode("431f54a4255bab0ac74cc0b392917f879f655d25422afd0b9ca28dba931182a5")
+                .unwrap();
         assert_eq!(got.as_slice(), expected.as_slice());
     }
 }

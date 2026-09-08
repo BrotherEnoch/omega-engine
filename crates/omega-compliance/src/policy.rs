@@ -1,4 +1,4 @@
-﻿// crates/omega-compliance/src/policy.rs
+// crates/omega-compliance/src/policy.rs
 //
 // ## Fix (this revision): asset_symbol()/notional_value() don't exist on
 // ExecutionBlueprint, and can't be implemented on it
@@ -129,12 +129,7 @@ impl Default for CompliancePolicy {
             // this file's module-level "Fix (this revision, 3)" note.
             // CNRY excluded deliberately: it never produces a real
             // blueprint for this checker to validate.
-            allowed_strategies: vec![
-                "SA".into(),
-                "MSA".into(),
-                "LA".into(),
-                "MEV".into(),
-            ],
+            allowed_strategies: vec!["SA".into(), "MSA".into(), "LA".into(), "MEV".into()],
         }
     }
 }

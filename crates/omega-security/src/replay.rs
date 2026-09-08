@@ -284,12 +284,7 @@ impl NonceRegistry {
 
     /// Record that blueprint nonce `processed_nonce` was accepted (pipeline) or
     /// confirmed on-chain (Stage-7). Sets tracked value to max(current, processed).
-    pub fn record_processed(
-        &self,
-        strategy_id: &str,
-        chain_id: u64,
-        processed_nonce: u64,
-    ) -> u64 {
+    pub fn record_processed(&self, strategy_id: &str, chain_id: u64, processed_nonce: u64) -> u64 {
         let key = nonce_map_key(strategy_id, chain_id);
         let mut entry = self.nonces.entry(key).or_insert_with(|| NonceState {
             next_nonce: 0,

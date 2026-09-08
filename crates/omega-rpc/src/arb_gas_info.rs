@@ -107,8 +107,9 @@ impl OmegaRpcClient {
             // Unnamed single return (`returns (uint256)`, no name) —
             // alloy's codegen convention numbers it positionally as
             // `._0`, same as chainlink_agg.rs's `decimalsCall` decode.
-            let result = getL1BaseFeeEstimateCall::abi_decode_returns(&raw, true)
-                .map_err(|e| anyhow::anyhow!("ArbGasInfo getL1BaseFeeEstimate decode failed: {e}"))?;
+            let result = getL1BaseFeeEstimateCall::abi_decode_returns(&raw, true).map_err(|e| {
+                anyhow::anyhow!("ArbGasInfo getL1BaseFeeEstimate decode failed: {e}")
+            })?;
 
             let wei_u128 = result._0.saturating_to::<u128>();
             Ok(wei_to_gwei_saturating(wei_u128))
@@ -139,6 +140,10 @@ mod tests {
         // keccak256("getL1BaseFeeEstimate()")[0..4] — computed once here
         // and pinned, not re-derived at call time from a different path.
         let encoded = getL1BaseFeeEstimateCall {}.abi_encode();
-        assert_eq!(encoded.len(), 4, "no-arg call encodes to exactly 4 selector bytes");
+        assert_eq!(
+            encoded.len(),
+            4,
+            "no-arg call encodes to exactly 4 selector bytes"
+        );
     }
 }

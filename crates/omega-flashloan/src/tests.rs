@@ -560,5 +560,4 @@ mod flashloan_tests {
             } if best_available_wei == U256::ZERO
         ));
     }
-
 }

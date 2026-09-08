@@ -173,7 +173,12 @@ async fn process_request(
     // second argument, matching T1SoftwareProver::prove()'s real signature
     // (blueprint_hash, public_inputs_hash, net_profit_wei, strategy_id).
     let prove_future = tokio::task::spawn_blocking(move || {
-        prover2.prove(blueprint_hash, public_inputs_hash, net_profit_wei, &strategy_id2)
+        prover2.prove(
+            blueprint_hash,
+            public_inputs_hash,
+            net_profit_wei,
+            &strategy_id2,
+        )
     });
 
     let result = tokio::time::timeout(Duration::from_millis(sla_ms), prove_future).await;
@@ -278,7 +283,14 @@ mod worker_tests {
         // FIX (this revision): added a public_inputs_hash argument ([0xef; 32]) matching
         // submit()'s new signature — see queue.rs's own fix history.
         let rx = queue
-            .submit([0xde; 32], [0xef; 32], 500_000_000, 42161, "LA".into(), false)
+            .submit(
+                [0xde; 32],
+                [0xef; 32],
+                500_000_000,
+                42161,
+                "LA".into(),
+                false,
+            )
             .unwrap();
 
         let result = tokio::time::timeout(Duration::from_secs(60), rx)
@@ -313,7 +325,14 @@ mod worker_tests {
             // (derived from `i`, same as blueprint_hash) so this test can't accidentally
             // pass with every request aliased to the same public_inputs_hash.
             let rx = queue
-                .submit([i; 32], [i.wrapping_add(100); 32], 100 + i as u128, 42161, "SA".into(), false)
+                .submit(
+                    [i; 32],
+                    [i.wrapping_add(100); 32],
+                    100 + i as u128,
+                    42161,
+                    "SA".into(),
+                    false,
+                )
                 .unwrap();
             rxs.push(rx);
         }

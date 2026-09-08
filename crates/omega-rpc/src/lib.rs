@@ -141,11 +141,11 @@
 // consecutive tool invocations (`build`, `check`, `test`, `clippy`) before this fix
 // landed — anyone adding a new symbol to `flashloan_liq.rs` in the future needs to
 // remember this file has its own separate list to update.
+mod aave_positions;
 mod arb_gas_info;
 mod chainlink_agg;
-mod net;
 mod flashloan_liq;
-mod aave_positions;
+mod net;
 
 pub mod client;
 pub mod rate_limiter;

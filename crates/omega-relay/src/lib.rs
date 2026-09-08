@@ -419,11 +419,8 @@ mod integration_tests {
         // exact state main.rs's own reorg-drain task sits in today: it awaits
         // reorg_event_rx, but nothing anywhere calls on_new_block to ever
         // produce an event for it to receive.
-        let timed_out = tokio::time::timeout(
-            std::time::Duration::from_millis(100),
-            event_rx.recv(),
-        )
-        .await;
+        let timed_out =
+            tokio::time::timeout(std::time::Duration::from_millis(100), event_rx.recv()).await;
         assert!(
             timed_out.is_err(),
             "with on_new_block never called, no reorg event can ever be emitted — \

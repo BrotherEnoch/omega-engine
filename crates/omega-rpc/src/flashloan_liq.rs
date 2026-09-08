@@ -163,7 +163,8 @@ pub const ARBITRUM_ONE_CHAIN_ID: u64 = 42_161;
 /// Aave v3 Pool proxy, Arbitrum One market.
 /// Verified against Arbiscan (`0x794a61358d6845594f94dc1db02a252b5b4814ad`, contract
 /// name "Aave: Pool V3") in this session.
-pub const AAVE_V3_POOL: Address = alloy_primitives::address!("794a61358D6845594F94dc1DB02A252b5b4814aD");
+pub const AAVE_V3_POOL: Address =
+    alloy_primitives::address!("794a61358D6845594F94dc1DB02A252b5b4814aD");
 
 /// Aave v3 AaveProtocolDataProvider, Arbitrum One market.
 /// Verified against the `eth_defi` project's maintained Aave v3 address constants
@@ -178,7 +179,8 @@ pub const AAVE_PROTOCOL_DATA_PROVIDER: Address =
 /// against Arbiscan, Etherscan, GnosisScan, PolygonScan, and Balancer's own
 /// `balancer-deployments` GitHub repo, all agreeing on the same value — not a single
 /// source, and not trusted from memory alone.
-pub const BALANCER_V2_VAULT: Address = alloy_primitives::address!("BA12222222228d8Ba445958a75a0704d566BF2C8");
+pub const BALANCER_V2_VAULT: Address =
+    alloy_primitives::address!("BA12222222228d8Ba445958a75a0704d566BF2C8");
 
 /// Canonical bridged WETH on Arbitrum One.
 /// Verified against Arbiscan (`0x82af49447d8a07e3bd95bd0d56f35241523fbab1`, "Wrapped
@@ -190,7 +192,8 @@ pub const WETH: Address = alloy_primitives::address!("82aF49447D8a07e3bd95BD0d56
 /// conflate the two; see this module's header for why).
 /// Verified against Circle's own "USDC on Arbitrum" announcement and Arbiscan in this
 /// session.
-pub const USDC_NATIVE: Address = alloy_primitives::address!("af88d065e77c8cC2239327C5EDb3A432268e5831");
+pub const USDC_NATIVE: Address =
+    alloy_primitives::address!("af88d065e77c8cC2239327C5EDb3A432268e5831");
 
 /// Uniswap V3 WETH / USDC_NATIVE pool, 0.05% fee tier, Arbitrum One.
 ///

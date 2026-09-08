@@ -564,7 +564,6 @@ mod integrity_tests {
 
     #[test]
     fn freeze_is_permanent() {
-
         let reg = reg_with_sa();
         reg.freeze("SA");
         // Freeze again (idempotent) — still frozen

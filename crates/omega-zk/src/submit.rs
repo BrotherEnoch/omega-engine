@@ -81,10 +81,7 @@ pub fn encode_sp1_public_values(
 /// Build the opaque `bytes proof` argument expected by
 /// `SP1StarkVerifierAdapter.verify` / `OmegaVault.submitProof`:
 ///   abi.encode(bytes publicValues, bytes proofBytes)
-pub fn encode_sp1_adapter_proof_blob(
-    public_values: &[u8],
-    proof_bytes: &[u8],
-) -> Vec<u8> {
+pub fn encode_sp1_adapter_proof_blob(public_values: &[u8], proof_bytes: &[u8]) -> Vec<u8> {
     fn pad32(n: usize) -> usize {
         (32 - (n % 32)) % 32
     }
@@ -367,7 +364,11 @@ mod tests {
         assert_eq!(buf.len(), 2, "remaining 2 entries must stay buffered");
 
         let second_batch = buf.drain(10);
-        assert_eq!(second_batch.len(), 2, "drain(10) on 2 remaining must return just those 2");
+        assert_eq!(
+            second_batch.len(),
+            2,
+            "drain(10) on 2 remaining must return just those 2"
+        );
         assert!(buf.is_empty());
     }
 

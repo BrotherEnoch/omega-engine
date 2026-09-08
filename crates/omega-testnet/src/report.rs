@@ -201,7 +201,12 @@ impl TestnetReport {
 mod tests {
     use super::*;
 
-    fn outcome(expected: i128, realized: Option<i128>, accepted: bool, included: bool) -> RelayOutcome {
+    fn outcome(
+        expected: i128,
+        realized: Option<i128>,
+        accepted: bool,
+        included: bool,
+    ) -> RelayOutcome {
         RelayOutcome {
             cycle_index: 0,
             submitted_at: Utc::now(),
@@ -211,7 +216,11 @@ mod tests {
             blocks_to_inclusion: if included { Some(1) } else { None },
             expected_profit_wei: expected,
             realized_profit_wei: realized,
-            rejection_reason: if accepted { None } else { Some("stale_state".into()) },
+            rejection_reason: if accepted {
+                None
+            } else {
+                Some("stale_state".into())
+            },
         }
     }
 
@@ -228,7 +237,7 @@ mod tests {
     fn profit_divergence_only_counts_included() {
         let mut r = TestnetReport::new("test".into(), 11155111);
         r.record(outcome(100, Some(80), true, true)); // divergence 20
-        r.record(outcome(100, None, false, false));   // no divergence, no realized
+        r.record(outcome(100, None, false, false)); // no divergence, no realized
         assert_eq!(r.mean_profit_divergence_wei(), Some(20.0));
         assert_eq!(r.total_realized_profit_wei(), 80);
     }

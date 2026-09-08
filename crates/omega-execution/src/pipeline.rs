@@ -444,7 +444,6 @@ impl<S: TransactionSigner> ExecutionPipeline<S> {
             return Err(ExecutionError::RiskCheckFailed(code));
         }
 
-
         // ── Stage 2d: flashloan identity fail-closed ─────────────────────
         //
         // OmegaOrchestrator reverts when flashloanToken == address(0).

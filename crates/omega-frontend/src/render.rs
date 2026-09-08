@@ -23,12 +23,15 @@ impl RenderFrame {
         Self {
             revision: store.revision,
             status_label: status_label(store.realtime_status),
-            halted_layers: layers.iter().filter(|layer| layer.state == "HALTED").count(),
-            degraded_layers: layers.iter().filter(|layer| layer.state == "DEGRADED").count(),
-            operational_layers: layers
+            halted_layers: layers
                 .iter()
-                .filter(|layer| layer.is_operational)
+                .filter(|layer| layer.state == "HALTED")
                 .count(),
+            degraded_layers: layers
+                .iter()
+                .filter(|layer| layer.state == "DEGRADED")
+                .count(),
+            operational_layers: layers.iter().filter(|layer| layer.is_operational).count(),
         }
     }
 }

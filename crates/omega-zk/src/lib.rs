@@ -22,9 +22,9 @@ pub mod error;
 pub mod metrics;
 pub mod prover;
 pub mod queue;
+pub mod submit;
 pub mod verifier;
 pub mod worker;
-pub mod submit;
 
 pub use binding::{compute_public_inputs_hash, PUBLIC_INPUTS_VERSION};
 pub use checkpoint::ProofCheckpointManager;
@@ -33,10 +33,10 @@ pub use config::ZkConfig;
 pub use error::ZkError;
 pub use prover::{ProverTier, T1SoftwareProver, ZkProof};
 pub use queue::{ProofQueue, ProofRequest, ProofResponse, QueuePressure};
-pub use verifier::ZkVerifier;
-pub use worker::ProofWorkerPool;
 pub use submit::{
     encode_sp1_adapter_proof_blob, encode_sp1_public_values, encode_sp1_stark_proof_arg,
     encode_submit_proof_calldata, submit_proof_selector, PendingProofBuffer,
     VerifiedProofSubmission,
 };
+pub use verifier::ZkVerifier;
+pub use worker::ProofWorkerPool;

@@ -1,4 +1,4 @@
-﻿// crates/omega-rpc/src/client.rs
+// crates/omega-rpc/src/client.rs
 //
 // OmegaRpcClient — rate-limited WebSocket RPC client.
 //

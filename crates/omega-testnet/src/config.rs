@@ -72,10 +72,14 @@ impl TestnetConfig {
     /// guard. Call before starting any run.
     pub fn validate(&self) -> Result<()> {
         if self.run_label.trim().is_empty() {
-            return Err(TestnetError::InvalidConfig("run_label must not be empty".into()));
+            return Err(TestnetError::InvalidConfig(
+                "run_label must not be empty".into(),
+            ));
         }
         if self.rpc_url.trim().is_empty() {
-            return Err(TestnetError::InvalidConfig("rpc_url must not be empty".into()));
+            return Err(TestnetError::InvalidConfig(
+                "rpc_url must not be empty".into(),
+            ));
         }
         if self.relay_auth_key_env_var.trim().is_empty() {
             return Err(TestnetError::InvalidConfig(
@@ -88,15 +92,20 @@ impl TestnetConfig {
             ));
         }
         if self.burner_wallet_address.trim().is_empty() {
-            return Err(TestnetError::InvalidConfig("burner_wallet_address must not be empty".into()));
+            return Err(TestnetError::InvalidConfig(
+                "burner_wallet_address must not be empty".into(),
+            ));
         }
         if self.max_position_wei == 0 {
             return Err(TestnetError::InvalidConfig(
-                "max_position_wei must be > 0 (0 would mean the run can never submit anything)".into(),
+                "max_position_wei must be > 0 (0 would mean the run can never submit anything)"
+                    .into(),
             ));
         }
         if self.min_cycles == 0 {
-            return Err(TestnetError::InvalidConfig("min_cycles must be >= 1".into()));
+            return Err(TestnetError::InvalidConfig(
+                "min_cycles must be >= 1".into(),
+            ));
         }
 
         if KNOWN_MAINNET_CHAIN_IDS.contains(&self.chain_id) && !self.allow_mainnet_chain_id {

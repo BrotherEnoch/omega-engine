@@ -43,7 +43,10 @@ impl SimulationSubmitter {
             .map_err(|e| SimError::Other(anyhow::anyhow!(e)))?
             .with_chain_id(chain_id);
 
-        Ok(Self { provider, signer: wallet })
+        Ok(Self {
+            provider,
+            signer: wallet,
+        })
     }
 
     /// Explicit guard used by config validation and tests: any string that
@@ -52,7 +55,12 @@ impl SimulationSubmitter {
     /// guarantee above (`bound_to` only accepts a `ForkHandle`).
     pub fn reject_if_live_looking(candidate: &str) -> Result<()> {
         const FORBIDDEN_MARKERS: &[&str] = &[
-            "flashbots", "bloxroute", "titan", "eden", "relay.", "mev-share",
+            "flashbots",
+            "bloxroute",
+            "titan",
+            "eden",
+            "relay.",
+            "mev-share",
         ];
         let lower = candidate.to_lowercase();
         if FORBIDDEN_MARKERS.iter().any(|m| lower.contains(m)) {
@@ -191,7 +199,9 @@ mod tests {
     #[tokio::test]
     async fn test_reject_if_live_looking() {
         assert!(SimulationSubmitter::reject_if_live_looking("flashbots").is_err());
-        assert!(SimulationSubmitter::reject_if_live_looking("https://relay.flashbots.net").is_err());
+        assert!(
+            SimulationSubmitter::reject_if_live_looking("https://relay.flashbots.net").is_err()
+        );
         assert!(SimulationSubmitter::reject_if_live_looking("bloxroute").is_err());
         assert!(SimulationSubmitter::reject_if_live_looking("titan").is_err());
         assert!(SimulationSubmitter::reject_if_live_looking("eden").is_err());

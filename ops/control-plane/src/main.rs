@@ -159,9 +159,9 @@ use omega_observability::{EventRingBuffer, DEFAULT_CAPACITY};
 // AppState lives in state.rs; WsEvent/WS_CHANNEL_CAPACITY are the real,
 // frontend-shared types from omega_control_contracts::ws, NOT anything
 // local to this crate. See this file's module-level FIX note.
-pub use state::AppState;
 pub use omega_control_contracts::ws::{WsEvent, WS_CHANNEL_CAPACITY};
 use state::load_config;
+pub use state::AppState;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // CLI
@@ -760,12 +760,11 @@ mod tests {
         assert!(check_auth(&h, "secret").is_err());
     }
 
-        #[test]
+    #[test]
     fn load_config_missing_file_returns_defaults() {
         let cfg = load_config("/tmp/omega_nonexistent_xyz.toml").unwrap();
         assert_eq!(
-            cfg.active_phase,
-            4,
+            cfg.active_phase, 4,
             "missing config file falls back to OmegaConfig::default(), which is \
              active_phase 4 (full production) by design — see omega-core's \
              defaults::active_phase() doc comment"

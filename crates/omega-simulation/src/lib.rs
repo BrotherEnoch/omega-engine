@@ -29,9 +29,9 @@
 
 pub mod error;
 pub mod fork;
-pub mod submitter;
 pub mod harness;
 pub mod report;
+pub mod submitter;
 pub mod traits;
 
 pub use error::SimError;

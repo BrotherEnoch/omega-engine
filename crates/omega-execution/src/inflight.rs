@@ -133,10 +133,12 @@ impl InFlightJournal {
 
     fn append(&self, rec: &InFlightRecord) -> std::io::Result<()> {
         let _guard = self.lock.lock().unwrap_or_else(|e| e.into_inner());
-        let mut f = OpenOptions::new().create(true).append(true).open(&self.path)?;
-        let line = serde_json::to_string(rec).map_err(|e| {
-            std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string())
-        })?;
+        let mut f = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&self.path)?;
+        let line = serde_json::to_string(rec)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?;
         f.write_all(line.as_bytes())?;
         f.write_all(b"\n")?;
         f.flush()?;

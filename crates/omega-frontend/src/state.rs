@@ -77,12 +77,16 @@ impl EngineStore {
                     // `state`, `is_operational`, `reason`. Renamed to match
                     // the actual struct, same fix as render.rs's
                     // `stable_layer_key`.
-                    if let Some(entry) = health.layers.iter_mut().find(|entry| entry.layer_id == *layer)
+                    if let Some(entry) = health
+                        .layers
+                        .iter_mut()
+                        .find(|entry| entry.layer_id == *layer)
                     {
                         entry.state = to.clone();
                         entry.is_operational = to != "HALTED";
                     }
-                    health.system_halted = health.layers.iter().any(|entry| entry.state == "HALTED");
+                    health.system_halted =
+                        health.layers.iter().any(|entry| entry.state == "HALTED");
                 }
             }
             WsEvent::ModelPauseChanged { paused, .. } => {

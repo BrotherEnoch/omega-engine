@@ -160,17 +160,13 @@ pub fn priority_fee_gwei(
     raw.clamp(2, 500)
 }
 
-
 /// Blend tier-based competition probability with recent MEV-Share order-flow intensity.
 ///
 /// `mev_share_events_in_window` is the count of competition-indicating MEV-Share
 /// events observed in the last activity window (see main's MevShareActivityTracker).
 /// Each event adds a small bump (capped) so a quiet stream does not dominate the
 /// asset-tier model, while a burst of bundles pushes probability toward 0.99.
-pub fn competition_with_mev_share(
-    base_probability: f64,
-    mev_share_events_in_window: u32,
-) -> f64 {
+pub fn competition_with_mev_share(base_probability: f64, mev_share_events_in_window: u32) -> f64 {
     const PER_EVENT_BUMP: f64 = 0.02;
     const MAX_BUMP: f64 = 0.25;
     let bump = (mev_share_events_in_window as f64 * PER_EVENT_BUMP).min(MAX_BUMP);

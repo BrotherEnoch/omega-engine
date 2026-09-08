@@ -332,7 +332,14 @@ mod queue_tests {
         q: &ProofQueue,
         is_microtx: bool,
     ) -> Result<oneshot::Receiver<ProofResponse>, ZkError> {
-        q.submit([0x01; 32], [0x02; 32], 1_000, 42161, "LA".into(), is_microtx)
+        q.submit(
+            [0x01; 32],
+            [0x02; 32],
+            1_000,
+            42161,
+            "LA".into(),
+            is_microtx,
+        )
     }
 
     #[test]

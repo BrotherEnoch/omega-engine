@@ -86,7 +86,10 @@ impl SimulationReport {
 
     /// Total cycles that surfaced at least one opportunity attempt.
     pub fn attempted_count(&self) -> usize {
-        self.cycles.iter().filter(|c| c.opportunity.is_some()).count()
+        self.cycles
+            .iter()
+            .filter(|c| c.opportunity.is_some())
+            .count()
     }
 
     /// Successful on-fork executions (bundle landed, contract didn't revert).

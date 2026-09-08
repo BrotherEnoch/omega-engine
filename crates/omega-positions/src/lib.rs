@@ -396,5 +396,4 @@ mod tests {
         assert_eq!(reg.liquidatable_positions(42161).len(), 0);
         assert_eq!(reg.liquidatable_positions(1).len(), 1);
     }
-
 }

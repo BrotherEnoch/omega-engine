@@ -94,9 +94,8 @@ pub use la_bonus::{LaBonusOracle, LendingProtocol};
 pub use per_chain::{EilSnapshot, PerChainOracle};
 pub use pyth::PythOracle;
 pub use resolution::{
-    resolve_price, validate_observation_timestamp, validate_price_usd, OraclePrice,
-    OracleSource, DIVERGENCE_THRESHOLD, MAX_FUTURE_SKEW_SECS, PRIMARY_STALE_SECS,
-    TWAP_STALE_SECS,
+    resolve_price, validate_observation_timestamp, validate_price_usd, OraclePrice, OracleSource,
+    DIVERGENCE_THRESHOLD, MAX_FUTURE_SKEW_SECS, PRIMARY_STALE_SECS, TWAP_STALE_SECS,
 };
 pub use twap::TwapOracle;
 

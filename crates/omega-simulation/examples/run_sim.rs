@@ -89,7 +89,10 @@ async fn main() -> anyhow::Result<()> {
     })
     .await?;
 
-    tracing::info!(endpoint = harness.fork_endpoint(), "fork ready, running cycles");
+    tracing::info!(
+        endpoint = harness.fork_endpoint(),
+        "fork ready, running cycles"
+    );
     eprintln!(
         "WARNING: this run uses FixtureDetector (placeholder opportunities \
          targeting the zero address). net_profit_wei in the resulting \

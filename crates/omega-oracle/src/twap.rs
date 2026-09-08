@@ -1,4 +1,4 @@
-﻿// crates/omega-oracle/src/twap.rs
+// crates/omega-oracle/src/twap.rs
 //
 // Uniswap v3 TWAP price cache (tertiary oracle source, spec Â§7).
 //
@@ -103,8 +103,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use dashmap::DashMap;
 
 use crate::resolution::{
-    validate_observation_timestamp, validate_price_usd, OraclePrice, OracleSource,
-    TWAP_STALE_SECS,
+    validate_observation_timestamp, validate_price_usd, OraclePrice, OracleSource, TWAP_STALE_SECS,
 };
 
 // â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
@@ -317,16 +316,25 @@ impl TwapOracle {
     pub fn update(&self, token: &str, price_usd: f64, block_time: u64, block_number: u64) {
         // C8 fail-closed: reject invalid price or missing/future block timestamps.
         if let Err(reason) = validate_price_usd(price_usd) {
-            tracing::warn!(token, price_usd, reason, "TWAP update rejected (fail closed)");
+            tracing::warn!(
+                token,
+                price_usd,
+                reason,
+                "TWAP update rejected (fail closed)"
+            );
             return;
         }
         if let Err(reason) = validate_observation_timestamp(block_time) {
-            tracing::warn!(token, block_time, reason, "TWAP update rejected (fail closed)");
+            tracing::warn!(
+                token,
+                block_time,
+                reason,
+                "TWAP update rejected (fail closed)"
+            );
             return;
         }
 
         self.cache.insert(
-
             token.to_owned(),
             TwapEntry {
                 price_usd,

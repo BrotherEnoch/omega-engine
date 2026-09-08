@@ -869,7 +869,10 @@ mod tests {
             "an L2-base-fee-triggered FeeOracle signal must not clobber a \
              previously-set real l1_data_fee_gwei value"
         );
-        assert_eq!(snap.fee.base_fee_gwei, 10, "base fee itself still updates normally");
+        assert_eq!(
+            snap.fee.base_fee_gwei, 10,
+            "base fee itself still updates normally"
+        );
     }
 
     // ── L1 gas volatility risk (this revision) ────────────────────────────

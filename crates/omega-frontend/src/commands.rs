@@ -68,7 +68,9 @@ mod tests {
             routes::AuthTier::L2
         );
         assert_eq!(
-            FrontendCommand::RevertCheckpoint { version: 7 }.request().auth,
+            FrontendCommand::RevertCheckpoint { version: 7 }
+                .request()
+                .auth,
             routes::AuthTier::L2
         );
     }

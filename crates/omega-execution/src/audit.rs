@@ -150,10 +150,7 @@ mod tests {
     fn reject_reason_labels_are_stable() {
         assert_eq!(RejectReason::Halted.as_str(), "halted");
         assert_eq!(
-            RejectReason::InvalidFlashloanIdentity {
-                detail: "x".into()
-            }
-            .as_str(),
+            RejectReason::InvalidFlashloanIdentity { detail: "x".into() }.as_str(),
             "invalid_flashloan_identity"
         );
     }

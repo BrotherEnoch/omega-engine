@@ -107,60 +107,59 @@ use omega_observability::EventRingBuffer;
 
 pub struct AppState {
     // ── Config ────────────────────────────────────────────────────────────────
-    pub config:          RwLock<OmegaConfig>,
-    pub config_path:     PathBuf,
+    pub config: RwLock<OmegaConfig>,
+    pub config_path: PathBuf,
 
     // ── Gas model ─────────────────────────────────────────────────────────────
-    pub checkpoint_dir:  PathBuf,
-    pub model_paused:    AtomicBool,
+    pub checkpoint_dir: PathBuf,
+    pub model_paused: AtomicBool,
     pub ceiling_tracker: RwLock<CeilingEscalationTracker>,
 
     // ── Builder blacklist ─────────────────────────────────────────────────────
-    pub blacklist:       Arc<BuilderBlacklist>,
+    pub blacklist: Arc<BuilderBlacklist>,
 
     // ── Health ────────────────────────────────────────────────────────────────
-    pub health_layers:   Vec<Arc<LayerHealthImpl>>,
+    pub health_layers: Vec<Arc<LayerHealthImpl>>,
 
     // ── WebSocket broadcast ───────────────────────────────────────────────────
     /// Broadcasts `omega_control_contracts::ws::WsEvent` — the real type
     /// shared with the frontend dashboard (see this file's module-level
     /// FIX note). NOT a locally-defined type.
-    pub ws_tx:           broadcast::Sender<WsEvent>,
+    pub ws_tx: broadcast::Sender<WsEvent>,
 
     // ── Observability bridge ──────────────────────────────────────────────────
     /// Shared ring buffer — written by all engine layers via OmegaEvent::emit_*,
     /// drained by obs_bridge task which converts to WsEvent and publishes.
-    pub obs_buffer:      Arc<EventRingBuffer>,
+    pub obs_buffer: Arc<EventRingBuffer>,
 
     // ── Authentication ────────────────────────────────────────────────────────
-    pub api_token:       String,
+    pub api_token: String,
 }
 
 impl AppState {
     pub fn new(
-        config:         OmegaConfig,
-        config_path:    PathBuf,
+        config: OmegaConfig,
+        config_path: PathBuf,
         checkpoint_dir: PathBuf,
         blacklist_path: PathBuf,
-        api_token:      String,
-        obs_buffer:     Arc<EventRingBuffer>,
+        api_token: String,
+        obs_buffer: Arc<EventRingBuffer>,
     ) -> anyhow::Result<Arc<Self>> {
         let blacklist = BuilderBlacklist::load(&blacklist_path)?;
 
         // Same enumeration approach grpc.rs already uses — see this
         // file's module-level FIX note, 2.
-        let health_layers: Vec<Arc<LayerHealthImpl>> = LayerId::iter()
-            .map(LayerHealthImpl::new_bare)
-            .collect();
+        let health_layers: Vec<Arc<LayerHealthImpl>> =
+            LayerId::iter().map(LayerHealthImpl::new_bare).collect();
 
         let ceiling_threshold = config.ml.ceiling_escalation_threshold;
-        let (ws_tx, _)        = broadcast::channel(WS_CHANNEL_CAPACITY);
+        let (ws_tx, _) = broadcast::channel(WS_CHANNEL_CAPACITY);
 
         Ok(Arc::new(Self {
-            config:          RwLock::new(config),
+            config: RwLock::new(config),
             config_path,
             checkpoint_dir,
-            model_paused:    AtomicBool::new(false),
+            model_paused: AtomicBool::new(false),
             ceiling_tracker: RwLock::new(CeilingEscalationTracker::new(ceiling_threshold)),
             blacklist,
             health_layers,
@@ -275,7 +274,10 @@ mod tests {
         });
 
         let received = rx.try_recv();
-        assert!(received.is_ok(), "publish() must reach an active subscriber");
+        assert!(
+            received.is_ok(),
+            "publish() must reach an active subscriber"
+        );
     }
 
     // ── Coverage for the 5 variants obs_bridge.rs constructs but that

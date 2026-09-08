@@ -177,7 +177,8 @@ mod tests {
         let t = AccountExposureTracker::new();
         t.record("SA", 0, 200);
         assert_eq!(
-            t.current_exposure_wei("SA", 100), 0,
+            t.current_exposure_wei("SA", 100),
+            0,
             "a zero-amount blueprint contributes nothing and shouldn't grow the tracker"
         );
         assert!(

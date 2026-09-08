@@ -112,10 +112,18 @@ impl SimulationHarness {
 
         heartbeat.register(
             &heartbeat_component,
-            HeartbeatConfig { max_silence: cfg.heartbeat_max_silence },
+            HeartbeatConfig {
+                max_silence: cfg.heartbeat_max_silence,
+            },
         );
 
-        Ok(Self { fork, submitter, cfg, heartbeat, heartbeat_component })
+        Ok(Self {
+            fork,
+            submitter,
+            cfg,
+            heartbeat,
+            heartbeat_component,
+        })
     }
 
     pub fn fork_endpoint(&self) -> &str {

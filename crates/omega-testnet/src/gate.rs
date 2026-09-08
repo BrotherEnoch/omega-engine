@@ -86,7 +86,11 @@ impl GateStatus {
         }
         out.push_str(&format!(
             "\n**Overall: {}**\n",
-            if self.all_met() { "GATE PASSED" } else { "GATE NOT PASSED" }
+            if self.all_met() {
+                "GATE PASSED"
+            } else {
+                "GATE NOT PASSED"
+            }
         ));
         out
     }
@@ -170,7 +174,10 @@ pub fn evaluate(
     list.push(CriterionStatus {
         name: "Kill switch manually tested during run".into(),
         met: attestations.kill_switch_tested_at.is_some(),
-        detail: match (&attestations.kill_switch_tested_at, &attestations.kill_switch_tested_by) {
+        detail: match (
+            &attestations.kill_switch_tested_at,
+            &attestations.kill_switch_tested_by,
+        ) {
             (Some(t), Some(who)) => format!("tested {t} by {who}"),
             _ => "not yet attested".to_string(),
         },
@@ -203,7 +210,10 @@ pub fn evaluate(
     list.push(CriterionStatus {
         name: "Multisig keyholders/threshold reviewed".into(),
         met: attestations.multisig_reviewed_at.is_some(),
-        detail: match (&attestations.multisig_reviewed_at, &attestations.multisig_reviewed_by) {
+        detail: match (
+            &attestations.multisig_reviewed_at,
+            &attestations.multisig_reviewed_by,
+        ) {
             (Some(t), Some(who)) => format!("reviewed {t} by {who}"),
             _ => "not yet attested".to_string(),
         },
@@ -253,7 +263,11 @@ mod tests {
 
     #[test]
     fn fully_met_report_passes_gate() {
-        let status = evaluate(&passing_report(), &GateCriteria::default(), &full_attestations());
+        let status = evaluate(
+            &passing_report(),
+            &GateCriteria::default(),
+            &full_attestations(),
+        );
         assert!(status.all_met(), "{:#?}", status);
     }
 
@@ -273,7 +287,11 @@ mod tests {
         r.outcomes.truncate(10);
         let status = evaluate(&r, &GateCriteria::default(), &full_attestations());
         assert!(!status.all_met());
-        let cycles = status.criteria.iter().find(|c| c.name.contains("cycles")).unwrap();
+        let cycles = status
+            .criteria
+            .iter()
+            .find(|c| c.name.contains("cycles"))
+            .unwrap();
         assert!(!cycles.met);
     }
 
@@ -293,7 +311,11 @@ mod tests {
 
     #[test]
     fn markdown_renders_checkboxes() {
-        let status = evaluate(&passing_report(), &GateCriteria::default(), &full_attestations());
+        let status = evaluate(
+            &passing_report(),
+            &GateCriteria::default(),
+            &full_attestations(),
+        );
         let md = status.to_markdown();
         assert!(md.contains("GATE PASSED"));
         assert!(md.contains("- [x]"));

@@ -1,0 +1,17 @@
+#!/usr/bin/env bash
+# .githooks/pre-push
+set -euo pipefail
+
+echo "==> pre-push: cargo fmt --all --check"
+cargo fmt --all --check
+
+echo "==> pre-push: cargo clippy --workspace --all-targets -- -D warnings"
+cargo clippy --workspace --all-targets -- -D warnings
+
+echo "==> pre-push: cargo check --workspace"
+cargo check --workspace
+
+echo "==> pre-push: cargo test --workspace"
+cargo test --workspace
+
+echo "==> pre-push: OK"

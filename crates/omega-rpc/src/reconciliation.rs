@@ -243,7 +243,11 @@ pub fn reconciler_for_providers(
     providers: impl IntoIterator<Item = Address>,
 ) -> AtomicBalanceReconciler {
     let cfg = ReconciliationConfig {
-        monitored_contracts: providers.into_iter().collect::<HashSet<_>>().into_iter().collect(),
+        monitored_contracts: providers
+            .into_iter()
+            .collect::<HashSet<_>>()
+            .into_iter()
+            .collect(),
         ..Default::default()
     };
     AtomicBalanceReconciler::new(rpc, cfg)
@@ -275,7 +279,10 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(cfg.monitored_contracts.len(), 2);
-        assert_eq!(cfg.dust_tolerance_wei, ReconciliationConfig::default().dust_tolerance_wei);
+        assert_eq!(
+            cfg.dust_tolerance_wei,
+            ReconciliationConfig::default().dust_tolerance_wei
+        );
         assert_eq!(cfg.timeout, ReconciliationConfig::default().timeout);
     }
 }
