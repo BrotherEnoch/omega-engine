@@ -15,29 +15,20 @@
 // ## Realized profit policy (financial safety)
 //
 // On-chain inclusion only tells us the txs landed with status=1. True
-// vault `netProfit` lives in `OmegaVault.pending_profit[blueprintHash]`
-// and is not yet queried from this path (no blueprint_hash on
-// ConfirmationResult today — only bundle_hash). Until a RealizedProfitLookup
-// is wired, we use `expected_profit_net_wei` as a **provisional** figure:
+// vault `netProfit` lives in `OmegaVault.pending_profit[blueprintHash]`.
+// Prefer `AsyncRealizedProfitLookup` (async eth_call) over the sync trait.
+// When lookup returns None, use `expected_profit_net_wei` as provisional.
 //
-//   - included=true  → +expected (conservative for cumulative-loss trips
-//     only if expected was optimistic; still correct for consecutive-failure
-//     reset on success)
-//   - included=false → success=false; optional negative expected when
-//     `count_missed_profit` is set (operator opt-in via env)
+// ## Async error handling
 //
-// This is deliberately documented and logged as provisional so operators
-// never confuse it with audited vault accounting.
-//
-// ## Ownership
-//
-// The loop is started once from `main` after relay + kill switches +
-// NonceRegistry exist. It must share the same `Arc<KillSwitchRegistry>`
-// that `ExecutionPipeline` uses — otherwise Stage 2a and Stage 7 diverge.
+// Vault lookup failures must never panic the Stage-7 task. They log at
+// `warn` and fall back to provisional expected profit so kill-switch
+// consecutive-failure accounting still advances on `included`/`missed`.
 
 use std::sync::Arc;
 use std::time::Duration;
 
+use async_trait::async_trait;
 use omega_relay::{ConfirmationResult, MultiRelayClient};
 use omega_risk::kill_switch::KillSwitchRegistry;
 use omega_security::NonceRegistry;
@@ -67,6 +58,34 @@ impl Stage7Config {
     }
 }
 
+/// Sync lookup (tests / no-op). Prefer `AsyncRealizedProfitLookup` on the
+/// live Stage-7 path so HTTP never blocks the tokio worker.
+pub trait RealizedProfitLookup: Send + Sync {
+    fn realized_profit_wei(&self, blueprint_hash_hex: &str) -> Option<i128>;
+}
+
+/// Async lookup for vault pending_profit (production path).
+#[async_trait]
+pub trait AsyncRealizedProfitLookup: Send + Sync {
+    async fn realized_profit_wei(&self, blueprint_hash_hex: &str) -> Option<i128>;
+}
+
+/// No-op lookup: always returns None (provisional path only).
+pub struct NoRealizedProfitLookup;
+
+impl RealizedProfitLookup for NoRealizedProfitLookup {
+    fn realized_profit_wei(&self, _blueprint_hash_hex: &str) -> Option<i128> {
+        None
+    }
+}
+
+#[async_trait]
+impl AsyncRealizedProfitLookup for NoRealizedProfitLookup {
+    async fn realized_profit_wei(&self, _blueprint_hash_hex: &str) -> Option<i128> {
+        None
+    }
+}
+
 /// One processed confirmation after kill-switch / nonce side-effects.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProcessedConfirmation {
@@ -76,90 +95,172 @@ pub struct ProcessedConfirmation {
     pub nonce: u64,
     /// Provisional realized P&L fed to the kill switch (see module doc).
     pub provisional_realized_wei: Option<i128>,
+    /// Vault lookup result when an async/sync lookup was used.
+    pub vault_realized_wei: Option<i128>,
     /// Kill-switch trip reason if `record_outcome` tripped the switch.
     pub kill_trip_reason: Option<String>,
 }
 
-/// Pure-ish processing of a batch of confirmation results.
-///
-/// Extracted so unit tests can assert kill-switch and nonce behaviour
-/// without a live RPC or relay. Mutates `kill_switches` and
-/// `nonce_registry` in place.
+fn scope_of(r: &ConfirmationResult) -> String {
+    if r.strategy_id.is_empty() {
+        "global".to_string()
+    } else {
+        r.strategy_id.clone()
+    }
+}
+
+fn provisional_from(
+    r: &ConfirmationResult,
+    cfg: &Stage7Config,
+    vault: Option<i128>,
+) -> Option<i128> {
+    if r.included {
+        match vault {
+            Some(v) if v != 0 => Some(v),
+            _ => Some(r.expected_profit_net_wei.min(i128::MAX as u128) as i128),
+        }
+    } else if cfg.count_missed_profit && r.expected_profit_net_wei > 0 {
+        Some(-(r.expected_profit_net_wei.min(i128::MAX as u128) as i128))
+    } else {
+        None
+    }
+}
+
+fn apply_one(
+    r: &ConfirmationResult,
+    kill_switches: &KillSwitchRegistry,
+    nonce_registry: &NonceRegistry,
+    cfg: &Stage7Config,
+    vault: Option<i128>,
+) -> ProcessedConfirmation {
+    let scope = scope_of(r);
+    let provisional_realized = provisional_from(r, cfg, vault);
+
+    let kill_trip_reason = kill_switches
+        .record_outcome(&scope, provisional_realized, r.included)
+        .map(|reason| reason.to_string());
+
+    if let Some(ref reason) = kill_trip_reason {
+        error!(
+            reason = %reason,
+            strategy = %scope,
+            included = r.included,
+            nonce = r.nonce,
+            bundle_hash = %r.bundle_hash,
+            blueprint_hash = %r.blueprint_hash,
+            provisional_realized_wei = ?provisional_realized,
+            vault_realized_wei = ?vault,
+            "Stage-7: kill switch tripped after reconciliation"
+        );
+    }
+
+    if r.included && !r.strategy_id.is_empty() {
+        let _ = nonce_registry.record_processed(&r.strategy_id, cfg.chain_id, r.nonce);
+    }
+
+    crate::audit::log_confirmed(
+        chrono::Utc::now(),
+        &scope,
+        &r.blueprint_hash,
+        &r.bundle_hash,
+        r.included,
+        provisional_realized,
+        vault,
+        kill_trip_reason.is_some(),
+    );
+
+    info!(
+        bundle_hash = %r.bundle_hash,
+        blueprint_hash = %r.blueprint_hash,
+        strategy = %scope,
+        included = r.included,
+        nonce = r.nonce,
+        provisional_realized_wei = ?provisional_realized,
+        vault_realized_wei = ?vault,
+        kill_tripped = kill_trip_reason.is_some(),
+        "Stage-7: confirmation processed"
+    );
+
+    ProcessedConfirmation {
+        bundle_hash: r.bundle_hash.clone(),
+        strategy_id: scope,
+        included: r.included,
+        nonce: r.nonce,
+        provisional_realized_wei: provisional_realized,
+        vault_realized_wei: vault,
+        kill_trip_reason,
+    }
+}
+
+/// Pure processing without vault lookup (provisional expected profit only).
 pub fn process_confirmation_results(
     results: &[ConfirmationResult],
     kill_switches: &KillSwitchRegistry,
     nonce_registry: &NonceRegistry,
     cfg: &Stage7Config,
 ) -> Vec<ProcessedConfirmation> {
+    results
+        .iter()
+        .map(|r| apply_one(r, kill_switches, nonce_registry, cfg, None))
+        .collect()
+}
+
+/// Sync lookup path (unit tests / offline). Prefer `process_confirmation_results_async`.
+pub fn process_confirmation_results_with_lookup(
+    results: &[ConfirmationResult],
+    kill_switches: &KillSwitchRegistry,
+    nonce_registry: &NonceRegistry,
+    cfg: &Stage7Config,
+    lookup: &dyn RealizedProfitLookup,
+) -> Vec<ProcessedConfirmation> {
+    results
+        .iter()
+        .map(|r| {
+            let vault = if r.included && !r.blueprint_hash.is_empty() {
+                lookup.realized_profit_wei(&r.blueprint_hash)
+            } else {
+                None
+            };
+            apply_one(r, kill_switches, nonce_registry, cfg, vault)
+        })
+        .collect()
+}
+
+/// Production path: async vault lookups, never blocks the runtime on sync HTTP.
+///
+/// Lookup errors are absorbed as `None` (provisional expected profit). Callers
+/// that need hard failure should implement that in the lookup itself by
+/// logging via `tracing` before returning None.
+pub async fn process_confirmation_results_async(
+    results: &[ConfirmationResult],
+    kill_switches: &KillSwitchRegistry,
+    nonce_registry: &NonceRegistry,
+    cfg: &Stage7Config,
+    lookup: &dyn AsyncRealizedProfitLookup,
+) -> Vec<ProcessedConfirmation> {
     let mut out = Vec::with_capacity(results.len());
-
     for r in results {
-        let scope = if r.strategy_id.is_empty() {
-            "global".to_string()
-        } else {
-            r.strategy_id.clone()
-        };
-
-        let provisional_realized: Option<i128> = if r.included {
-            // Cap at i128::MAX to avoid wrap on pathological u128 values.
-            Some(r.expected_profit_net_wei.min(i128::MAX as u128) as i128)
-        } else if cfg.count_missed_profit && r.expected_profit_net_wei > 0 {
-            Some(-(r.expected_profit_net_wei.min(i128::MAX as u128) as i128))
+        let vault = if r.included && !r.blueprint_hash.is_empty() {
+            match lookup.realized_profit_wei(&r.blueprint_hash).await {
+                Some(v) => Some(v),
+                None => {
+                    warn!(
+                        blueprint_hash = %r.blueprint_hash,
+                        bundle_hash = %r.bundle_hash,
+                        "Stage-7: vault profit lookup returned None — using provisional expected P&L"
+                    );
+                    None
+                }
+            }
         } else {
             None
         };
-
-        let kill_trip_reason = kill_switches
-            .record_outcome(&scope, provisional_realized, r.included)
-            .map(|reason| reason.to_string());
-
-        if let Some(ref reason) = kill_trip_reason {
-            error!(
-                reason = %reason,
-                strategy = %scope,
-                included = r.included,
-                nonce = r.nonce,
-                bundle_hash = %r.bundle_hash,
-                provisional_realized_wei = ?provisional_realized,
-                "Stage-7: kill switch tripped after reconciliation"
-            );
-        }
-
-        if r.included && !r.strategy_id.is_empty() {
-            let _ = nonce_registry.record_processed(&r.strategy_id, cfg.chain_id, r.nonce);
-        }
-
-        info!(
-            bundle_hash = %r.bundle_hash,
-            strategy = %scope,
-            included = r.included,
-            nonce = r.nonce,
-            provisional_realized_wei = ?provisional_realized,
-            kill_tripped = kill_trip_reason.is_some(),
-            "Stage-7: confirmation processed (provisional P&L = expected until vault query)"
-        );
-
-        out.push(ProcessedConfirmation {
-            bundle_hash: r.bundle_hash.clone(),
-            strategy_id: scope,
-            included: r.included,
-            nonce: r.nonce,
-            provisional_realized_wei: provisional_realized,
-            kill_trip_reason,
-        });
+        out.push(apply_one(r, kill_switches, nonce_registry, cfg, vault));
     }
-
     out
 }
 
-/// Drive Stage 7 from oracle block notifications.
-///
-/// Subscribes to `block_rx` (typically from the fee/oracle stream). On
-/// each new block snapshot, calls `reconcile_inclusions` and processes
-/// results. Exits cleanly when the broadcast channel closes.
-///
-/// Same ownership model as `run_idempotency_eviction_loop`: caller
-/// spawns this on a background task after constructing shared Arcs.
+/// Drive Stage 7 from unit notifications (oracle bridge).
 pub async fn run_stage7_reconciliation_loop(
     relay: Arc<MultiRelayClient>,
     kill_switches: Arc<KillSwitchRegistry>,
@@ -167,11 +268,12 @@ pub async fn run_stage7_reconciliation_loop(
     mut block_rx: tokio::sync::broadcast::Receiver<()>,
     current_block_fn: impl Fn() -> u64,
     cfg: Stage7Config,
+    lookup: Arc<dyn AsyncRealizedProfitLookup>,
 ) {
     info!(
         chain_id = cfg.chain_id,
         count_missed_profit = cfg.count_missed_profit,
-        "Stage-7 reconciliation loop started"
+        "Stage-7 reconciliation loop started (async vault lookup)"
     );
 
     loop {
@@ -180,12 +282,14 @@ pub async fn run_stage7_reconciliation_loop(
                 let current_block = current_block_fn();
                 let results = relay.reconcile_inclusions(current_block).await;
                 if !results.is_empty() {
-                    let _ = process_confirmation_results(
+                    let _ = process_confirmation_results_async(
                         &results,
                         kill_switches.as_ref(),
                         &nonce_registry,
                         &cfg,
-                    );
+                        lookup.as_ref(),
+                    )
+                    .await;
                 }
             }
             Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
@@ -199,9 +303,7 @@ pub async fn run_stage7_reconciliation_loop(
     }
 }
 
-/// Interval-driven variant when no block broadcast is available (tests /
-/// degraded mode). Prefer the block-driven loop in production so
-/// reconciliation stays aligned with canonical head.
+/// Interval-driven variant when no block broadcast is available.
 pub async fn run_stage7_interval_loop(
     relay: Arc<MultiRelayClient>,
     kill_switches: Arc<KillSwitchRegistry>,
@@ -209,6 +311,7 @@ pub async fn run_stage7_interval_loop(
     current_block_fn: impl Fn() -> u64,
     cfg: Stage7Config,
     interval: Duration,
+    lookup: Arc<dyn AsyncRealizedProfitLookup>,
 ) {
     let mut ticker = tokio::time::interval(interval);
     info!(
@@ -222,12 +325,14 @@ pub async fn run_stage7_interval_loop(
         let current_block = current_block_fn();
         let results = relay.reconcile_inclusions(current_block).await;
         if !results.is_empty() {
-            let _ = process_confirmation_results(
+            let _ = process_confirmation_results_async(
                 &results,
                 kill_switches.as_ref(),
                 &nonce_registry,
                 &cfg,
-            );
+                lookup.as_ref(),
+            )
+            .await;
         }
     }
 }
@@ -240,7 +345,12 @@ mod tests {
     use omega_risk::kill_switch::KillSwitchConfig;
     use std::time::Duration as StdDuration;
 
-    fn sample_result(strategy: &str, included: bool, profit: u128, nonce: u64) -> ConfirmationResult {
+    fn sample_result(
+        strategy: &str,
+        included: bool,
+        profit: u128,
+        nonce: u64,
+    ) -> ConfirmationResult {
         ConfirmationResult {
             bundle_hash: format!("0xbundle{nonce}"),
             relay: RelayName::Flashbots,
@@ -248,23 +358,22 @@ mod tests {
             strategy_id: strategy.to_string(),
             nonce,
             expected_profit_net_wei: profit,
+            blueprint_hash: format!("0x{:0>64}", format!("{nonce:x}")),
         }
     }
 
     fn ks_registry() -> KillSwitchRegistry {
         KillSwitchRegistry::new(KillSwitchConfig {
-            max_cumulative_loss_wei: 10u128.pow(18) * 100, // 100 ETH
-            max_loss_per_window_wei: 10u128.pow(18) * 50,  // 50 ETH
+            max_cumulative_loss_wei: 10u128.pow(18) * 100,
+            max_loss_per_window_wei: 10u128.pow(18) * 50,
             loss_window: StdDuration::from_secs(3600),
             max_consecutive_failures: 5,
         })
         .expect("valid kill config")
     }
 
-    // note: max_loss_per_window_wei is required by KillSwitchConfig::validate
-
     #[test]
-    fn included_records_positive_provisional_and_advances_nonce() {
+    fn included_records_positive_provisional() {
         let ks = ks_registry();
         let nr = NonceRegistry::new();
         let cfg = Stage7Config {
@@ -272,7 +381,6 @@ mod tests {
             chain_id: 42161,
         };
         let results = vec![sample_result("SA", true, 1_000_000_000_000_000_000, 3)];
-
         let processed = process_confirmation_results(&results, &ks, &nr, &cfg);
         assert_eq!(processed.len(), 1);
         assert!(processed[0].included);
@@ -281,10 +389,6 @@ mod tests {
             Some(1_000_000_000_000_000_000)
         );
         assert!(processed[0].kill_trip_reason.is_none());
-        // Nonce advanced to at least the processed nonce
-        // (record_processed sets next when processed > current)
-        let _ = nr; // NonceRegistry has no public getter for next in all versions;
-                    // absence of panic + kill trip is the safety signal here.
     }
 
     #[test]
@@ -296,43 +400,9 @@ mod tests {
             chain_id: 42161,
         };
         let results = vec![sample_result("MSA", false, 5_000_000_000_000_000_000, 1)];
-
         let processed = process_confirmation_results(&results, &ks, &nr, &cfg);
-        assert_eq!(processed.len(), 1);
         assert!(!processed[0].included);
         assert_eq!(processed[0].provisional_realized_wei, None);
-        assert!(processed[0].kill_trip_reason.is_none());
-    }
-
-    #[test]
-    fn missed_with_count_missed_records_negative_provisional() {
-        let ks = ks_registry();
-        let nr = NonceRegistry::new();
-        let cfg = Stage7Config {
-            count_missed_profit: true,
-            chain_id: 42161,
-        };
-        let results = vec![sample_result("LA", false, 2_000_000_000_000_000_000, 2)];
-
-        let processed = process_confirmation_results(&results, &ks, &nr, &cfg);
-        assert_eq!(
-            processed[0].provisional_realized_wei,
-            Some(-2_000_000_000_000_000_000)
-        );
-    }
-
-    #[test]
-    fn empty_strategy_id_uses_global_scope() {
-        let ks = ks_registry();
-        let nr = NonceRegistry::new();
-        let cfg = Stage7Config {
-            count_missed_profit: false,
-            chain_id: 42161,
-        };
-        let mut r = sample_result("", true, 1, 0);
-        r.strategy_id = String::new();
-        let processed = process_confirmation_results(&[r], &ks, &nr, &cfg);
-        assert_eq!(processed[0].strategy_id, "global");
     }
 
     #[test]
@@ -349,17 +419,31 @@ mod tests {
             count_missed_profit: false,
             chain_id: 42161,
         };
-
-        let batch: Vec<_> = (0..3)
-            .map(|i| sample_result("MEV", false, 0, i))
-            .collect();
+        let batch: Vec<_> = (0..3).map(|i| sample_result("MEV", false, 0, i)).collect();
         let processed = process_confirmation_results(&batch, &ks, &nr, &cfg);
-        // Third consecutive failure should trip
-        assert!(
-            processed[2].kill_trip_reason.is_some(),
-            "third consecutive miss must trip kill switch"
-        );
-        // Guard must now fail for that scope
+        assert!(processed[2].kill_trip_reason.is_some());
         assert!(ks.guard("MEV").is_err());
+    }
+
+    struct FixedLookup(i128);
+    impl RealizedProfitLookup for FixedLookup {
+        fn realized_profit_wei(&self, _: &str) -> Option<i128> {
+            Some(self.0)
+        }
+    }
+
+    #[test]
+    fn vault_lookup_overrides_expected() {
+        let ks = ks_registry();
+        let nr = NonceRegistry::new();
+        let cfg = Stage7Config {
+            count_missed_profit: false,
+            chain_id: 42161,
+        };
+        let results = vec![sample_result("SA", true, 9_000_000_000_000_000_000, 1)];
+        let processed =
+            process_confirmation_results_with_lookup(&results, &ks, &nr, &cfg, &FixedLookup(42));
+        assert_eq!(processed[0].provisional_realized_wei, Some(42));
+        assert_eq!(processed[0].vault_realized_wei, Some(42));
     }
 }

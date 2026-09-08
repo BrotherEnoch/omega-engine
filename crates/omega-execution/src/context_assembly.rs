@@ -157,6 +157,7 @@ pub struct AssemblyInput<'a> {
     pub limits: StrategyLimits,
     pub flashloan_provider: Option<FlashloanProvider>,
     pub flashloan_contract: Option<alloy_primitives::Address>,
+    pub flashloan_asset: Option<alloy_primitives::Address>,
     pub competition: Option<CompetitionInputs>,
 }
 
@@ -210,7 +211,11 @@ pub async fn assemble_check_context(
             .fetch_fee_snapshot()
             .await
             .map_err(|e| ExecutionError::GasSourceUnavailable(e.to_string()))?;
-        (live.base_fee_gwei, live.l1_data_fee_gwei, GasSource::LiveRpcFallback)
+        (
+            live.base_fee_gwei,
+            live.l1_data_fee_gwei,
+            GasSource::LiveRpcFallback,
+        )
     };
     let gas_readout = GasReadout {
         source: gas_source,
@@ -251,19 +256,23 @@ pub async fn assemble_check_context(
     };
 
     // ── flashloan: live liquidity snapshot (unchanged from rev 1) ────────
-    let (flashloan_available, flashloan_protocol_id) =
-        match (input.flashloan_provider, input.flashloan_contract) {
-            (Some(provider), Some(contract)) => {
-                let snap = handles
+    let (flashloan_available, flashloan_protocol_id) = match (
+        input.flashloan_provider,
+        input.flashloan_contract,
+        input.flashloan_asset,
+    ) {
+        (Some(provider), Some(contract), Some(asset)) => {
+            let snap =
+                handles
                     .flashloan_registry
-                    .snapshot(input.chain_id, provider, contract);
-                let available: u128 = snap
-                    .map(|s| s.available_wei.try_into().unwrap_or(u128::MAX))
-                    .unwrap_or(0);
-                (available, provider.as_str().to_string())
-            }
-            _ => (0, "none".to_string()),
-        };
+                    .snapshot(input.chain_id, provider, asset, contract);
+            let available: u128 = snap
+                .map(|s| s.available_wei.try_into().unwrap_or(u128::MAX))
+                .unwrap_or(0);
+            (available, provider.as_str().to_string())
+        }
+        _ => (0, "none".to_string()),
+    };
     let flashloan = FlashloanSnapshot {
         available: flashloan_available,
         protocol_id: flashloan_protocol_id,

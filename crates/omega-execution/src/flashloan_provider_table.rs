@@ -34,8 +34,8 @@
 // 3. Only then add the entry below, with a comment naming your source,
 //    and deliberately update the table-length assertion in tests.
 
-use std::collections::HashMap;
 use alloy_primitives::{address, Address};
+use std::collections::HashMap;
 
 /// Real, verified Arbitrum One flashloan-provider addresses.
 /// See module doc for the verification bar applied to every entry.
@@ -165,7 +165,7 @@ mod tests {
     #[test]
     fn unverified_address_fails_closed() {
         // Arbitrary address NOT in the table must resolve to None.
-        let addr = address!("0000000000000000000000000000000000dEaD");
+        let addr = address!("000000000000000000000000000000000000dEaD");
         assert_eq!(resolve_flashloan_provider_id(addr), None);
     }
 

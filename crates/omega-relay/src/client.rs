@@ -42,6 +42,11 @@ pub struct BundlePayload {
     /// NOT sent to relays.
     #[serde(default, skip_serializing)]
     pub expected_profit_net_wei: u128,
+    /// Pre-signing ExecutionBlueprint content hash (0x-prefixed hex). Local
+    /// metadata only — NOT sent to relays. Required so Stage 7 can query
+    /// OmegaVault.pending_profit[blueprintHash] for realized P&L.
+    #[serde(default, skip_serializing)]
+    pub blueprint_hash: String,
 }
 
 /// Outcome of a single relay submission.

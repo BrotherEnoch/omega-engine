@@ -30,6 +30,14 @@
 // `check_dynamic_profit`, `check_flashloan_liquidity`, and
 // `check_account_exposure`'s real bodies. Only `expected_profit_net`
 // needed this new error variant.
+//
+// ## Fix (this revision): context_assembly + async surface errors
+//
+// `context_assembly.rs` fails closed when gas or nonce sources error.
+// Those variants were referenced but missing from this enum — added as
+// `GasSourceUnavailable` / `NonceSourceUnavailable`. Journal and vault
+// lookup failures used by Stage 7 / inflight recovery are also first-class
+// so async tasks can log typed errors instead of string-only messages.
 
 use omega_core::errors::DropCode;
 use thiserror::Error;
@@ -52,21 +60,22 @@ pub enum ExecutionError {
     DuplicateIdempotencyKey,
 
     #[error(
+        "invalid flashloan identity: {detail} — Orchestrator reverts on flashloanToken==0; \
+         refusing to submit a blueprint that cannot succeed on-chain"
+    )]
+    InvalidFlashloanIdentity { detail: String },
+
+    #[error(
         "no flashloan provider->protocol-name mapping available for address {address} — \
-         no such table exists anywhere in the omega-engine workspace as of this pipeline's \
-         implementation. Failing closed rather than submitting a flashloan blueprint through \
-         a no-self-flash check that could never actually fire against a fabricated or \
-         unmatchable placeholder value."
+         failing closed rather than submitting a flashloan blueprint through a no-self-flash \
+         check that could never fire against an unmatchable placeholder"
     )]
     UnknownFlashloanProvider { address: String },
 
     #[error(
         "no TransactionSigner configured — this pipeline cannot produce a signed transaction \
-         for relay submission. See signer.rs's TransactionSigner trait doc comment: no \
-         implementation of this trait exists anywhere in the omega-engine workspace as of \
-         ExecutionPipelineSpecification.md. This is not a bug in this pipeline — it is a \
-         genuinely unimplemented dependency that must be supplied before active_phase >= 1 \
-         can submit real bundles."
+         for relay submission. A real TransactionSigner must be supplied before \
+         active_phase >= 1 can submit real bundles."
     )]
     NoTransactionSigner,
 
@@ -81,15 +90,42 @@ pub enum ExecutionError {
     ///
     /// Mapping this overflow to `u128::MAX` would fail OPEN in
     /// `check_dynamic_profit` — see this file's module-level "Fix (this
-    /// revision)" note for the confirmed reasoning. Stage 1
-    /// (`verify_hash`/`verify_idempotency_key`) only checks that the
-    /// blueprint is internally self-consistent with its own claimed
-    /// hash, not that its economic fields are sane — so an overflowed
-    /// profit value is not caught anywhere before this mapping step
-    /// unless this variant exists and is used.
+    /// revision)" note for the confirmed reasoning.
     #[error(
         "blueprint field `{field}` does not fit in u128 — failing closed rather than \
          coercing to u128::MAX, which would fail open in check_dynamic_profit"
     )]
     BlueprintFieldOverflow { field: &'static str },
+
+    /// Live fee / gas snapshot source failed (context assembly Stage 2).
+    #[error("gas / fee source unavailable: {0}")]
+    GasSourceUnavailable(String),
+
+    /// Nonce registry / latest-nonce source failed (context assembly Stage 2).
+    /// Fails closed — never default to 0 (would defeat stale-blueprint check).
+    #[error("nonce source unavailable: {0}")]
+    NonceSourceUnavailable(String),
+
+    /// Durable in-flight journal I/O failed.
+    #[error("in-flight journal I/O failed: {0}")]
+    JournalIo(String),
+
+    /// Vault pending_profit eth_call failed or returned unusable data.
+    /// Stage 7 falls back to provisional expected profit; this variant is
+    /// for callers that treat vault lookup as mandatory.
+    #[error("vault realized-profit lookup failed for {blueprint_hash}: {detail}")]
+    VaultLookupFailed {
+        blueprint_hash: String,
+        detail: String,
+    },
+
+    /// Background async task joined with an unexpected error.
+    #[error("async task failed: {0}")]
+    AsyncTaskFailed(String),
+}
+
+impl From<std::io::Error> for ExecutionError {
+    fn from(e: std::io::Error) -> Self {
+        ExecutionError::JournalIo(e.to_string())
+    }
 }

@@ -22,6 +22,9 @@ omega-risk     = { path = "../omega-risk" }
 omega-relay    = { path = "../omega-relay" }
 omega-security = { path = "../omega-security" }
 omega-dag      = { path = "../omega-dag" }
+omega-oracle   = { path = "../omega-oracle" }
+omega-rpc      = { path = "../omega-rpc" }
+omega-flashloan = { path = "../omega-flashloan" }
 
 alloy-primitives = { workspace = true }
 alloy-sol-types  = { workspace = true }
@@ -32,7 +35,8 @@ chrono           = { workspace = true }
 tracing          = { workspace = true }
 thiserror        = { workspace = true }
 anyhow           = { workspace = true }
-serde            = { workspace = true }
+serde            = { workspace = true, features = ["derive"] }
+serde_json       = { workspace = true }
 
 # Hex encode/decode for the signed-transaction <-> bundle_hash transform
 # (transform.rs) — not a workspace-level dependency elsewhere, pinned

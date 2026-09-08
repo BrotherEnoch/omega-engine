@@ -77,8 +77,9 @@ pub async fn build_bundle_payload(
         .saturating_add(blocks_until_expiry.saturating_mul(ARBITRUM_BLOCK_TIME_MS) / 1000);
 
     let strategy_id = bp.strategy_id.to_string();
-    let expected_profit_net_wei: u128 =
-        bp.expected_profit_net.try_into().unwrap_or(u128::MAX);
+    let expected_profit_net_wei: u128 = bp.expected_profit_net.try_into().unwrap_or(u128::MAX);
+
+    let blueprint_hash = format!("0x{}", hex::encode(bp.blueprint_hash.as_slice()));
 
     Ok(BundlePayload {
         bundle_hash,
@@ -90,6 +91,7 @@ pub async fn build_bundle_payload(
         strategy_id,
         nonce: bp.nonce,
         expected_profit_net_wei,
+        blueprint_hash,
     })
 }
 

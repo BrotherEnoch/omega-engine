@@ -127,7 +127,7 @@
 
 use std::sync::{Arc, Mutex};
 
-use alloy_primitives::{Address, B256};
+use alloy_primitives::B256;
 use omega_core::types::blueprint::ExecutionBlueprint;
 use omega_core::types::lane::Lane;
 use omega_relay::MultiRelayClient;
@@ -358,6 +358,11 @@ impl<S: TransactionSigner> ExecutionPipeline<S> {
         self.idempotency.len()
     }
 
+    /// Re-seed a key recovered from the durable in-flight journal.
+    pub fn seed_idempotency_key(&self, key: alloy_primitives::B256) {
+        self.idempotency.seed_seen(key);
+    }
+
     async fn execute_inner(
         &self,
         bp: &ExecutionBlueprint,
@@ -437,6 +442,37 @@ impl<S: TransactionSigner> ExecutionPipeline<S> {
                 "execution pipeline: pre-trade check failed — dropping blueprint"
             );
             return Err(ExecutionError::RiskCheckFailed(code));
+        }
+
+
+        // ── Stage 2d: flashloan identity fail-closed ─────────────────────
+        //
+        // OmegaOrchestrator reverts when flashloanToken == address(0).
+        // Submitting such a blueprint wastes gas and can leave capital
+        // accounting inconsistent. Also reject amount/token mismatches.
+        {
+            use alloy_primitives::Address;
+            let token_zero = bp.flashloan_token == Address::ZERO;
+            let amount_zero = bp.flashloan_amount.is_zero();
+            if token_zero && !amount_zero {
+                return Err(ExecutionError::InvalidFlashloanIdentity {
+                    detail: "flashloan_token is zero but flashloan_amount is non-zero".into(),
+                });
+            }
+            if !token_zero && amount_zero {
+                return Err(ExecutionError::InvalidFlashloanIdentity {
+                    detail: "flashloan_amount is zero but flashloan_token is non-zero".into(),
+                });
+            }
+            // Both zero: only allowed if flashloan_provider is also zero
+            // (explicit no-flashloan). Still refused for live submission
+            // because the current Orchestrator has no no-flashloan path —
+            // fail closed rather than burn gas on a guaranteed revert.
+            if token_zero && amount_zero {
+                return Err(ExecutionError::InvalidFlashloanIdentity {
+                    detail: "flashloan_token and amount are zero — Orchestrator has no                              no-flashloan execute path; refusing submission".into(),
+                });
+            }
         }
 
         // ── Stage 3: submission-layer idempotency dedup ──────────────────
@@ -582,9 +618,11 @@ fn blueprint_to_check_fields(bp: &ExecutionBlueprint) -> Result<BlueprintFields,
 /// ordinals) over a non-existent address→name table. Legacy zero address
 /// with no type still maps to `"none"`.
 fn resolve_flashloan_provider_id(bp: &ExecutionBlueprint) -> Result<&'static str, ExecutionError> {
+    use alloy_primitives::Address;
     use omega_core::types::flashloan_provider::FlashloanProviderType;
 
-    // Zero address + no capital from a provider — PIL path.
+    // Zero provider addresses + zero capital — "none" sentinel for risk checks.
+    // Stage 2d separately rejects zero-token blueprints before submission.
     if bp.flashloan_provider == Address::ZERO
         && bp.provider_contract == Address::ZERO
         && bp.flashloan_amount.is_zero()
@@ -592,14 +630,28 @@ fn resolve_flashloan_provider_id(bp: &ExecutionBlueprint) -> Result<&'static str
         return Ok("none");
     }
 
-    // Control-point fix (C4): use the real enum rather than failing every
-    // non-zero address. Strings align with L2e watch-channel protocol_id
-    // labels ("aave" / "balancer" / "uniswap") used in main.rs.
-    Ok(match bp.flashloan_provider_type {
-        FlashloanProviderType::Balancer => "balancer",
-        FlashloanProviderType::AaveV3 => "aave",
-        FlashloanProviderType::UniswapV3 => "uniswap",
-    })
+    // Prefer verified Arbitrum address table (flashloan_provider_table.rs).
+    // Unknown non-zero addresses fail closed — never invent a protocol id.
+    for addr in [bp.flashloan_provider, bp.provider_contract] {
+        if addr != Address::ZERO {
+            match crate::flashloan_provider_table::resolve_flashloan_provider_id(addr) {
+                Some(id) => return Ok(id),
+                None => {
+                    return Err(ExecutionError::UnknownFlashloanProvider {
+                        address: format!("{addr}"),
+                    });
+                }
+            }
+        }
+    }
+
+    // Addresses zero / amount non-zero: use structured enum type labels.
+    // Strings align with L2e watch-channel protocol_id labels used in main.rs.
+    match bp.flashloan_provider_type {
+        FlashloanProviderType::Balancer => Ok("balancer"),
+        FlashloanProviderType::AaveV3 => Ok("aave"),
+        FlashloanProviderType::UniswapV3 => Ok("uniswap"),
+    }
 }
 
 fn strategy_id_label(id: omega_core::types::blueprint::StrategyId) -> &'static str {
@@ -617,7 +669,7 @@ fn strategy_id_label(id: omega_core::types::blueprint::StrategyId) -> &'static s
 mod tests {
     use super::*;
     use crate::signer::MockTransactionSigner;
-    use alloy_primitives::{Bytes, B256, U256};
+    use alloy_primitives::{Address, Bytes, B256, U256};
     use omega_core::types::blueprint::StrategyId;
     use omega_core::types::flashloan_provider::FlashloanProviderType;
     use omega_core::types::lane::Simulator;
@@ -830,7 +882,7 @@ mod tests {
             // "no flashloan" convention.
             flashloan_provider_type: FlashloanProviderType::Balancer,
             provider_contract: Address::ZERO,
-            flashloan_token: Address::ZERO,
+            flashloan_token: Address::from([0x11u8; 20]),
             calldata: Bytes::new(),
             strategy_bytecode_hash: B256::from([0xaa; 32]),
             l2_exec_gas_estimate: 100_000,
@@ -1981,7 +2033,7 @@ mod tests {
             // sample_bp above.
             flashloan_provider_type: FlashloanProviderType::Balancer,
             provider_contract: Address::ZERO,
-            flashloan_token: Address::ZERO,
+            flashloan_token: Address::from([0x11u8; 20]),
             calldata: Bytes::new(),
             strategy_bytecode_hash: B256::from([0xaa; 32]),
             l2_exec_gas_estimate: 100_000,
@@ -2083,6 +2135,7 @@ mod tests {
     fn zero_flashloan_amount_resolves_to_none() {
         let mut bp = sample_bp(1);
         bp.flashloan_amount = U256::ZERO;
+        bp.flashloan_token = Address::ZERO;
         assert_eq!(resolve_flashloan_provider_id(&bp).unwrap(), "none");
     }
 

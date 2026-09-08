@@ -47,6 +47,19 @@ impl IdempotencyCache {
         }
     }
 
+    /// Mark `key` as already seen without erroring if present.
+    /// Used on boot to re-seed from the durable in-flight journal so a
+    /// crash cannot cause re-submission of the same idempotency key.
+    pub fn seed_seen(&self, key: B256) {
+        use dashmap::mapref::entry::Entry;
+        match self.seen.entry(key) {
+            Entry::Occupied(_) => {}
+            Entry::Vacant(e) => {
+                e.insert(Utc::now());
+            }
+        }
+    }
+
     pub fn len(&self) -> usize {
         self.seen.len()
     }

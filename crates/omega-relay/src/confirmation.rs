@@ -52,6 +52,8 @@ struct PendingBundle {
     strategy_id: String,
     nonce: u64,
     expected_profit_net_wei: u128,
+    /// ExecutionBlueprint content hash for vault pending_profit lookup.
+    blueprint_hash: String,
 }
 
 /// Result of a resolved (confirmed-included or given-up-on) bundle.
@@ -73,6 +75,8 @@ pub struct ConfirmationResult {
     /// Expected net profit in wei carried through from the original `BundlePayload`,
     /// for reputation/ranking accounting.
     pub expected_profit_net_wei: u128,
+    /// ExecutionBlueprint content hash (0x-hex) for OmegaVault.pending_profit lookup.
+    pub blueprint_hash: String,
 }
 
 /// Tracks bundles pending on-chain inclusion confirmation.
@@ -108,6 +112,7 @@ impl InclusionTracker {
                 strategy_id: bundle.strategy_id.clone(),
                 nonce: bundle.nonce,
                 expected_profit_net_wei: bundle.expected_profit_net_wei,
+                blueprint_hash: bundle.blueprint_hash.clone(),
             },
         );
         Ok(())
@@ -157,6 +162,7 @@ impl InclusionTracker {
                 strategy_id: pending.strategy_id,
                 nonce: pending.nonce,
                 expected_profit_net_wei: pending.expected_profit_net_wei,
+                blueprint_hash: pending.blueprint_hash,
             });
         }
 

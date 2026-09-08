@@ -141,6 +141,137 @@
 //   doesn't know about, rather than registering LA against an invented address.
 // VERIFIED / closed — see StrategyEntry and omega-strategies lib.rs re-exports.
 
+/// Parse a 0x-prefixed or bare 32-byte hex string into B256.
+fn parse_b256_hex(s: &str) -> Option<alloy_primitives::B256> {
+    let s = s.trim().trim_start_matches("0x");
+    if s.len() != 64 {
+        return None;
+    }
+    let mut out = [0u8; 32];
+    for i in 0..32 {
+        out[i] = u8::from_str_radix(&s[i * 2..i * 2 + 2], 16).ok()?;
+    }
+    Some(alloy_primitives::B256::from(out))
+}
+
+/// Async eth_call lookup of OmegaVault.pending_profit(bytes32).
+///
+/// Never blocks the tokio runtime: all HTTP is `.await`ed. Lookup failures
+/// log at `warn` and return `None` so Stage 7 can fall back to provisional
+/// expected profit without aborting the reconciliation task.
+struct HttpVaultPendingProfitLookup {
+    rpc_url: String,
+    vault_address: String,
+    http: reqwest::Client,
+}
+
+impl HttpVaultPendingProfitLookup {
+    fn new(rpc_url: impl Into<String>, vault_address: impl Into<String>) -> Self {
+        Self {
+            rpc_url: rpc_url.into(),
+            vault_address: vault_address.into(),
+            http: reqwest::Client::new(),
+        }
+    }
+
+    async fn fetch_pending_profit(&self, blueprint_hash_hex: &str) -> Option<i128> {
+        let hash = blueprint_hash_hex.trim_start_matches("0x");
+        if hash.len() != 64 {
+            tracing::warn!(
+                blueprint_hash = %blueprint_hash_hex,
+                "vault profit lookup: invalid blueprint_hash length (need 32 bytes hex)"
+            );
+            return None;
+        }
+        let full = omega_security::keccak256(b"pending_profit(bytes32)");
+        let selector = format!(
+            "{:02x}{:02x}{:02x}{:02x}",
+            full[0], full[1], full[2], full[3]
+        );
+        let data = format!("0x{}{}", selector, hash);
+        let body = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "eth_call",
+            "params": [
+                { "to": self.vault_address, "data": data },
+                "latest"
+            ]
+        });
+        let resp = match self.http.post(&self.rpc_url).json(&body).send().await {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    blueprint_hash = %blueprint_hash_hex,
+                    "vault profit lookup: HTTP request failed"
+                );
+                return None;
+            }
+        };
+        if !resp.status().is_success() {
+            tracing::warn!(
+                status = %resp.status(),
+                blueprint_hash = %blueprint_hash_hex,
+                "vault profit lookup: non-success HTTP status"
+            );
+            return None;
+        }
+        let v: serde_json::Value = match resp.json().await {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    blueprint_hash = %blueprint_hash_hex,
+                    "vault profit lookup: JSON decode failed"
+                );
+                return None;
+            }
+        };
+        if let Some(err) = v.get("error") {
+            tracing::warn!(
+                rpc_error = %err,
+                blueprint_hash = %blueprint_hash_hex,
+                "vault profit lookup: JSON-RPC error"
+            );
+            return None;
+        }
+        let hex = match v.get("result").and_then(|r| r.as_str()) {
+            Some(h) => h,
+            None => {
+                tracing::warn!(
+                    blueprint_hash = %blueprint_hash_hex,
+                    "vault profit lookup: missing result field"
+                );
+                return None;
+            }
+        };
+        let hex = hex.trim_start_matches("0x");
+        if hex.is_empty() {
+            return Some(0);
+        }
+        match u128::from_str_radix(hex, 16) {
+            Ok(profit) if profit > i128::MAX as u128 => Some(i128::MAX),
+            Ok(profit) => Some(profit as i128),
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    blueprint_hash = %blueprint_hash_hex,
+                    "vault profit lookup: hex parse failed"
+                );
+                None
+            }
+        }
+    }
+}
+
+#[async_trait]
+impl AsyncRealizedProfitLookup for HttpVaultPendingProfitLookup {
+    async fn realized_profit_wei(&self, blueprint_hash_hex: &str) -> Option<i128> {
+        self.fetch_pending_profit(blueprint_hash_hex).await
+    }
+}
+
 fn resolve_chain_id() -> Result<u64> {
     resolve_chain_id_from(std::env::var("OMEGA_CHAIN_ID").ok())
 }
@@ -167,13 +298,16 @@ use tracing::Level;
 
 // LayerHealth trait must be in scope for .state(), .layer_id(), .set_state() to resolve
 // on Arc<LayerHealthImpl>.
+use async_trait::async_trait;
 use omega_core::{HealthState, LayerHealth, LayerId, OmegaConfig, StrategyId};
 use omega_dag::{DagConfig, ExecutionDag};
 use omega_execution::config_translation::{translate_relay_config, RelayBootstrapInputs};
 use omega_execution::run_idempotency_eviction_loop;
 use omega_execution::signer::KeyManagerTransactionSigner;
 use omega_execution::{
-    process_confirmation_results, ExecutionPipeline, Stage7Config,
+    default_journal_path, open_default_journal, process_confirmation_results_async,
+    AsyncRealizedProfitLookup, ExecutionOutcome, ExecutionPipeline, InFlightJournal,
+    InFlightRecord, InFlightStatus, Stage7Config,
 };
 use omega_health::{halt::HaltFlag, LayerHealthImpl};
 use omega_hot_path::{HotPathConfig, HotPathRequest, HotPathRunner, MICROTX_GAS_LIMIT};
@@ -1597,22 +1731,79 @@ async fn main() -> Result<()> {
         tracing::info!("idempotency eviction loop started (60s tick, 2h max age)");
     }
 
+    // ── In-flight journal (crash recovery) ────────────────────────────────────
+    // Phase ≥ 1 refuses to start without a durable journal: otherwise a crash
+    // after submit and before Stage 7 leaves no local record of capital at risk.
+    let inflight_journal: Option<Arc<InFlightJournal>> = match open_default_journal() {
+        Some(j) => Some(Arc::new(j)),
+        None => {
+            if active_phase >= 1 {
+                anyhow::bail!(
+                    "OMEGA_INFLIGHT_JOURNAL (or default {}) could not be opened while                      active_phase={} — refusing production start without crash-recovery trail",
+                    default_journal_path().display(),
+                    active_phase
+                );
+            }
+            tracing::warn!(
+                "InFlightJournal unavailable in phase 0 (shadow) — continuing without durable recovery"
+            );
+            None
+        }
+    };
+
+    // Re-seed idempotency cache from still-open journal records so a restart
+    // cannot re-submit the same blueprint identity.
+    if let Some(ref journal) = inflight_journal {
+        match journal.recover_open() {
+            Ok(open) => {
+                let mut seeded = 0usize;
+                for rec in &open {
+                    if let Some(key) = parse_b256_hex(&rec.idempotency_key_hex) {
+                        execution_pipeline.seed_idempotency_key(key);
+                        seeded += 1;
+                    } else {
+                        tracing::warn!(
+                            blueprint_hash = %rec.blueprint_hash,
+                            key = %rec.idempotency_key_hex,
+                            "InFlightJournal recover: unparseable idempotency_key_hex — skipped seed"
+                        );
+                    }
+                }
+                tracing::info!(
+                    open = open.len(),
+                    seeded,
+                    "InFlightJournal recovery: idempotency keys re-seeded"
+                );
+            }
+            Err(e) => {
+                if active_phase >= 1 {
+                    return Err(e).context("InFlightJournal::recover_open failed at phase >= 1");
+                }
+                tracing::warn!(error = %e, "InFlightJournal::recover_open failed in phase 0");
+            }
+        }
+    }
+
     // ── Nonce registry ────────────────────────────────────────────────────────
     let nonce_registry = omega_security::replay::NonceRegistry::new();
     tracing::info!("NonceRegistry ready — advanced on execute Ok + Stage-7 inclusion");
 
     // ── Stage 7: confirmation reconciliation ───────────────────────────────────
     // Inclusion I/O: MultiRelayClient::reconcile_inclusions.
-    // Side-effects (kill switch, NonceRegistry, audit log): process_confirmation_results.
+    // Side-effects: process_confirmation_results_with_lookup (vault P&L when
+    // available) + InFlightJournal::record_terminal + NonceRegistry.
     // Shares the same KillSwitchRegistry Arc as ExecutionPipeline Stage 2a.
-    // Realized P&L is provisional (expected) until vault pending_profit is
-    // queried — see omega_execution::stage7 module docs.
     {
         let relay7 = Arc::clone(&relay);
         let oracle7 = Arc::clone(&oracle);
         let ks7 = Arc::clone(&kill_switches);
         let nr7 = nonce_registry.clone();
         let stage7_cfg = Stage7Config::from_env(chain_id);
+        let journal7 = inflight_journal.clone();
+        let http_rpc = confirmation_rpc_url.clone();
+        let vault_hex = format!("0x{}", hex::encode(vault_address));
+        let profit_lookup: Arc<dyn AsyncRealizedProfitLookup> =
+            Arc::new(HttpVaultPendingProfitLookup::new(http_rpc, vault_hex));
         let mut rx = oracle7.subscribe();
         tokio::spawn(async move {
             loop {
@@ -1620,13 +1811,42 @@ async fn main() -> Result<()> {
                     Ok(_) => {
                         let current_block = oracle7.snapshot().fee.block_number;
                         let results = relay7.reconcile_inclusions(current_block).await;
-                        if !results.is_empty() {
-                            let _ = process_confirmation_results(
-                                &results,
-                                ks7.as_ref(),
-                                &nr7,
-                                &stage7_cfg,
-                            );
+                        if results.is_empty() {
+                            continue;
+                        }
+                        let processed = process_confirmation_results_async(
+                            &results,
+                            ks7.as_ref(),
+                            &nr7,
+                            &stage7_cfg,
+                            profit_lookup.as_ref(),
+                        )
+                        .await;
+                        if let Some(ref journal) = journal7 {
+                            for (r, p) in results.iter().zip(processed.iter()) {
+                                let status = if p.included {
+                                    InFlightStatus::Included
+                                } else {
+                                    InFlightStatus::Missed
+                                };
+                                if let Err(e) = journal.record_terminal(
+                                    &r.blueprint_hash,
+                                    &r.bundle_hash,
+                                    status,
+                                    &p.strategy_id,
+                                    p.nonce,
+                                    stage7_cfg.chain_id,
+                                    r.expected_profit_net_wei,
+                                    current_block,
+                                    "", // idempotency key not on ConfirmationResult
+                                ) {
+                                    tracing::error!(
+                                        error = %e,
+                                        bundle_hash = %r.bundle_hash,
+                                        "InFlightJournal::record_terminal failed"
+                                    );
+                                }
+                            }
                         }
                     }
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
@@ -1636,7 +1856,7 @@ async fn main() -> Result<()> {
                 }
             }
         });
-        tracing::info!("Stage-7 reconciliation started (omega_execution::stage7)");
+        tracing::info!("Stage-7 reconciliation started (with vault P&L lookup + journal terminal)");
     }
 
     // ── L7: ZK ────────────────────────────────────────────────────────────────
@@ -1964,10 +2184,11 @@ async fn main() -> Result<()> {
         let pp3 = Arc::clone(&pending_proofs);
         let l1e3 = Arc::clone(&l1_gas_ema);
         let msa3 = Arc::clone(&mev_share_activity);
+        let ij3 = inflight_journal.clone();
         tokio::spawn(async move {
             run_scoring_loop(
                 reg, ora3, cl3, py3, tw3, dag2, tx, pq, halt3, ph, ep3, nr3, ir3, et3, max_exp3,
-                fl3, cid3, va3, pt3, zv3, pp3, l1e3, msa3,
+                fl3, cid3, va3, pt3, zv3, pp3, l1e3, msa3, ij3,
             )
             .await;
         });
@@ -2053,6 +2274,7 @@ async fn run_scoring_loop(
     pending_proofs: Arc<PendingProofBuffer>,
     l1_gas_ema: Arc<omega_risk::gas_model::L1GasEma>,
     mev_share_activity: Arc<MevShareActivityTracker>,
+    inflight_journal: Option<Arc<InFlightJournal>>,
 ) {
     let mut rx = oracle.subscribe();
     loop {
@@ -2104,10 +2326,11 @@ async fn run_scoring_loop(
                     let pp2 = Arc::clone(&pending_proofs);
                     let l1e2 = Arc::clone(&l1_gas_ema);
                     let msa2 = Arc::clone(&mev_share_activity);
+                    let ij2 = inflight_journal.clone();
                     tokio::spawn(async move {
                         score_and_admit(
                             strategy, s2, dag2, tx2, pq2, h2, ph, os2, ep2, nr2, ir2, gv2, et2,
-                            max_exp2, fl2, cid2, va2, pt2, zv2, pp2, l1e2, msa2,
+                            max_exp2, fl2, cid2, va2, pt2, zv2, pp2, l1e2, msa2, ij2,
                         )
                         .await;
                     });
@@ -2162,6 +2385,7 @@ async fn score_and_admit(
     pending_proofs: Arc<PendingProofBuffer>,
     l1_gas_ema: Arc<omega_risk::gas_model::L1GasEma>,
     mev_share_activity: Arc<MevShareActivityTracker>,
+    inflight_journal: Option<Arc<InFlightJournal>>,
 ) {
     if halt.is_halted() {
         return;
@@ -2468,6 +2692,43 @@ async fn score_and_admit(
                 released_exposure_wei = amount,
                 "ExecutionPipeline::execute completed; nonce+exposure updated"
             );
+            // Durable journal only when a relay actually accepted the bundle.
+            let any_accepted = match &outcome {
+                ExecutionOutcome::SubmittedSingle { any_accepted } => *any_accepted,
+                ExecutionOutcome::SubmittedCascade { any_accepted, .. } => *any_accepted,
+                ExecutionOutcome::Suppressed => false,
+            };
+            if any_accepted {
+                if let Some(ref journal) = inflight_journal {
+                    let expected: u128 = bp.expected_profit_net.try_into().unwrap_or(u128::MAX);
+                    let rec = InFlightRecord {
+                        recorded_at: chrono::Utc::now(),
+                        status: InFlightStatus::Submitted,
+                        strategy_id: strategy_label.clone(),
+                        nonce: bp.nonce,
+                        bundle_hash: format!("0x{}", hex::encode(bp.blueprint_hash.as_slice())),
+                        blueprint_hash: format!("0x{}", hex::encode(bp.blueprint_hash.as_slice())),
+                        chain_id,
+                        target_block: current_block,
+                        expected_profit_net_wei: expected,
+                        idempotency_key_hex: format!(
+                            "0x{}",
+                            hex::encode(bp.idempotency_key.as_slice())
+                        ),
+                    };
+                    // Note: bundle_hash above is provisional (blueprint hash) until
+                    // transform's true signed-bundle hash is plumbed back via ExecutionOutcome.
+                    // Crash recovery still re-seeds idempotency_key which is the safety-critical
+                    // identity for preventing double submit.
+                    if let Err(e) = journal.record_submitted(rec) {
+                        tracing::error!(
+                            error = %e,
+                            hash = %bp.blueprint_hash,
+                            "InFlightJournal::record_submitted failed — capital may lack durable trail"
+                        );
+                    }
+                }
+            }
         }
         Err(e) => {
             // Expected today for any strategy not in a real, loaded manifest (Stage 2b
@@ -3131,6 +3392,7 @@ mod hot_path_zk_provisioning_tests {
                 pending_proofs,
                 Arc::new(omega_risk::gas_model::L1GasEma::new(8)),
                 mev_share_activity,
+                None, // no in-flight journal in this unit test
             ),
         )
         .await;

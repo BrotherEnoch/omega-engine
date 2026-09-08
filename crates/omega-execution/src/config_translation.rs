@@ -290,10 +290,7 @@ mod tests {
     fn unknown_name_becomes_other_not_dropped() {
         let names = vec!["some_new_relay".to_string()];
         let parsed = parse_relay_names(&names);
-        assert_eq!(
-            parsed,
-            vec![RelayName::Other("some_new_relay".to_string())]
-        );
+        assert_eq!(parsed, vec![RelayName::Other("some_new_relay".to_string())]);
         assert_eq!(
             parsed.len(),
             1,

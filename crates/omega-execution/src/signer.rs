@@ -621,12 +621,12 @@ impl KeyManagerTransactionSigner {
             });
         }
 
-        let secret_key = self
-            .tx_key_manager
-            .active_secret_key()
-            .ok_or(ExecutionError::SigningFailed {
-                detail: "tx_key_manager has no active signing key".into(),
-            })?;
+        let secret_key =
+            self.tx_key_manager
+                .active_secret_key()
+                .ok_or(ExecutionError::SigningFailed {
+                    detail: "tx_key_manager has no active signing key".into(),
+                })?;
 
         let unsigned_rlp = encode_eip1559_unsigned(
             chain_id,
@@ -1195,17 +1195,14 @@ mod tests {
         // Fixture MUST match contracts/test/BlueprintCalldataAbi.t.sol constants.
         let km = make_km(0x20);
         let mut ids = HashMap::new();
-        ids.insert(
-            "SA".into(),
-            {
-                let mut arr = [0u8; 32];
-                arr.copy_from_slice(
-                    &hex::decode("c4bb1c851b1c74593f61f8d1f99ec07e2960d847a94d4a736e321ba387d4d2d7")
-                        .expect("valid strategy id hex"),
-                );
-                arr
-            },
-        );
+        ids.insert("SA".into(), {
+            let mut arr = [0u8; 32];
+            arr.copy_from_slice(
+                &hex::decode("c4bb1c851b1c74593f61f8d1f99ec07e2960d847a94d4a736e321ba387d4d2d7")
+                    .expect("valid strategy id hex"),
+            );
+            arr
+        });
         let signer = KeyManagerTransactionSigner::new(
             km,
             Address::from([0x01; 20]),
@@ -1368,10 +1365,9 @@ mod tests {
         // vector above — the one value in this set with independent solc
         // verification behind it in addition to the keccak256 preimage
         // check above.
-        let expected_sa = hex::decode(
-            "c4bb1c851b1c74593f61f8d1f99ec07e2960d847a94d4a736e321ba387d4d2d7",
-        )
-        .unwrap();
+        let expected_sa =
+            hex::decode("c4bb1c851b1c74593f61f8d1f99ec07e2960d847a94d4a736e321ba387d4d2d7")
+                .unwrap();
         assert_eq!(
             ids["SA"].as_slice(),
             expected_sa.as_slice(),
@@ -1481,8 +1477,14 @@ mod tests {
 
         let result = signer.sign_transaction(&bp, 42161).await;
         let signed = result.expect("sign_transaction must succeed with real config wired");
-        assert!(signed.raw_tx_hex.starts_with("0x02"), "must be an EIP-1559 typed tx");
-        assert!(signed.raw_tx_hex.len() > 4, "must contain real RLP payload, not just the type byte");
+        assert!(
+            signed.raw_tx_hex.starts_with("0x02"),
+            "must be an EIP-1559 typed tx"
+        );
+        assert!(
+            signed.raw_tx_hex.len() > 4,
+            "must contain real RLP payload, not just the type byte"
+        );
     }
 
     #[test]
@@ -1678,12 +1680,11 @@ mod tests {
         // computation, so no update was needed once forge confirmed it.
         // Closes the CAVEAT this file's top doc comment previously
         // tracked for compute_bp_hash's abi_encode_params() fix.
-        let solc_golden: [u8; 32] = hex::decode(
-            "74d1c22598dab6e5f1cb1a1809d3b7255728a0c10c971a9f05257cd6758b356b",
-        )
-        .expect("valid golden hash hex")
-        .try_into()
-        .expect("golden hash must be exactly 32 bytes");
+        let solc_golden: [u8; 32] =
+            hex::decode("74d1c22598dab6e5f1cb1a1809d3b7255728a0c10c971a9f05257cd6758b356b")
+                .expect("valid golden hash hex")
+                .try_into()
+                .expect("golden hash must be exactly 32 bytes");
 
         assert_eq!(
             bp_hash, solc_golden,
@@ -1971,17 +1972,19 @@ mod tests {
             .try_into()
             .expect("real tx `to` must be exactly 20 bytes");
         let real_to = Address::from(real_to_bytes);
-        let real_r = hex::decode("236084da36000fb2c7373cfa78e8f1bc9d8eb081dc240630c8024aa06fc39f96")
-            .expect("valid real tx r hex");
-        let real_s = hex::decode("30bdc5cd4e1f5f6abbb36c3b004270b68724cc46c56ad5847c99f8ced9c4112d")
-            .expect("valid real tx s hex");
+        let real_r =
+            hex::decode("236084da36000fb2c7373cfa78e8f1bc9d8eb081dc240630c8024aa06fc39f96")
+                .expect("valid real tx r hex");
+        let real_s =
+            hex::decode("30bdc5cd4e1f5f6abbb36c3b004270b68724cc46c56ad5847c99f8ced9c4112d")
+                .expect("valid real tx s hex");
 
         let signed = encode_eip1559_signed(
-            1,      // chain_id — Ethereum mainnet
-            86964,  // nonce
+            1,                             // chain_id — Ethereum mainnet
+            86964,                         // nonce
             U256::from(1_000_000_000u64),  // max_priority_fee_per_gas
             U256::from(34_154_125_362u64), // max_fee_per_gas
-            120_000,                        // gas_limit
+            120_000,                       // gas_limit
             real_to,
             U256::ZERO, // value
             &real_data,

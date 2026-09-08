@@ -77,6 +77,8 @@ toml               = "0.8"
 reqwest            = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
 hex                = "0.4"
 alloy-primitives   = { workspace = true }
+async-trait        = { workspace = true }
+serde_json         = { workspace = true }
 
 omega-core          = { path = "crates/omega-core" }
 omega-health        = { path = "crates/omega-health" }
