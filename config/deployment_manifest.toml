@@ -1,3 +1,8 @@
+﻿# config/deployment_manifest.toml
+# CRITICAL: Replace every bytecode_hash and contract_address with values from
+# YOUR live deployments (prefer omega-manifest-gen against eth_getCode).
+# Hardhat-style sample addresses below will fail integrity / Stage 2b on mainnet.
+
 [[strategies]]
 strategy_id = "CNRY"
 bytecode_hash = "0x793138164060ac16fd2f9366fcd874da8ef61346904a3f17d0ef203d1661cb92"

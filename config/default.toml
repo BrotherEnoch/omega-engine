@@ -1,7 +1,6 @@
-# config/default.toml
-# PRODUCTION LIVE � phase 4 lifts Stage-0 relay suppression and enables SA/MSA/LA/MEV.
-# Shadow/dev: set active_phase = 0 or use a separate shadow config.
+﻿# config/default.toml — keep in sync for live
 active_phase = 4
+
 [gas]
 l2_buffer_factor            = 1.15
 l1_data_buffer_factor       = 1.10
