@@ -126,7 +126,7 @@ contract RegisterStrategies is Script {
         string memory toml,
         string memory tomlKey,
         StrategyEntry memory entry
-    ) internal view {
+    ) internal pure {
         bytes32 manifestId = vm.parseTomlBytes32(toml, tomlKey);
         require(
             manifestId == entry.strategyId,
