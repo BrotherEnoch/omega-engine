@@ -1524,7 +1524,7 @@ async fn main() -> Result<()> {
                 }
             },
             RelayName::Bloxroute => match std::env::var("BLOXROUTE_AUTH_TOKEN") {
-                Ok(t) => RelayAuth::BearerToken(t),
+                Ok(t) => RelayAuth::AuthorizationToken(t),
                 Err(_) => {
                     tracing::warn!(relay = %name, "BLOXROUTE_AUTH_TOKEN not set — relay skipped");
                     continue;

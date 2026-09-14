@@ -41,11 +41,15 @@ use crate::error::{RelayError, RelayResult};
 /// Per-relay authentication method.
 #[derive(Clone)]
 pub enum RelayAuth {
-    /// Flashbots-style `X-Flashbots-Signature` header (Flashbots, Titan).
+    /// Per-request EIP-191 signature auth used by Flashbots and Titan
+    /// (`X-Flashbots-Signature: <address>:<sig>`, re-signed over the exact
+    /// request body on every call — see `FlashbotsSigner`).
     FlashbotsStyle(FlashbotsSigner),
-    /// Static bearer-style token header (bloXroute, Eden).
+    /// Raw `Authorization: <token>` header used by bloXroute.
+    AuthorizationToken(String),
+    /// `Authorization: Bearer <token>` header used by relays that require bearer auth.
     BearerToken(String),
-    /// No authentication — e.g. a local/dev relay in tests.
+    /// No authentication — the request is submitted with no auth header at all.
     None,
 }
 
@@ -68,6 +72,7 @@ impl RelayAuth {
             RelayAuth::FlashbotsStyle(signer) => {
                 Ok(vec![("X-Flashbots-Signature", signer.sign_header(body)?)])
             }
+            RelayAuth::AuthorizationToken(token) => Ok(vec![("Authorization", token.clone())]),
             RelayAuth::BearerToken(token) => Ok(vec![("Authorization", format!("Bearer {token}"))]),
             RelayAuth::None => Ok(vec![]),
         }
@@ -238,6 +243,14 @@ mod tests {
             headers,
             vec![("Authorization", "Bearer secret123".to_string())]
         );
+    }
+
+    #[test]
+    fn authorization_token_header_format() {
+        let auth = RelayAuth::AuthorizationToken("secret123".into());
+        let headers = auth.headers_for_body(b"body").unwrap();
+
+        assert_eq!(headers, vec![("Authorization", "secret123".to_string())]);
     }
 
     #[test]
