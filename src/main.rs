@@ -28,6 +28,18 @@
 //
 // ## Changelog (most recent first within each item; see VCS for full history)
 //
+// - C10g (this package, patch): fixed E0428 (`main` defined multiple times) and the
+//   resulting E0432/E0433 unresolved-crate errors — a leftover scratch block (an
+//   `aws_sdk_kms` import plus its own standalone `fn main() { ... }` that only checked
+//   that the AWS KMS SDK's API surface compiled) had been left in this file above the
+//   real `#[tokio::main] async fn main() -> Result<()>`. Two separate `fn main`
+//   definitions in one module is a hard error regardless of signature, and this crate
+//   has no `aws-sdk-kms` dependency in Cargo.toml, so the import was also unresolved on
+//   its own. Removed both the import and the scratch `fn main() { ... }` entirely; the
+//   real, `#[tokio::main]`-annotated `async fn main() -> Result<()>` below is unchanged
+//   and is now the sole `main`. No behavior change to the running engine — this was
+//   dead scratch code, never reachable from the real entry point.
+//
 // - C10f (this package, patch): fixed the `-D warnings` clippy failure —
 //   `use std::collections::{HashMap, HashSet};` triggered `unused_imports` on
 //   `HashSet` because the only `HashSet` usage in this file (the Gap 6 manifest

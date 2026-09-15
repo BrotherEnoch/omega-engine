@@ -1,0 +1,23 @@
+# crates/aws-kms-signer/Cargo.toml
+[workspace]
+
+[package]
+name = "aws-kms-signer"
+version = "0.1.0"
+edition = "2021"
+description = "AWS KMS-backed secp256k1 signer for Omega (minimal surface)"
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+aws-sdk-kms = "=1.119.0"
+k256 = { version = "0.13", features = ["ecdsa", "std", "pkcs8"] }
+sha3 = "0.10"
+thiserror = "2.0"
+hex = "0.4"
+
+[dev-dependencies]
+tokio = { version = "1.40", features = ["rt-multi-thread", "macros"] }
+
+[[example]]
+name = "basic"
+path = "examples/basic.rs"

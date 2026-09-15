@@ -1,0 +1,31 @@
+# crates/aws-kms-omega-adapter/Cargo.toml
+[workspace]
+
+[package]
+name = "aws-kms-omega-adapter"
+version = "0.1.0"
+edition = "2021"
+description = "Non-invasive TransactionSigner adapter: Omega trait + AWS KMS outer envelope"
+license = "MIT OR Apache-2.0"
+publish = false
+
+[dependencies]
+# Isolated KMS crypto crate (sibling, also workspace-excluded)
+aws-kms-signer = { path = "../aws-kms-signer" }
+
+# Omega public surface only — no edits to these crates
+omega-execution = { path = "../omega-execution" }
+omega-security = { path = "../omega-security" }
+omega-core = { path = "../omega-core" }
+
+# Match Omega workspace pins (alloy 0.3 / primitives 0.8 generation)
+alloy-primitives = { version = "0.8", features = ["serde"] }
+async-trait = "0.1"
+hex = "0.4"
+rlp = "0.5"
+sha3 = "0.10"
+thiserror = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }

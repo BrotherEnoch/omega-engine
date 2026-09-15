@@ -8,6 +8,7 @@ pub mod background_tasks;
 pub mod config_translation;
 pub mod context_assembly;
 pub mod error;
+pub mod execute_calldata;
 pub mod flashloan_provider_table;
 pub mod idempotency;
 pub mod inflight;
@@ -27,6 +28,10 @@ pub use context_assembly::{
     LatestNonceSource, LiveContextHandles, RiskScoreSource, StrategyLimits,
 };
 pub use error::ExecutionError;
+pub use execute_calldata::{
+    encode_execute_call, envelope_fees_wei, ExecuteCalldataBuilder, GWEI_TO_WEI, MAX_FEE_GWEI_CAP,
+    MAX_PRIORITY_FEE_GWEI_CAP,
+};
 pub use flashloan_provider_table::{
     arbitrum_flashloan_provider_table, resolve_flashloan_provider_id as resolve_provider_address,
 };
@@ -36,7 +41,9 @@ pub use inflight::{
 };
 pub use pipeline::{ExecutionOutcome, ExecutionPipeline};
 pub use relay_factory::{RelayClientFactory, UnconfiguredRelayClientFactory};
-pub use signer::{SignedTransaction, TransactionSigner, UnconfiguredSigner};
+pub use signer::{
+    KeyManagerTransactionSigner, SignedTransaction, TransactionSigner, UnconfiguredSigner,
+};
 pub use stage7::{
     process_confirmation_results, process_confirmation_results_async,
     process_confirmation_results_with_lookup, run_stage7_interval_loop,
