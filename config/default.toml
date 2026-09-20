@@ -1,4 +1,4 @@
-﻿# config/default.toml — keep in sync for live
+# config/default.toml — keep in sync for live
 active_phase = 4
 
 [gas]

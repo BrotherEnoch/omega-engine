@@ -1,4 +1,4 @@
-﻿PS C:\Users\silve\Documents\omega-engine> Get-ChildItem . -Recurse -Filter *.rs |
+PS C:\Users\silve\Documents\omega-engine> Get-ChildItem . -Recurse -Filter *.rs |
 >>     Select-String -Pattern "struct\s+ExecutionBlueprint|enum\s+ExecutionBlueprint|type\s+ExecutionBlueprint"
 
 crates\omega-core\src\types\blueprint.rs:208:pub struct ExecutionBlueprint {

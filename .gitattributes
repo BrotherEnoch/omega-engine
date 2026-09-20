@@ -1,4 +1,4 @@
-﻿# Normalize line endings to LF for all text files, regardless of platform
+# Normalize line endings to LF for all text files, regardless of platform
 # or which editor/tool last touched them. Prevents CRLF/LF diff noise like
 # the ~175-line diff churn a single-character encoding fix produced this
 # session, purely from a Windows tool round-tripping line endings.

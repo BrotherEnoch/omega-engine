@@ -1,4 +1,4 @@
-﻿# contracts/foundry.toml
+# contracts/foundry.toml
 [profile.default]
 src          = "src"
 out          = "out"

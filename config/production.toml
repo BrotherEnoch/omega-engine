@@ -1,4 +1,4 @@
-﻿# config/production.toml — FULL PRODUCTION (active_phase = 4)
+# config/production.toml — FULL PRODUCTION (active_phase = 4)
 active_phase = 4
 
 [gas]

@@ -1,4 +1,4 @@
-﻿# config/base.toml
+# config/base.toml
 [chain]
 chain_id    = 8453
 name        = "base"
