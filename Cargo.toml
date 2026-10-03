@@ -57,6 +57,9 @@
 debug       = 1
 incremental = true
 
+[features]
+kms = ["dep:aws-config", "dep:aws-sdk-kms"]
+
 [package]
 name        = "omega-engine"
 version     = "12.0.0"
@@ -95,6 +98,8 @@ omega-relay         = { path = "crates/omega-relay" }
 omega-flashloan     = { path = "crates/omega-flashloan" }
 omega-security      = { path = "crates/omega-security" }
 omega-execution     = { path = "crates/omega-execution" }
+aws-config = { version = "1.12.0", optional = true }
+aws-sdk-kms = { version = "1.121.0", optional = true }
 
 [workspace]
 resolver = "2"

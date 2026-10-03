@@ -15,9 +15,7 @@
 //      https://arb1.arbitrum.io/rpc (chain id 42161 / 0xa4b1) on
 //      2026-08-25. Prefix and approximate size recorded at verification time.
 //
-// Entries deliberately still omitted: Balancer Vault (mainnet address
-// 0xBA1222… has empty code on Arbitrum One; no verified Arbitrum deployment
-// was confirmed this session).
+// Balancer V2 Vault (0xBA12...) was added after confirming live code on Arbitrum One.
 //
 // ## Before adding any further address to this table
 //
@@ -96,6 +94,12 @@ pub fn arbitrum_flashloan_provider_table() -> HashMap<Address, &'static str> {
         "euler_v2",
     );
 
+    // Balancer V2 Vault - same-address deployment on Arbitrum One (Balancer docs);
+    // confirmed non-empty via eth_getCode on Arbitrum, and validated by main.rs C7.
+    m.insert(
+        address!("BA12222222228d8Ba445958a75a0704d566BF2C8"),
+        "balancer",
+    );
     m
 }
 
@@ -186,7 +190,7 @@ mod tests {
         let table = arbitrum_flashloan_provider_table();
         assert_eq!(
             table.len(),
-            7,
+            8,
             "table should have exactly the verified entries — update this \
              count deliberately when adding a new address, and confirm its \
              sourcing per this file's module doc before doing so"

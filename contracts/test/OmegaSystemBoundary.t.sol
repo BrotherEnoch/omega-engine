@@ -137,10 +137,13 @@ contract OmegaVaultBoundaryTest is Test {
     }
 
     function test_DailyCapOneWeiOverReverts() public {
+        // Named `fillHash` (rather than `bpHash`) so it doesn't shadow the `bpHash` declared
+        // below for the final, over-the-cap release -- the two serve different purposes and
+        // previously triggered a shadowed-declaration warning from the compiler.
         for (uint256 i = 0; i < 11; i++) {
-            bytes32 bpHash = keccak256(abi.encode("daily-overflow-fill", i));
-            _depositAndConfirm(bpHash, CHUNK);
-            vault.releaseProfit(bpHash);
+            bytes32 fillHash = keccak256(abi.encode("daily-overflow-fill", i));
+            _depositAndConfirm(fillHash, CHUNK);
+            vault.releaseProfit(fillHash);
         }
         assertEq(vault.daily_released(), 495 ether);
         // Remaining headroom is exactly 5 ether. Request 5 ether + 1 wei -- still well under
@@ -414,7 +417,8 @@ contract MockSwapPool {
         uint256 /* minOut */,
         address recipient
     ) external returns (uint256 amountOut) {
-        MockERC20(tokenIn).transferFrom(msg.sender, address(this), amountIn);
+        bool ok = MockERC20(tokenIn).transferFrom(msg.sender, address(this), amountIn);
+        require(ok, "MockSwapPool: transferFrom failed");
         amountOut = amountIn + 1;
         MockERC20(tokenOut).mint(recipient, amountOut);
     }
@@ -606,6 +610,9 @@ contract MevOfaBoundaryTest is Test {
         uint256 amountIn
     ) internal view returns (bytes memory) {
         return abi.encode(
+            // casting to 'bytes32' is safe because "tx" is a 2-byte ASCII literal, far
+            // short of the 32-byte width, so right-padding on conversion can never truncate.
+            // forge-lint: disable-next-line(unsafe-typecast)
             bytes32("tx"),
             address(pool),
             address(tokenIn),

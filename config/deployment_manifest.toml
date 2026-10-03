@@ -1,34 +1,29 @@
-# config/deployment_manifest.toml
-# CRITICAL: Replace every bytecode_hash and contract_address with values from
-# YOUR live deployments (prefer omega-manifest-gen against eth_getCode).
-# Hardhat-style sample addresses below will fail integrity / Stage 2b on mainnet.
-
 [[strategies]]
 strategy_id = "CNRY"
-bytecode_hash = "0x793138164060ac16fd2f9366fcd874da8ef61346904a3f17d0ef203d1661cb92"
-contract_address = "0xB7f8BC63BbcaD18155201308C8f3540b07f84F5e"
+bytecode_hash = "0xa65a276585238cbcbf71b428b0d8f81c00722c246393dc2ba4e962d4cbc03291"
+contract_address = "0x80352e2A85474B0B6e2e3d8ca2C40Ac9DCFeB9D6"
 min_phase = 0
 
 [[strategies]]
 strategy_id = "SA"
-bytecode_hash = "0xbcb9a4a15eb63df192b2e2fbb1ca527cf9f02c4a0c871aa2d173b78405189938"
-contract_address = "0x610178dA211FEF7D417bC0e6FeD39F05609AD788"
+bytecode_hash = "0x29cd4206a557655c451fea9deb87e8e2a9f50e46f9c5519b15e8afd51bab76f4"
+contract_address = "0x171EA4921DF8A2d8F57c50667F791E0B639d7328"
 min_phase = 1
 
 [[strategies]]
 strategy_id = "MSA"
-bytecode_hash = "0x9a96fcaea07fa6e4a0a8a94e3874f2c5eb5d689d8351c4e778834d7674443bfb"
-contract_address = "0x0DCd1Bf9A1b36cE34237eEaFef220932846BCD82"
+bytecode_hash = "0x4aedd99c79851ac54c39758844898f5a7b3742a68e39e13efe5bff93fe0bf23e"
+contract_address = "0x38732EDBFB5A0ae7f2C4e1C4dB9BE45041d2d51B"
 min_phase = 2
 
 [[strategies]]
 strategy_id = "LA"
-bytecode_hash = "0x57aeeb759921b817c4bf6c9d25b85b4b698e5393530e1ec634c61d4d01f1e7da"
-contract_address = "0xA51c1fc2f0D1a1b8494Ed1FE312d7C3a78Ed91C0"
+bytecode_hash = "0xf339bfcd443b2f153567fd85f32876917c7d84a5048bc92862640afcec3a3215"
+contract_address = "0xeE29a1fA411B590C204E1Db6101681a4eEdff0D3"
 min_phase = 3
 
 [[strategies]]
 strategy_id = "MEV"
-bytecode_hash = "0x1f1be6a697bd8caba06b6c8bff9b947f0c0955672a6d645c97aa8d469ed7f470"
-contract_address = "0x9A676e781A523b5d0C0e43731313A708CB607508"
+bytecode_hash = "0x1217a8f00e7efa4f1d4b09a30e3e78bd8373a3793d738c64024b35b5a0941b7b"
+contract_address = "0x0bD2e0Dabf017397955EC169fB30269d1324d31B"
 min_phase = 4

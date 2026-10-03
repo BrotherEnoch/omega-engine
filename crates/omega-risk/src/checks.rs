@@ -1,4 +1,5 @@
 // crates/omega-risk/src/checks.rs
+// crates/omega-risk/src/checks.rs
 // 16 pre-trade checks in FAST-FAIL order (spec Section 5 / S7 / S11 / S12).
 //
 // Order is mandatory and maps directly to the spec:
@@ -25,7 +26,26 @@
 // Thread-safety: run_all_checks() is a pure function (no interior state).
 // Callers should construct CheckContext once per scoring cycle and reuse across checks.
 //
-// ## Audit fix (this revision): check 14, account exposure limit
+// ## Fix (this revision): check 6 fired on identical zero fees
+//
+// `check_gas_spike` previously clamped the creation-time fee with
+// `.max(1)` BEFORE computing the difference, but left the current fee
+// unclamped. When both fees were 0 (e.g. a local Anvil/Hardhat chain with
+// no ArbGasInfo precompile, where the L2d poll fails every cycle and
+// `l1_data_fee_gwei` stays at its default of 0), the check computed
+// `diff = |0 - 1| = 1` and `1 * 100 > 1 * 30`, so it returned
+// `MissGasSpike` for every blueprint even though NOTHING had moved.
+// Observed symptom: 226 of 226 drops were `MissGasSpike`.
+//
+// Fixed by computing `diff` from the RAW creation fee and clamping only
+// the DENOMINATOR (the baseline the percentage is measured against):
+//   - 0 vs 0 → diff 0 → passes (nothing moved).
+//   - 0 → N>0 → diff N, baseline 1 → N*100 > 30 → drops (any rise from a
+//     zero baseline is treated as "infinite" percentage change, which is
+//     the conservative reading and cannot divide by zero).
+//   - every non-zero creation fee behaves exactly as before.
+//
+// ## Audit fix (earlier revision): check 14, account exposure limit
 //
 // Added as specified, with one correction: the field added to
 // `current_account_exposure_wei` is `bp.flashloan_amount`, NOT
@@ -45,7 +65,7 @@
 // `DropCode::MissExposureLimit` must exist on `omega_core::errors::DropCode`
 // — that enum lives outside this crate and is not modified here.
 //
-// ## Audit fix (this revision): integer arithmetic for checks 6 and 10
+// ## Audit fix (earlier revision): integer arithmetic for checks 6 and 10
 //
 // `check_gas_spike` and `check_flashloan_liquidity` previously used `f64`
 // division/multiplication to evaluate ratio thresholds. Replaced with exact
@@ -70,7 +90,7 @@
 // rather than inline literals, so there is exactly one place to change either
 // threshold and no risk of the check silently drifting out of sync with it.
 //
-// ## Audit fix (this revision): check 15, nonce replay / stale blueprint
+// ## Audit fix (earlier revision): check 15, nonce replay / stale blueprint
 //
 // A blueprint carries a monotonically-increasing `nonce` assigned at
 // creation. If `bp.nonce <= ctx.latest_blueprint_nonce`, this blueprint is
@@ -100,7 +120,7 @@
 // nonce` stays a plain `u64` in `CheckContext`, consistent with every other
 // counter/threshold field already there.
 //
-// ## Audit fix (this revision): structured audit logging on every drop
+// ## Audit fix (earlier revision): structured audit logging on every drop
 //
 // The per-check tracing call in `run_all_checks` was widened from a
 // bare `drop_code`/`strategy` pair to include the fields an operator
@@ -115,7 +135,7 @@
 // structured JSON under a JSON-formatted subscriber, so no separate
 // hand-rolled JSON logger is introduced.
 //
-// ## Audit fix (this revision): check 16, oracle price sanity / flash-crash
+// ## Audit fix (earlier revision): check 16, oracle price sanity / flash-crash
 // guard, and shared check functions for cross-crate reuse
 //
 // `DropCode::MissFlashCrash` already existed as a match arm in
@@ -152,7 +172,7 @@
 // could silently drift out of sync exactly the way the gas-spike/
 // flashloan-safety constants were fixed to prevent above.
 //
-// ## Fix (this revision): unused staleness-constant imports
+// ## Fix (earlier revision): unused staleness-constant imports
 //
 // `CHAINLINK_STALENESS_SECS`, `PYTH_STALENESS_SECS`, `TWAP_STALENESS_SECS`
 // were imported here but never referenced — the actual per-feed
@@ -164,7 +184,7 @@
 // `#[allow(unused_imports)]`-ing them, since the actual fix is simply
 // not importing what this file doesn't use.
 //
-// ## Audit fix (this revision): clippy::collapsible_if in oracle_hierarchy_check
+// ## Audit fix (earlier revision): clippy::collapsible_if in oracle_hierarchy_check
 //
 // `oracle_hierarchy_check` previously nested `if oracle.chainlink_fresh()
 // && oracle.pyth_fresh() { if oracle.chainlink_pyth_divergence() > ... {
@@ -176,7 +196,7 @@
 // which is what `clippy::collapsible_if` (denied under `-D warnings`)
 // requires.
 //
-// ## Audit fix (this revision, 2): check 8 must skip non-sane prices,
+// ## Audit fix (earlier revision, 2): check 8 must skip non-sane prices,
 // not treat them as "divergence"
 //
 // Root cause of three test failures (`zero_price_on_fresh_oracle_
@@ -272,7 +292,7 @@ pub fn oracle_freshness_check(oracle: &OracleSnapshot) -> Option<DropCode> {
 /// `ORACLE_DIVERGE_THRESHOLD`. Skipped (returns `None`) when fewer than
 /// two fresh spot feeds are available to compare, **or when either fresh
 /// price is non-sane** (zero, negative, NaN, or infinite) — see this
-/// file's module-level "Audit fix (this revision, 2)" note. A non-sane
+/// file's module-level "Audit fix (earlier revision, 2)" note. A non-sane
 /// price is not "divergence"; that case is check 16's
 /// (`oracle_price_sanity_check` / `MissFlashCrash`) responsibility, and
 /// letting `chainlink_pyth_divergence()`'s `f64::INFINITY` sentinel leak
@@ -437,7 +457,7 @@ fn run_checks_inner(bp: &BlueprintFields, ctx: &CheckContext) -> CheckResult {
     }
 
     // 8. Oracle hierarchy — one float division (only when both feeds fresh
-    // AND sane; see this file's module doc comment, "Audit fix (this
+    // AND sane; see this file's module doc comment, "Audit fix (earlier
     // revision, 2)").
     if let Some(c) = check_oracle_hierarchy(bp, ctx) {
         return CheckResult::Fail(c);
@@ -558,14 +578,18 @@ fn check_dynamic_profit(bp: &BlueprintFields, _ctx: &CheckContext) -> Option<Dro
 /// Check 6: reject if L1 gas price has moved > threshold since blueprint
 /// creation (spec S12: MissGasSpike).
 ///
-/// Exact integer form of `diff / at_creation > NUM / DEN`, rearranged to
-/// `diff * DEN > at_creation * NUM` to avoid division entirely — no float
+/// Exact integer form of `diff / baseline > NUM / DEN`, rearranged to
+/// `diff * DEN > baseline * NUM` to avoid division entirely — no float
 /// precision loss near the boundary, and bit-identical across platforms.
 ///
-/// `at_creation.max(1)` guards the same as before: a zero-fee-at-creation
-/// value (which should never happen in practice, but must not panic or
-/// divide by zero if it does) is treated as 1 gwei rather than triggering
-/// undefined behavior.
+/// `diff` is computed from the RAW creation-time fee, so two identical
+/// fees (including 0 vs 0) always yield `diff == 0` and pass. Only the
+/// `baseline` (the denominator the percentage move is measured against)
+/// is clamped with `.max(1)`, so a zero creation fee cannot divide by
+/// zero or make every comparison degenerate: a rise from a zero baseline
+/// to any non-zero value is treated as a spike (conservative). See this
+/// file's module doc comment ("Fix (this revision): check 6 fired on
+/// identical zero fees") for the bug this replaces.
 ///
 /// `saturating_mul` on both sides guards against overflow from a
 /// malformed/extreme gas price feeding in from upstream — same principle
@@ -574,12 +598,13 @@ fn check_dynamic_profit(bp: &BlueprintFields, _ctx: &CheckContext) -> Option<Dro
 /// around into something that looks small and safe.
 #[inline]
 fn check_gas_spike(bp: &BlueprintFields, ctx: &CheckContext) -> Option<DropCode> {
-    let at_creation = bp.l1_data_fee_at_creation.max(1);
+    let at_creation = bp.l1_data_fee_at_creation;
     let current = ctx.current_l1_gas_price_gwei;
     let diff = current.abs_diff(at_creation);
+    let baseline = at_creation.max(1);
 
     if diff.saturating_mul(GAS_SPIKE_THRESHOLD_DEN)
-        > at_creation.saturating_mul(GAS_SPIKE_THRESHOLD_NUM)
+        > baseline.saturating_mul(GAS_SPIKE_THRESHOLD_NUM)
     {
         return Some(DropCode::MissGasSpike);
     }
@@ -966,6 +991,44 @@ mod checks_tests {
             run_all_checks(&bp, &ctx),
             CheckResult::Fail(DropCode::MissGasSpike)
         );
+    }
+
+    #[test]
+    fn gas_spike_zero_fee_on_both_sides_passes() {
+        // Regression guard for the local-chain bug: no ArbGasInfo precompile
+        // means both the creation-time fee and the current fee are 0.
+        // Nothing moved, so check 6 must NOT fire. Previously the creation
+        // fee was clamped to 1 before the diff was taken, giving
+        // diff = |0 - 1| = 1 and 1*100 > 1*30 → a false MissGasSpike for
+        // every blueprint.
+        let mut bp = passing_bp();
+        bp.l1_data_fee_at_creation = 0;
+        let mut ctx = passing_ctx();
+        ctx.current_l1_gas_price_gwei = 0;
+        assert_eq!(run_all_checks(&bp, &ctx), CheckResult::Pass);
+    }
+
+    #[test]
+    fn gas_spike_zero_creation_fee_then_nonzero_current_fails() {
+        // A rise from a zero baseline is still treated as a spike
+        // (conservative), without dividing by zero.
+        let mut bp = passing_bp();
+        bp.l1_data_fee_at_creation = 0;
+        let mut ctx = passing_ctx();
+        ctx.current_l1_gas_price_gwei = 5;
+        assert_eq!(
+            run_all_checks(&bp, &ctx),
+            CheckResult::Fail(DropCode::MissGasSpike)
+        );
+    }
+
+    #[test]
+    fn gas_spike_identical_nonzero_fees_pass() {
+        let mut bp = passing_bp();
+        bp.l1_data_fee_at_creation = 1;
+        let mut ctx = passing_ctx();
+        ctx.current_l1_gas_price_gwei = 1;
+        assert_eq!(run_all_checks(&bp, &ctx), CheckResult::Pass);
     }
 
     // ── Check 7: oracle freshness ─────────────────────────────────────────────
@@ -1512,7 +1575,7 @@ mod checks_tests {
     fn nonce_replay_fails_before_price_sanity() {
         // check 16 runs last — confirm check 15 (nonce) still wins when
         // both would fail, since code order (not cost) governs. Also
-        // exercises this revision's check-8 fix: a non-sane chainlink
+        // exercises the earlier check-8 fix: a non-sane chainlink
         // price must not short-circuit into MissOracleDiverge before
         // check 15 is even reached.
         let mut bp = passing_bp();

@@ -256,11 +256,21 @@ mod arbitrum_addrs {
     /// refuses to start while these remain unset (see
     /// `ensure_addresses_configured`) rather than silently subscribing
     /// to the wrong (or nonexistent) contracts.
-    pub const COMPOUND_V3: Address = address!("0000000000000000000000000000000000000001");
-    pub const MORPHO: Address = address!("0000000000000000000000000000000000000002");
+    pub const COMPOUND_V3: Address = address!("9c4ec768c28520B50860ea7a15bd7213a9fF58bf");
+    pub const MORPHO: Address = address!("6c247b1F6182318877311737BaC0844bAa518F5e");
+    pub const COMPOUND_V3_WETH: Address = address!("6f7D514bbD4aFf3BcD1140B7344b32f063dEe486");
+    pub const COMPOUND_V3_USDCE: Address = address!("A5EDBDD9646f8dFF606d7448e414884C7d905dCA");
+    pub const COMPOUND_V3_USDT: Address = address!("d98Be00b5D27fc98112BdE293e487f8D4cA57d07");
+    pub const COMPOUND_V3_MARKETS: [Address; 4] = [
+        COMPOUND_V3,
+        COMPOUND_V3_WETH,
+        COMPOUND_V3_USDCE,
+        COMPOUND_V3_USDT,
+    ];
+    #[allow(dead_code)]
     pub const EULER_V2: Address = address!("eeee15a3a7de0b6a7d1e5c6c4a4b8e5e2e6e6ddd");
 
-    pub const PLACEHOLDER_ADDRESSES: [Address; 3] = [COMPOUND_V3, MORPHO, EULER_V2];
+    pub const PLACEHOLDER_ADDRESSES: [Address; 0] = [];
 }
 
 const LENDING_STREAM_CHAIN_ID: u64 = 42161; // addresses above are Arbitrum-specific
@@ -339,8 +349,10 @@ async fn run_lending_once(
     let filter = Filter::new().address(vec![
         arbitrum_addrs::AAVE_V3_POOL,
         arbitrum_addrs::COMPOUND_V3,
+        arbitrum_addrs::COMPOUND_V3_WETH,
+        arbitrum_addrs::COMPOUND_V3_USDCE,
+        arbitrum_addrs::COMPOUND_V3_USDT,
         arbitrum_addrs::MORPHO,
-        arbitrum_addrs::EULER_V2,
     ]);
 
     let mut stream = provider
@@ -368,9 +380,8 @@ async fn run_lending_once(
 
         let protocol = match log.address() {
             a if a == arbitrum_addrs::AAVE_V3_POOL => LendingProtocol::AaveV3,
-            a if a == arbitrum_addrs::COMPOUND_V3 => LendingProtocol::CompoundV3,
+            a if arbitrum_addrs::COMPOUND_V3_MARKETS.contains(&a) => LendingProtocol::CompoundV3,
             a if a == arbitrum_addrs::MORPHO => LendingProtocol::Morpho,
-            a if a == arbitrum_addrs::EULER_V2 => LendingProtocol::EulerV2,
             other => {
                 tracing::warn!(addr = %other, "Unknown lending contract in log");
                 continue;

@@ -7,9 +7,14 @@
 //   VAULT_ADDRESS            OmegaVault address — feeds publicInputsHash for ZK proofs
 //   PROFIT_TOKEN             Profit token address — feeds publicInputsHash for ZK proofs
 //   ORCHESTRATOR_ADDRESS     OmegaOrchestrator address every signed tx calls execute() on
-//   OMEGA_TX_SIGNING_KEY     Hex secp256k1 key for the gas-paying tx-envelope signer
 //   OMEGA_BLUEPRINT_SIGNING_KEY  Hex secp256k1 key; derived address must match
 //                            OmegaOrchestrator.execution_key on-chain
+//
+// Gas-paying outer envelope (choose one):
+//   OMEGA_TX_SIGNER=local    (default) requires OMEGA_TX_SIGNING_KEY
+//   OMEGA_TX_SIGNER=kms      requires AWS_KMS_KEY_ID (+ AWS creds/region);
+//                            optional OMEGA_TX_EXPECTED_ADDRESS fail-closed check
+//   OMEGA_TX_SIGNING_KEY     Hex secp256k1 key when OMEGA_TX_SIGNER=local
 //
 // Optional env vars:
 //   OMEGA_CONFIG                          default: config/default.toml
@@ -25,8 +30,84 @@
 //   BLOXROUTE_AUTH_TOKEN, EDEN_AUTH_TOKEN, OMEGA_EXECUTION_ADDRESS
 //                                          per-relay bootstrap; a relay missing its
 //                                          endpoint/secret is skipped, never faked
+//   OMEGA_VAULT_SUBMIT_NONCE              FALLBACK ONLY (see C10k): the submitProof keeper
+//                                          reads the signer's pending nonce from the chain
+//                                          at startup and re-syncs on any broadcast error;
+//                                          this value is used only if that chain read fails
+//   OMEGA_LOCAL_L1_DATA_FEE_GWEI          non-default chains only (see C10k): L1 data fee
+//                                          seeded when the ArbGasInfo poll fails; default 1
 //
 // ## Changelog (most recent first within each item; see VCS for full history)
+//
+// - C10k (this package, patch): three fixes found while running against a local Anvil
+//   chain (OMEGA_CHAIN_ID=31337).
+//   (1) L2d seed: Anvil has no ArbGasInfo precompile, so `getL1BaseFeeEstimate` fails with
+//   `InvalidFEOpcode` every cycle and `l1_data_fee_gwei` stays 0. Combined with check 6's
+//   old zero-clamping bug (fixed in omega-risk's checks.rs) that dropped 226/226
+//   blueprints as MissGasSpike. On a NON-default chain only, a failed poll now seeds a
+//   stable fee (OMEGA_LOCAL_L1_DATA_FEE_GWEI, default 1) so the signal carries a
+//   consistent value. On the default chain (Arbitrum One) behavior is unchanged: a failed
+//   poll keeps the previous value.
+//   (2) submitProof keeper nonce: the keeper used an AtomicU64 seeded once from the
+//   OMEGA_VAULT_SUBMIT_NONCE env var and never looked at the chain again, so any other
+//   sender sharing the account (Anvil account #0 is shared with deploy scripts and the
+//   execution path) produced a flood of `nonce too low`. It now reads the signer's
+//   pending nonce via eth_getTransactionCount at startup, and on ANY broadcast failure
+//   re-reads it from the chain and (for `nonce too low`) retries that proof up to
+//   SUBMIT_PROOF_MAX_ATTEMPTS times. The failure log now includes the nonce used.
+//   (3) Removed a duplicated, unreachable `Err(e)` match arm in that keeper that had been
+//   introduced by pasting the nonce-logging edit next to the original arm.
+//
+// - C10j (this package, patch): re-wired `tx_signer_factory` back into the binary.
+//   A prior edit had started constructing the transaction signer directly in main()
+//   via `KeyManagerTransactionSigner::new(...)`, bypassing `tx_signer_factory.rs`'s
+//   `ProductionTxSigner` enum and its `OMEGA_TX_SIGNER=local|kms` branch entirely —
+//   confirmed by the absence of `mod tx_signer_factory;` and by `aws-sdk-kms` /
+//   `aws-config` / `aws-kms-signer` / `aws-kms-omega-adapter` never appearing in a real
+//   `cargo build --release` dependency list, even though `tx_signer_factory.rs` directly
+//   imports and uses all four. That made `tx_signer_factory.rs` dead code: on disk, but
+//   unreachable from the running binary, and `OMEGA_TX_SIGNER`/`AWS_KMS_KEY_ID`/
+//   `OMEGA_TX_EXPECTED_ADDRESS` silently did nothing. Restored `mod tx_signer_factory;`
+//   and construct the signer via `tx_signer_factory::build_production_tx_signer(...)`,
+//   matching this file's own header comment, which has documented the KMS backend the
+//   whole time. `ExecutionPipeline<...>`'s generic parameter changes accordingly, from
+//   `KeyManagerTransactionSigner` to `tx_signer_factory::ProductionTxSigner`, in both
+//   `run_scoring_loop` and `score_and_admit`'s signatures; `hot_path_zk_provisioning_
+//   tests::build_harness` now wraps its test-only `KeyManagerTransactionSigner` in
+//   `tx_signer_factory::ProductionTxSigner::Local(...)` so its constructed
+//   `ExecutionPipeline` still type-checks against `score_and_admit`'s updated signature.
+//   No behavior change for anyone already running `OMEGA_TX_SIGNER=local` (or unset) —
+//   `ProductionTxSigner::Local` wraps the same `KeyManagerTransactionSigner` construction
+//   that was inlined in main() before; this fix makes `OMEGA_TX_SIGNER=kms` actually
+//   reachable, which it was not.
+//
+// - C10i (this package, patch): removed unused-import/dead-code warnings flagged by
+//   `cargo check --workspace` without touching behavior or breaking `cargo test`.
+//   `KeyManagerTransactionSigner`, `BlueprintSigner`, and `KeyManager` are only
+//   referenced from `hot_path_zk_provisioning_tests::build_harness` (via `use
+//   super::*;`), so `cargo check` (which doesn't compile `#[cfg(test)]` code) flagged
+//   them as unused even though deleting them outright would have broken `cargo test`
+//   with an unresolved-name error in that module. Gated the three imports behind
+//   `#[cfg(test)]` instead of removing them. `ProductionTxSigner::sign_call()` in
+//   `tx_signer_factory.rs` was genuinely dead (only `sign_call_gwei()` is called, from
+//   the ZK submitProof keeper) and was removed outright, along with the
+//   `alloy_primitives::U256` import that existed only for that method's signature and
+//   would otherwise have become a new unused-import warning.
+//
+// - C10h (this package, patch): fixed E0728 (`await` outside an async function/block)
+//   in `OracleTokenPriceLookup::price_usd_and_decimals` — this method implements
+//   `omega_strategies::TokenPriceLookup`, whose trait signature is synchronous (see
+//   `build_oracle_snapshot` above, which already calls `chainlink.read(token)` /
+//   `pyth.read(token)` / `twap.read(token)` with no `.await`), but the Chainlink branch
+//   here was still writing `self.chainlink.read(symbol).await` — a leftover `.await`
+//   from an earlier draft where this lookup was sketched as async. `ChainlinkOracle::read`
+//   is not an async fn, so `.await`ing its return value is only legal inside an
+//   `async fn`/block, and `price_usd_and_decimals` is neither. Fixed by dropping the
+//   stray `.await`; the Pyth branch immediately below was already correctly
+//   synchronous (`self.pyth.read(symbol)`, no `.await`) and needed no change. No
+//   behavior change: `ChainlinkOracle::read` already returned its `Option<Price>`
+//   synchronously, so removing `.await` from a value that was never a `Future` doesn't
+//   alter what value flows through — it only removes code that could never compile.
 //
 // - C10g (this package, patch): fixed E0428 (`main` defined multiple times) and the
 //   resulting E0432/E0433 unresolved-crate errors — a leftover scratch block (an
@@ -46,111 +127,31 @@
 //   completeness check below) already spells it out via the fully-qualified
 //   `std::collections::HashSet` path rather than the bare imported name. Fixed by
 //   importing only `HashMap`; behavior is unchanged, this is formatting/import-hygiene
-//   only. `cargo test --workspace` and `cargo check --workspace` already passed before
-//   this fix — only `cargo clippy --workspace --all-targets -- -D warnings` (and
-//   consequently the "test" target build under clippy) was failing on it.
+//   only.
 //
 // - C10c (this package, patch): fixed pyth_ratio in build_check_context's oracle
 //   freshness calculation — it was dividing Pyth's age by CHAINLINK_STALENESS_SECS
 //   instead of PYTH_STALENESS_SECS (a copy-paste bug from the adjacent cl_ratio line).
-//   This is also why cargo previously flagged PYTH_STALENESS_SECS as an unused import:
-//   the import existed for exactly this line and was never actually referenced. Also
-//   fixed hot_path_zk_provisioning_tests::hot_path_admission_does_not_block_on_zk_proof_completion,
-//   which was calling score_and_admit with 20 arguments instead of 21 — missing the
-//   mev_share_activity: Arc<MevShareActivityTracker> parameter added when MEV-Share
-//   competition scoring was wired into the real run_scoring_loop call site. build_harness
-//   now also constructs and returns a MevShareActivityTracker for the test to pass
-//   through.
 //
 // - C10d (this package, patch): fixed E0061 in
 //   hot_path_zk_provisioning_tests::build_harness — SaStrategy::new's constructor
 //   signature gained a `liquidity_registry: Arc<LiquidityRegistry>` parameter (Option B
 //   capital path, see sa.rs's own module-level comment) that this test harness was
-//   never updated for; it was still calling SaStrategy::new with 4 arguments instead of
-//   5. Fixed by constructing a real LiquidityRegistry and seeding it with WETH liquidity
-//   before passing it in — seeding (not just an empty registry) preserves this test's
-//   original intent, since an empty registry would make SaStrategy::build_blueprint fail
-//   closed on flashloan selection before ever reaching the hot-path branch this test
-//   exists to exercise.
+//   never updated for.
 //
 // - C10e (this package, patch): OraclePrice::is_fresh() no longer takes a staleness
 //   argument (omega-oracle's own resolution.rs derives the threshold from the price's
-//   own `source` internally) — OracleTokenPriceLookup::price_usd_and_decimals below was
-//   still calling it with an explicit PRIMARY_STALE_SECS argument (E0061). Fixed to
-//   call is_fresh() with no arguments; PRIMARY_STALE_SECS and the unused
-//   omega_strategies::TokenPriceLookup import (referenced only via its full path below)
-//   were dropped accordingly. Also normalised the hardcoded Arbitrum token-address byte
-//   arrays (WETH/USDC/USDC_E/USDT) to consistent lowercase hex to satisfy
-//   clippy::mixed_case_hex_literals under -D warnings — values unchanged, formatting only.
+//   own `source` internally).
 //
 // - C10b: CheckContext WETH watch-channel MAX now includes Uniswap V3
-//   alongside Aave/Balancer (was registry-only for Uni). Fail closed when all three
-//   WETH reads fail (keep previous watch value). `fetch_uniswap_v3_pool_balance`
-//   rejects assets other than WETH/USDC_NATIVE when targeting the canonical pool.
+//   alongside Aave/Balancer (was registry-only for Uni).
 //
-// - C10: L2e now also polls Uniswap V3 (previously the only provider written to
-//   omega-rpc's address list but never actually read from — see the C9 item below,
-//   "UniswapV3 is deliberately not written"). Uses a single, verified WETH/USDC_NATIVE
-//   0.05%-fee pool (`omega_rpc::UNISWAP_V3_WETH_USDC_POOL`) that covers both currently
-//   tracked assets, since a Uniswap V3 pool holds both its tokens' balances directly —
-//   "available liquidity" there is just `ERC20(asset).balanceOf(pool)`
-//   (`OmegaRpcClient::fetch_uniswap_v3_pool_balance`), no protocol-accounting layer to
-//   navigate the way Aave's aToken indirection needs. Verifying that pool address this
-//   session caught a real trap worth flagging here, not just in omega-rpc's own
-//   comments: Arbitrum has TWO different "USDC/WETH 0.05%" Uniswap V3 pools — one
-//   paired with `USDC_NATIVE` (~$75M pooled, the one used here) and one paired with
-//   the older bridged `USDC.e` (well under $1M pooled) — and nothing about querying
-//   the wrong one would have errored; it would have silently reported a thin,
-//   wrong-token pool's balance as this system's Uniswap V3 liquidity signal for every
-//   cycle, forever. `omega-rpc`'s own `UNISWAP_V3_WETH_USDC_POOL` doc comment carries
-//   the full verification trail. C7's `validate_deployed_contracts` now checks this
-//   pool's bytecode presence at startup alongside the other five addresses (6 total),
-//   though — same scope limit as always — bytecode presence would NOT by itself have
-//   caught the wrong-pool trap above (the wrong pool has real code too); the
-//   `balanceOf` read itself is the closest thing to a live check for "is this actually
-//   the pool we think it is," the same posture C7 already takes for Aave/Balancer.
-//   `select_provider` needed NO changes for this — `omega_flashloan`'s registry and
-//   selector were already fully provider- and asset-generic as of C9; UniswapV3 was
-//   dead purely because nothing ever wrote to it, not because of any gap in that
-//   crate. `omega_flashloan::FlashloanError::NoneAvailable` separately gained an
-//   `asset: Address` field this same session (independent of C10's Uniswap wiring) —
-//   with multiple assets tracked, a "no provider available" error that didn't say
-//   which asset it was about had become a real diagnostic gap.
+// - C10: L2e now also polls Uniswap V3, via a single verified WETH/USDC_NATIVE
+//   0.05%-fee pool (`omega_rpc::UNISWAP_V3_WETH_USDC_POOL`).
 //
-// - C9: L2e now polls BOTH WETH and USDC_NATIVE into LiquidityRegistry (was: WETH
-//   only, despite USDC_NATIVE already being validated at startup by C7). This was
-//   deliberately NOT safe to do as a one-line addition: `LiquidityRegistry`'s key was
-//   `(chain_id, provider, contract)` — no asset component — and Aave's Pool /
-//   Balancer's Vault are each a SINGLE contract shared across every token they
-//   support. Polling USDC into the old key would have silently overwritten whatever
-//   was last written for WETH at that same (chain_id, provider, contract) triple, or
-//   vice versa depending on poll ordering — not a panic, not a staleness warning, a
-//   quietly wrong liquidity number for one of the two assets. Fixed at the source:
-//   omega-flashloan's `ProviderKey`/`LiquidityRegistry::update`/`snapshot`/
-//   `available_contracts` and `select_provider` all now take an explicit `asset`
-//   parameter (see that crate's own module-level "CHANGE" note); `LaStrategy::
-//   build_blueprint` already resolves a real `flashloan_token` per position and now
-//   passes it straight through to `select_provider` instead of relying on an
-//   asset-agnostic global. The L2e loop below iterates `[WETH, USDC_NATIVE]` and
-//   writes a registry row per (provider, asset) pair each tick. The single-scalar
-//   `FlashloanLiquidityState` watch channel that feeds `CheckContext.flashloan`
-//   deliberately stays WETH-only — it's paired with `ORACLE_SNAPSHOT_TOKEN`, which is
-//   also WETH-only, and making that pairing asset-aware is a separate, larger change
-//   to `CheckContext`'s shape, not attempted here. STILL OPEN: Uniswap V3 remains
-//   unwritten for either asset (no single canonical pool per asset the way
-//   AAVE_V3_POOL/BALANCER_V2_VAULT are) — unchanged by this revision, same as the C1
-//   item below already noted for WETH.
+// - C9: L2e now polls BOTH WETH and USDC_NATIVE into LiquidityRegistry.
 //
-// - C8: LA registered alongside CNRY in the L13 strategy registry (this revision).
-//   LaStrategy::new's constructor signature gained `position_registry:
-//   Arc<PositionRegistry>` in an earlier omega-strategies revision; main() now
-//   constructs that registry and threads it through. LA's bytecode_hash/contract_addr
-//   are sourced ONLY from IntegrityRegistry::snapshot()'s "LA" entry (the same,
-//   already-loaded deployment-manifest data Stage 2b and resolve_strategy_bytecode_hash
-//   already read) — never a placeholder or guessed address. No manifest, or a manifest
-//   with no "LA" entry, means LA is simply not registered this run; this mirrors the
-//   fail-closed posture Stage 2b already applies to any strategy_id IntegrityRegistry
-//   doesn't know about, rather than registering LA against an invented address.
+// - C8: LA registered alongside CNRY in the L13 strategy registry.
 // VERIFIED / closed — see StrategyEntry and omega-strategies lib.rs re-exports.
 
 /// Parse a 0x-prefixed or bare 32-byte hex string into B256.
@@ -164,6 +165,50 @@ fn parse_b256_hex(s: &str) -> Option<alloy_primitives::B256> {
         out[i] = u8::from_str_radix(&s[i * 2..i * 2 + 2], 16).ok()?;
     }
     Some(alloy_primitives::B256::from(out))
+}
+
+/// Reads `eth_getTransactionCount(address, "pending")` over plain HTTP JSON-RPC.
+///
+/// Used by the ZK submitProof keeper (C10k) so its nonce always comes from the chain
+/// rather than from a one-shot env var. Returns `None` (and logs at `warn`) on any
+/// transport/parse failure; callers decide how to fall back.
+async fn fetch_pending_nonce(
+    http: &reqwest::Client,
+    rpc_url: &str,
+    address_hex: &str,
+) -> Option<u64> {
+    let body = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "eth_getTransactionCount",
+        "params": [address_hex, "pending"]
+    });
+    let resp = match http.post(rpc_url).json(&body).send().await {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::warn!(error = %e, address = %address_hex, "pending nonce lookup: HTTP request failed");
+            return None;
+        }
+    };
+    let v: serde_json::Value = match resp.json().await {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::warn!(error = %e, address = %address_hex, "pending nonce lookup: JSON decode failed");
+            return None;
+        }
+    };
+    if let Some(err) = v.get("error") {
+        tracing::warn!(rpc_error = %err, address = %address_hex, "pending nonce lookup: JSON-RPC error");
+        return None;
+    }
+    let hex = v.get("result").and_then(|r| r.as_str())?;
+    match u64::from_str_radix(hex.trim_start_matches("0x"), 16) {
+        Ok(n) => Some(n),
+        Err(e) => {
+            tracing::warn!(error = %e, address = %address_hex, "pending nonce lookup: hex parse failed");
+            None
+        }
+    }
 }
 
 /// Async eth_call lookup of OmegaVault.pending_profit(bytes32).
@@ -315,6 +360,12 @@ use omega_core::{HealthState, LayerHealth, LayerId, OmegaConfig, StrategyId};
 use omega_dag::{DagConfig, ExecutionDag};
 use omega_execution::config_translation::{translate_relay_config, RelayBootstrapInputs};
 use omega_execution::run_idempotency_eviction_loop;
+// C10i: only referenced from hot_path_zk_provisioning_tests::build_harness (via
+// `use super::*;`) — not from any non-test code in this file. `cargo check
+// --workspace` doesn't compile #[cfg(test)] code, so an unconditional import here
+// showed up as unused there; gating it behind #[cfg(test)] keeps `cargo test` compiling
+// (that module still needs it) while silencing the `cargo check` warning.
+#[cfg(test)]
 use omega_execution::signer::KeyManagerTransactionSigner;
 use omega_execution::{
     default_journal_path, open_default_journal, process_confirmation_results_async,
@@ -345,9 +396,14 @@ use omega_rpc::{
     UNISWAP_V3_WETH_USDC_POOL, USDC_NATIVE, WETH,
 };
 use omega_security::{
-    strategy_entries_from_manifest, AccountExposureTracker, BlueprintSigner, DeploymentManifest,
-    IntegrityRegistry, KeyManager,
+    strategy_entries_from_manifest, AccountExposureTracker, DeploymentManifest, IntegrityRegistry,
 };
+// C10i: same reasoning as the KeyManagerTransactionSigner gate above —
+// BlueprintSigner/KeyManager are only used by hot_path_zk_provisioning_tests::
+// build_harness (constructing a test-only signer pair), not by any non-test code in
+// this file.
+#[cfg(test)]
+use omega_security::{BlueprintSigner, KeyManager};
 // Strategies from IntegrityRegistry manifest. VERIFIED: re-exported at crate root.
 use omega_flashloan::{FlashloanProvider, LiquidityRegistry};
 use omega_strategies::{
@@ -359,14 +415,15 @@ use omega_zk::{
     ProofWorkerPool, VerifiedProofSubmission, ZkConfig, ZkVerifier,
 };
 // C8: real, live lending-position registry LaStrategy now requires at construction.
-// Nothing in this codebase writes to it yet — see the C8 changelog entry above and the
-// warning logged at the L13 registration site below.
 use omega_positions::PositionRegistry;
 // C10f: HashSet dropped from this import — its only use in this file (the Gap 6
 // manifest-completeness check below) already spells it out as the fully-qualified
-// `std::collections::HashSet`, so importing the bare name here was unused and tripped
-// `-D warnings` under clippy.
+// `std::collections::HashSet`, so importing the bare name here was unused.
 use std::collections::HashMap;
+
+/// Restored (C10j): the signer factory module — see this file's header for why this
+/// must be declared for `tx_signer_factory.rs` to be reachable at all.
+mod tx_signer_factory;
 
 /// Fallback chain ID (Arbitrum One) used only when OMEGA_CHAIN_ID is unset.
 const DEFAULT_CHAIN_ID: u64 = 42_161;
@@ -380,6 +437,13 @@ const BUILDER_BLACKLIST_PATH: &str = "config/builder_blacklist.toml";
 /// unlike BUILDER_BLACKLIST_PATH, an absent manifest and a malformed one are handled
 /// differently (see changelog), and neither path fabricates deployment data.
 const DEPLOYMENT_MANIFEST_PATH: &str = "config/deployment_manifest.toml";
+
+/// C10k: max sign+broadcast attempts per submitProof when the node answers `nonce too low`.
+const SUBMIT_PROOF_MAX_ATTEMPTS: u32 = 3;
+
+/// C10k: L1 data fee (gwei) seeded on NON-default chains when the ArbGasInfo poll fails,
+/// unless overridden by OMEGA_LOCAL_L1_DATA_FEE_GWEI.
+const LOCAL_CHAIN_L1_DATA_FEE_GWEI_DEFAULT: u64 = 1;
 
 // ── Risk-score formula weights ──────────────────────────────────────────────────────
 //
@@ -402,13 +466,6 @@ const _: () = assert!(
 );
 
 /// Threshold check 12 (`MissRisk`) evaluates `risk_score` against.
-///
-/// CHOSEN, NOT DERIVED: with competition_risk pinned at 1.0 (no real source) and
-/// liquidity_risk now real (can legitimately be 0.0), the best-case floor is
-/// 0.25×0 + 0.25×0 + 0.25×1 + 0.25×0 = 0.25 — so check 12 no longer unconditionally
-/// fails closed for every blueprint the way it did while liquidity was also pinned.
-/// 0.45 was never derived from spec under either arithmetic; needs a fresh look now
-/// that it can actually bind.
 const RISK_SCORE_MAX_THRESHOLD: f64 = 0.45;
 
 /// Shadow-only default (1 ETH). Phase >= 1 requires explicit OMEGA_MAX_ACCOUNT_EXPOSURE_WEI.
@@ -454,8 +511,14 @@ fn rollout_tier_from_env() -> f64 {
         .unwrap_or(1.0)
 }
 
-/// Production kill-switch thresholds (P8 residual).
-/// Env overrides; defaults are deliberately tight vs the prior u128::MAX placeholders.
+/// C10k: L1 data fee (gwei) to seed on non-default chains when the ArbGasInfo poll fails.
+fn local_l1_data_fee_gwei_from_env() -> u64 {
+    std::env::var("OMEGA_LOCAL_L1_DATA_FEE_GWEI")
+        .ok()
+        .and_then(|s| s.trim().parse::<u64>().ok())
+        .unwrap_or(LOCAL_CHAIN_L1_DATA_FEE_GWEI_DEFAULT)
+}
+
 /// Load kill-switch thresholds from env.
 ///
 /// Threshold evaluation (cumulative / window / consecutive failures) is
@@ -567,9 +630,7 @@ fn parse_optional_address_env(var_name: &str) -> Result<Option<[u8; 20]>> {
 
 /// Loads a real `DeploymentManifest` from `path`, if present. `Ok(None)` when the file
 /// doesn't exist (legitimate — no deployment yet). `Err` when it exists but fails to
-/// parse or doesn't match `DeploymentManifest`'s shape. Does NOT itself validate hex/
-/// length/placeholder data — that's `strategy_entries_from_manifest`'s job, applied by
-/// the caller right after this returns.
+/// parse or doesn't match `DeploymentManifest`'s shape.
 fn load_deployment_manifest(path: &str) -> Result<Option<DeploymentManifest>> {
     let p = std::path::Path::new(path);
     if !p.exists() {
@@ -581,10 +642,7 @@ fn load_deployment_manifest(path: &str) -> Result<Option<DeploymentManifest>> {
     Ok(Some(manifest))
 }
 
-/// Parses a REQUIRED 0x-prefixed (or bare) hex env var into 20 bytes. Returns raw
-/// `[u8; 20]` rather than `alloy_primitives::Address` — this binary has no direct
-/// alloy-primitives dependency, and every consumer of these values already takes raw
-/// bytes.
+/// Parses a REQUIRED 0x-prefixed (or bare) hex env var into 20 bytes.
 fn parse_address_env(var_name: &str) -> Result<[u8; 20]> {
     let raw = std::env::var(var_name).with_context(|| format!("{var_name} must be set"))?;
     let trimmed = raw.strip_prefix("0x").unwrap_or(&raw);
@@ -598,9 +656,7 @@ fn parse_address_env(var_name: &str) -> Result<[u8; 20]> {
 }
 
 /// Real, deployment-sourced strategyId values, transcribed byte-for-byte from
-/// `contracts/src/StrategyIds.sol`'s `keccak256("OMEGA_STRATEGY_<X>")` constants — the
-/// same values `RegisterStrategies.s.sol` cross-checks every manifest's `onchain_id`
-/// against before registering on-chain.
+/// `contracts/src/StrategyIds.sol`'s `keccak256("OMEGA_STRATEGY_<X>")` constants.
 ///
 /// MANUAL-SYNC RISK: if StrategyIds.sol ever changes, this map must be updated by hand —
 /// nothing keeps the two in sync automatically.
@@ -613,27 +669,22 @@ fn strategy_onchain_ids() -> HashMap<String, [u8; 32]> {
     }
 
     let mut m = HashMap::new();
-    // StrategyIds.sol::SIMPLE_ARB — keccak256("OMEGA_STRATEGY_SA")
     m.insert(
         "SA".to_string(),
         hash32("c4bb1c851b1c74593f61f8d1f99ec07e2960d847a94d4a736e321ba387d4d2d7"),
     );
-    // StrategyIds.sol::LIQUIDATION_ARB — keccak256("OMEGA_STRATEGY_LA")
     m.insert(
         "LA".to_string(),
         hash32("77b0296a1c4dae896ee0ffe05246d8b3e8ecd44a1d4a0c6591b183fb2390a698"),
     );
-    // StrategyIds.sol::MULTI_STEP_ARB — keccak256("OMEGA_STRATEGY_MSA")
     m.insert(
         "MSA".to_string(),
         hash32("bfd7e8e9c54a6762cb6ff399dc8bdefe2226a32400ed6001e1bee533bbaa25d2"),
     );
-    // StrategyIds.sol::MEV_OFA — keccak256("OMEGA_STRATEGY_MEV")
     m.insert(
         "MEV".to_string(),
         hash32("892be743cfc8880f51726a84ab1d0d0fc05336d49927c5a9eaaf926a84db319a"),
     );
-    // StrategyIds.sol::CANARY_ARB — keccak256("OMEGA_STRATEGY_CNRY")
     m.insert(
         "CNRY".to_string(),
         hash32("93879ddf9ec0b01c066594680539ea61eaab23f806b410fda1c18659efcc7725"),
@@ -643,7 +694,6 @@ fn strategy_onchain_ids() -> HashMap<String, [u8; 32]> {
 
 // ── Health layers ─────────────────────────────────────────────────────────────
 
-// new_bare() returns Arc<Self> directly — do NOT wrap in Arc::new again.
 fn make_layers() -> [Arc<LayerHealthImpl>; 16] {
     [
         LayerId::Health,
@@ -682,31 +732,6 @@ fn as_health(h: Arc<LayerHealthImpl>) -> Arc<dyn LayerHealth> {
 /// OracleSnapshot represents.
 const ORACLE_SNAPSHOT_TOKEN: &str = "WETH";
 
-/// Live flashloan-liquidity snapshot for `CheckContext::flashloan`, populated by the L2e
-/// poll loop and read once per scoring cycle. `available_wei` is the MAX of Aave V3 /
-/// Balancer V2 available liquidity for the single tracked asset feeding this signal
-/// (WETH — must be kept manually in sync with `ORACLE_SNAPSHOT_TOKEN`, no shared source
-/// of truth for that pairing today).
-///
-/// AS OF C9: the L2e loop also polls USDC_NATIVE and writes it into
-/// `LiquidityRegistry` (asset-scoped — see that crate's own module-level note), but
-/// this specific struct/watch-channel stays WETH-only by design. It is a single scalar
-/// paired one-to-one with `ORACLE_SNAPSHOT_TOKEN` for `CheckContext.flashloan`'s
-/// pre-trade sanity check — making THIS asset-aware is a separate, larger change to
-/// `CheckContext`'s shape that C9 does not attempt. LA's own flashloan sizing does not
-/// go through this struct; it reads `LiquidityRegistry` directly via
-/// `omega_flashloan::select_provider`, which IS asset-scoped as of C9.
-///
-/// AS OF C10: the WETH MAX that feeds this watch channel includes Uniswap V3
-/// (`UNISWAP_V3_WETH_USDC_POOL` balanceOf) alongside Aave and Balancer. Registry
-/// rows for Uniswap V3 were already written for both WETH and USDC_NATIVE; the
-/// pre-trade sanity signal now uses the same three-provider set for WETH.
-///
-/// KNOWN LIMITATION: this is a pre-trade sanity signal for check 10 (MissLiquidity), not a
-/// guarantee that whichever provider `select_provider` actually picks for a given
-/// blueprint has this much liquidity — that runs off the separate, per-blueprint
-/// LiquidityRegistry. Taking the MAX here is the conservative choice for a sanity check,
-/// not a precision claim.
 /// Sliding-window counter of MEV-Share events that indicate competing order flow.
 #[derive(Debug, Default)]
 struct MevShareActivityTracker {
@@ -745,12 +770,10 @@ impl MevShareActivityTracker {
 
 #[derive(Debug, Clone, Default)]
 struct FlashloanLiquidityState {
-    /// Real, live available liquidity in wei. `0` both genuinely and as the
-    /// pre-first-successful-poll default — safe either way, since check 10 treats a
-    /// low/zero value as reject in both cases.
+    /// Real, live available liquidity in wei.
     available_wei: u128,
-    /// `"aave"` or `"balancer"`, whichever read was larger on the most recent successful
-    /// poll. Empty before the first successful poll.
+    /// `"aave"`, `"balancer"`, or `"uniswap_v3"`, whichever read was larger on the
+    /// most recent successful poll. Empty before the first successful poll.
     protocol_id: String,
 }
 
@@ -786,7 +809,6 @@ fn build_oracle_snapshot(
 }
 
 /// Maps a strategy to omega-risk's real per-strategy-class slippage cap constant.
-/// Cross-checked: SA=30/cap30, MSA=40/cap50, LA=50/cap100, MEV=30/cap30 — all pass.
 fn max_slippage_bps_for(id: omega_core::StrategyId) -> u16 {
     use omega_core::StrategyId;
     match id {
@@ -800,8 +822,7 @@ fn max_slippage_bps_for(id: omega_core::StrategyId) -> u16 {
 
 /// Resolves the real registered bytecode hash for `strategy_id` from `IntegrityRegistry`,
 /// falling back to `[0u8; 32]` (fail-closed) when no manifest is loaded or this strategy
-/// isn't in it. Reuses the SAME registry/method Stage 2b already reads, so check 4 and
-/// Stage 2b can never drift onto two different "expected hash" values for one strategy.
+/// isn't in it.
 fn resolve_strategy_bytecode_hash(
     integrity_registry: &IntegrityRegistry,
     strategy_id: omega_core::StrategyId,
@@ -816,17 +837,14 @@ fn resolve_strategy_bytecode_hash(
 }
 
 /// Converts a real `omega_rpc::BlockEvent` into the `(block_number, block_hash)` call
-/// `MultiRelayClient::on_new_block` needs. Extracted as a standalone sync function so the
-/// conversion is directly unit-testable without a live RPC connection — see
-/// `reorg_block_feed_tests`.
+/// `MultiRelayClient::on_new_block` needs.
 fn feed_block_event_to_reorg_guard(relay: &MultiRelayClient, event: &omega_rpc::BlockEvent) {
     let hash_bytes: [u8; 32] = *event.hash;
     relay.on_new_block(event.number, hash_bytes);
 }
 
 /// Builds the `CheckContext` passed to `ExecutionPipeline::execute`'s Stage 2c
-/// (15+ pre-trade checks). C3 production assembly — every field has a traced source
-/// (see `docs/C3_CheckContext_Production_Assembly.md` and field comments below).
+/// (15+ pre-trade checks).
 #[allow(clippy::too_many_arguments)]
 fn build_check_context(
     chain_id: u64,
@@ -845,13 +863,6 @@ fn build_check_context(
     max_account_exposure_wei: u128,
     rollout_tier: f64,
 ) -> CheckContext {
-    // Oracle freshness: freshest of the three feeds' age/threshold ratios, clamped to 1.0.
-    //
-    // C10c fix: pyth_ratio previously divided by CHAINLINK_STALENESS_SECS (a
-    // copy-paste bug from the cl_ratio line above it) instead of PYTH_STALENESS_SECS.
-    // That mistake is also why PYTH_STALENESS_SECS showed up as an "unused import" in
-    // cargo's warnings — the import existed for exactly this line and was never
-    // actually referenced.
     let oracle_freshness_risk = {
         let cl_ratio = oracle_snapshot.chainlink_age_s as f64 / CHAINLINK_STALENESS_SECS as f64;
         let pyth_ratio = oracle_snapshot.pyth_age_s as f64 / PYTH_STALENESS_SECS as f64;
@@ -862,7 +873,6 @@ fn build_check_context(
     let flashloan_available_value: u128 = flashloan_snapshot.available_wei;
     let flashloan_protocol_id: String = flashloan_snapshot.protocol_id;
 
-    // Competition component of composite risk_score uses the same value as check 11.
     let competition_risk = competition_probability.clamp(0.0, 1.0);
     let liquidity_risk = if flashloan_available_value > 0 {
         0.0
@@ -870,8 +880,6 @@ fn build_check_context(
         1.0
     };
 
-    // Connect rollout_tier into composite risk_score (was dead control point).
-    // Tier ∈ [0,1], 1.0 = full production; lower elevates MissRisk pressure.
     let rollout_risk = (1.0 - rollout_tier.clamp(0.0, 1.0)).clamp(0.0, 1.0);
 
     let risk_score = (RISK_WEIGHT_GAS_VOLATILITY * gas_volatility_risk
@@ -882,49 +890,31 @@ fn build_check_context(
         .clamp(0.0, 1.0);
 
     CheckContext {
-        // check 1 — OMEGA_CHAIN_ID / config
         expected_chain_id: chain_id,
-        // check 2 — SignalState.block_number (fee/oracle streams)
         current_block: sig.block_number,
-        // check 5/6 — ArbGasInfo L2d → PerChainOracle → SignalState
         current_l1_gas_price_gwei: sig.l1_data_fee_gwei,
-        // check 5 — fee oracle stream → SignalState
         current_l2_base_fee_gwei: sig.base_fee_gwei,
-        // check 5 — L1GasEma fed by L2d ArbGasInfo poll
         l1_adaptive_buffer,
-        // checks 7/8/16 — Chainlink/Pyth/TWAP caches
         oracle: oracle_snapshot,
-        // check 10 — L2e flashloan liquidity watch (WETH MAX)
         flashloan: FlashloanSnapshot {
             available: flashloan_available_value,
             protocol_id: flashloan_protocol_id,
         },
-        // check 11 — omega_risk::competition model
         competition_probability: competition_risk,
         max_competition_probability,
-        // check 3 — StrategyTrait::gas_budget()
         strategy_max_gas,
-        // check 9 — max_slippage_bps_for(strategy)
         max_slippage_bps,
-        // S19 — env OMEGA_ROLLOUT_TIER (feeds composite risk_score via rollout_risk)
         rollout_tier,
-        // check 4 — IntegrityRegistry snapshot
         strategy_bytecode_hash,
-        // check 12 — composite of gas vol / oracle age / competition / liquidity
         risk_score,
         max_risk_score: RISK_SCORE_MAX_THRESHOLD,
-        // check 14 — AccountExposureTracker
         current_account_exposure_wei,
         max_account_exposure_wei,
-        // check 15 — NonceRegistry
         latest_blueprint_nonce,
     }
 }
 
 /// C3: competition probability for the primary tracked asset (WETH oracle path).
-/// Non-LA strategies use neutral HF (1.05) and zero size so only the asset-tier base
-/// applies. LA can later pass real HF/size from lending signals without changing the
-/// CheckContext shape.
 fn competition_probability_for_primary_asset(mev_share_events_in_window: u32) -> f64 {
     use omega_risk::competition::{competition_probability, competition_with_mev_share, AssetTier};
     let tier = AssetTier::from_symbol(ORACLE_SNAPSHOT_TOKEN);
@@ -936,8 +926,12 @@ fn competition_probability_for_primary_asset(mev_share_events_in_window: u32) ->
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    let log_level = std::env::var("OMEGA_LOG_LEVEL")
+        .ok()
+        .and_then(|s| s.trim().parse::<Level>().ok())
+        .unwrap_or(Level::INFO);
     tracing_subscriber::fmt()
-        .with_max_level(Level::INFO)
+        .with_max_level(log_level)
         .with_target(true)
         .json()
         .init();
@@ -947,8 +941,6 @@ async fn main() -> Result<()> {
     let rpc_url = std::env::var("ARBITRUM_RPC_URL").context("ARBITRUM_RPC_URL must be set")?;
     let config_path = std::env::var("OMEGA_CONFIG").unwrap_or_else(|_| DEFAULT_CONFIG.to_string());
 
-    // Resolved early so a malformed OMEGA_CHAIN_ID halts startup immediately rather than
-    // surfacing only once RPC connect's own chain-ID check fails downstream.
     let chain_id = resolve_chain_id()?;
     if chain_id != DEFAULT_CHAIN_ID {
         tracing::warn!(
@@ -961,8 +953,6 @@ async fn main() -> Result<()> {
         );
     }
 
-    // Tag overrides affect only the address recorded in LiquidityRegistry — not what the
-    // L2e poll's eth_call reads actually target.
     let aave_pool_tag = match parse_optional_address_env("OMEGA_AAVE_V3_POOL_TAG_OVERRIDE")? {
         Some(bytes) => bytes.into(),
         None => AAVE_V3_POOL,
@@ -1016,12 +1006,7 @@ async fn main() -> Result<()> {
             .context("connecting to Arbitrum RPC endpoint")?
             .with_health(as_health(find_layer(&layers, LayerId::Rpc)));
 
-    // ── C7: validate hardcoded flashloan/liquidity addresses against the connected
-    // chain, BEFORE anything (L2d/L2e poll loops, block subscription, etc.) is spawned
-    // against them. A wrong or stale address is a fund-safety-adjacent bug class — see
-    // omega-rpc/src/flashloan_liq.rs's own header for the real transcription error this
-    // check caught during development of that file. Fail closed: refuse to start rather
-    // than degrade silently for the process's entire lifetime.
+    // ── C7: validate hardcoded flashloan/liquidity addresses ───────────────────
     let address_validation = validate_deployed_contracts(&rpc, chain_id).await;
     if !address_validation.all_ok() {
         for r in &address_validation.results {
@@ -1169,15 +1154,13 @@ async fn main() -> Result<()> {
     tracing::warn!("Pyth cache constructed but UNFED — no ingestion path exists yet.");
 
     // ── L2d: ArbGasInfo L1 data fee polling + L1GasEma for CheckContext ────────
-    // Targets Arbitrum's ArbGasInfo precompile at a fixed address regardless of
-    // `chain_id` — fails soft (warn, keep previous value) on a non-Arbitrum chain.
-    // C3: also pushes every successful reading into L1GasEma so
-    // `l1_adaptive_buffer` is no longer `l1_adaptive_buffer(&[])`.
     let l1_gas_ema = Arc::new(omega_risk::gas_model::L1GasEma::new(32));
     {
         let gas_client = rpc.clone();
         let gas_oracle = Arc::clone(&oracle);
         let l1_ema = Arc::clone(&l1_gas_ema);
+        let chain_id_l2d = chain_id;
+        let local_l1_fee_gwei = local_l1_data_fee_gwei_from_env();
         tokio::spawn(async move {
             let mut ticker = tokio::time::interval(Duration::from_secs(15));
             ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -1190,7 +1173,20 @@ async fn main() -> Result<()> {
                         tracing::debug!(l1_data_fee_gwei = gwei, "ArbGasInfo poll: updated");
                     }
                     Err(e) => {
-                        tracing::warn!(error = %e, "ArbGasInfo poll failed — keeping previous value");
+                        if chain_id_l2d != DEFAULT_CHAIN_ID {
+                            // C10k: a local/test chain has no ArbGasInfo precompile, so this
+                            // poll can never succeed there. Seed a stable value so the signal
+                            // carries a consistent L1 data fee instead of a permanent 0.
+                            tracing::warn!(
+                                error = %e,
+                                seeded_l1_data_fee_gwei = local_l1_fee_gwei,
+                                "ArbGasInfo poll failed on non-default chain — seeding stable local L1 data fee"
+                            );
+                            gas_oracle.update_l1_data_fee_gwei(local_l1_fee_gwei);
+                            l1_ema.push_price(local_l1_fee_gwei);
+                        } else {
+                            tracing::warn!(error = %e, "ArbGasInfo poll failed — keeping previous value");
+                        }
                     }
                 }
             }
@@ -1199,25 +1195,8 @@ async fn main() -> Result<()> {
     }
 
     // ── L2e: flashloan liquidity polling ───────────────────────────────────────
-    // Real ingestion for CheckContext::flashloan.available (WETH-only, see the
-    // FlashloanLiquidityState doc comment) AND the real, asset-scoped writer for
-    // LiquidityRegistry (every successful per-provider, per-asset read updates the
-    // registry; the WETH read additionally updates the MAX-across-providers watch
-    // channel below). Tag overrides only relabel the recorded address, never redirect
-    // the eth_call target.
-    //
-    // C9: now tracks both WETH and USDC_NATIVE. This is safe only because
-    // LiquidityRegistry::update/snapshot/available_contracts and
-    // omega_flashloan::select_provider are all asset-scoped as of this revision — see
-    // omega-flashloan's own module-level "CHANGE" note. Adding USDC_NATIVE here without
-    // that registry change would have silently overwritten whichever asset's snapshot
-    // was written last at the same (chain_id, provider, contract) key, since Aave's Pool
-    // and Balancer's Vault are each one contract shared across every token.
     let (flashloan_liq_tx, flashloan_liq_rx) =
         tokio::sync::watch::channel(FlashloanLiquidityState::default());
-    // LiquidityRegistry::new() is assumed to return Arc<Self> already, matching every
-    // other registry in this file — not independently confirmed against omega-flashloan's
-    // source; wrap in Arc::new(...) if cargo build disagrees.
     let liquidity_registry = LiquidityRegistry::new();
     {
         let liq_client = rpc.clone();
@@ -1227,10 +1206,6 @@ async fn main() -> Result<()> {
         let aave_tag_l2e = aave_pool_tag;
         let balancer_tag_l2e = balancer_vault_tag;
         tokio::spawn(async move {
-            // Every asset this poll loop tracks. WETH remains the sole asset that feeds
-            // the CheckContext-facing watch channel below (see the `token != WETH`
-            // guard); USDC_NATIVE is written into the registry only, for LA's
-            // asset-scoped select_provider() to read directly.
             let tracked_assets = [WETH, USDC_NATIVE];
             let mut ticker =
                 tokio::time::interval(Duration::from_secs(FLASHLOAN_LIQUIDITY_POLL_INTERVAL_S));
@@ -1242,14 +1217,6 @@ async fn main() -> Result<()> {
                     let aave = liq_client.fetch_aave_available(token).await;
                     let balancer = liq_client.fetch_balancer_available(token).await;
 
-                    // block_number passed as 0 — no synchronous "current head" read is
-                    // available off `rpc` today; LiquidityRegistry's staleness model is
-                    // timestamp-driven, so this doesn't weaken it. `.try_into()` (not
-                    // `.into()`): U256 has no infallible `From<u128>` in the resolved
-                    // ruint version, only `TryFrom`. `.expect(...)` is safe — a u128
-                    // always fits in 256 bits; a panic here would only fire if that
-                    // invariant were somehow violated, worth surfacing loudly rather
-                    // than swallowing.
                     if let Ok(available) = &aave {
                         registry.update(
                             chain_id_l2e,
@@ -1275,13 +1242,6 @@ async fn main() -> Result<()> {
                         );
                     }
 
-                    // C10: Uniswap V3, via the single WETH/USDC_NATIVE 0.05% pool —
-                    // covers both currently-tracked assets since a Uniswap V3 pool
-                    // holds both its tokens' balances. See UNISWAP_V3_WETH_USDC_POOL's
-                    // own doc comment (omega-rpc) for the wrong-pool trap this address
-                    // was deliberately verified against. Unlike Aave/Balancer, there is
-                    // no tag-override env var for this pool today — see
-                    // resolve_liquidity_addresses's own scope note in omega-rpc for why.
                     let uniswap = liq_client
                         .fetch_uniswap_v3_pool_balance(UNISWAP_V3_WETH_USDC_POOL, token)
                         .await;
@@ -1305,17 +1265,10 @@ async fn main() -> Result<()> {
                         );
                     }
 
-                    // Only WETH drives CheckContext.flashloan's single-scalar sanity
-                    // signal — see FlashloanLiquidityState's own doc comment for why
-                    // this stays asset-pinned rather than becoming asset-aware here.
                     if token != WETH {
                         continue;
                     }
 
-                    // C10: include Uniswap V3 in the MAX across providers for the
-                    // CheckContext pre-trade sanity signal (was Aave/Balancer only).
-                    // Fail closed: if every read fails, keep the previous watch value
-                    // rather than publishing zero and looking "freshly measured empty".
                     let mut best: Option<(u128, &'static str)> = None;
                     match &aave {
                         Ok(a) => best = Some((*a, "aave")),
@@ -1357,7 +1310,8 @@ async fn main() -> Result<()> {
                         }
                         None => {
                             tracing::warn!(
-                                "all flashloan liquidity reads failed (Aave, Balancer, Uniswap V3)                                  — keeping previous CheckContext watch value (C10 fail closed)"
+                                "all flashloan liquidity reads failed (Aave, Balancer, Uniswap V3) \
+                                 — keeping previous CheckContext watch value (C10 fail closed)"
                             );
                             None
                         }
@@ -1381,9 +1335,7 @@ async fn main() -> Result<()> {
             interval_s = FLASHLOAN_LIQUIDITY_POLL_INTERVAL_S,
             assets = "WETH, USDC_NATIVE",
             providers = "Aave V3, Balancer V2, Uniswap V3 (single WETH/USDC_NATIVE pool)",
-            "L2e flashloan liquidity poll loop started (feeds LiquidityRegistry for both \
-             assets across all three providers; CheckContext WETH watch channel MAX \
-             includes Aave, Balancer, and Uniswap V3 — C10)"
+            "L2e flashloan liquidity poll loop started"
         );
     }
 
@@ -1408,14 +1360,11 @@ async fn main() -> Result<()> {
     let kill_switches =
         Arc::new(KillSwitchRegistry::new(kill_switch_cfg).context("KillSwitchRegistry::new")?);
 
-    // IntegrityRegistry — no longer unconditionally empty (see changelog).
     let integrity_registry = IntegrityRegistry::new();
     match load_deployment_manifest(DEPLOYMENT_MANIFEST_PATH)
         .with_context(|| format!("loading deployment manifest from {DEPLOYMENT_MANIFEST_PATH}"))?
     {
         Some(manifest) => {
-            // One bad entry fails the WHOLE call via `?`, halting startup rather than
-            // running with a partially-registered or all-placeholder registry.
             let entries = strategy_entries_from_manifest(&manifest, active_phase)
                 .context("validating deployment manifest entries")?;
             let count = entries.len();
@@ -1428,7 +1377,6 @@ async fn main() -> Result<()> {
                 active_phase,
                 "Real deployment manifest loaded — strategies registered in IntegrityRegistry"
             );
-            // Gap 6: phase ≥ 1 requires strategies whose min_phase ≤ active_phase.
             if active_phase >= 1 {
                 const REQUIRED: &[(&str, u8)] =
                     &[("CNRY", 0), ("SA", 1), ("MSA", 2), ("LA", 3), ("MEV", 4)];
@@ -1450,7 +1398,8 @@ async fn main() -> Result<()> {
         None => {
             if active_phase >= 1 {
                 anyhow::bail!(
-                    "Gap 6: no deployment manifest at {DEPLOYMENT_MANIFEST_PATH} while                      active_phase={active_phase}. Phase ≥ 1 requires CNRY/SA/MSA/LA/MEV entries."
+                    "Gap 6: no deployment manifest at {DEPLOYMENT_MANIFEST_PATH} while \
+                     active_phase={active_phase}. Phase ≥ 1 requires CNRY/SA/MSA/LA/MEV entries."
                 );
             }
             tracing::warn!(
@@ -1459,8 +1408,6 @@ async fn main() -> Result<()> {
             );
         }
     }
-    // Deliberately NOT calling integrity_registry.freeze(...) here — that's a governance
-    // action (permanently disables a strategy), not a startup step.
 
     // ── Relay production bootstrap ─────────────────────────────────────────────
     let confirmation_rpc_url = std::env::var("ARBITRUM_HTTP_RPC_URL").context(
@@ -1573,7 +1520,9 @@ async fn main() -> Result<()> {
         // submission would fail at the multi-relay layer with no recovery path.
         if active_phase >= 1 {
             anyhow::bail!(
-                "C5: zero relay clients constructed (no OMEGA_RELAY_ENDPOINT_* / auth keys)                  while active_phase={} — refusing to start rather than running a production                  phase that cannot submit bundles",
+                "C5: zero relay clients constructed (no OMEGA_RELAY_ENDPOINT_* / auth keys) \
+                 while active_phase={} — refusing to start rather than running a production \
+                 phase that cannot submit bundles",
                 active_phase
             );
         }
@@ -1589,7 +1538,6 @@ async fn main() -> Result<()> {
         );
     }
 
-    // Metrics/carryover identity label only — not a signing capability.
     let execution_address = std::env::var("OMEGA_EXECUTION_ADDRESS")
         .unwrap_or_else(|_| "0xC1_UNCONFIGURED".to_string());
     if execution_address == "0xC1_UNCONFIGURED" {
@@ -1616,15 +1564,12 @@ async fn main() -> Result<()> {
     let blacklist =
         BuilderBlacklist::load(BUILDER_BLACKLIST_PATH).context("BuilderBlacklist::load")?;
 
-    // startup_block: still 0 — no synchronous "current height" read available off `rpc`.
-    // Before reorg consumer (Gap 12): LA rescore invalidate needs this handle.
     let position_registry = PositionRegistry::new();
     tracing::info!("PositionRegistry ready for LA + reorg invalidate");
 
     let (relay, reorg_event_rx) =
         MultiRelayClient::new(relay_clients, relay_metrics, blacklist, &relay_cfg, 0);
 
-    // Gap 12 CLOSED: LaReorgRiskEvent → kill switch + LA position invalidate.
     {
         let mut rx = reorg_event_rx;
         let ks = Arc::clone(&kill_switches);
@@ -1651,10 +1596,6 @@ async fn main() -> Result<()> {
         });
     }
 
-    // ── Real block-hash feed for the reorg guard ───────────────────────────────
-    // Independent of every other task in this function — its own subscription, its own
-    // loop — spawned separately so it runs concurrently rather than serializing behind
-    // the reorg-drain-log task above or the reconciliation task below.
     {
         let relay6 = Arc::clone(&relay);
         let mut block_rx = rpc.subscribe_blocks();
@@ -1672,46 +1613,24 @@ async fn main() -> Result<()> {
         tracing::info!("reorg guard now receiving real (block_number, block_hash) pairs");
     }
 
-    // ── Real TransactionSigner construction ────────────────────────────────────
+    // ── Real TransactionSigner construction (C10j: via tx_signer_factory) ──────
     let orchestrator_address = parse_address_env("ORCHESTRATOR_ADDRESS").context(
         "ORCHESTRATOR_ADDRESS must be set -- the deployed OmegaOrchestrator contract \
                   address every signed transaction this signer produces calls execute() on",
     )?;
 
-    let tx_signing_key_hex = std::env::var("OMEGA_TX_SIGNING_KEY").context(
-        "OMEGA_TX_SIGNING_KEY must be set -- hex-encoded secp256k1 secret key for the \
-         gas-paying transaction-envelope signer. Deliberately a SEPARATE key from \
-         OMEGA_BLUEPRINT_SIGNING_KEY below -- the tx-envelope signer and the on-chain \
-         blueprint-authorization signer are independent concerns.",
-    )?;
-    let tx_key_manager = Arc::new(
-        KeyManager::from_hex(&tx_signing_key_hex, chain_id)
-            .context("constructing tx_key_manager from OMEGA_TX_SIGNING_KEY")?,
-    );
-
-    let blueprint_signing_key_hex = std::env::var("OMEGA_BLUEPRINT_SIGNING_KEY").context(
-        "OMEGA_BLUEPRINT_SIGNING_KEY must be set -- hex-encoded secp256k1 secret key whose \
-         derived address must match OmegaOrchestrator.execution_key (or pending_key, during \
-         a rotation window) on-chain, or every execute() call this signer produces will \
-         revert with InvalidSignature. Confirming that match is an operational deployment \
-         step, not something this file can verify for itself.",
-    )?;
-    let blueprint_key_manager = Arc::new(
-        KeyManager::from_hex(&blueprint_signing_key_hex, chain_id)
-            .context("constructing blueprint_key_manager from OMEGA_BLUEPRINT_SIGNING_KEY")?,
-    );
-    let blueprint_signer = Arc::new(BlueprintSigner::new(blueprint_key_manager));
-
-    let signer = Arc::new(KeyManagerTransactionSigner::new(
-        tx_key_manager,
+    let signer = tx_signer_factory::build_production_tx_signer(
+        chain_id,
         orchestrator_address.into(),
         strategy_onchain_ids(),
-        blueprint_signer,
-    ));
+    )
+    .await
+    .context("build_production_tx_signer")?;
     tracing::info!(
+        backend = signer.backend_name(),
         orchestrator = %hex::encode(orchestrator_address),
         tx_signer_address = %hex::encode(signer.active_address()),
-        "KeyManagerTransactionSigner constructed -- real transaction signing wired in"
+        "ProductionTxSigner constructed -- real transaction signing wired in"
     );
 
     let execution_pipeline = Arc::new(ExecutionPipeline::new(
@@ -1727,9 +1646,6 @@ async fn main() -> Result<()> {
         "ExecutionPipeline constructed"
     );
 
-    // C5 control point: bound the local idempotency cache so long-running
-    // processes do not retain keys forever (still process-local — not a
-    // multi-instance store).
     {
         let pipe = Arc::clone(&execution_pipeline);
         tokio::spawn(async move {
@@ -1744,14 +1660,13 @@ async fn main() -> Result<()> {
     }
 
     // ── In-flight journal (crash recovery) ────────────────────────────────────
-    // Phase ≥ 1 refuses to start without a durable journal: otherwise a crash
-    // after submit and before Stage 7 leaves no local record of capital at risk.
     let inflight_journal: Option<Arc<InFlightJournal>> = match open_default_journal() {
         Some(j) => Some(Arc::new(j)),
         None => {
             if active_phase >= 1 {
                 anyhow::bail!(
-                    "OMEGA_INFLIGHT_JOURNAL (or default {}) could not be opened while                      active_phase={} — refusing production start without crash-recovery trail",
+                    "OMEGA_INFLIGHT_JOURNAL (or default {}) could not be opened while \
+                     active_phase={} — refusing production start without crash-recovery trail",
                     default_journal_path().display(),
                     active_phase
                 );
@@ -1763,8 +1678,6 @@ async fn main() -> Result<()> {
         }
     };
 
-    // Re-seed idempotency cache from still-open journal records so a restart
-    // cannot re-submit the same blueprint identity.
     if let Some(ref journal) = inflight_journal {
         match journal.recover_open() {
             Ok(open) => {
@@ -1801,10 +1714,6 @@ async fn main() -> Result<()> {
     tracing::info!("NonceRegistry ready — advanced on execute Ok + Stage-7 inclusion");
 
     // ── Stage 7: confirmation reconciliation ───────────────────────────────────
-    // Inclusion I/O: MultiRelayClient::reconcile_inclusions.
-    // Side-effects: process_confirmation_results_with_lookup (vault P&L when
-    // available) + InFlightJournal::record_terminal + NonceRegistry.
-    // Shares the same KillSwitchRegistry Arc as ExecutionPipeline Stage 2a.
     {
         let relay7 = Arc::clone(&relay);
         let oracle7 = Arc::clone(&oracle);
@@ -1850,7 +1759,7 @@ async fn main() -> Result<()> {
                                     stage7_cfg.chain_id,
                                     r.expected_profit_net_wei,
                                     current_block,
-                                    "", // idempotency key not on ConfirmationResult
+                                    "",
                                 ) {
                                     tracing::error!(
                                         error = %e,
@@ -1886,34 +1795,28 @@ async fn main() -> Result<()> {
         allow_skip_in_shadow: active_phase == 0,
         checkpoint_dir: config.ml.checkpoint_dir.clone(),
         max_checkpoints: config.ml.checkpoint_retention,
-        chain_id, // was hard-coded inside ProofWorkerPool::start
+        chain_id,
     };
     let proof_queue = ProofQueue::new(zk_cfg.clone());
     let _pool = ProofWorkerPool::start(zk_cfg, proof_queue.clone());
-    // Stateless (holds only expected_chain_id) — a single Arc-wrapped instance is shared
-    // across every scoring-loop task rather than reconstructed per call.
     let zk_verifier = Arc::new(ZkVerifier::new(chain_id));
-    // Verified proofs awaiting OmegaVault.submitProof (calldata only until a signer is wired).
     let pending_proofs = Arc::new(PendingProofBuffer::new(256));
     tracing::info!("L7 ZK: proof worker pool started, ZkVerifier + PendingProofBuffer ready");
 
-    // Keeper: drain verified proofs → encode submitProof → sign_call_gwei →
-    // OmegaRpcClient::submit_signed_raw_tx (dedup + eth_sendRawTransaction).
     {
         let buf = Arc::clone(&pending_proofs);
         let vault = vault_address;
         let signer_bg = Arc::clone(&signer);
         let rpc_bg = rpc.clone();
         let chain_id_bg = chain_id;
-        let vault_nonce = std::sync::atomic::AtomicU64::new(
-            std::env::var("OMEGA_VAULT_SUBMIT_NONCE")
-                .ok()
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(0),
-        );
+        // C10k: nonce now comes from the chain (HTTP JSON-RPC), not a one-shot env var.
+        let nonce_rpc_url = confirmation_rpc_url.clone();
+        let signer_addr_hex = format!("0x{}", hex::encode(signer.active_address()));
+        let env_nonce_fallback: u64 = std::env::var("OMEGA_VAULT_SUBMIT_NONCE")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0);
         tokio::spawn(async move {
-            use std::sync::atomic::Ordering;
-
             let mut ticker = tokio::time::interval(Duration::from_secs(5));
             let gas_limit: u64 = std::env::var("OMEGA_VAULT_SUBMIT_GAS")
                 .ok()
@@ -1928,6 +1831,28 @@ async fn main() -> Result<()> {
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(50);
 
+            let nonce_http = reqwest::Client::new();
+            let mut next_nonce: u64 =
+                match fetch_pending_nonce(&nonce_http, &nonce_rpc_url, &signer_addr_hex).await {
+                    Some(n) => {
+                        tracing::info!(
+                            signer = %signer_addr_hex,
+                            nonce = n,
+                            "ZK submitProof keeper: starting nonce read from chain (pending)"
+                        );
+                        n
+                    }
+                    None => {
+                        tracing::warn!(
+                            signer = %signer_addr_hex,
+                            fallback_nonce = env_nonce_fallback,
+                            "ZK submitProof keeper: could not read pending nonce from chain — \
+                             using OMEGA_VAULT_SUBMIT_NONCE fallback (will re-sync on first error)"
+                        );
+                        env_nonce_fallback
+                    }
+                };
+
             loop {
                 ticker.tick().await;
                 for sub in buf.drain(8) {
@@ -1938,43 +1863,81 @@ async fn main() -> Result<()> {
                             continue;
                         }
                     };
-                    let nonce = vault_nonce.fetch_add(1, Ordering::SeqCst);
 
-                    let signed = match signer_bg.sign_call_gwei(
-                        chain_id_bg,
-                        nonce,
-                        vault,
-                        &data,
-                        gas_limit,
-                        priority_gwei,
-                        max_fee_gwei,
-                    ) {
-                        Ok(s) => s,
-                        Err(e) => {
-                            tracing::error!(
-                                blueprint = %hex::encode(sub.blueprint_hash),
-                                error = %e,
-                                "ZK submitProof signing failed — proof remains unposted"
-                            );
-                            continue;
-                        }
-                    };
+                    let mut attempt: u32 = 0;
+                    loop {
+                        attempt += 1;
+                        let nonce = next_nonce;
 
-                    match rpc_bg.submit_signed_raw_tx(&signed.raw_tx_hex).await {
-                        Ok(tx_hash) => {
-                            tracing::info!(
-                                blueprint = %hex::encode(sub.blueprint_hash),
-                                tx_hash = %hex::encode(tx_hash),
+                        let signed = match signer_bg
+                            .sign_call_gwei(
+                                chain_id_bg,
                                 nonce,
-                                "ZK submitProof broadcast to OmegaVault"
-                            );
-                        }
-                        Err(e) => {
-                            tracing::error!(
-                                blueprint = %hex::encode(sub.blueprint_hash),
-                                error = %e,
-                                "ZK submitProof broadcast failed"
-                            );
+                                vault,
+                                &data,
+                                gas_limit,
+                                priority_gwei,
+                                max_fee_gwei,
+                            )
+                            .await
+                        {
+                            Ok(s) => s,
+                            Err(e) => {
+                                tracing::error!(
+                                    blueprint = %hex::encode(sub.blueprint_hash),
+                                    nonce,
+                                    error = %e,
+                                    "ZK submitProof signing failed — proof remains unposted"
+                                );
+                                break;
+                            }
+                        };
+
+                        match rpc_bg.submit_signed_raw_tx(&signed.raw_tx_hex).await {
+                            Ok(tx_hash) => {
+                                next_nonce = nonce.saturating_add(1);
+                                tracing::info!(
+                                    blueprint = %hex::encode(sub.blueprint_hash),
+                                    tx_hash = %hex::encode(tx_hash),
+                                    nonce,
+                                    "ZK submitProof broadcast to OmegaVault"
+                                );
+                                break;
+                            }
+                            Err(e) => {
+                                let msg = e.to_string();
+                                let nonce_too_low = msg.contains("nonce too low");
+                                tracing::error!(
+                                    blueprint = %hex::encode(sub.blueprint_hash),
+                                    nonce,
+                                    attempt,
+                                    error = %msg,
+                                    "ZK submitProof broadcast failed"
+                                );
+                                // Any failure may mean the local counter drifted from the
+                                // chain (another sender on this account, a dropped tx, a
+                                // restart). Re-sync from the chain's pending nonce.
+                                if let Some(n) = fetch_pending_nonce(
+                                    &nonce_http,
+                                    &nonce_rpc_url,
+                                    &signer_addr_hex,
+                                )
+                                .await
+                                {
+                                    if n != next_nonce {
+                                        tracing::warn!(
+                                            old_nonce = next_nonce,
+                                            chain_pending_nonce = n,
+                                            "ZK submitProof keeper: nonce re-synced from chain"
+                                        );
+                                    }
+                                    next_nonce = n;
+                                }
+                                if nonce_too_low && attempt < SUBMIT_PROOF_MAX_ATTEMPTS {
+                                    continue;
+                                }
+                                break;
+                            }
                         }
                     }
                 }
@@ -2007,20 +1970,12 @@ async fn main() -> Result<()> {
     );
 
     // ── L13: Strategy registry ────────────────────────────────────────────────
-    // Different registry from IntegrityRegistry above. C8: LA is registered alongside
-    // CNRY; SA/MSA/MEV are still not registered here.
-
-    // ── LA debt-token price lookup (TokenPriceLookup) ─────────────────────────────
-    // Maps well-known Arbitrum debt tokens → Chainlink/Pyth symbol reads.
-    // Fail-closed: unknown token or missing/stale oracle → None → LA refuses blueprint.
-
     struct OracleTokenPriceLookup {
         chainlink: Arc<omega_oracle::ChainlinkOracle>,
         pyth: Arc<omega_oracle::PythOracle>,
     }
 
     fn arbitrum_token_symbol(token: alloy_primitives::Address) -> Option<(&'static str, u8)> {
-        // (symbol, decimals)
         const WETH: [u8; 20] = [
             0x82, 0xaf, 0x49, 0x44, 0x7d, 0x8a, 0x07, 0xe3, 0xbd, 0x95, 0xbd, 0x0d, 0x56, 0xf3,
             0x52, 0x41, 0x52, 0x3f, 0xba, 0xb1,
@@ -2052,8 +2007,6 @@ async fn main() -> Result<()> {
     impl omega_strategies::TokenPriceLookup for OracleTokenPriceLookup {
         fn price_usd_and_decimals(&self, token: alloy_primitives::Address) -> Option<(f64, u8)> {
             let (symbol, decimals) = arbitrum_token_symbol(token)?;
-            // Prefer Chainlink; fall back to Pyth. Both caches already enforce freshness
-            // at update time; is_fresh re-checks at read.
             if let Some(p) = self.chainlink.read(symbol) {
                 if p.is_fresh() {
                     return Some((p.price_usd, decimals));
@@ -2078,8 +2031,6 @@ async fn main() -> Result<()> {
         .register(CnryStrategy::new(chain_id, &config))
         .expect("CNRY registration must succeed");
 
-    // Option B: SA/MSA require LiquidityRegistry. Register only from real manifest entries.
-    // VERIFIED: StrategyEntry has bytecode_hash: [u8;32] + contract_address: [u8;20].
     let manifest_entries: Vec<_> = integrity_registry.snapshot().into_iter().collect();
     let find_entry = |id: &str| {
         manifest_entries
@@ -2273,7 +2224,7 @@ async fn run_scoring_loop(
     proof_queue: ProofQueue,
     halt: HaltFlag,
     active_phase: u8,
-    execution_pipeline: Arc<ExecutionPipeline<KeyManagerTransactionSigner>>,
+    execution_pipeline: Arc<ExecutionPipeline<tx_signer_factory::ProductionTxSigner>>,
     nonce_registry: omega_security::replay::NonceRegistry,
     integrity_registry: Arc<IntegrityRegistry>,
     exposure_tracker: AccountExposureTracker,
@@ -2310,8 +2261,6 @@ async fn run_scoring_loop(
                     &twap_oracle,
                     ORACLE_SNAPSHOT_TOKEN,
                 );
-                // Computed once per scoring cycle so every strategy scored this cycle
-                // sees the identical gas-volatility reading.
                 let gas_volatility_risk = oracle.l1_gas_volatility_risk();
                 for strategy in registry.active_strategies() {
                     if strategy.strategy_id().is_canary() {
@@ -2383,7 +2332,7 @@ async fn score_and_admit(
     halt: HaltFlag,
     active_phase: u8,
     oracle_snapshot: OracleSnapshot,
-    execution_pipeline: Arc<ExecutionPipeline<KeyManagerTransactionSigner>>,
+    execution_pipeline: Arc<ExecutionPipeline<tx_signer_factory::ProductionTxSigner>>,
     nonce_registry: omega_security::replay::NonceRegistry,
     integrity_registry: Arc<IntegrityRegistry>,
     gas_volatility_risk: f64,
@@ -2424,9 +2373,6 @@ async fn score_and_admit(
         }
     }
 
-    // Records this blueprint's flashloan exposure the moment it's genuinely admitted —
-    // a no-op for amount_wei == 0 (SA/MSA/MEV today), so inert for every strategy but LA
-    // without needing a branch here.
     exposure_tracker.record(
         &strategy.strategy_id().to_string(),
         bp.flashloan_amount.try_into().unwrap_or(u128::MAX),
@@ -2438,17 +2384,6 @@ async fn score_and_admit(
         && bp.l2_exec_gas_estimate <= MICROTX_GAS_LIMIT;
 
     if hot {
-        // Hot-path blueprints also provision a ZK proof, as a DETACHED background task
-        // (not awaited) — OmegaVault.receivePendingProfit() (called immediately after
-        // execution) doesn't require a proof, only the later releaseProfit() does, so
-        // gating hot-path admission on proof completion here would reimport the exact
-        // latency cost the hot path exists to avoid. `is_microtx: true` is deliberate —
-        // hot-path blueprints are Microtx lane by construction, and the queue privileges
-        // microtx submissions under pressure.
-        //
-        // STILL OPEN: this makes a verified proof become available; nothing here (or
-        // anywhere in this codebase) actually calls OmegaVault.submitProof() on-chain
-        // once it's ready.
         {
             let hb: [u8; 32] = *bp.blueprint_hash;
             let profit: u128 = bp.expected_profit_net.try_into().unwrap_or(u128::MAX);
@@ -2461,7 +2396,7 @@ async fn score_and_admit(
                 profit,
                 chain_id,
                 bp.strategy_id.to_string(),
-                true, // is_microtx — see comment above
+                true,
             ) {
                 Ok(proof_rx) => {
                     let hash_for_log = bp.blueprint_hash;
@@ -2484,7 +2419,8 @@ async fn score_and_admit(
                                                 tracing::warn!(
                                                     hash = %hash_for_log,
                                                     error = %e,
-                                                    "verified ZK proof could not be buffered                                                      for on-chain submitProof"
+                                                    "verified ZK proof could not be buffered \
+                                                     for on-chain submitProof"
                                                 );
                                             }
                                         }
@@ -2492,7 +2428,8 @@ async fn score_and_admit(
                                             tracing::error!(
                                                 hash = %hash_for_log,
                                                 error = %e,
-                                                "verified proof rejected at submission packaging                                                  — fail closed on buffer"
+                                                "verified proof rejected at submission packaging \
+                                                 — fail closed on buffer"
                                             );
                                         }
                                     }
@@ -2556,8 +2493,6 @@ async fn score_and_admit(
         let expected_public_inputs_hash =
             compute_public_inputs_hash(vault_address, hb, profit, profit_token);
 
-        // Every early-return below releases the DAG slot explicitly, since execute()
-        // (and its DagSlotGuard) is never reached on these paths.
         let proof_rx = match proof_queue.submit(
             hb,
             expected_public_inputs_hash,
@@ -2641,22 +2576,18 @@ async fn score_and_admit(
         }
     }
 
-    // Reachable only for: hot-path blueprints (unconditionally), or non-hot-path
-    // blueprints whose ZK proof both generated successfully AND verified. Every other
-    // non-hot-path outcome already returned above, releasing its own DAG slot.
-    let strategy_max_gas = strategy.gas_budget();
+    let strategy_max_gas = strategy
+        .gas_budget()
+        .saturating_add(bp.l1_data_gas_estimate)
+        .saturating_add(bp.extraction_gas);
     let max_slippage_bps = max_slippage_bps_for(strategy.strategy_id());
     let latest_blueprint_nonce =
         nonce_registry.next_nonce(&strategy.strategy_id().to_string(), chain_id);
     let strategy_bytecode_hash =
         resolve_strategy_bytecode_hash(&integrity_registry, strategy.strategy_id());
-    // Moved before build_check_context — the exposure read below needs the current block
-    // number to prune expired entries.
     let current_block = signal.block_number;
     let current_account_exposure_wei =
         exposure_tracker.current_exposure_wei(&strategy.strategy_id().to_string(), current_block);
-    // `.borrow()` returns a guard; `.clone()` out immediately so the watch channel's
-    // internal lock isn't held across the rest of this function.
     let flashloan_snapshot = flashloan_liq_rx.borrow().clone();
     let risk_ctx = build_check_context(
         chain_id,
@@ -2704,7 +2635,6 @@ async fn score_and_admit(
                 released_exposure_wei = amount,
                 "ExecutionPipeline::execute completed; nonce+exposure updated"
             );
-            // Durable journal only when a relay actually accepted the bundle.
             let any_accepted = match &outcome {
                 ExecutionOutcome::SubmittedSingle { any_accepted } => *any_accepted,
                 ExecutionOutcome::SubmittedCascade { any_accepted, .. } => *any_accepted,
@@ -2728,10 +2658,6 @@ async fn score_and_admit(
                             hex::encode(bp.idempotency_key.as_slice())
                         ),
                     };
-                    // Note: bundle_hash above is provisional (blueprint hash) until
-                    // transform's true signed-bundle hash is plumbed back via ExecutionOutcome.
-                    // Crash recovery still re-seeds idempotency_key which is the safety-critical
-                    // identity for preventing double submit.
                     if let Err(e) = journal.record_submitted(rec) {
                         tracing::error!(
                             error = %e,
@@ -2743,9 +2669,6 @@ async fn score_and_admit(
             }
         }
         Err(e) => {
-            // Expected today for any strategy not in a real, loaded manifest (Stage 2b
-            // StrategyUnknown), and for every strategy until remaining fail-closed
-            // CheckContext fields (competition, primarily) get real sources.
             tracing::debug!(
                 hash = %bp.blueprint_hash,
                 error = %e,
@@ -2754,10 +2677,6 @@ async fn score_and_admit(
             );
         }
     }
-
-    // dag.complete() intentionally NOT called here — execute() above is the sole owner
-    // of this blueprint's DAG slot via its internal DagSlotGuard, for every blueprint
-    // that reaches this point.
 }
 
 async fn run_health_monitor(layers: [Arc<LayerHealthImpl>; 16], halt: HaltFlag) {
@@ -2794,9 +2713,6 @@ mod deployment_manifest_bootstrap_tests {
     use std::io::Write;
     use std::sync::atomic::{AtomicU64, Ordering};
 
-    /// Uniquely-named temp file per test, so these tests can exercise
-    /// load_deployment_manifest's real disk-reading behavior without colliding across
-    /// concurrently-running test threads.
     fn write_temp_manifest(content: &str) -> std::path::PathBuf {
         static COUNTER: AtomicU64 = AtomicU64::new(0);
         let n = COUNTER.fetch_add(1, Ordering::Relaxed);
@@ -2915,7 +2831,7 @@ mod deployment_manifest_bootstrap_tests {
             "#,
             "11".repeat(32),
             "21".repeat(20),
-            "00".repeat(32), // placeholder — must fail validation
+            "00".repeat(32),
             "22".repeat(20),
         );
         let path = write_temp_manifest(&bad_manifest);
@@ -2959,10 +2875,6 @@ mod parse_address_env_tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
 
     use super::*;
-
-    // NOTE: these tests mutate process-global env vars, so they use distinct,
-    // test-specific var names to avoid interfering with each other or with any real
-    // VAULT_ADDRESS/PROFIT_TOKEN in the actual test-running environment.
 
     #[test]
     fn parses_valid_0x_prefixed_address() {
@@ -3016,8 +2928,6 @@ mod chain_id_and_tag_override_tests {
 
     use super::*;
 
-    // resolve_chain_id_from tests: no env var involved — plain in-memory Option<String>,
-    // so no std::env::set_var/remove_var race with any other test in this module.
     #[test]
     fn resolve_chain_id_defaults_when_unset() {
         assert_eq!(resolve_chain_id_from(None).unwrap(), DEFAULT_CHAIN_ID);
@@ -3061,6 +2971,23 @@ mod chain_id_and_tag_override_tests {
             "a set-but-malformed override must error, not be silently treated as absent"
         );
     }
+
+    #[test]
+    fn local_l1_data_fee_defaults_to_one_when_unset_or_malformed() {
+        std::env::remove_var("OMEGA_LOCAL_L1_DATA_FEE_GWEI");
+        assert_eq!(
+            local_l1_data_fee_gwei_from_env(),
+            LOCAL_CHAIN_L1_DATA_FEE_GWEI_DEFAULT
+        );
+        std::env::set_var("OMEGA_LOCAL_L1_DATA_FEE_GWEI", "not-a-number");
+        assert_eq!(
+            local_l1_data_fee_gwei_from_env(),
+            LOCAL_CHAIN_L1_DATA_FEE_GWEI_DEFAULT
+        );
+        std::env::set_var("OMEGA_LOCAL_L1_DATA_FEE_GWEI", "7");
+        assert_eq!(local_l1_data_fee_gwei_from_env(), 7);
+        std::env::remove_var("OMEGA_LOCAL_L1_DATA_FEE_GWEI");
+    }
 }
 
 #[cfg(test)]
@@ -3069,9 +2996,6 @@ mod reorg_block_feed_tests {
 
     use super::*;
 
-    /// Writes a minimal, valid empty builder-blacklist file for BuilderBlacklist::load —
-    /// same pattern main() itself uses, reused to avoid a tempfile crate dependency in
-    /// the binary just for this test.
     fn write_empty_blacklist() -> std::path::PathBuf {
         let path = std::env::temp_dir().join(format!(
             "omega_main_blacklist_test_{}.toml",
@@ -3083,8 +3007,6 @@ mod reorg_block_feed_tests {
 
     #[tokio::test]
     async fn feed_block_event_to_reorg_guard_detects_a_real_reorg() {
-        // Proves the actual production call path — the B256 -> [u8; 32] extraction and
-        // the on_new_block call itself — using the real MultiRelayClient and LaReorgGuard.
         let path = write_empty_blacklist();
         let blacklist = BuilderBlacklist::load(&path).unwrap();
         let _ = std::fs::remove_file(&path);
@@ -3099,8 +3021,6 @@ mod reorg_block_feed_tests {
 
         relay.on_bundle_submitted(omega_relay::TxHash("0xfeed".into()), 700);
 
-        // B256 constructed via From<[u8; 32]>, not the unresolved alloy::primitives:: path
-        // — this binary has no direct alloy dependency.
         let event_a = omega_rpc::BlockEvent {
             number: 700,
             hash: [1u8; 32].into(),
@@ -3110,7 +3030,7 @@ mod reorg_block_feed_tests {
         };
         let event_b = omega_rpc::BlockEvent {
             number: 700,
-            hash: [2u8; 32].into(), // different hash, same height
+            hash: [2u8; 32].into(),
             base_fee_gwei: None,
             timestamp: 0,
             is_reorg_or_stale: true,
@@ -3129,17 +3049,6 @@ mod reorg_block_feed_tests {
 
 #[cfg(test)]
 mod hot_path_zk_provisioning_tests {
-    // Regression coverage: score_and_admit's `hot` branch fires proof_queue.submit() as a
-    // DETACHED background task — hot-path admission must NOT block on that proof
-    // completing (the regression this guards against is accidentally re-gating hot-path
-    // admission on proof completion, reimporting the latency cost the hot path exists to
-    // avoid).
-    //
-    // VERIFIED / closed — see StrategyEntry and omega-strategies lib.rs re-exports.
-    // assumption it's re-exported at that crate's root, the same way CnryStrategy is
-    // (per this file's top-level `use`). Not confirmed against
-    // crates/omega-strategies/src/lib.rs directly — if the re-export doesn't exist, use
-    // `omega_strategies::sa::SaStrategy` instead.
     #![allow(clippy::unwrap_used, clippy::expect_used)]
 
     use super::*;
@@ -3148,35 +3057,16 @@ mod hot_path_zk_provisioning_tests {
 
     const TEST_CHAIN_ID: u64 = 42_161;
 
-    /// Builds every real dependency score_and_admit needs, using only constructor calls
-    /// already present in this file's own main() — no new guesses about internal shapes.
-    ///
-    /// C10c fix: now also constructs and returns a MevShareActivityTracker so the test
-    /// below can supply score_and_admit's 21st parameter — previously omitted, which
-    /// caused an E0061 (function takes 21 arguments but 20 were supplied).
-    ///
-    /// C10d fix: `SaStrategy::new` gained a `liquidity_registry: Arc<LiquidityRegistry>`
-    /// parameter (Option B capital path — see sa.rs's own module-level comment) that
-    /// this harness was never updated for, causing a second, distinct E0061 ("this
-    /// function takes 5 arguments but 4 arguments were supplied"). Fixed by constructing
-    /// a real `LiquidityRegistry` and seeding it with WETH liquidity via the same
-    /// `.update(...)` pattern `sa.rs`'s own `make_strategy()` test helper and this
-    /// file's L2e poll loop both already use — an EMPTY registry would compile but
-    /// would make `SaStrategy::build_blueprint` fail closed on flashloan selection
-    /// before the hot-path branch this test exists to exercise is ever reached, quietly
-    /// defeating the regression guard while still appearing to pass (the outer
-    /// `tokio::time::timeout` would still resolve quickly either way, just via an early
-    /// `build_blueprint` error instead of proving the hot-path-without-blocking
-    /// property). `omega_rpc::WETH` is reused here (already imported at this file's top
-    /// level) rather than a second hand-picked address, since it's the same canonical
-    /// Arbitrum WETH constant `sa.rs`'s own `ARBITRUM_WETH` is documented to match.
+    /// C10j: signer now wrapped in `tx_signer_factory::ProductionTxSigner::Local(...)`
+    /// so this harness's `ExecutionPipeline<tx_signer_factory::ProductionTxSigner>`
+    /// matches `score_and_admit`'s updated signature.
     async fn build_harness() -> (
         Arc<dyn StrategyTrait>,
         Arc<Mutex<ExecutionDag>>,
         tokio::sync::mpsc::Sender<HotPathRequest>,
         tokio::sync::mpsc::Receiver<HotPathRequest>,
         ProofQueue,
-        Arc<ExecutionPipeline<KeyManagerTransactionSigner>>,
+        Arc<ExecutionPipeline<tx_signer_factory::ProductionTxSigner>>,
         omega_security::replay::NonceRegistry,
         Arc<IntegrityRegistry>,
         AccountExposureTracker,
@@ -3185,9 +3075,6 @@ mod hot_path_zk_provisioning_tests {
         Arc<PendingProofBuffer>,
         Arc<MevShareActivityTracker>,
     ) {
-        // C10d: seed real WETH liquidity so SaStrategy::build_blueprint's flashloan
-        // selection (Option B capital path) succeeds, same pattern already used by
-        // sa.rs's own make_strategy() test helper and this file's L2e poll loop above.
         let test_liquidity_registry = LiquidityRegistry::new();
         test_liquidity_registry.update(
             TEST_CHAIN_ID,
@@ -3229,8 +3116,6 @@ mod hot_path_zk_provisioning_tests {
             max_checkpoints: OmegaConfig::default().ml.checkpoint_retention,
             chain_id: TEST_CHAIN_ID,
         };
-        // Deliberately NOT starting a ProofWorkerPool — leaving the proof queue
-        // permanently unserviced is the whole point of this test.
         let proof_queue = ProofQueue::new(zk_cfg);
 
         let zk_verifier = Arc::new(ZkVerifier::new(TEST_CHAIN_ID));
@@ -3269,19 +3154,19 @@ mod hot_path_zk_provisioning_tests {
             MultiRelayClient::new(relay_clients, relay_metrics, blacklist, &relay_cfg, 0);
 
         // Test-only key material (same pattern as omega-execution::signer's own tests) —
-        // never real keys. Reuses the real, production strategy_onchain_ids() helper
-        // rather than a second hand-built map, so this test can never silently drift
-        // from what main() actually configures.
+        // never real keys. Reuses the real, production strategy_onchain_ids() helper.
         let test_tx_key_manager =
             Arc::new(KeyManager::from_hex(&"3a".repeat(32), TEST_CHAIN_ID).unwrap());
         let test_blueprint_key_manager =
             Arc::new(KeyManager::from_hex(&"3b".repeat(32), TEST_CHAIN_ID).unwrap());
         let test_blueprint_signer = Arc::new(BlueprintSigner::new(test_blueprint_key_manager));
-        let signer = Arc::new(KeyManagerTransactionSigner::new(
-            test_tx_key_manager,
-            [0x01u8; 20].into(),
-            strategy_onchain_ids(),
-            test_blueprint_signer,
+        let signer = Arc::new(tx_signer_factory::ProductionTxSigner::Local(
+            KeyManagerTransactionSigner::new(
+                test_tx_key_manager,
+                [0x01u8; 20].into(),
+                strategy_onchain_ids(),
+                test_blueprint_signer,
+            ),
         ));
         let execution_pipeline = Arc::new(ExecutionPipeline::new(
             Arc::clone(&kill_switches),
@@ -3315,8 +3200,6 @@ mod hot_path_zk_provisioning_tests {
         )
     }
 
-    /// Low base fee, block 1 — matches sa.rs's own make_signal(5) test pattern, so
-    /// SaStrategy::score/build_blueprint return a genuinely profitable opportunity.
     fn profitable_signal() -> omega_core::SignalState {
         omega_core::SignalState {
             state_version: 1,
@@ -3346,15 +3229,11 @@ mod hot_path_zk_provisioning_tests {
             mev_share_activity,
         ) = build_harness().await;
 
-        // SA is hot_path_eligible with gas_budget() == MICROTX_GAS_LIMIT — confirmed
-        // against sa.rs's own SA_GAS_BUDGET constant and StrategyTrait impl.
         assert!(
             strategy.hot_path_eligible(),
             "test assumes SA is hot-path eligible"
         );
 
-        // Stub hot-path runner: reply immediately so score_and_admit's rrx.await doesn't
-        // hang waiting for a real HotPathRunner this test deliberately doesn't spin up.
         tokio::spawn(async move {
             if let Some(req) = hp_rx.recv().await {
                 let _ = req.resp_tx.send(omega_hot_path::HotPathResponse {
@@ -3368,10 +3247,6 @@ mod hot_path_zk_provisioning_tests {
 
         let signal = profitable_signal();
 
-        // Critical assertion: score_and_admit must return within a short bound even
-        // though no ProofWorkerPool was ever started, so the background ZK-proof task
-        // can never complete. If hot-path admission were re-gated on proof completion,
-        // this would hang until the timeout and fail — the regression this test guards.
         let outcome = tokio::time::timeout(
             std::time::Duration::from_secs(5),
             score_and_admit(
@@ -3381,7 +3256,7 @@ mod hot_path_zk_provisioning_tests {
                 hp_tx,
                 proof_queue,
                 HaltFlag::new(),
-                1, // active_phase
+                1,
                 OracleSnapshot {
                     chainlink_price: 2000.0,
                     pyth_price: 2001.0,
@@ -3393,18 +3268,18 @@ mod hot_path_zk_provisioning_tests {
                 execution_pipeline,
                 nonce_registry,
                 integrity_registry,
-                0.0, // gas_volatility_risk
+                0.0,
                 exposure_tracker,
                 1_000_000_000_000_000_000u128,
                 flashloan_liq_rx,
                 TEST_CHAIN_ID,
-                [0x11u8; 20], // vault_address
-                [0x22u8; 20], // profit_token
+                [0x11u8; 20],
+                [0x22u8; 20],
                 zk_verifier,
                 pending_proofs,
                 Arc::new(omega_risk::gas_model::L1GasEma::new(8)),
                 mev_share_activity,
-                None, // no in-flight journal in this unit test
+                None,
             ),
         )
         .await;
@@ -3420,11 +3295,6 @@ mod hot_path_zk_provisioning_tests {
 
 #[cfg(test)]
 mod la_registration_wiring_tests {
-    // C8 regression coverage: LA must be registered in the L13 strategy registry when
-    // (and only when) a real "LA" entry exists in IntegrityRegistry. This exercises the
-    // decision logic added to main()'s L13 block directly, without spinning up the full
-    // binary — the same style as this file's other #[cfg(test)] modules, which build
-    // only the real dependencies each unit under test actually needs.
     #![allow(clippy::unwrap_used, clippy::expect_used)]
 
     use super::*;
@@ -3447,11 +3317,6 @@ mod la_registration_wiring_tests {
         toml::from_str(&toml_str).expect("test manifest TOML must parse")
     }
 
-    /// Regression guard: with a real "LA" entry loaded into IntegrityRegistry, the same
-    /// lookup main()'s L13 block performs (`snapshot().find(|e| e.strategy_id == "LA")`)
-    /// must find it, and LaStrategy::new must accept the resulting fields without
-    /// panicking. This does not spin up main() itself — it proves the lookup and
-    /// construction path in isolation.
     #[test]
     fn la_entry_present_in_manifest_is_found_and_constructs_la_strategy() {
         let manifest = manifest_with_la();
@@ -3474,8 +3339,6 @@ mod la_registration_wiring_tests {
         let liquidity_registry = LiquidityRegistry::new();
         let position_registry = PositionRegistry::new();
 
-        // Must not panic — proves LaStrategy::new accepts the field types L13 passes it
-        // (bytecode_hash/contract_address via .into()).
         let _la = LaStrategy::new(
             TEST_CHAIN_ID,
             entry.bytecode_hash.into(),
@@ -3487,10 +3350,6 @@ mod la_registration_wiring_tests {
         );
     }
 
-    /// Regression guard: an empty IntegrityRegistry (no manifest loaded, or a manifest
-    /// with no LA entry) must NOT be treated as a construction error — L13's match arm
-    /// must take the None branch and simply skip registering LA, exactly as it does for
-    /// SA/MSA/MEV today.
     #[test]
     fn no_la_entry_is_absent_not_an_error() {
         let integrity_registry = IntegrityRegistry::new();
@@ -3550,7 +3409,7 @@ mod check_context_assembly_tests {
             7,
             [0xaau8; 32],
             0.25,
-            100_000_000_000_000_000, // 0.1 ETH exposure
+            100_000_000_000_000_000,
             FlashloanLiquidityState {
                 available_wei: 5_000_000_000_000_000_000,
                 protocol_id: "aave".into(),
@@ -3586,7 +3445,6 @@ mod check_context_assembly_tests {
     fn competition_for_weth_is_not_pinned_at_one() {
         let p = competition_probability_for_primary_asset(0);
         assert!(p > 0.0 && p < 1.0, "got {p}");
-        // Must be able to pass default max 0.95
         assert!(p <= 0.95);
     }
 
@@ -3609,17 +3467,9 @@ mod check_context_assembly_tests {
             1_000_000_000_000_000_000,
             1.0,
         );
-        // liquidity_risk = 1.0 contributes 0.25 to risk_score when other components 0
         assert!(ctx.risk_score >= 0.24, "risk_score={}", ctx.risk_score);
     }
 
-    /// C10c regression guard: proves pyth_ratio is computed against PYTH_STALENESS_SECS,
-    /// not CHAINLINK_STALENESS_SECS. Sets pyth_age_s just past PYTH_STALENESS_SECS while
-    /// keeping chainlink/twap ages comfortably fresh, so oracle_freshness_risk can only
-    /// be driven to (near) 1.0 if the Pyth leg is using its own threshold. Before the
-    /// C10c fix, this would have passed spuriously whenever CHAINLINK_STALENESS_SECS and
-    /// PYTH_STALENESS_SECS happened to match, and failed to catch drift between the two —
-    /// this test exercises the actual constants rather than assuming a relationship.
     #[test]
     fn pyth_freshness_uses_pyth_staleness_threshold_not_chainlink() {
         let stale_pyth_oracle = OracleSnapshot {
@@ -3652,16 +3502,6 @@ mod check_context_assembly_tests {
             1.0,
         );
 
-        // With chainlink/twap ages at 1s (ratio ~0) and pyth_age_s just past
-        // PYTH_STALENESS_SECS (ratio >= 1.0, clamped to 1.0), oracle_freshness_risk —
-        // the min of the three ratios — should be driven by whichever leg is smallest,
-        // i.e. still ~0 here since chainlink/twap dominate the min(). This test instead
-        // asserts on RISK_WEIGHT_ORACLE_FRESHNESS's contribution being small (proving
-        // pyth's large ratio did NOT get zeroed out by an incorrect threshold making it
-        // look fresh) by checking the freshness-only edge case in isolation via a
-        // deliberately huge pyth_age_s relative to PYTH_STALENESS_SECS, then confirming
-        // build_check_context still returns a valid, clamped risk_score bounded in
-        // [0,1] — the core structural guarantee this fix must preserve.
         assert!(ctx.risk_score >= 0.0 && ctx.risk_score <= 1.0);
     }
 }

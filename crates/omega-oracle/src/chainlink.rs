@@ -58,8 +58,8 @@ use crate::resolution::{OraclePrice, OracleSource, PRIMARY_STALE_SECS};
 pub fn arbitrum_feeds() -> &'static [(&'static str, &'static str)] {
     &[
         ("WETH", "0x639Fe6ab55C921f74e7fac1ee960C0B6293ba612"),
-        ("WBTC", "0x6ce185960625439572af5E015ba3cfB1f14Eaba9"),
-        ("LINK", "0x86E53CF1B873786aC51Ac36aC8538E84E0Da64C7"),
+        ("WBTC", "0xd0C7101eACbB49F3deCcCc166d238410D6D46d57"),
+        ("LINK", "0x86E53CF1B870786351Da77A57575e79CB55812CB"),
         ("ARB", "0xb2A824043730FE05F3DA2efaFa1CBbe83fa548D6"),
         ("USDC", "0x50834F3163758fcC1Df9973b6e91f0F0F0434aD3"),
         ("USDT", "0x3f3f5dF88dC9F13eac63DF89EC16ef6e7E25DdE7"),

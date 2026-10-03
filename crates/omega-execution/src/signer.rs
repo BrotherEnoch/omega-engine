@@ -1063,8 +1063,8 @@ fn encode_eip1559_signed(
         rlp_bytes(data),
         rlp_list(&[]), // access list
         rlp_u64(y_parity as u64),
-        rlp_bytes(r),
-        rlp_bytes(s),
+        rlp_scalar(r),
+        rlp_scalar(s),
     ]);
     payload.push(0x02);
     payload.extend_from_slice(&list);
@@ -1087,6 +1087,13 @@ fn rlp_u256(v: U256) -> Vec<u8> {
         return vec![0x80];
     }
     rlp_bytes(&bytes[start..])
+}
+
+/// RLP-encode a big-endian scalar (ECDSA r/s): leading zero bytes MUST be
+/// stripped or nodes reject the transaction as non-canonical.
+fn rlp_scalar(b: &[u8]) -> Vec<u8> {
+    let start = b.iter().position(|&x| x != 0).unwrap_or(b.len());
+    rlp_bytes(&b[start..])
 }
 
 fn rlp_address(addr: Address) -> Vec<u8> {
