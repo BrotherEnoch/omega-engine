@@ -358,9 +358,9 @@ use omega_security::{
     strategy_entries_from_manifest, AccountExposureTracker, DeploymentManifest, IntegrityRegistry,
 };
 // Test-only imports (used by hot_path_zk_provisioning_tests::build_harness).
+use omega_flashloan::{FlashloanProvider, LiquidityRegistry};
 #[cfg(test)]
 use omega_security::{BlueprintSigner, KeyManager};
-use omega_flashloan::{FlashloanProvider, LiquidityRegistry};
 use omega_strategies::{
     registry::StrategyRegistryBuilder, CnryStrategy, LaStrategy, MevStrategy, MsaStrategy,
     SaStrategy, StrategyRegistry,
@@ -3222,7 +3222,11 @@ mod relay_metrics_seed_tests {
         let seeded = seed_relay_metrics(&metrics, &keys);
         assert_eq!(seeded, 2);
         let ranked = metrics.la_ranked_relays();
-        assert_eq!(ranked.len(), 2, "every seeded relay must appear in the ranking");
+        assert_eq!(
+            ranked.len(),
+            2,
+            "every seeded relay must appear in the ranking"
+        );
     }
 
     #[test]

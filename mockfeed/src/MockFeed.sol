@@ -1,0 +1,7 @@
+// mockfeed\src\MockFeed.sol
+contract MockFeed {
+    function decimals() external pure returns (uint8) { return 8; }
+    function latestRoundData() external view returns (uint80, int256, uint256, uint256, uint80) {
+        return (1, 2000e8, block.timestamp, block.timestamp, 1);
+    }
+}

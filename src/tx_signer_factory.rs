@@ -19,6 +19,15 @@
 //! Blueprint authorization remains local `BlueprintSigner` from
 //! `OMEGA_BLUEPRINT_SIGNING_KEY` in both modes (independent concern).
 //!
+//! ## C10l: `orchestrator_bp_hash` forwarding
+//!
+//! `OmegaVault` keys everything (pending profit, ZK public-inputs binding) on the
+//! Orchestrator's domain-separated `bpHash` — `keccak256(abi.encode(orchestrator,
+//! chainId, blueprintCalldata))` — NOT on `ExecutionBlueprint::compute_hash()`.
+//! `ProductionTxSigner::orchestrator_bp_hash` exposes the former so the engine can
+//! find a submitted blueprint's vault entry and prove against the right key. The
+//! `Kms` arm forwards to a method the (still unwritten) KMS adapter must also provide.
+//!
 //! ## C10k: KMS backend is feature-gated (`--features kms`), OFF by default
 //!
 //! `build_production_tx_signer`'s `"kms"` branch has always called two crates —
@@ -88,6 +97,20 @@ impl ProductionTxSigner {
             Self::Local(_) => "local",
             #[cfg(feature = "kms")]
             Self::Kms(_) => "kms",
+        }
+    }
+
+    /// The Orchestrator's domain-separated `bpHash` for `bp` — the key `OmegaVault`
+    /// uses for `pending_profit` / `proofInputsBound` / `boundProofInputsOf`.
+    pub fn orchestrator_bp_hash(
+        &self,
+        bp: &ExecutionBlueprint,
+        chain_id: u64,
+    ) -> Result<[u8; 32], ExecutionError> {
+        match self {
+            Self::Local(s) => s.orchestrator_bp_hash(bp, chain_id),
+            #[cfg(feature = "kms")]
+            Self::Kms(s) => s.orchestrator_bp_hash(bp, chain_id),
         }
     }
 

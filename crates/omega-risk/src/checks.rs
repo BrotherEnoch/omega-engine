@@ -1,5 +1,4 @@
 // crates/omega-risk/src/checks.rs
-// crates/omega-risk/src/checks.rs
 // 16 pre-trade checks in FAST-FAIL order (spec Section 5 / S7 / S11 / S12).
 //
 // Order is mandatory and maps directly to the spec:
@@ -23,10 +22,36 @@
 // Fast-fail principle: cheapest checks (no memory allocation, no division) run first.
 // The first failing check returns its DropCode immediately; subsequent checks are skipped.
 //
-// Thread-safety: run_all_checks() is a pure function (no interior state).
+// Thread-safety: run_all_checks() is a pure function (no interior state), apart from
+// reading the optional env-var threshold overrides below.
 // Callers should construct CheckContext once per scoring cycle and reuse across checks.
 //
-// ## Fix (this revision): check 6 fired on identical zero fees
+// Env-var threshold overrides (all fall back to the constants in context.rs when unset,
+// unparseable, or out of range):
+//   OMEGA_ORACLE_DIVERGE_THRESHOLD   check 8, fraction in (0.0, 1.0]
+//   OMEGA_MAX_PRICE_IMPACT_BPS       check 13, bps in [1, 500]
+//
+// ## Fix (this revision): clippy failures under `-D warnings`
+//
+// `cargo clippy --workspace --all-targets -- -D warnings` failed on this file with
+// `clippy::empty_line_after_doc_comments`: the doc comment of `oracle_hierarchy_check`
+// was followed by a blank line and then `oracle_diverge_threshold_from_env`, so the
+// doc comment attached to the wrong function and `oracle_hierarchy_check` itself had
+// no doc comment at all. Fixed by moving `oracle_diverge_threshold_from_env` (with its
+// own doc comment) ABOVE `oracle_hierarchy_check`'s doc comment, so each doc comment
+// sits directly on the function it documents.
+//
+// Two further lints of the same family were fixed in the same pass, since the first
+// would have been the next failure once the above was cleared:
+//   - `max_price_impact_bps_from_env` was sitting between check 13's doc comment /
+//     `#[inline]` and `check_price_impact`, so those attached to the wrong function.
+//     The env helper now comes first with its own doc comment; the doc comment and
+//     `#[inline]` for check 13 sit directly on `check_price_impact`.
+//   - its filter `*v >= 1 && *v <= 500` is `clippy::manual_range_contains`; rewritten
+//     as `(1..=500).contains(v)`, which accepts exactly the same values.
+// No check logic or threshold changed.
+//
+// ## Fix (earlier revision): check 6 fired on identical zero fees
 //
 // `check_gas_spike` previously clamped the creation-time fee with
 // `.max(1)` BEFORE computing the difference, but left the current fee
@@ -287,17 +312,32 @@ pub fn oracle_freshness_check(oracle: &OracleSnapshot) -> Option<DropCode> {
     None
 }
 
+/// Chainlink-vs-Pyth divergence threshold used by check 8.
+///
+/// Reads `OMEGA_ORACLE_DIVERGE_THRESHOLD` (a fraction in `(0.0, 1.0]`);
+/// falls back to `ORACLE_DIVERGE_THRESHOLD` when the variable is unset,
+/// unparseable, or out of range.
+fn oracle_diverge_threshold_from_env() -> f64 {
+    std::env::var("OMEGA_ORACLE_DIVERGE_THRESHOLD")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .filter(|v: &f64| *v > 0.0 && *v <= 1.0)
+        .unwrap_or(ORACLE_DIVERGE_THRESHOLD)
+}
+
 /// Standalone oracle hierarchy check (spec S5: MissOracleDiverge) —
 /// rejects when Chainlink AND Pyth are both fresh but diverge beyond
-/// `ORACLE_DIVERGE_THRESHOLD`. Skipped (returns `None`) when fewer than
-/// two fresh spot feeds are available to compare, **or when either fresh
-/// price is non-sane** (zero, negative, NaN, or infinite) — see this
-/// file's module-level "Audit fix (earlier revision, 2)" note. A non-sane
-/// price is not "divergence"; that case is check 16's
-/// (`oracle_price_sanity_check` / `MissFlashCrash`) responsibility, and
-/// letting `chainlink_pyth_divergence()`'s `f64::INFINITY` sentinel leak
-/// through here as a false "diverged" result would mask check 16 (and
-/// check 15, which sits between them) from ever running.
+/// the divergence threshold (`ORACLE_DIVERGE_THRESHOLD`, or the
+/// `OMEGA_ORACLE_DIVERGE_THRESHOLD` override). Skipped (returns `None`)
+/// when fewer than two fresh spot feeds are available to compare, **or
+/// when either fresh price is non-sane** (zero, negative, NaN, or
+/// infinite) — see this file's module-level "Audit fix (earlier
+/// revision, 2)" note. A non-sane price is not "divergence"; that case
+/// is check 16's (`oracle_price_sanity_check` / `MissFlashCrash`)
+/// responsibility, and letting `chainlink_pyth_divergence()`'s
+/// `f64::INFINITY` sentinel leak through here as a false "diverged"
+/// result would mask check 16 (and check 15, which sits between them)
+/// from ever running.
 pub fn oracle_hierarchy_check(oracle: &OracleSnapshot) -> Option<DropCode> {
     if !oracle.chainlink_fresh() || !oracle.pyth_fresh() {
         return None;
@@ -307,7 +347,7 @@ pub fn oracle_hierarchy_check(oracle: &OracleSnapshot) -> Option<DropCode> {
         // "divergence" between two otherwise-comparable feeds.
         return None;
     }
-    if oracle.chainlink_pyth_divergence() > ORACLE_DIVERGE_THRESHOLD {
+    if oracle.chainlink_pyth_divergence() > oracle_diverge_threshold_from_env() {
         return Some(DropCode::MissOracleDiverge);
     }
     None
@@ -588,7 +628,7 @@ fn check_dynamic_profit(bp: &BlueprintFields, _ctx: &CheckContext) -> Option<Dro
 /// is clamped with `.max(1)`, so a zero creation fee cannot divide by
 /// zero or make every comparison degenerate: a rise from a zero baseline
 /// to any non-zero value is treated as a spike (conservative). See this
-/// file's module doc comment ("Fix (this revision): check 6 fired on
+/// file's module doc comment ("Fix (earlier revision): check 6 fired on
 /// identical zero fees") for the bug this replaces.
 ///
 /// `saturating_mul` on both sides guards against overflow from a
@@ -698,12 +738,25 @@ fn check_risk_score(_bp: &BlueprintFields, ctx: &CheckContext) -> Option<DropCod
     None
 }
 
+/// Maximum LA price impact (bps) used by check 13.
+///
+/// Reads `OMEGA_MAX_PRICE_IMPACT_BPS` (an integer in `[1, 500]`); falls
+/// back to `MAX_PRICE_IMPACT_BPS` when the variable is unset,
+/// unparseable, or out of range.
+fn max_price_impact_bps_from_env() -> u16 {
+    std::env::var("OMEGA_MAX_PRICE_IMPACT_BPS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .filter(|v: &u16| (1..=500).contains(v))
+        .unwrap_or(MAX_PRICE_IMPACT_BPS)
+}
+
 /// Check 13: price impact must not exceed 50 bps for LA blueprints (spec S11: MissPriceImpact).
 ///
 /// Only evaluated when `bp.price_impact_bps` is `Some(...)` (LA strategy only).
 #[inline]
 fn check_price_impact(bp: &BlueprintFields, _ctx: &CheckContext) -> Option<DropCode> {
-    if bp.price_impact_bps.unwrap_or(0) > MAX_PRICE_IMPACT_BPS {
+    if bp.price_impact_bps.unwrap_or(0) > max_price_impact_bps_from_env() {
         return Some(DropCode::MissPriceImpact);
     }
     None

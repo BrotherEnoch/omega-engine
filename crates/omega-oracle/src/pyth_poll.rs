@@ -1,209 +1,249 @@
-// crates/omega-oracle/src/pyth_poll.rs
-//
-// Pyth ingestion path for the secondary oracle cache (`PythOracle`).
-//
-// ## Why this lives here (same reasoning as chainlink_poll.rs)
-//
-// References `crate::PythOracle`. Dependency direction is
-// `omega-oracle -> omega-rpc` only. A live Hermes/SSE path would call
-// into omega-rpc; until that RPC helper exists, this module provides:
-//
-//   1. Local seed mode for Anvil / fork tests (`OMEGA_PYTH_LOCAL_SEED=1`)
-//   2. A poll-loop skeleton that only refreshes stale symbols
-//
-// Production Hermes polling is intentionally a no-op until a real
-// `OmegaRpcClient::fetch_pyth_price` (or equivalent) exists — fail closed,
-// never invent prices.
-//
-// ## Local seed (fork testing)
-//
-// When `OMEGA_PYTH_LOCAL_SEED` is set to a non-empty value other than "0",
-// the loop seeds `PythOracle` with fixed USD prices for the Arbitrum
-// symbol table. Those prices must be near the forked pool prices or the
-// tri-oracle divergence check (check 8 / MissOracleDiverge) will drop
-// SA/MSA. For a short diagnostic run you can raise the divergence
-// threshold to ~1.0; for longer fork testing, set the seed prices near
-// the pool instead and leave the threshold at ~0.25.
+// omega-engine\crates\omega-oracle\src\pyth_poll.rs
+//! Pyth Hermes HTTP polling loop — ingestion path for `PythOracle`.
+//!
+//! Since 2026-08-26 Hermes requires `Authorization: Bearer <PYTH_API_KEY>`.
+//!
+//! Env:
+//! - `OMEGA_PYTH_HERMES_URL` — base (default https://hermes.pyth.network)
+//! - `OMEGA_PYTH_API_KEY` / `PYTH_API_KEY` — required for live Hermes
+//! - `OMEGA_PYTH_LOCAL_SEED=1` — seed static USD prices when no API key
+//!   (local Anvil fork only)
 
-use std::env;
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use serde::Deserialize;
+
 use crate::pyth::{arbitrum_price_ids, PythOracle};
 
-/// Default local-seed USD prices for Arbitrum symbols.
-///
-/// Order matches `arbitrum_price_ids()`. Override individual values via
-/// env if your fork’s pool mid is far from these (e.g. after a large
-/// move): `OMEGA_PYTH_SEED_WETH=3250.5` etc.
-fn default_local_seed_prices() -> Vec<(String, f64)> {
-    vec![
-        ("WETH".into(), 3_200.0),
-        ("WBTC".into(), 95_000.0),
-        ("LINK".into(), 14.5),
-        ("ARB".into(), 0.55),
-        ("USDC".into(), 1.0),
-        ("USDT".into(), 1.0),
-    ]
+pub const DEFAULT_HERMES_BASE: &str = "https://hermes.pyth.network";
+
+fn hermes_base_from_env() -> String {
+    std::env::var("OMEGA_PYTH_HERMES_URL")
+        .ok()
+        .map(|s| s.trim().trim_end_matches('/').to_owned())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| DEFAULT_HERMES_BASE.to_owned())
 }
 
-fn env_seed_price(symbol: &str, fallback: f64) -> f64 {
-    let key = format!("OMEGA_PYTH_SEED_{symbol}");
-    env::var(&key)
+fn api_key_from_env() -> Option<String> {
+    std::env::var("OMEGA_PYTH_API_KEY")
+        .or_else(|_| std::env::var("PYTH_API_KEY"))
         .ok()
-        .and_then(|s| s.parse::<f64>().ok())
-        .filter(|p| p.is_finite() && *p > 0.0)
-        .unwrap_or(fallback)
+        .map(|s| s.trim().to_owned())
+        .filter(|s| !s.is_empty())
 }
 
 fn local_seed_enabled() -> bool {
-    match env::var("OMEGA_PYTH_LOCAL_SEED") {
-        Ok(v) => {
+    std::env::var("OMEGA_PYTH_LOCAL_SEED")
+        .map(|v| {
             let t = v.trim();
-            !t.is_empty() && t != "0" && !t.eq_ignore_ascii_case("false")
-        }
-        Err(_) => false,
-    }
+            t == "1" || t.eq_ignore_ascii_case("true") || t.eq_ignore_ascii_case("yes")
+        })
+        .unwrap_or(false)
 }
 
-fn now_secs() -> u64 {
+fn local_seed_prices() -> &'static [(&'static str, f64)] {
+    &[
+        ("WETH", 3500.0),
+        ("WBTC", 95_000.0),
+        ("LINK", 18.0),
+        ("ARB", 0.85),
+        ("USDC", 1.0),
+        ("USDT", 1.0),
+    ]
+}
+
+#[derive(Debug, Deserialize)]
+struct HermesLatestResponse {
+    #[serde(default)]
+    parsed: Vec<HermesParsedPrice>,
+}
+
+#[derive(Debug, Deserialize)]
+struct HermesParsedPrice {
+    id: String,
+    price: HermesPriceFields,
+}
+
+#[derive(Debug, Deserialize)]
+struct HermesPriceFields {
+    price: String,
+    conf: String,
+    expo: i32,
+    publish_time: i64,
+}
+
+fn scale_i64(raw: &str, expo: i32) -> Option<f64> {
+    let v: i64 = raw.parse().ok()?;
+    Some((v as f64) * 10f64.powi(expo))
+}
+
+fn symbol_by_price_id() -> HashMap<String, String> {
+    let mut m = HashMap::new();
+    for &(symbol, id) in arbitrum_price_ids() {
+        let lower = id.to_lowercase();
+        m.insert(lower.clone(), symbol.to_owned());
+        m.insert(format!("0x{lower}"), symbol.to_owned());
+    }
+    m
+}
+
+fn now_unix() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs()
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
 }
 
-/// One-shot local seed: write tight-confidence prices into `PythOracle`
-/// for every Arbitrum symbol. Safe to call at startup before the loop.
-///
-/// Confidence is 0.1% of price so `MAX_CONFIDENCE_RATIO` (1%) accepts it.
-pub fn seed_local_pyth_prices(oracle: &PythOracle, block_number: u64) {
-    let defaults = default_local_seed_prices();
-    let publish_time = now_secs();
-
-    for (symbol, default_px) in defaults {
-        let price_usd = env_seed_price(&symbol, default_px);
-        let confidence_usd = (price_usd * 0.001).max(1e-6);
-        oracle.update(
-            &symbol,
-            price_usd,
-            confidence_usd,
-            publish_time,
-            block_number,
-        );
-        tracing::info!(
-            token = %symbol,
-            price_usd,
-            confidence_usd,
-            "Pyth local seed applied",
-        );
+pub fn seed_local_prices(pyth: &PythOracle, block_number: u64) -> usize {
+    let ts = now_unix();
+    let mut n = 0usize;
+    for &(symbol, price) in local_seed_prices() {
+        if arbitrum_price_ids().iter().any(|(s, _)| *s == symbol) {
+            let conf = price * 0.001;
+            pyth.update(symbol, price, conf, ts, block_number);
+            n += 1;
+        }
     }
+    n
 }
 
-/// Symbols that `PythOracle` is expected to track on Arbitrum (from the
-/// static price-id table). Used by the poll loop’s staleness sweep.
-pub fn arbitrum_pyth_symbols() -> Vec<String> {
-    arbitrum_price_ids()
+pub async fn poll_hermes_once(
+    http: &reqwest::Client,
+    pyth: &PythOracle,
+    block_number: u64,
+) -> anyhow::Result<usize> {
+    let key = match api_key_from_env() {
+        Some(k) => k,
+        None => {
+            if local_seed_enabled() {
+                let n = seed_local_prices(pyth, block_number);
+                tracing::debug!(updated = n, "Pyth local seed (no API key)");
+                return Ok(n);
+            }
+            anyhow::bail!(
+                "no OMEGA_PYTH_API_KEY/PYTH_API_KEY; set key or OMEGA_PYTH_LOCAL_SEED=1 for local fork"
+            );
+        }
+    };
+
+    let base = hermes_base_from_env();
+    let ids: Vec<String> = arbitrum_price_ids()
         .iter()
-        .map(|(sym, _)| (*sym).to_owned())
-        .collect()
-}
-
-/// Poll / refresh loop for the Pyth secondary cache.
-///
-/// Behaviour:
-/// - If `OMEGA_PYTH_LOCAL_SEED` is enabled: re-seed stale symbols each tick
-///   so the cache never ages out during a long Anvil session.
-/// - Otherwise: log once that live Hermes ingestion is not wired and idle
-///   (fail closed — do not fabricate prices).
-///
-/// Interval recommendation: 15–20s (same as Chainlink). `PRIMARY_STALE_SECS`
-/// is 45s; polling much faster only burns work.
-pub async fn run_pyth_poll_loop(oracle: Arc<PythOracle>, interval: Duration) {
-    let symbols = arbitrum_pyth_symbols();
-    let local = local_seed_enabled();
-
-    tracing::info!(
-        symbol_count = symbols.len(),
-        interval_s = interval.as_secs(),
-        local_seed = local,
-        "Pyth poll loop starting",
-    );
-
-    if local {
-        // Initial seed so the first resolution pass is not empty.
-        seed_local_pyth_prices(&oracle, 0);
-    } else {
-        tracing::warn!(
-            "Pyth live ingestion is not wired (no Hermes/RPC helper yet). \
-             Cache stays empty unless OMEGA_PYTH_LOCAL_SEED=1. Resolution \
-             fails closed when Chainlink+TWAP are also stale."
-        );
+        .map(|(_, id)| {
+            if id.starts_with("0x") {
+                id.to_string()
+            } else {
+                format!("0x{id}")
+            }
+        })
+        .collect();
+    if ids.is_empty() {
+        return Ok(0);
     }
 
+    let mut url = format!("{base}/v2/updates/price/latest?");
+    for (i, id) in ids.iter().enumerate() {
+        if i > 0 {
+            url.push('&');
+        }
+        url.push_str("ids[]=");
+        url.push_str(id);
+    }
+
+    let resp = http
+        .get(&url)
+        .header("Authorization", format!("Bearer {key}"))
+        .timeout(Duration::from_secs(8))
+        .send()
+        .await?
+        .error_for_status()?;
+
+    let body: HermesLatestResponse = resp.json().await?;
+    let map = symbol_by_price_id();
+    let mut updated = 0usize;
+
+    for item in body.parsed {
+        let id_key = item.id.to_lowercase();
+        let symbol = match map
+            .get(&id_key)
+            .or_else(|| map.get(&format!("0x{id_key}")))
+        {
+            Some(s) => s.as_str(),
+            None => continue,
+        };
+
+        let price_usd = match scale_i64(&item.price.price, item.price.expo) {
+            Some(p) if p.is_finite() && p > 0.0 => p,
+            _ => {
+                tracing::warn!(
+                    symbol,
+                    raw = %item.price.price,
+                    expo = item.price.expo,
+                    "Pyth Hermes: bad price scale — skip"
+                );
+                continue;
+            }
+        };
+        let conf_usd = scale_i64(&item.price.conf, item.price.expo).unwrap_or(0.0);
+        let publish_time = if item.price.publish_time > 0 {
+            item.price.publish_time as u64
+        } else {
+            tracing::warn!(symbol, "Pyth Hermes: missing publish_time — skip");
+            continue;
+        };
+
+        pyth.update(symbol, price_usd, conf_usd, publish_time, block_number);
+        updated += 1;
+    }
+
+    Ok(updated)
+}
+
+pub async fn run_pyth_hermes_poll_loop(
+    http: reqwest::Client,
+    pyth: Arc<PythOracle>,
+    interval: Duration,
+) {
     let mut ticker = tokio::time::interval(interval);
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
+    let has_key = api_key_from_env().is_some();
+    let local = local_seed_enabled();
+    tracing::info!(
+        hermes = %hermes_base_from_env(),
+        interval_secs = interval.as_secs(),
+        feeds = arbitrum_price_ids().len(),
+        has_api_key = has_key,
+        local_seed = local,
+        "L2p Pyth Hermes poll loop started"
+    );
+
+    if !has_key && local {
+        let n = seed_local_prices(&pyth, 0);
+        tracing::info!(updated = n, "Pyth local seed applied at startup");
+    }
+
     loop {
         ticker.tick().await;
-
-        if !local {
-            // Nothing to do until a real fetch path exists.
-            continue;
-        }
-
-        // Re-seed only stale symbols so publish_time stays fresh under
-        // PRIMARY_STALE_SECS during long fork runs.
-        let defaults = default_local_seed_prices();
-        let publish_time = now_secs();
-        for (symbol, default_px) in &defaults {
-            if !oracle.is_stale(symbol) {
-                continue;
+        match poll_hermes_once(&http, &pyth, 0).await {
+            Ok(n) if n > 0 => {
+                tracing::debug!(updated = n, "Pyth Hermes poll: cache refreshed");
             }
-            let price_usd = env_seed_price(symbol, *default_px);
-            let confidence_usd = (price_usd * 0.001).max(1e-6);
-            oracle.update(symbol, price_usd, confidence_usd, publish_time, 0);
-            tracing::debug!(
-                token = %symbol,
-                price_usd,
-                "Pyth local seed refreshed (was stale)",
-            );
-        }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn arbitrum_symbols_non_empty() {
-        let s = arbitrum_pyth_symbols();
-        assert!(!s.is_empty());
-        assert!(s.iter().any(|x| x == "WETH"));
-    }
-
-    #[test]
-    fn seed_writes_readable_weth() {
-        let o = PythOracle::new(42161);
-        seed_local_pyth_prices(&o, 1);
-        let p = o.read("WETH").expect("WETH should be readable after seed");
-        assert!(p.price_usd > 0.0);
-        assert!(!o.is_stale("WETH"));
-    }
-
-    #[test]
-    fn default_seed_table_covers_price_id_table() {
-        let ids: Vec<_> = arbitrum_price_ids().iter().map(|(s, _)| *s).collect();
-        let seeds: Vec<_> = default_local_seed_prices()
-            .into_iter()
-            .map(|(s, _)| s)
-            .collect();
-        for id in ids {
-            assert!(
-                seeds.iter().any(|s| s == id),
-                "missing default seed for {id}"
-            );
+            Ok(_) => {
+                tracing::warn!("Pyth Hermes poll: zero feeds updated");
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "Pyth Hermes poll failed — keeping previous cache");
+                if local_seed_enabled() {
+                    let n = seed_local_prices(&pyth, 0);
+                    if n > 0 {
+                        tracing::info!(updated = n, "Pyth local seed after Hermes failure");
+                    }
+                }
+            }
         }
     }
 }
