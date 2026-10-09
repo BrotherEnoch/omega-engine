@@ -1,8 +1,55 @@
 // crates/omega-execution/src/signer.rs
-// crates/omega-execution/src/signer.rs
 //
 // TransactionSigner — the genuinely missing piece identified in
 // ExecutionPipelineSpecification.md §8.
+//
+// ## ENVELOPE NONCE FIX (2026-10-09): gas-paying tx nonce is no longer `bp.nonce`
+//
+// Found on a local Anvil fork: every `eth_sendBundle` was rejected with
+// `nonce too low` / `replacement transaction underpriced`. Root cause: this
+// file used `ExecutionBlueprint::nonce` — the Orchestrator's per-strategy REPLAY
+// counter (`next_nonce[strategyId]`, which lives INSIDE the blueprint calldata) —
+// as the nonce of the OUTER EIP-1559 transaction envelope. Those are two
+// unrelated counters:
+//   - blueprint nonce: per-strategy, checked by OmegaOrchestrator.execute()
+//   - envelope nonce:  per-ACCOUNT (the gas-paying EOA behind `tx_key_manager`),
+//                      checked by the node's mempool / state transition
+// SA and MSA blueprints for the same tick therefore signed two transactions from
+// the same account with the SAME envelope nonce (one accepted, one "replacement
+// transaction underpriced"), and the envelope nonce bore no relation to the
+// account's real nonce (e.g. blueprint nonce 22 vs an account nonce of 21287).
+// This would fail identically on any real chain.
+//
+// Fix: `KeyManagerTransactionSigner` now owns a single envelope-nonce counter
+// (`tx_nonce`, mutex-protected, shared by every strategy and by the ZK
+// `next_tx_nonce()` path). The caller seeds it once at startup, and again after
+// any failed send, with `eth_getTransactionCount(active_address, "pending")` via
+// `seed_tx_nonce`. `sign_transaction` takes the current value, signs with it, and
+// advances it only after a successful signature. `bp.nonce` is now used ONLY inside
+// the blueprint calldata, exactly as the contract expects.
+//
+// UNSEEDED BEHAVIOUR (read this): until the caller invokes `seed_tx_nonce`, the
+// signer falls back to the OLD behaviour (`bp.nonce`) and logs a WARN on every
+// signature. That keeps existing call sites working while they are migrated, but it
+// is NOT correct on a real chain: seed the nonce at startup in `main.rs`. The
+// counter is deliberately not advanced while unseeded.
+//
+// `sign_call` / `sign_call_gwei` still take an explicit nonce (unchanged
+// signature); ZK/`submitProof` callers should obtain it from `next_tx_nonce()` so
+// they draw from the same counter and cannot collide with `sign_transaction`.
+//
+// ## C10l (earlier revision): `orchestrator_bp_hash`
+//
+// `OmegaVault` keys `pending_profit`, `proofInputsBound`, and the ZK
+// public-inputs binding on the Orchestrator's domain-separated `bpHash`
+// (`keccak256(abi.encode(address(this), EXPECTED_CHAIN_ID, blueprintCalldata))`),
+// NOT on `ExecutionBlueprint::compute_hash()`. `compute_bp_hash` was private and
+// `build_execute_calldata` only logged its result, so nothing outside this file
+// could learn the key the Vault would use. `orchestrator_bp_hash` is the public,
+// pure accessor: build the blueprint calldata, hash it with the same domain
+// separation `execute()` signs. It performs no signing and touches no key
+// material. See `main.rs` (C10l) for how the engine uses it to prove only AFTER a
+// blueprint has landed on-chain.
 //
 // ## Status as of this revision — real progress against a real contract
 //
@@ -137,7 +184,7 @@
 //      implemented — closing item 4 does not imply the manifest is
 //      complete.
 //
-// ## RESOLVED (this revision): the blueprint-authorization signature
+// ## RESOLVED (earlier revision): the blueprint-authorization signature
 //
 // `omega-security/src/signer.rs`'s real source was provided and directly
 // confirms `BlueprintSigner::sign_raw_hash()` is exactly the primitive
@@ -303,7 +350,7 @@
 // obscure the correspondence to the spec this code deliberately
 // preserves, not simplify anything.
 //
-// ## Build fix (this revision): E0382 partial-move in two tests
+// ## Build fix (carried forward): E0382 partial-move in two tests
 //
 // `cargo test --workspace` / `cargo clippy --workspace --all-targets -- -D
 // warnings` both failed to compile with two `E0382` "borrow of partially
@@ -321,12 +368,12 @@
 // `err` by reference and never moves out of it, leaving `err` fully
 // intact for the subsequent `{err:?}` use.
 //
-// ## Build fix (this revision, 2): clippy::too_many_arguments on the new
+// ## Build fix (carried forward, 2): clippy::too_many_arguments on the
 // ## sign_call / sign_call_gwei ZK-envelope helpers
 //
 // `cargo clippy --workspace --all-targets -- -D warnings` failed with
 // two `too_many_arguments` errors (8/7) on `sign_call` and
-// `sign_call_gwei`, added this revision to close the ZK gap
+// `sign_call_gwei`, added to close the ZK gap
 // (`OmegaVault.submitProof` is a different call target than
 // `OmegaOrchestrator.execute`, so it needs its own gas-paying-envelope
 // signer entry point rather than reusing `sign_transaction`, which is
@@ -344,7 +391,7 @@
 // rather than inventing a different justification.
 
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use alloy_primitives::{Address, Bytes, U256};
 use alloy_sol_types::{sol, SolCall, SolValue};
@@ -538,9 +585,18 @@ pub struct KeyManagerTransactionSigner {
     /// from `tx_key_manager` — see this struct's top doc comment for why
     /// the two are independent concerns. Uses `BlueprintSigner::
     /// sign_raw_hash()` specifically, never `BlueprintSigner::sign()` —
-    /// see this file's top doc comment, "RESOLVED (this revision)", for
+    /// see this file's top doc comment, "RESOLVED (earlier revision)", for
     /// why the latter is confirmed incompatible with this contract.
     blueprint_signer: Arc<BlueprintSigner>,
+    /// Next nonce for the OUTER gas-paying envelope of `tx_key_manager`'s
+    /// account. ONE counter per signing account, shared by every strategy
+    /// (SA, MSA, MEV, ...) and by `next_tx_nonce()` (ZK `submitProof` path).
+    /// Independent of `ExecutionBlueprint::nonce`, which is the
+    /// Orchestrator's per-strategy replay counter and lives only inside
+    /// the blueprint calldata. `None` until seeded via `seed_tx_nonce`
+    /// from `eth_getTransactionCount(active_address, "pending")`. See this
+    /// file's top doc comment, "ENVELOPE NONCE FIX (2026-10-09)".
+    tx_nonce: Mutex<Option<u64>>,
     secp: Secp256k1<secp256k1::All>,
 }
 
@@ -566,15 +622,65 @@ impl KeyManagerTransactionSigner {
             orchestrator,
             strategy_onchain_ids,
             blueprint_signer,
+            tx_nonce: Mutex::new(None),
             secp: Secp256k1::new(),
         }
     }
 
     /// The address that will appear as `from` on every transaction this
     /// signer produces. Useful for pre-funding checks / logging without
-    /// exposing key material.
+    /// exposing key material, and the address whose pending transaction
+    /// count must be passed to `seed_tx_nonce`.
     pub fn active_address(&self) -> [u8; 20] {
         self.tx_key_manager.active_address()
+    }
+
+    /// Seed or resync the envelope-nonce counter.
+    ///
+    /// `pending_count` MUST be `eth_getTransactionCount(active_address(), "pending")`.
+    /// Call once at startup, and again after any send failure (rejected,
+    /// dropped, or never broadcast) so the local counter cannot run ahead of
+    /// the chain and strand later transactions behind a nonce gap.
+    pub fn seed_tx_nonce(&self, pending_count: u64) {
+        *self.tx_nonce.lock().unwrap_or_else(|p| p.into_inner()) = Some(pending_count);
+    }
+
+    /// Reserve and return the next envelope nonce, advancing the shared
+    /// counter. Use this for `sign_call` / `sign_call_gwei` callers (ZK
+    /// `submitProof`) so they draw from the same counter as
+    /// `sign_transaction` and cannot collide with it. Fails closed if the
+    /// counter has not been seeded.
+    pub fn next_tx_nonce(&self) -> Result<u64, ExecutionError> {
+        let mut guard = self.tx_nonce.lock().unwrap_or_else(|p| p.into_inner());
+        let n = guard.ok_or_else(|| ExecutionError::SigningFailed {
+            detail: "envelope nonce not seeded — call seed_tx_nonce(eth_getTransactionCount(\
+                     active_address, \"pending\")) at startup"
+                .into(),
+        })?;
+        *guard = Some(n.saturating_add(1));
+        Ok(n)
+    }
+
+    /// Current value of the envelope-nonce counter without advancing it.
+    /// `None` if not yet seeded. Intended for logging / diagnostics.
+    pub fn peek_tx_nonce(&self) -> Option<u64> {
+        *self.tx_nonce.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
+    /// The Orchestrator's domain-separated `bpHash` for `bp` — i.e.
+    /// `keccak256(abi.encode(orchestrator, chain_id, blueprintCalldata))`, the exact key
+    /// `OmegaVault` stores `pending_profit` and the ZK public-inputs binding under (the
+    /// Orchestrator passes its own `bpHash` to `receivePendingProfit`).
+    ///
+    /// Pure: builds the blueprint calldata and hashes it. No signing, no key material.
+    /// Fails only if `bp.strategy_id` has no entry in `strategy_onchain_ids`.
+    pub fn orchestrator_bp_hash(
+        &self,
+        bp: &ExecutionBlueprint,
+        chain_id: u64,
+    ) -> Result<[u8; 32], ExecutionError> {
+        let blueprint_calldata = self.build_blueprint_calldata(bp)?;
+        Ok(self.compute_bp_hash(&blueprint_calldata, chain_id))
     }
 
     /// Sign an EIP-1559 transaction to an arbitrary `to` with arbitrary calldata.
@@ -583,8 +689,11 @@ impl KeyManagerTransactionSigner {
     /// this is the gas-paying envelope for verified proof broadcast. Fail closed if
     /// no active tx key or empty calldata / zero `to`.
     ///
+    /// The caller supplies `nonce`. To avoid colliding with `sign_transaction`
+    /// (same signing account), obtain it from `next_tx_nonce()`.
+    ///
     /// `#[allow(clippy::too_many_arguments)]`: see this file's top doc
-    /// comment, "Build fix (this revision, 2)" — this argument list is
+    /// comment, "Build fix (carried forward, 2)" — this argument list is
     /// the minimum EIP-1559 itself requires to build an arbitrary-call
     /// envelope, matching the precedent already set by
     /// `encode_eip1559_unsigned`/`encode_eip1559_signed` below.
@@ -726,13 +835,19 @@ impl KeyManagerTransactionSigner {
             .get(&strategy_key)
             .ok_or_else(|| ExecutionError::SigningFailed {
                 detail: format!(
-                    "no on-chain strategyId configured for strategy_id {strategy_key:?} — this                      value is real deployment configuration (whatever bytes32 was passed to                      OmegaOrchestrator.registerStrategy() for this strategy on-chain), not                      something derivable from code. Wire it into                      KeyManagerTransactionSigner::new's strategy_onchain_ids map, sourced from                      real deployment records, never guessed at."
+                    "no on-chain strategyId configured for strategy_id {strategy_key:?} — this \
+                     value is real deployment configuration (whatever bytes32 was passed to \
+                     OmegaOrchestrator.registerStrategy() for this strategy on-chain), not \
+                     something derivable from code. Wire it into \
+                     KeyManagerTransactionSigner::new's strategy_onchain_ids map, sourced from \
+                     real deployment records, never guessed at."
                 ),
             })?;
         if strategy_id_bytes == [0u8; 32] {
             return Err(ExecutionError::SigningFailed {
                 detail: format!(
-                    "on-chain strategyId for {strategy_key:?} is all-zero — refusing to sign                      (C6 fail closed)"
+                    "on-chain strategyId for {strategy_key:?} is all-zero — refusing to sign \
+                     (C6 fail closed)"
                 ),
             });
         }
@@ -746,6 +861,9 @@ impl KeyManagerTransactionSigner {
     /// The ONLY failure mode is a strategy missing from
     /// `strategy_onchain_ids` — everything else is a pure, infallible
     /// transformation of already-real `ExecutionBlueprint` fields.
+    ///
+    /// NOTE: `bp.nonce` is encoded HERE, inside the blueprint calldata, as the
+    /// Orchestrator's per-strategy replay counter. It is NOT the envelope nonce.
     fn build_blueprint_calldata(&self, bp: &ExecutionBlueprint) -> Result<Vec<u8>, ExecutionError> {
         let strategy_id_bytes = self.resolve_strategy_id(bp)?;
 
@@ -810,18 +928,18 @@ impl KeyManagerTransactionSigner {
     /// `OmegaOrchestrator.execute(bytes blueprintCalldata, bytes sig)`,
     /// including the real on-chain-authorization signature.
     ///
-    /// As of this revision this is fully real end-to-end: `blueprintCalldata`
-    /// and `bp_hash` are built and hashed for real (see
-    /// `build_blueprint_calldata` / `compute_bp_hash` above), `sig` is
-    /// produced by `BlueprintSigner::sign_raw_hash()` — the primitive
-    /// confirmed compatible with `OmegaOrchestrator.sol`'s
-    /// `bpHash.recover(sig)` (see this file's top doc comment, "RESOLVED
-    /// (this revision)") — and the three are assembled via
-    /// `encode_execute_call`. The only remaining failure mode is a
-    /// strategy missing from `strategy_onchain_ids` (real deployment
-    /// configuration this file cannot supply for itself) or a signing
-    /// failure surfaced from `BlueprintSigner` itself (e.g. no active
-    /// key) — both fail loudly and specifically, never silently.
+    /// Fully real end-to-end: `blueprintCalldata` and `bp_hash` are built
+    /// and hashed for real (see `build_blueprint_calldata` /
+    /// `compute_bp_hash` above), `sig` is produced by
+    /// `BlueprintSigner::sign_raw_hash()` — the primitive confirmed
+    /// compatible with `OmegaOrchestrator.sol`'s `bpHash.recover(sig)`
+    /// (see this file's top doc comment, "RESOLVED (earlier revision)") —
+    /// and the three are assembled via `encode_execute_call`. The only
+    /// remaining failure mode is a strategy missing from
+    /// `strategy_onchain_ids` (real deployment configuration this file
+    /// cannot supply for itself) or a signing failure surfaced from
+    /// `BlueprintSigner` itself (e.g. no active key) — both fail loudly
+    /// and specifically, never silently.
     fn build_execute_calldata(
         &self,
         bp: &ExecutionBlueprint,
@@ -878,9 +996,32 @@ impl TransactionSigner for KeyManagerTransactionSigner {
         let (max_priority_fee_per_gas, max_fee_per_gas) =
             envelope_fees_wei(bp.base_fee_at_creation, bp.priority_fee_gwei)?;
 
+        // Envelope nonce — see module doc, "ENVELOPE NONCE FIX (2026-10-09)".
+        // The guard is held through signing so concurrent strategies (SA, MSA,
+        // ...) are serialized and can never reuse a nonce. There is no `.await`
+        // in this function, so holding a std Mutex guard here is sound and the
+        // future stays `Send`.
+        let mut nonce_guard = self.tx_nonce.lock().unwrap_or_else(|p| p.into_inner());
+        let envelope_nonce = match *nonce_guard {
+            Some(n) => n,
+            None => {
+                // Legacy fallback: NOT correct on a real chain. The caller must
+                // `seed_tx_nonce` at startup. The counter is deliberately left
+                // unseeded (and not advanced) in this mode.
+                tracing::warn!(
+                    blueprint_hash = %bp.blueprint_hash,
+                    fallback_nonce = bp.nonce,
+                    "envelope nonce NOT seeded — falling back to blueprint nonce; this will \
+                     collide across strategies and mismatch the account nonce. Call \
+                     KeyManagerTransactionSigner::seed_tx_nonce at startup."
+                );
+                bp.nonce
+            }
+        };
+
         let unsigned_rlp = encode_eip1559_unsigned(
             chain_id,
-            bp.nonce,
+            envelope_nonce,
             max_priority_fee_per_gas,
             max_fee_per_gas,
             gas_limit,
@@ -911,7 +1052,7 @@ impl TransactionSigner for KeyManagerTransactionSigner {
 
         let signed_rlp = encode_eip1559_signed(
             chain_id,
-            bp.nonce,
+            envelope_nonce,
             max_priority_fee_per_gas,
             max_fee_per_gas,
             gas_limit,
@@ -923,12 +1064,20 @@ impl TransactionSigner for KeyManagerTransactionSigner {
             &compact[32..],
         );
 
+        // Advance the shared counter only after a successful signature, and only
+        // when it is seeded (see the unseeded fallback above).
+        if nonce_guard.is_some() {
+            *nonce_guard = Some(envelope_nonce.saturating_add(1));
+        }
+        drop(nonce_guard);
+
         let raw_tx_hex = format!("0x{}", hex::encode(&signed_rlp));
 
         tracing::debug!(
             blueprint_hash = %bp.blueprint_hash,
             chain_id,
-            nonce = bp.nonce,
+            blueprint_nonce = bp.nonce,
+            envelope_nonce,
             gas_limit,
             "transaction signed"
         );
@@ -941,11 +1090,10 @@ impl TransactionSigner for KeyManagerTransactionSigner {
 /// already-built `blueprint_calldata` and an already-produced
 /// authorization `sig`. Free function (not a method) so it's directly
 /// unit-testable without constructing a full `KeyManagerTransactionSigner`
-/// — see the tests below. As of this revision, genuinely called from
-/// `build_execute_calldata` above (no longer dead code) — kept as a free
-/// function regardless, since that keeps the "pure assembly" step
-/// independently testable from the signing step that produces its `sig`
-/// input.
+/// — see the tests below. Genuinely called from `build_execute_calldata`
+/// above (no longer dead code) — kept as a free function regardless,
+/// since that keeps the "pure assembly" step independently testable from
+/// the signing step that produces its `sig` input.
 pub(crate) fn encode_execute_call(blueprint_calldata: Vec<u8>, sig: Vec<u8>) -> Vec<u8> {
     executeCall {
         blueprint_calldata: blueprint_calldata.into(),
@@ -1480,6 +1628,7 @@ mod tests {
             strategy_ids_with_sa(),
             make_blueprint_signer(0x0d),
         );
+        signer.seed_tx_nonce(21_287);
         let bp = sample_bp();
 
         let result = signer.sign_transaction(&bp, 42161).await;
@@ -1491,6 +1640,11 @@ mod tests {
         assert!(
             signed.raw_tx_hex.len() > 4,
             "must contain real RLP payload, not just the type byte"
+        );
+        assert_eq!(
+            signer.peek_tx_nonce(),
+            Some(21_288),
+            "envelope nonce must advance by exactly one after a successful signature"
         );
     }
 
@@ -1540,6 +1694,130 @@ mod tests {
             }
             other => panic!("expected ExecutionError::SigningFailed, got {other:?}"),
         }
+    }
+
+    // ── Envelope nonce (2026-10-09 fix) ─────────────────────────────────────
+
+    fn nonce_test_signer(km_byte: u8, bs_byte: u8) -> KeyManagerTransactionSigner {
+        KeyManagerTransactionSigner::new(
+            make_km(km_byte),
+            Address::from([0x01; 20]),
+            strategy_ids_with_sa(),
+            make_blueprint_signer(bs_byte),
+        )
+    }
+
+    #[tokio::test]
+    async fn envelope_nonce_is_independent_of_blueprint_nonce() {
+        // Two blueprints with the SAME blueprint nonce (as SA and MSA had in the
+        // field) must be signed with DIFFERENT, consecutive envelope nonces drawn
+        // from the seeded counter — never from bp.nonce.
+        let signer = nonce_test_signer(0x60, 0x61);
+        signer.seed_tx_nonce(21_287);
+
+        let mut bp1 = sample_bp();
+        bp1.nonce = 22;
+        let mut bp2 = sample_bp();
+        bp2.nonce = 22;
+
+        let a = signer.sign_transaction(&bp1, 42161).await.unwrap();
+        let b = signer.sign_transaction(&bp2, 42161).await.unwrap();
+
+        assert_ne!(
+            a.raw_tx_hex, b.raw_tx_hex,
+            "two signatures from the same account must carry different envelope nonces"
+        );
+        assert_eq!(signer.peek_tx_nonce(), Some(21_289));
+    }
+
+    #[tokio::test]
+    async fn envelope_nonce_in_raw_tx_is_the_seeded_value_not_the_blueprint_nonce() {
+        // Decode the nonce back out of the signed RLP: it must be the seeded value.
+        let signer = nonce_test_signer(0x62, 0x63);
+        signer.seed_tx_nonce(21_287);
+        let mut bp = sample_bp();
+        bp.nonce = 22;
+
+        let signed = signer.sign_transaction(&bp, 42161).await.unwrap();
+
+        // EIP-1559 field order: [chain_id, nonce, ...]. For chain 42161 (0xa4b1) the
+        // RLP list is: 0x02 || list-header || 0x82 0xa4 0xb1 || <rlp(nonce)> ...
+        let raw = hex::decode(signed.raw_tx_hex.trim_start_matches("0x")).unwrap();
+        let needle_chain = [0x82u8, 0xa4, 0xb1];
+        let pos = raw
+            .windows(3)
+            .position(|w| w == needle_chain)
+            .expect("chain id field present");
+        let after = &raw[pos + 3..];
+        // 21287 = 0x5327 -> RLP 0x82 0x53 0x27
+        assert_eq!(&after[..3], &[0x82, 0x53, 0x27]);
+    }
+
+    #[tokio::test]
+    async fn unseeded_signer_falls_back_to_blueprint_nonce_and_does_not_advance() {
+        // Documented legacy fallback: unseeded -> bp.nonce, counter stays None.
+        let signer = nonce_test_signer(0x64, 0x65);
+        assert_eq!(signer.peek_tx_nonce(), None);
+        let signed = signer.sign_transaction(&sample_bp(), 42161).await.unwrap();
+        assert!(signed.raw_tx_hex.starts_with("0x02"));
+        assert_eq!(
+            signer.peek_tx_nonce(),
+            None,
+            "an unseeded counter must stay unseeded after a fallback signature"
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_signature_does_not_advance_envelope_nonce() {
+        // Out-of-policy fee fails before the nonce is touched.
+        let signer = nonce_test_signer(0x66, 0x67);
+        signer.seed_tx_nonce(100);
+        let mut bp = sample_bp();
+        bp.priority_fee_gwei = MAX_PRIORITY_FEE_GWEI_CAP + 1;
+        assert!(signer.sign_transaction(&bp, 42161).await.is_err());
+        assert_eq!(signer.peek_tx_nonce(), Some(100));
+    }
+
+    #[test]
+    fn next_tx_nonce_fails_closed_when_unseeded() {
+        let signer = nonce_test_signer(0x68, 0x69);
+        let err = signer.next_tx_nonce().unwrap_err();
+        assert!(
+            matches!(err, ExecutionError::SigningFailed { ref detail } if detail.contains("not seeded")),
+            "expected not-seeded fail-closed, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn next_tx_nonce_returns_current_then_advances() {
+        let signer = nonce_test_signer(0x6a, 0x6b);
+        signer.seed_tx_nonce(7);
+        assert_eq!(signer.next_tx_nonce().unwrap(), 7);
+        assert_eq!(signer.next_tx_nonce().unwrap(), 8);
+        assert_eq!(signer.peek_tx_nonce(), Some(9));
+    }
+
+    #[test]
+    fn seed_tx_nonce_resyncs_after_failure() {
+        let signer = nonce_test_signer(0x6c, 0x6d);
+        signer.seed_tx_nonce(10);
+        let _ = signer.next_tx_nonce().unwrap();
+        let _ = signer.next_tx_nonce().unwrap();
+        // simulate a rejected send: caller re-reads the chain and resyncs
+        signer.seed_tx_nonce(10);
+        assert_eq!(signer.peek_tx_nonce(), Some(10));
+    }
+
+    #[tokio::test]
+    async fn shared_counter_across_sign_transaction_and_next_tx_nonce() {
+        // The ZK submitProof path (next_tx_nonce + sign_call) and the strategy path
+        // (sign_transaction) must draw from ONE counter.
+        let signer = nonce_test_signer(0x6e, 0x6f);
+        signer.seed_tx_nonce(50);
+        let _ = signer.sign_transaction(&sample_bp(), 42161).await.unwrap(); // uses 50
+        assert_eq!(signer.next_tx_nonce().unwrap(), 51);
+        let _ = signer.sign_transaction(&sample_bp(), 42161).await.unwrap(); // uses 52
+        assert_eq!(signer.peek_tx_nonce(), Some(53));
     }
 
     // ── build_blueprint_calldata — real ABI encoding ────────────────────────
@@ -1755,6 +2033,50 @@ mod tests {
              replay-across-deployments vulnerability OmegaOrchestrator.sol's own \
              change #3 note describes fixing"
         );
+    }
+
+    // ── orchestrator_bp_hash (C10l) ─────────────────────────────────────────
+
+    #[test]
+    fn orchestrator_bp_hash_matches_compute_bp_hash_of_built_calldata() {
+        let signer = KeyManagerTransactionSigner::new(
+            make_km(0x50),
+            Address::from([0x01; 20]),
+            strategy_ids_with_sa(),
+            make_blueprint_signer(0x51),
+        );
+        let bp = sample_bp();
+        let calldata = signer.build_blueprint_calldata(&bp).unwrap();
+        assert_eq!(
+            signer.orchestrator_bp_hash(&bp, 42161).unwrap(),
+            signer.compute_bp_hash(&calldata, 42161)
+        );
+    }
+
+    #[test]
+    fn orchestrator_bp_hash_differs_from_engine_blueprint_hash() {
+        // The whole reason this accessor exists: the Vault's key is NOT the engine's
+        // ExecutionBlueprint::compute_hash().
+        let signer = KeyManagerTransactionSigner::new(
+            make_km(0x52),
+            Address::from([0x01; 20]),
+            strategy_ids_with_sa(),
+            make_blueprint_signer(0x53),
+        );
+        let bp = sample_bp();
+        let h = signer.orchestrator_bp_hash(&bp, 42161).unwrap();
+        assert_ne!(h.as_slice(), bp.blueprint_hash.as_slice());
+    }
+
+    #[test]
+    fn orchestrator_bp_hash_fails_for_unconfigured_strategy() {
+        let signer = KeyManagerTransactionSigner::new(
+            make_km(0x54),
+            Address::from([0x01; 20]),
+            empty_strategy_ids(),
+            make_blueprint_signer(0x55),
+        );
+        assert!(signer.orchestrator_bp_hash(&sample_bp(), 42161).is_err());
     }
 
     // ── encode_execute_call — outer calldata assembly ───────────────────────
