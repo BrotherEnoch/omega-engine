@@ -4,7 +4,7 @@ active_phase = 4
 [gas]
 l2_buffer_factor            = 1.15
 l1_data_buffer_factor       = 1.10
-max_priority_fee_gwei       = 500
+max_priority_fee_gwei       = 50
 conservative_fee_fraction   = 0.70
 emergency_bundle_enabled    = true
 gas_token_enabled           = false
