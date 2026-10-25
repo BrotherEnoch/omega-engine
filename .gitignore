@@ -40,3 +40,5 @@ omega_backup_*/
 build_errors.txt
 test_results.txt
 rustc-ice-*.txt
+/cache/
+/out/
