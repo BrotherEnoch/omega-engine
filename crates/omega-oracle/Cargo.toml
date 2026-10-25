@@ -26,6 +26,7 @@ thiserror = { workspace = true }
 
 # Telemetry
 tracing = { workspace = true }
+reqwest = { workspace = true }
 
 # Concurrent price cache (per-token, per-chain)
 dashmap = { workspace = true }
@@ -35,6 +36,7 @@ arc-swap = { workspace = true }
 
 # Timestamps — staleness tracking, signal versioning
 chrono = { workspace = true }
+
 
 [dev-dependencies]
 tokio = { workspace = true }

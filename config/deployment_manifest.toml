@@ -1,29 +1,29 @@
 [[strategies]]
 strategy_id = "CNRY"
-bytecode_hash = "0xa65a276585238cbcbf71b428b0d8f81c00722c246393dc2ba4e962d4cbc03291"
-contract_address = "0x80352e2A85474B0B6e2e3d8ca2C40Ac9DCFeB9D6"
+bytecode_hash = "0xe45848115f3be7508d3813b6c46cdc4aaa34760cec783e1687e8176234e743c2"
+contract_address = "0xfEC063A3be6BbDB768321a626eF7618A8Ebc84DB"
 min_phase = 0
 
 [[strategies]]
 strategy_id = "SA"
-bytecode_hash = "0x29cd4206a557655c451fea9deb87e8e2a9f50e46f9c5519b15e8afd51bab76f4"
-contract_address = "0x171EA4921DF8A2d8F57c50667F791E0B639d7328"
+bytecode_hash = "0xfdf231ab7fbc506152a929ecae79f21b9c8f14f52485312898c45a63a698b50c"
+contract_address = "0x7d296EF557aCac15070e8F3C8b4Bb0179012165C"
 min_phase = 1
 
 [[strategies]]
 strategy_id = "MSA"
-bytecode_hash = "0x4aedd99c79851ac54c39758844898f5a7b3742a68e39e13efe5bff93fe0bf23e"
-contract_address = "0x38732EDBFB5A0ae7f2C4e1C4dB9BE45041d2d51B"
+bytecode_hash = "0x584fa364460861e502c4a949f37f9380dd9c99f04b78f9018f951979a23ea099"
+contract_address = "0x70cb8b72CCaa962E848fDcc6d0bAe223fAEAc25b"
 min_phase = 2
 
 [[strategies]]
 strategy_id = "LA"
-bytecode_hash = "0xf339bfcd443b2f153567fd85f32876917c7d84a5048bc92862640afcec3a3215"
-contract_address = "0xeE29a1fA411B590C204E1Db6101681a4eEdff0D3"
+bytecode_hash = "0xbfe4098808ed8c684373d7814bef245cbfb83a83a8411ca0e77b446e3dd39fd1"
+contract_address = "0x6A814E15C74f7030D9c1D7af741048CAEacA3FC4"
 min_phase = 3
 
 [[strategies]]
 strategy_id = "MEV"
-bytecode_hash = "0x1217a8f00e7efa4f1d4b09a30e3e78bd8373a3793d738c64024b35b5a0941b7b"
-contract_address = "0x0bD2e0Dabf017397955EC169fB30269d1324d31B"
+bytecode_hash = "0x00bfce4f782237bf0c97cd7bc9bf5ff34f8c30779d4e2e13cab3d9948a93cba0"
+contract_address = "0x31532Fe1F6802f9A3a22790Aa584636076cE4DCb"
 min_phase = 4

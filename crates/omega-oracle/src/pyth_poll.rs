@@ -167,10 +167,7 @@ pub async fn poll_hermes_once(
 
     for item in body.parsed {
         let id_key = item.id.to_lowercase();
-        let symbol = match map
-            .get(&id_key)
-            .or_else(|| map.get(&format!("0x{id_key}")))
-        {
+        let symbol = match map.get(&id_key).or_else(|| map.get(&format!("0x{id_key}"))) {
             Some(s) => s.as_str(),
             None => continue,
         };

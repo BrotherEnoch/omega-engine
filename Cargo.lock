@@ -4888,6 +4888,7 @@ dependencies = [
  "omega-core",
  "omega-health",
  "omega-rpc",
+ "reqwest 0.12.28",
  "serde",
  "serde_json",
  "thiserror 1.0.69",

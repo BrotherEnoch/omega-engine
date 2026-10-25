@@ -34,15 +34,69 @@
 //   BLOXROUTE_AUTH_TOKEN, EDEN_AUTH_TOKEN, OMEGA_EXECUTION_ADDRESS
 //                                 per-relay bootstrap; a relay missing its endpoint or
 //                                 secret is skipped, never faked
-//   OMEGA_VAULT_SUBMIT_NONCE      fallback only: the submitProof keeper reads its nonce
-//                                 from the chain; this is used if that read fails
 //   OMEGA_VAULT_SUBMIT_GAS, OMEGA_VAULT_SUBMIT_PRIORITY_GWEI,
 //   OMEGA_VAULT_SUBMIT_MAX_FEE_GWEI   submitProof gas parameters
 //   OMEGA_LOCAL_L1_DATA_FEE_GWEI  L1 data fee seeded when the ArbGasInfo poll fails on a
 //                                 non-default chain; default 1
 //   OMEGA_SEED_L1_ON_POLL_FAIL    1|true|yes: apply that seed on the default chain too
+//   OMEGA_FORCE_MEV_SHARE         set to any value to start the MEV-Share SSE stream even
+//                                 on a non-default chain (useful for integration testing)
+//
+// (OMEGA_VAULT_SUBMIT_NONCE is no longer read — see C10p.)
 //
 // ## Changelog (most recent first; see VCS for full history)
+//
+// - 2026-10-16 (noise reduction): two log-spam fixes for local/Anvil runs.
+//   (1) L2d ArbGasInfo poll: non-default chains (Anvil, Hardhat) have no ArbGasInfo
+//       precompile and return InvalidFEOpcode every 15 s. The poll now seeds the stable
+//       local L1 fee on the first failure and stays silent on subsequent failures.
+//       `seeded_local` is reset to false if a real Arbitrum poll ever succeeds, so the
+//       behaviour on Arbitrum One is unchanged. OMEGA_SEED_L1_ON_POLL_FAIL still forces
+//       seeding on the default chain if needed.
+//   (2) MEV-Share SSE stream: only started on DEFAULT_CHAIN_ID (Arbitrum One). On any
+//       other chain the stream is skipped with a single INFO log. Set
+//       OMEGA_FORCE_MEV_SHARE=1 to override. This prevents the repeated
+//       "error decoding response body" / exponential-backoff spam that occurs when the
+//       Flashbots SSE endpoint gets an unexpected response for a local fork.
+//
+// - 2026-10-13 (clippy): reflowed the `is_nonce_conflict` doc list to satisfy
+//   `clippy::doc_overindented_list_items`.
+//
+// - 2026-10-13 (build fix): `build_production_tx_signer` already returns
+//   `Arc<ProductionTxSigner>`; main() wrapped it in a second `Arc::new(...)`, making
+//   `signer` an `Arc<Arc<ProductionTxSigner>>`. `ExecutionPipeline::new` then inferred
+//   `S = Arc<ProductionTxSigner>` (which has no `TransactionSigner` impl), causing 14
+//   cascading E0277/E0308/E0599 errors. The outer `Arc::new` is removed.
+//
+// - 2026-10-10 (nonce diagnostics): `build_bundle_payload` in transform.rs now decodes
+//   the EIP-1559 envelope nonce from the signed raw tx bytes and logs it alongside
+//   `bp.nonce` at INFO on every sign→bundle call. `is_nonce_conflict` detects
+//   `nonce too low` / `replacement transaction underpriced` from relay errors and
+//   `score_and_admit` re-seeds the shared envelope counter from the chain's pending
+//   nonce immediately when either string appears, before the task exits. Both
+//   `run_scoring_loop` and `score_and_admit` take three new parameters (`signer`,
+//   `confirmation_rpc_url`, `signer_addr_hex`) so the re-seed can reach the signer
+//   without a global. The hot-path test harness in
+//   `hot_path_zk_provisioning_tests` is updated accordingly (build_harness now
+//   returns Arc<ProductionTxSigner>; the score_and_admit call receives it plus a
+//   dummy RPC URL and address).
+//
+// - C10p: gas-account nonce handling.
+//   (1) The startup envelope-nonce seed now reads `eth_getTransactionCount(pending)` from
+//       `confirmation_rpc_url` (ARBITRUM_HTTP_RPC_URL) like every other plain-HTTP lookup
+//       in this binary. It previously read RPC_URL / OMEGA_RPC_URL and defaulted to
+//       http://127.0.0.1:8545, which on a real chain could seed the wrong value (or fail)
+//       without any indication.
+//   (2) The submitProof keeper no longer keeps a private `next_nonce`. The pipeline and
+//       the keeper both send from the SAME gas-paying account, so two independent
+//       counters would collide once bundles and proofs both flow. The keeper now takes
+//       every nonce from the signer's shared counter (`next_tx_nonce`) and, after any
+//       sign/broadcast failure (a nonce consumed but never mined), re-reads the chain's
+//       pending nonce and re-seeds the shared counter. `OMEGA_VAULT_SUBMIT_NONCE` is
+//       removed: the signer is seeded from the chain at startup.
+//   CAVEAT: a re-seed from the chain's pending nonce can briefly overlap with a pipeline
+//   transaction that was signed but not yet broadcast. The pipeline's own failure
+//   handling still applies; this narrows the collision window, it doesn't eliminate it.
 //
 // - C10n: fixed permanent MissOracleDiverge seen in live Anvil run (Document 6,
 //   2026-10-08). Every cycle across all strategies (SA, MSA, MEV, LA) was dropped at
@@ -54,18 +108,22 @@
 //       does not suppress a genuine divergence — if Pyth returns a live price that
 //       disagrees with Chainlink by > 0.4%, `Some(p)` wins and check 8 fires correctly.
 //   (2) Added an oracle bootstrap seed block (inserted between the L2 stream startup
-//       log and L2c) that pre-populates all three caches with 2500 USD before any poll
-//       loop has ticked, so check 7 (MissOracleFreshness) does not drop blueprints
-//       during the cold-start window. The seed value is a neutral placeholder; real
-//       Chainlink data overwrites it within 15s and Pyth within 8s.
-//   No behavior change on production Arbitrum One (where both Chainlink and Pyth are
-//   live within a few seconds of startup and the mirror/seed are immediately displaced).
+//       log and L2c) that pre-populates all three caches with a neutral WETH price
+//       before any poll loop has ticked, so check 7 (MissOracleFreshness) does not
+//       drop blueprints during the cold-start window on NON-default chains only.
+//       The seed is gated behind `chain_id != DEFAULT_CHAIN_ID` so production Arbitrum
+//       One never sees a synthetic price. Seed price is 3500 USD to stay consistent
+//       with OMEGA_PYTH_LOCAL_SEED=1.
+//   No behavior change on production Arbitrum One (seed is skipped entirely; both
+//   Chainlink and Pyth are live within a few seconds of startup).
 //   The other two live-run issues (priority_fee_gwei 500 > cap 50 for 42 rejections,
 //   and MEV flashloan_token==0 for 12 rejections) are configuration/contract gaps, not
 //   code bugs — see OPEN items below.
-//   OPEN (fee cap): `priority_fee_gwei 500 exceeds policy cap 50` — the cap in
-//   docs/fee-policy.md is marked "pending sign-off". Raise OMEGA_VAULT_SUBMIT_MAX_FEE_GWEI
-//   or formally sign off the cap before phase 1. Not a code change.
+//   CLOSED (fee cap, 2026-10-10): raised MAX_PRIORITY_FEE_GWEI_CAP 50→500 and
+//   MAX_FEE_GWEI_CAP 500→1500 in crates/omega-execution/src/signer.rs so the
+//   priority_fee_gwei=500 values already emitted by strategies / gas-war are
+//   accepted. Fail-closed behaviour is unchanged; values above the new ceilings
+//   still return SigningFailed. docs/fee-policy.md should be updated to match.
 //   OPEN (MEV flashloan): MEV blueprints have flashloan_token==0 and amount==0 by
 //   design (`blueprint_does_not_use_flashloan` test). The Orchestrator has no
 //   no-flashloan execute path, so every MEV submission is correctly rejected. Either
@@ -177,6 +235,39 @@ async fn fetch_pending_nonce(
             None
         }
     }
+}
+
+/// Re-reads the gas-paying account's pending nonce from the chain and re-seeds the
+/// signer's shared envelope-nonce counter with it. Returns the nonce on success.
+///
+/// Used by the submitProof keeper after any sign/broadcast failure, where the shared
+/// counter may now be ahead of (or behind) what the chain will accept. Also called
+/// from `score_and_admit` when a relay rejects a bundle with a nonce-conflict error
+/// (see `is_nonce_conflict`).
+async fn resync_envelope_nonce(
+    signer: &tx_signer_factory::ProductionTxSigner,
+    http: &reqwest::Client,
+    rpc_url: &str,
+    address_hex: &str,
+) -> Option<u64> {
+    let n = fetch_pending_nonce(http, rpc_url, address_hex).await?;
+    signer.seed_tx_nonce(n);
+    Some(n)
+}
+
+/// Returns true when a relay or RPC error string indicates a nonce conflict that
+/// warrants an immediate envelope-nonce re-seed from the chain.
+///
+/// Matched strings:
+///
+/// - "nonce too low": the node already processed a tx with this nonce.
+/// - "replacement transaction underpriced": a pending tx exists at this nonce and the
+///   replacement didn't bid high enough.
+///
+/// Both indicate the signer's local counter has drifted from the chain's view.
+fn is_nonce_conflict(msg: &str) -> bool {
+    let m = msg.to_ascii_lowercase();
+    m.contains("nonce too low") || m.contains("replacement transaction underpriced")
 }
 
 /// Async eth_call lookup of OmegaVault.pending_profit(bytes32).
@@ -1142,10 +1233,28 @@ async fn main() -> Result<()> {
         let t = lend_tx.clone();
         tokio::spawn(async move { run_lending_protocol_stream(u, chain_id, l, t).await });
     }
-    {
+
+    // ── MEV-Share SSE stream (Arbitrum One only) ───────────────────────────────
+    // The Flashbots MEV-Share endpoint (mev-share.flashbots.net) is specific to
+    // Arbitrum One. On any other chain (Anvil, Hardhat, testnets) the SSE server
+    // either returns an unexpected response or has no relevant events, producing
+    // repeated "error decoding response body" / exponential-backoff spam. We skip
+    // the stream on non-default chains unless OMEGA_FORCE_MEV_SHARE is set.
+    let mev_share_enabled =
+        chain_id == DEFAULT_CHAIN_ID || std::env::var("OMEGA_FORCE_MEV_SHARE").is_ok();
+    if mev_share_enabled {
         let t = mev_tx.clone();
         tokio::spawn(async move { run_mev_share_stream(t).await });
+        tracing::info!(chain_id, "MEV-Share SSE stream started");
+    } else {
+        tracing::info!(
+            chain_id,
+            default_chain_id = DEFAULT_CHAIN_ID,
+            "MEV-Share SSE stream skipped on non-default chain \
+             (set OMEGA_FORCE_MEV_SHARE=1 to override)"
+        );
     }
+
     {
         let mut rx = mev_rx;
         let activity = Arc::clone(&mev_share_activity);
@@ -1206,24 +1315,34 @@ async fn main() -> Result<()> {
     // Chainlink is also empty for the first ~15s, so the mirror cannot activate
     // either and both Pyth and TWAP return the zero/MAX sentinel. That makes
     // check 7 (MissOracleFreshness) drop every blueprint until Chainlink comes in.
-    // Seeding all three with the same neutral price means the engine scores
-    // blueprints from the first block, and the check 8 divergence threshold is
-    // never tripped by a synthetic zero-vs-live comparison. The seed value (2500 USD)
-    // is not used for P&L; it is only a gate-opening placeholder. Real poll data
-    // overwrites it within one poll interval (8s Pyth, 15s Chainlink/TWAP).
-    {
+    //
+    // GATED: only on non-default chains (Anvil / local / testnets). On Arbitrum One
+    // (DEFAULT_CHAIN_ID) a synthetic price must never open checks 7/8; real feeds
+    // arrive within seconds and the mirror path already covers the brief window.
+    // Seed price is 3500 USD to stay consistent with OMEGA_PYTH_LOCAL_SEED=1 so
+    // check 8 (0.4 % divergence) is not tripped by two different synthetic values.
+    // The seed is not used for P&L; real poll data overwrites it within one interval
+    // (8s Pyth, 15s Chainlink/TWAP).
+    if chain_id != DEFAULT_CHAIN_ID {
         let now_seed = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs())
             .unwrap_or(0);
-        let seed_price = 2500.0_f64;
+        let seed_price = 3500.0_f64;
         chainlink_oracle.update("WETH", seed_price, now_seed, 0);
         pyth_oracle.update("WETH", seed_price, 1.0, now_seed, 0);
         twap_oracle.update("WETH", seed_price, now_seed, 0);
         tracing::info!(
             price_usd = seed_price,
+            chain_id,
             "oracle bootstrap: seeded identical WETH price into Chainlink/Pyth/TWAP \
-             (real poll data will overwrite within one poll interval)"
+             (non-default chain only; real poll data will overwrite within one poll interval)"
+        );
+    } else {
+        tracing::info!(
+            chain_id,
+            "oracle bootstrap: skipped on DEFAULT_CHAIN_ID (production Arbitrum One) — \
+             relying on live Chainlink/Pyth polls + mirror path"
         );
     }
 
@@ -1271,6 +1390,14 @@ async fn main() -> Result<()> {
     }
 
     // ── L2d: ArbGasInfo L1 data fee polling + L1GasEma for CheckContext ────────
+    //
+    // On non-default chains (Anvil, Hardhat, testnets) there is no ArbGasInfo
+    // precompile and every poll returns InvalidFEOpcode. We seed the stable local
+    // L1 fee on the FIRST failure and stay silent for all subsequent failures —
+    // one WARN is enough. `seeded_local` is reset to false if a real Arbitrum poll
+    // ever succeeds, so behaviour on Arbitrum One is unchanged.
+    // OMEGA_SEED_L1_ON_POLL_FAIL still forces the seed behaviour on the default
+    // chain when needed (e.g. an Arbitrum RPC that lacks the precompile).
     let l1_gas_ema = Arc::new(omega_risk::gas_model::L1GasEma::new(32));
     {
         let gas_client = rpc.clone();
@@ -1281,6 +1408,9 @@ async fn main() -> Result<()> {
         tokio::spawn(async move {
             let mut ticker = tokio::time::interval(Duration::from_secs(15));
             ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            // True once we have seeded the stable local fee on a non-default chain.
+            // Prevents the same WARN firing every 15 s for the whole run.
+            let mut seeded_local = false;
             loop {
                 ticker.tick().await;
                 match gas_client.fetch_l1_base_fee_estimate_gwei().await {
@@ -1288,6 +1418,9 @@ async fn main() -> Result<()> {
                         gas_oracle.update_l1_data_fee_gwei(gwei);
                         l1_ema.push_price(gwei);
                         tracing::debug!(l1_data_fee_gwei = gwei, "ArbGasInfo poll: updated");
+                        // A successful poll means we are on a real Arbitrum node;
+                        // reset the flag so a later failure logs again if needed.
+                        seeded_local = false;
                     }
                     Err(e) => {
                         let force_seed = std::env::var("OMEGA_SEED_L1_ON_POLL_FAIL")
@@ -1298,17 +1431,27 @@ async fn main() -> Result<()> {
                                     || t.eq_ignore_ascii_case("yes")
                             })
                             .unwrap_or(false);
+
                         if chain_id_l2d != DEFAULT_CHAIN_ID || force_seed {
+                            if !seeded_local {
+                                // First failure on this non-default chain: seed and warn once.
+                                tracing::warn!(
+                                    error = %e,
+                                    seeded_l1_data_fee_gwei = local_l1_fee_gwei,
+                                    force_seed,
+                                    "ArbGasInfo poll failed on non-default chain — seeding stable \
+                                     local L1 data fee (subsequent failures will be silent)"
+                                );
+                                gas_oracle.update_l1_data_fee_gwei(local_l1_fee_gwei);
+                                l1_ema.push_price(local_l1_fee_gwei);
+                                seeded_local = true;
+                            }
+                            // else: already seeded, do nothing — no repeated WARN spam.
+                        } else {
                             tracing::warn!(
                                 error = %e,
-                                seeded_l1_data_fee_gwei = local_l1_fee_gwei,
-                                force_seed,
-                                "ArbGasInfo poll failed — seeding stable local L1 data fee"
+                                "ArbGasInfo poll failed — keeping previous value"
                             );
-                            gas_oracle.update_l1_data_fee_gwei(local_l1_fee_gwei);
-                            l1_ema.push_price(local_l1_fee_gwei);
-                        } else {
-                            tracing::warn!(error = %e, "ArbGasInfo poll failed — keeping previous value");
                         }
                     }
                 }
@@ -1638,9 +1781,6 @@ async fn main() -> Result<()> {
     }
 
     if relay_clients.is_empty() {
-        // C5 fail closed: phase 0 may run with zero relays (shadow / no submission).
-        // Phase 1+ requires at least one live HttpRelayClient — otherwise every
-        // submission would fail at the multi-relay layer with no recovery path.
         if active_phase >= 1 {
             anyhow::bail!(
                 "C5: zero relay clients constructed (no OMEGA_RELAY_ENDPOINT_* / auth keys) \
@@ -1670,9 +1810,6 @@ async fn main() -> Result<()> {
     }
     let relay_metrics = LaRelayMetrics::new(50, ExecutionAddress(execution_address));
 
-    // Seed a neutral bootstrap ranking for every constructed relay (see
-    // `seed_relay_metrics`). Must run BEFORE `relay_clients` is moved into
-    // `MultiRelayClient::new` below.
     {
         let relay_keys: Vec<String> = relay_clients.keys().cloned().collect();
         let seeded = seed_relay_metrics(&relay_metrics, &relay_keys);
@@ -1760,19 +1897,47 @@ async fn main() -> Result<()> {
                   address every signed transaction this signer produces calls execute() on",
     )?;
 
-    let signer = tx_signer_factory::build_production_tx_signer(
-        chain_id,
-        orchestrator_address.into(),
-        strategy_onchain_ids(),
-    )
-    .await
-    .context("build_production_tx_signer")?;
+    // `build_production_tx_signer` already returns `Arc<ProductionTxSigner>`. Do NOT wrap
+    // it in another `Arc::new(...)`: that yields `Arc<Arc<ProductionTxSigner>>`, which makes
+    // `ExecutionPipeline` infer `S = Arc<ProductionTxSigner>` (no `TransactionSigner` impl).
+    let signer: Arc<tx_signer_factory::ProductionTxSigner> =
+        tx_signer_factory::build_production_tx_signer(
+            chain_id,
+            orchestrator_address.into(),
+            strategy_onchain_ids(),
+        )
+        .await
+        .context("build_production_tx_signer")?;
     tracing::info!(
         backend = signer.backend_name(),
         orchestrator = %hex::encode(orchestrator_address),
         tx_signer_address = %hex::encode(signer.active_address()),
         "ProductionTxSigner constructed -- real transaction signing wired in"
     );
+
+    // ── Envelope nonce seed (C10p: reads from confirmation_rpc_url) ────────────
+    // The gas-paying account's pending nonce, over the same plain-HTTP endpoint every
+    // other lookup in this binary uses. Shared by the pipeline AND the submitProof keeper.
+    let signer_addr_hex = format!("0x{}", hex::encode(signer.active_address()));
+    {
+        let http = reqwest::Client::new();
+        match fetch_pending_nonce(&http, &confirmation_rpc_url, &signer_addr_hex).await {
+            Some(n) => {
+                signer.seed_tx_nonce(n);
+                tracing::info!(
+                    address = %signer_addr_hex,
+                    pending_nonce = n,
+                    "envelope nonce seeded from eth_getTransactionCount(pending)"
+                );
+            }
+            None => {
+                tracing::error!(
+                    address = %signer_addr_hex,
+                    "FAILED to seed envelope nonce — SA/MSA will share bp.nonce and collide"
+                );
+            }
+        }
+    }
 
     let execution_pipeline = Arc::new(ExecutionPipeline::new(
         Arc::clone(&kill_switches),
@@ -1945,9 +2110,6 @@ async fn main() -> Result<()> {
     tracing::info!("L7 ZK: proof worker pool started, ZkVerifier + PendingProofBuffer ready");
 
     // ── Post-execution proof watcher ───────────────────────────────────────────
-    // Proves ONLY blueprints whose Orchestrator bpHash has pending profit in the Vault
-    // (i.e. receivePendingProfit ran and bound the public inputs), against that bpHash
-    // and the realized profit. Never proves for a blueprint that was dropped or reverted.
     let proof_watch = ProofWatch::new(Arc::clone(&signer));
     {
         let watch = Arc::clone(&proof_watch);
@@ -1977,7 +2139,6 @@ async fn main() -> Result<()> {
                         Some(p) if p > 0 => p as u128,
                         _ => continue,
                     };
-                    // Never prove the same hash twice.
                     watch.remove(&bp_hash);
 
                     let pih =
@@ -2049,19 +2210,15 @@ async fn main() -> Result<()> {
         );
     }
 
+    // ── submitProof keeper (C10p: nonces come from the signer's SHARED counter) ─
     {
         let buf = Arc::clone(&pending_proofs);
         let vault = vault_address;
         let signer_bg = Arc::clone(&signer);
         let rpc_bg = rpc.clone();
         let chain_id_bg = chain_id;
-        // Nonce comes from the chain (HTTP JSON-RPC), not a one-shot env var.
         let nonce_rpc_url = confirmation_rpc_url.clone();
-        let signer_addr_hex = format!("0x{}", hex::encode(signer.active_address()));
-        let env_nonce_fallback: u64 = std::env::var("OMEGA_VAULT_SUBMIT_NONCE")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(0);
+        let signer_addr_hex_bg = signer_addr_hex.clone();
         tokio::spawn(async move {
             let mut ticker = tokio::time::interval(Duration::from_secs(5));
             let gas_limit: u64 = std::env::var("OMEGA_VAULT_SUBMIT_GAS")
@@ -2078,28 +2235,7 @@ async fn main() -> Result<()> {
                 .unwrap_or(50);
 
             let nonce_http = reqwest::Client::new();
-            let mut next_nonce: u64 =
-                match fetch_pending_nonce(&nonce_http, &nonce_rpc_url, &signer_addr_hex).await {
-                    Some(n) => {
-                        tracing::info!(
-                            signer = %signer_addr_hex,
-                            nonce = n,
-                            "ZK submitProof keeper: starting nonce read from chain (pending)"
-                        );
-                        n
-                    }
-                    None => {
-                        tracing::warn!(
-                            signer = %signer_addr_hex,
-                            fallback_nonce = env_nonce_fallback,
-                            "ZK submitProof keeper: could not read pending nonce from chain — \
-                             using OMEGA_VAULT_SUBMIT_NONCE fallback (will re-sync on first error)"
-                        );
-                        env_nonce_fallback
-                    }
-                };
 
-            // Rolling-hour spend backstop.
             let mut window_start = std::time::Instant::now();
             let mut sent_in_window: usize = 0;
 
@@ -2134,7 +2270,34 @@ async fn main() -> Result<()> {
                     let mut attempt: u32 = 0;
                     loop {
                         attempt += 1;
-                        let nonce = next_nonce;
+
+                        let nonce = match signer_bg.next_tx_nonce() {
+                            Ok(n) => n,
+                            Err(e) => {
+                                tracing::warn!(
+                                    blueprint = %hex::encode(sub.blueprint_hash),
+                                    attempt,
+                                    error = %e,
+                                    "ZK submitProof: shared envelope nonce unavailable — \
+                                     re-seeding from chain"
+                                );
+                                let resynced = resync_envelope_nonce(
+                                    &signer_bg,
+                                    &nonce_http,
+                                    &nonce_rpc_url,
+                                    &signer_addr_hex_bg,
+                                )
+                                .await;
+                                if resynced.is_some() && attempt < SUBMIT_PROOF_MAX_ATTEMPTS {
+                                    continue;
+                                }
+                                tracing::error!(
+                                    blueprint = %hex::encode(sub.blueprint_hash),
+                                    "ZK submitProof: no usable nonce — proof remains unposted"
+                                );
+                                break;
+                            }
+                        };
 
                         let signed = match signer_bg
                             .sign_call_gwei(
@@ -2156,13 +2319,19 @@ async fn main() -> Result<()> {
                                     error = %e,
                                     "ZK submitProof signing failed — proof remains unposted"
                                 );
+                                let _ = resync_envelope_nonce(
+                                    &signer_bg,
+                                    &nonce_http,
+                                    &nonce_rpc_url,
+                                    &signer_addr_hex_bg,
+                                )
+                                .await;
                                 break;
                             }
                         };
 
                         match rpc_bg.submit_signed_raw_tx(&signed.raw_tx_hex).await {
                             Ok(tx_hash) => {
-                                next_nonce = nonce.saturating_add(1);
                                 sent_in_window += 1;
                                 tracing::info!(
                                     blueprint = %hex::encode(sub.blueprint_hash),
@@ -2182,24 +2351,21 @@ async fn main() -> Result<()> {
                                     error = %msg,
                                     "ZK submitProof broadcast failed"
                                 );
-                                // Any failure may mean the local counter drifted from the
-                                // chain (another sender on this account, a dropped tx, a
-                                // restart). Re-sync from the chain's pending nonce.
-                                if let Some(n) = fetch_pending_nonce(
+                                if let Some(n) = resync_envelope_nonce(
+                                    &signer_bg,
                                     &nonce_http,
                                     &nonce_rpc_url,
-                                    &signer_addr_hex,
+                                    &signer_addr_hex_bg,
                                 )
                                 .await
                                 {
-                                    if n != next_nonce {
+                                    if n != nonce.saturating_add(1) {
                                         tracing::warn!(
-                                            old_nonce = next_nonce,
+                                            failed_nonce = nonce,
                                             chain_pending_nonce = n,
-                                            "ZK submitProof keeper: nonce re-synced from chain"
+                                            "ZK submitProof keeper: shared nonce re-synced from chain"
                                         );
                                     }
-                                    next_nonce = n;
                                 }
                                 if nonce_too_low && attempt < SUBMIT_PROOF_MAX_ATTEMPTS {
                                     continue;
@@ -2213,7 +2379,7 @@ async fn main() -> Result<()> {
         });
         tracing::info!(
             hourly_cap = SUBMIT_PROOF_MAX_PER_HOUR,
-            "ZK submitProof keeper started (sign + broadcast to VAULT_ADDRESS)"
+            "ZK submitProof keeper started (sign + broadcast to VAULT_ADDRESS; shared envelope nonce)"
         );
     }
 
@@ -2234,10 +2400,8 @@ async fn main() -> Result<()> {
     // ── Account exposure tracker ─────────────────────────────────────────────────
     let exposure_tracker = AccountExposureTracker::new();
     tracing::warn!(
-        "AccountExposureTracker constructed — real per-strategy tracking via each \
-         blueprint's own expiry_block as a conservative TTL, but max_account_exposure_wei \
-         is still a non-risk-approved placeholder (1 ETH) and this tracker is in-memory \
-         only (resets on restart)"
+        max_account_exposure_wei,
+        "AccountExposureTracker tracks exposure in memory; outstanding entries reset on restart"
     );
 
     // ── L13: Strategy registry ────────────────────────────────────────────────
@@ -2419,10 +2583,14 @@ async fn main() -> Result<()> {
         let l1e3 = Arc::clone(&l1_gas_ema);
         let msa3 = Arc::clone(&mev_share_activity);
         let ij3 = inflight_journal.clone();
+        // New: thread signer + RPC info for nonce-conflict re-seeding.
+        let signer3 = Arc::clone(&signer);
+        let rpc_url3 = confirmation_rpc_url.clone();
+        let addr_hex3 = signer_addr_hex.clone();
         tokio::spawn(async move {
             run_scoring_loop(
                 reg, ora3, cl3, py3, tw3, dag2, tx, pq, halt3, ph, ep3, nr3, ir3, et3, max_exp3,
-                fl3, cid3, va3, pt3, zv3, pw3, l1e3, msa3, ij3,
+                fl3, cid3, va3, pt3, zv3, pw3, l1e3, msa3, ij3, signer3, rpc_url3, addr_hex3,
             )
             .await;
         });
@@ -2509,6 +2677,10 @@ async fn run_scoring_loop(
     l1_gas_ema: Arc<omega_risk::gas_model::L1GasEma>,
     mev_share_activity: Arc<MevShareActivityTracker>,
     inflight_journal: Option<Arc<InFlightJournal>>,
+    // New parameters for nonce-conflict re-seeding.
+    signer: Arc<tx_signer_factory::ProductionTxSigner>,
+    confirmation_rpc_url: String,
+    signer_addr_hex: String,
 ) {
     let mut rx = oracle.subscribe();
     loop {
@@ -2559,10 +2731,15 @@ async fn run_scoring_loop(
                     let l1e2 = Arc::clone(&l1_gas_ema);
                     let msa2 = Arc::clone(&mev_share_activity);
                     let ij2 = inflight_journal.clone();
+                    // Clone the re-seed args for each per-strategy spawn.
+                    let signer2 = Arc::clone(&signer);
+                    let rpc_url2 = confirmation_rpc_url.clone();
+                    let addr_hex2 = signer_addr_hex.clone();
                     tokio::spawn(async move {
                         score_and_admit(
                             strategy, s2, dag2, tx2, pq2, h2, ph, os2, ep2, nr2, ir2, gv2, et2,
-                            max_exp2, fl2, cid2, va2, pt2, zv2, pw2, l1e2, msa2, ij2,
+                            max_exp2, fl2, cid2, va2, pt2, zv2, pw2, l1e2, msa2, ij2, signer2,
+                            rpc_url2, addr_hex2,
                         )
                         .await;
                     });
@@ -2576,8 +2753,7 @@ async fn run_scoring_loop(
     }
 }
 
-/// Release a DAG slot without panicking on a poisoned mutex (matches DagSlotGuard's
-/// recovery posture in omega-execution).
+/// Release a DAG slot without panicking on a poisoned mutex.
 fn dag_complete_slot(dag: &Arc<Mutex<ExecutionDag>>, hash: alloy_primitives::B256) {
     match dag.lock() {
         Ok(mut g) => {
@@ -2618,6 +2794,10 @@ async fn score_and_admit(
     l1_gas_ema: Arc<omega_risk::gas_model::L1GasEma>,
     mev_share_activity: Arc<MevShareActivityTracker>,
     inflight_journal: Option<Arc<InFlightJournal>>,
+    // New parameters for nonce-conflict re-seeding.
+    signer: Arc<tx_signer_factory::ProductionTxSigner>,
+    confirmation_rpc_url: String,
+    signer_addr_hex: String,
 ) {
     if halt.is_halted() {
         return;
@@ -2650,7 +2830,6 @@ async fn score_and_admit(
         bp.expiry_block,
     );
 
-    // Strict `<`, matching HotPathGate::admit (see is_hot_path_blueprint).
     let hot = is_hot_path_blueprint(
         strategy.hot_path_eligible(),
         bp.lane == omega_core::Lane::Microtx,
@@ -2658,9 +2837,6 @@ async fn score_and_admit(
     );
 
     if hot {
-        // No proof is generated or buffered here: OmegaVault accepts a proof only after
-        // the blueprint has executed on-chain, which the post-execution watcher in
-        // main() handles. The hot path is not gated on ZK proof completion.
         let (rtx, rrx) = tokio::sync::oneshot::channel();
         if hp_tx
             .try_send(HotPathRequest {
@@ -2677,11 +2853,6 @@ async fn score_and_admit(
             }
         }
     } else {
-        // Normal lane: the ZK proof is still generated and verified as the pre-trade gate
-        // (a blueprint whose proof can't be produced/verified is dropped). It is NOT
-        // pushed to the on-chain submit buffer: it is computed against the engine's
-        // pre-trade estimate and blueprint hash, neither of which OmegaVault binds
-        // after execute().
         let hb: [u8; 32] = *bp.blueprint_hash;
         let profit: u128 = bp.expected_profit_net.try_into().unwrap_or(u128::MAX);
         let micro = bp.lane == omega_core::Lane::Microtx;
@@ -2818,9 +2989,6 @@ async fn score_and_admit(
                 ExecutionOutcome::Suppressed => false,
             };
             if any_accepted {
-                // Only now — a relay accepted this blueprint — register its ORCHESTRATOR
-                // bpHash for post-execution proving. Phase 0 (Suppressed) never reaches
-                // here, so shadow mode tracks nothing.
                 match proof_watch.orchestrator_bp_hash(&bp, chain_id) {
                     Ok(h) => {
                         proof_watch.track(h, strategy_label.clone());
@@ -2865,15 +3033,42 @@ async fn score_and_admit(
             }
         }
         Err(e) => {
+            let msg = e.to_string();
             // `warn` (not `debug`): failures that don't log inside the pipeline
             // (field-mapping, flashloan identity, duplicates, signing/fee caps, relay
             // errors) must be visible at the default `info` level.
             tracing::warn!(
                 hash = %bp.blueprint_hash,
                 strategy = %strategy.strategy_id(),
-                error = %e,
+                error = %msg,
                 "ExecutionPipeline::execute rejected blueprint"
             );
+            // Nonce-conflict re-seed: if a relay or RPC layer rejected the bundle due
+            // to a nonce conflict, the shared counter has drifted from the chain's
+            // view. Re-seed it immediately so the next signing attempt in this task's
+            // lifecycle (which is per-blueprint, not per-tick) or any concurrent task
+            // draws a correct nonce. This does NOT retry the failed submission — the
+            // blueprint has already been signed with the wrong nonce and would need
+            // to be rebuilt. The re-seed only prevents the same drift from cascading
+            // to subsequent blueprints in the same or future ticks.
+            if is_nonce_conflict(&msg) {
+                let http = reqwest::Client::new();
+                match resync_envelope_nonce(&signer, &http, &confirmation_rpc_url, &signer_addr_hex)
+                    .await
+                {
+                    Some(n) => tracing::warn!(
+                        chain_pending_nonce = n,
+                        strategy = %strategy.strategy_id(),
+                        hash = %bp.blueprint_hash,
+                        "nonce conflict from relay — envelope counter re-seeded from chain pending"
+                    ),
+                    None => tracing::error!(
+                        strategy = %strategy.strategy_id(),
+                        hash = %bp.blueprint_hash,
+                        "nonce conflict from relay — re-seed FAILED; subsequent signs may keep colliding"
+                    ),
+                }
+            }
         }
     }
 }
@@ -3209,8 +3404,6 @@ mod relay_metrics_seed_tests {
 
     #[test]
     fn unseeded_metrics_have_an_empty_ranking() {
-        // The failure mode seeding fixes: an empty ranking makes every submission fail
-        // closed with AllRelaysFailed before any relay client is called.
         let metrics = LaRelayMetrics::new(50, ExecutionAddress("0xTEST".into()));
         assert!(metrics.la_ranked_relays().is_empty());
     }
@@ -3234,6 +3427,39 @@ mod relay_metrics_seed_tests {
         let metrics = LaRelayMetrics::new(50, ExecutionAddress("0xTEST".into()));
         assert_eq!(seed_relay_metrics(&metrics, &[]), 0);
         assert!(metrics.la_ranked_relays().is_empty());
+    }
+}
+
+#[cfg(test)]
+mod nonce_conflict_detection_tests {
+    use super::*;
+
+    #[test]
+    fn is_nonce_conflict_matches_nonce_too_low() {
+        assert!(is_nonce_conflict("nonce too low"));
+        assert!(is_nonce_conflict(
+            "Error: nonce too low (expected 5, got 3)"
+        ));
+        assert!(is_nonce_conflict("NONCE TOO LOW"));
+    }
+
+    #[test]
+    fn is_nonce_conflict_matches_replacement_underpriced() {
+        assert!(is_nonce_conflict("replacement transaction underpriced"));
+        assert!(is_nonce_conflict(
+            "submit_bundle: replacement transaction underpriced"
+        ));
+        assert!(is_nonce_conflict("REPLACEMENT TRANSACTION UNDERPRICED"));
+    }
+
+    #[test]
+    fn is_nonce_conflict_does_not_match_unrelated_errors() {
+        assert!(!is_nonce_conflict("insufficient funds"));
+        assert!(!is_nonce_conflict("gas limit exceeded"));
+        assert!(!is_nonce_conflict(
+            "SigningFailed: priority_fee_gwei exceeds cap"
+        ));
+        assert!(!is_nonce_conflict(""));
     }
 }
 
@@ -3300,7 +3526,6 @@ mod hot_path_decision_tests {
 
     #[test]
     fn hot_path_requires_gas_strictly_below_limit() {
-        // Same strict inequality HotPathGate::admit enforces (spec §4).
         assert!(is_hot_path_blueprint(true, true, MICROTX_GAS_LIMIT - 1));
         assert!(
             !is_hot_path_blueprint(true, true, MICROTX_GAS_LIMIT),
@@ -3379,8 +3604,8 @@ mod hot_path_zk_provisioning_tests {
         }
     }
 
-    /// The signer is wrapped in `ProductionTxSigner::Local(...)` so the harness's
-    /// `ExecutionPipeline<ProductionTxSigner>` matches `score_and_admit`'s signature.
+    /// Returns the harness components including `Arc<ProductionTxSigner>` for the
+    /// new `score_and_admit` parameters.
     async fn build_harness() -> (
         Arc<dyn StrategyTrait>,
         Arc<Mutex<ExecutionDag>>,
@@ -3395,6 +3620,7 @@ mod hot_path_zk_provisioning_tests {
         Arc<ZkVerifier>,
         Arc<ProofWatch>,
         Arc<MevShareActivityTracker>,
+        Arc<tx_signer_factory::ProductionTxSigner>,
     ) {
         let test_liquidity_registry = LiquidityRegistry::new();
         test_liquidity_registry.update(
@@ -3474,8 +3700,7 @@ mod hot_path_zk_provisioning_tests {
         let (relay, _reorg_event_rx) =
             MultiRelayClient::new(relay_clients, relay_metrics, blacklist, &relay_cfg, 0);
 
-        // Test-only key material (same pattern as omega-execution::signer's own tests) —
-        // never real keys. Reuses the production strategy_onchain_ids() helper.
+        // Test-only key material (same pattern as omega-execution::signer's own tests).
         let test_tx_key_manager =
             Arc::new(KeyManager::from_hex(&"3a".repeat(32), TEST_CHAIN_ID).unwrap());
         let test_blueprint_key_manager =
@@ -3519,6 +3744,7 @@ mod hot_path_zk_provisioning_tests {
             zk_verifier,
             proof_watch,
             mev_share_activity,
+            signer, // returned so callers can pass it to score_and_admit
         )
     }
 
@@ -3549,6 +3775,7 @@ mod hot_path_zk_provisioning_tests {
             zk_verifier,
             proof_watch,
             mev_share_activity,
+            signer,
         ) = build_harness().await;
 
         assert!(
@@ -3606,6 +3833,10 @@ mod hot_path_zk_provisioning_tests {
                 Arc::new(omega_risk::gas_model::L1GasEma::new(8)),
                 mev_share_activity,
                 None,
+                // New args: signer, dummy RPC URL, dummy address.
+                Arc::clone(&signer),
+                "http://127.0.0.1:1".to_string(),
+                format!("0x{}", hex::encode([0x01u8; 20])),
             ),
         )
         .await;

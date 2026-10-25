@@ -6,6 +6,7 @@ libs         = ["lib"]
 test         = "test"
 solc         = "0.8.24"
 evm_version  = "cancun"
+fs_permissions = [{ access = "read", path = "../config" }]
 optimizer    = true
 optimizer_runs = 200
 via_ir       = true

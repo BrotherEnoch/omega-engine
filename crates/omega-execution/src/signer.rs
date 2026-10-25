@@ -1,394 +1,120 @@
 // crates/omega-execution/src/signer.rs
 //
-// TransactionSigner — the genuinely missing piece identified in
-// ExecutionPipelineSpecification.md §8.
+// TransactionSigner — the gas-paying transaction-envelope signer for the
+// ExecutionPipeline (ExecutionPipelineSpecification.md §8).
 //
-// ## ENVELOPE NONCE FIX (2026-10-09): gas-paying tx nonce is no longer `bp.nonce`
+// ## Changelog (most recent first)
 //
-// Found on a local Anvil fork: every `eth_sendBundle` was rejected with
-// `nonce too low` / `replacement transaction underpriced`. Root cause: this
-// file used `ExecutionBlueprint::nonce` — the Orchestrator's per-strategy REPLAY
-// counter (`next_nonce[strategyId]`, which lives INSIDE the blueprint calldata) —
-// as the nonce of the OUTER EIP-1559 transaction envelope. Those are two
-// unrelated counters:
-//   - blueprint nonce: per-strategy, checked by OmegaOrchestrator.execute()
-//   - envelope nonce:  per-ACCOUNT (the gas-paying EOA behind `tx_key_manager`),
-//                      checked by the node's mempool / state transition
-// SA and MSA blueprints for the same tick therefore signed two transactions from
-// the same account with the SAME envelope nonce (one accepted, one "replacement
-// transaction underpriced"), and the envelope nonce bore no relation to the
-// account's real nonce (e.g. blueprint nonce 22 vs an account nonce of 21287).
-// This would fail identically on any real chain.
+// - 2026-10-10: fee caps raised (priority 50 -> 500, max fee 500 -> 1500) so blueprints
+//   that already emit competitive tips (observed live: 500 gwei) are not rejected by a
+//   still-unsigned policy floor. Fail-closed behaviour is unchanged: values above a cap
+//   return `SigningFailed` and are never clamped. Still PENDING SIGN-OFF (see below).
 //
-// Fix: `KeyManagerTransactionSigner` now owns a single envelope-nonce counter
-// (`tx_nonce`, mutex-protected, shared by every strategy and by the ZK
-// `next_tx_nonce()` path). The caller seeds it once at startup, and again after
-// any failed send, with `eth_getTransactionCount(active_address, "pending")` via
-// `seed_tx_nonce`. `sign_transaction` takes the current value, signs with it, and
-// advances it only after a successful signature. `bp.nonce` is now used ONLY inside
-// the blueprint calldata, exactly as the contract expects.
+// - 2026-10-09: ENVELOPE NONCE FIX. The gas-paying tx nonce is no longer `bp.nonce`.
+//   Found on a local Anvil fork: every `eth_sendBundle` was rejected with `nonce too low` /
+//   `replacement transaction underpriced`. Cause: the Orchestrator's per-strategy REPLAY
+//   counter (`next_nonce[strategyId]`, inside the blueprint calldata) was being used as the
+//   nonce of the OUTER EIP-1559 envelope. They are unrelated counters:
+//     - blueprint nonce: per-strategy, checked by OmegaOrchestrator.execute()
+//     - envelope nonce:  per-ACCOUNT (the gas-paying EOA), checked by the node
+//   `KeyManagerTransactionSigner` now owns ONE mutex-protected envelope-nonce counter
+//   (`tx_nonce`) shared by every strategy and by `next_tx_nonce()` (ZK submitProof path).
+//   The caller seeds it at startup, and again after any failed send, with
+//   `eth_getTransactionCount(active_address, "pending")` via `seed_tx_nonce`.
+//   `sign_transaction` takes the current value and advances it only after a successful
+//   signature. `bp.nonce` is used ONLY inside the blueprint calldata.
+//   UNSEEDED BEHAVIOUR: until `seed_tx_nonce` is called, the signer falls back to `bp.nonce`
+//   and logs a WARN on every signature. That is NOT correct on a real chain; the counter is
+//   deliberately not advanced while unseeded. `sign_call` / `sign_call_gwei` take an
+//   explicit nonce; ZK callers should obtain it from `next_tx_nonce()`.
 //
-// UNSEEDED BEHAVIOUR (read this): until the caller invokes `seed_tx_nonce`, the
-// signer falls back to the OLD behaviour (`bp.nonce`) and logs a WARN on every
-// signature. That keeps existing call sites working while they are migrated, but it
-// is NOT correct on a real chain: seed the nonce at startup in `main.rs`. The
-// counter is deliberately not advanced while unseeded.
+// - C10l: `orchestrator_bp_hash`. `OmegaVault` keys `pending_profit`, `proofInputsBound` and
+//   the ZK public-inputs binding on the Orchestrator's domain-separated `bpHash`
+//   (`keccak256(abi.encode(address(this), EXPECTED_CHAIN_ID, blueprintCalldata))`), NOT on
+//   `ExecutionBlueprint::compute_hash()`. `orchestrator_bp_hash` is the public, pure
+//   accessor (no signing, no key material).
 //
-// `sign_call` / `sign_call_gwei` still take an explicit nonce (unchanged
-// signature); ZK/`submitProof` callers should obtain it from `next_tx_nonce()` so
-// they draw from the same counter and cannot collide with `sign_transaction`.
+// ## ABI / contract status (all RESOLVED against the real OmegaOrchestrator.sol)
 //
-// ## C10l (earlier revision): `orchestrator_bp_hash`
-//
-// `OmegaVault` keys `pending_profit`, `proofInputsBound`, and the ZK
-// public-inputs binding on the Orchestrator's domain-separated `bpHash`
-// (`keccak256(abi.encode(address(this), EXPECTED_CHAIN_ID, blueprintCalldata))`),
-// NOT on `ExecutionBlueprint::compute_hash()`. `compute_bp_hash` was private and
-// `build_execute_calldata` only logged its result, so nothing outside this file
-// could learn the key the Vault would use. `orchestrator_bp_hash` is the public,
-// pure accessor: build the blueprint calldata, hash it with the same domain
-// separation `execute()` signs. It performs no signing and touches no key
-// material. See `main.rs` (C10l) for how the engine uses it to prove only AFTER a
-// blueprint has landed on-chain.
-//
-// ## Status as of this revision — real progress against a real contract
-//
-// The prior revision of this file listed four unconfirmed items blocking
-// `build_execute_calldata`. This revision was given the real
-// `contracts/src/OmegaOrchestrator.sol` source for the first time. Against
-// that real text:
-//
-//   1. RESOLVED — ABI encoder. `alloy-sol-types` is now a workspace
-//      dependency (matching the existing `alloy-primitives = "0.8"` pin).
-//      `Blueprint` / `DomainSeparatedBlueprint` / `execute` below are
-//      `sol!`-macro-generated types whose field ORDER and TYPES are
-//      transcribed directly from OmegaOrchestrator.sol's own
-//      `execute()` decode statement:
+//   1. ABI encoder: `Blueprint` / `DomainSeparatedBlueprint` / `execute` are `sol!` types
+//      whose field ORDER and TYPES are transcribed from `execute()`'s decode statement:
 //        (uint64, uint64, bytes32, FlashloanProviderType, address, address,
 //         bytes, uint256, uint256, uint256)
-//      Solidity ABI-encodes a struct identically to a tuple of the same
-//      field types in the same order, and identically encodes an enum to
-//      its `uint8` ordinal — so encoding `Blueprint`'s fields as a flat
-//      tuple (see the 2026-08-24 bug-fix note below for exactly which
-//      alloy-sol-types method that requires) produces the exact bytes
-//      `abi.decode(blueprintCalldata, (...))` expects, PROVIDED
-//      `provider_type` is passed as the correct ordinal. That last piece
-//      is not a guess: `omega_core::types::flashloan_provider` already
-//      carries a passing test, `ordinals_match_solidity_enum_order`,
-//      guaranteeing `FlashloanProviderType as u8` matches this exact
-//      contract's enum order. Field-name casing in the `sol!` blocks
-//      below was chosen as plain Rust snake_case rather than copied
-//      verbatim from the contract (`strategyId`, `flashloanToken`, etc.)
-//      — ABI encoding of a struct depends only on field TYPE and ORDER,
-//      never on the names chosen for them in the encoding library, so
-//      this is a readability choice, not a behavioral one, and avoids
-//      `-D warnings` tripping on `non_snake_case` for no benefit.
+//      A struct ABI-encodes like a tuple of the same types, and an enum like its uint8
+//      ordinal (guarded by `omega_core`'s `ordinals_match_solidity_enum_order` test). Field
+//      names are Rust snake_case by choice; names never affect encoded bytes.
+//   2. Flashloan identity: `providerType` uint8, `providerContract` address (meaningful
+//      only for UniswapV3; address(0) for Balancer/AaveV3), `flashloanToken` address.
+//      Confirmed byte-for-byte against a real solc golden vector.
+//   3. `minNetProfit` = `bp.dynamic_min_profit` (semantic match with the contract's
+//      `InsufficientProfit` check and omega_risk check 5).
+//   4. `StrategyId -> bytes32`: `registerStrategy` accepts an arbitrary bytes32, so this is
+//      deployment configuration, never derived or guessed here. The caller
+//      (`main.rs::strategy_onchain_ids()`) supplies it, transcribed from
+//      `contracts/src/StrategyIds.sol` (`keccak256("OMEGA_STRATEGY_<X>")`). All five were
+//      re-derived with an independent keccak implementation, and
+//      `known_strategy_onchain_ids_match_their_documented_keccak256_preimages` re-checks
+//      them on every `cargo test`. MANUAL-SYNC RISK: nothing keeps StrategyIds.sol,
+//      main.rs and arbitrum.toml in sync automatically. `implementation` / `bytecode_hash`
+//      in arbitrum.toml remain TODO placeholders needing a live deployment.
 //
-//   2. RESOLVED — the flashloan-identity ABI shape, confirmed byte-for-byte
-//      against a compiled solc/EVM decode (see
-//      `build_blueprint_calldata_matches_solc_golden_vector` below, which
-//      now compares against a real `forge test` golden vector rather than
-//      the earlier internal-only `abi_decode` round-trip check — and which
-//      is what caught the 2026-08-24 encoding bug documented below).
-//      Confirmed directly from the real contract: `providerType` is `uint8`,
-//      `providerContract` is `address` (meaningful ONLY for UniswapV3 —
-//      the contract's own comment says pass `address(0)` for
-//      Balancer/AaveV3, which use fixed admin-set addresses instead),
-//      `flashloanToken` is `address`. Mapped from `ExecutionBlueprint`'s
-//      already-real `flashloan_provider_type` / `provider_contract` /
-//      `flashloan_token` fields below.
+// ## Blueprint-authorization signature
 //
-//   3. RESOLVED (semantic match, not an explicit written cross-reference)
-//      — `minNetProfit`'s source. The contract's own check —
-//      `if (netProfit < minNetProfit) revert InsufficientProfit(...)` —
-//      is exactly the on-chain profit floor `dynamic_min_profit` already
-//      represents off-chain throughout this workspace's pre-trade risk
-//      checks (see `omega_risk::checks`'s own
-//      `insufficient_profit_fails_at_check_5`). Mapped directly:
-//      `min_net_profit: bp.dynamic_min_profit`.
+// `BlueprintSigner::sign_raw_hash()` (no prefix, 65-byte r||s||v with v = recid + 27) is
+// the primitive `OmegaOrchestrator.sol`'s `bpHash.recover(sig)` expects.
+// `BlueprintSigner::sign()` applies an EIP-191 prefix meant for the Flashbots header and is
+// NOT usable here. `blueprint_signer` is a SEPARATE dependency from `tx_key_manager`: the
+// gas-paying key and the blueprint-authorization key are independent concerns.
 //
-//   4. RESOLVED (2026-08-25, in the CALLER, not this file — see below) —
-//      the `StrategyId -> bytes32 strategyId` mapping.
-//      Read directly against the real contract: `registerStrategy(bytes32
-//      strategyId, address implementation)` accepts an ARBITRARY bytes32
-//      chosen by whoever calls it — there is no on-chain derivation rule
-//      from a string like "SA"/"LA" to a bytes32 value. This is real
-//      DEPLOYMENT CONFIGURATION (whatever bytes32 was actually passed to
-//      `registerStrategy()` for each strategy), not something derivable
-//      from code, and guessing a hash convention here (e.g.
-//      `keccak256("SA")`) for a contract that moves flashloaned funds
-//      would be exactly the fabrication this codebase has refused
-//      everywhere else. `KeyManagerTransactionSigner::new` correctly
-//      still takes a required `strategy_onchain_ids: HashMap<String,
-//      [u8; 32]>` parameter — keyed by the same `StrategyId::to_string()`
-//      values (`"SA"`, `"LA"`, ...) already used by `IntegrityRegistry`
-//      and `DeploymentManifest` elsewhere in this workspace — and this
-//      file still does not, and should not, hardcode deployment data
-//      itself; that would just relocate the fabrication risk rather than
-//      remove it.
+// ## BUG FIXED (2026-08-24): abi_encode() vs abi_encode_params()
 //
-//      What's actually resolved is WHERE THE CALLER GETS REAL VALUES
-//      FROM: `crates/omega-engine/src/main.rs`'s own `strategy_
-//      onchain_ids()` function (its "C6" revision) now supplies this
-//      map, transcribed byte-for-byte from `contracts/src/
-//      StrategyIds.sol`'s five `keccak256("OMEGA_STRATEGY_<X>")`
-//      constants — the same canonical values `contracts/script/
-//      RegisterStrategies.s.sol` reads and asserts against every
-//      deployment manifest's `onchain_id` field (via that script's own
-//      `_checkManifestIdMatches` guard) before ever calling
-//      `registerStrategy()` on-chain, so a typo'd manifest can't
-//      silently register a strategy under the wrong id.
+// `Blueprint::abi_encode()` carried one extra leading 0x20 offset word versus the solc
+// golden vector. `abi_encode()` encodes a struct as ONE dynamic value (leading offset);
+// `abi.decode(blueprintCalldata, (a, b, c, ...))` is the flat-tuple form, which is
+// `abi_encode_params()`. Fixed in `build_blueprint_calldata`, in `compute_bp_hash`
+// (`DomainSeparatedBlueprint`, by the same reasoning) and in the round-trip tests
+// (`abi_decode_params`). `compute_bp_hash_matches_solc_golden_vector` is confirmed against
+// a real `forge test` run, so both halves have a real solc/EVM oracle.
 //
-//      As of this same revision, `StrategyIds.sol`'s actual primary
-//      source has been seen directly (not just referenced secondhand by
-//      other files' comments), and each of its five constants was
-//      independently RE-DERIVED — via a separate keccak256
-//      implementation (Python's `Crypto.Hash.keccak`, not
-//      alloy/solc/cast) computing `keccak256(utf8("OMEGA_STRATEGY_SA"))`
-//      etc. from scratch — and confirmed to match the Solidity file's
-//      own constants byte-for-byte, for all five (SA/LA/MSA/MEV/CNRY),
-//      not just SA. This is a materially stronger claim than "three
-//      sources happen to agree with each other": it confirms
-//      `StrategyIds.sol`'s constants actually equal what their own
-//      `/// @dev keccak256(...)` comments say they are, using a fourth,
-//      independent computation, not just cross-referencing.
-//      `config/deployment/arbitrum.toml`'s `onchain_id` fields (verified
-//      there separately via `cast keccak`) and this file's own
-//      `build_blueprint_calldata_matches_solc_golden_vector` SA fixture
-//      (verified there via a real `forge test` run against solc) both
-//      still independently agree with these same values, for the
-//      overlapping cases each covers.
+// ## Envelope fee formula — PROPOSED, PENDING SIGN-OFF
 //
-//      MANUAL-SYNC RISK, same as `main.rs`'s own doc comment already
-//      flags: nothing keeps `StrategyIds.sol`, `main.rs`'s hardcoded
-//      map, and `arbitrum.toml`'s `onchain_id` fields in sync
-//      automatically if `StrategyIds.sol` is ever changed. See the
-//      `known_strategy_onchain_ids_are_internally_consistent` test
-//      below for a narrow, this-file-local guard against the specific
-//      failure mode of a copy-paste/transposition error among the five
-//      values as transcribed here for cross-reference — it cannot
-//      detect drift against `StrategyIds.sol` itself, only internal
-//      self-consistency (distinct, non-zero, and SA matching the
-//      existing golden-vector fixture).
-//
-//      NOT YET DONE, and correctly so per `main.rs`'s own C4-A note:
-//      `config/deployment/arbitrum.toml`'s `implementation` and
-//      `bytecode_hash` fields are still real TODO placeholders — those
-//      need an actual live deployment (or an `eth_getCode` read against
-//      one), not something derivable from `StrategyIds.sol` the way
-//      `onchain_id` is. `strategy_onchain_ids` and the broader
-//      `DeploymentManifest` (bytecode hash / contract address /
-//      integrity registration) remain two genuinely separate pieces of
-//      deployment configuration — see the option-2 sketch that exists
-//      for eventually unifying them into one manifest, not yet
-//      implemented — closing item 4 does not imply the manifest is
-//      complete.
-//
-// ## RESOLVED (earlier revision): the blueprint-authorization signature
-//
-// `omega-security/src/signer.rs`'s real source was provided and directly
-// confirms `BlueprintSigner::sign_raw_hash()` is exactly the primitive
-// needed: it signs a hash with NO prefix of any kind and returns a
-// 65-byte `[r(32) || s(32) || v(1)]` signature with `v = recovery_id +
-// 27` — precisely the input `OmegaOrchestrator.sol`'s `bpHash.recover(sig)`
-// (OpenZeppelin `ECDSA.recover(bytes32, bytes)`, v ∈ {27, 28}) expects.
-// `BlueprintSigner::sign()` (the OTHER method on that same type) is
-// confirmed NOT usable here — it applies an EIP-191 prefix intended for
-// the Flashbots reputation header, a different, unrelated signature.
-//
-// `KeyManagerTransactionSigner` now takes a required
-// `blueprint_signer: Arc<BlueprintSigner>` — deliberately a SEPARATE
-// dependency from `tx_key_manager`, since (per this struct's own doc
-// comment) the gas-paying transaction-envelope key and the on-chain
-// blueprint-authorization key are two independent concerns; a caller may
-// legitimately construct both from the same `KeyManager`/`Arc` or from
-// two different ones, and this file does not assume either. With this
-// wired in, `build_execute_calldata` — and therefore `sign_transaction`
-// — can now succeed end-to-end for a strategy present in
-// `strategy_onchain_ids`. See `build_execute_calldata_succeeds_with_
-// real_blueprint_signer` / `sign_transaction_succeeds_end_to_end_with_
-// real_blueprint_signer` below for the regression tests proving this.
-//
-// As of 2026-08-25, item 4 is also resolved — see the updated item 4
-// entry above for the full evidence chain (main.rs's C6 revision,
-// cross-checked against StrategyIds.sol, RegisterStrategies.s.sol, and
-// arbitrum.toml). Nothing named by items 1-4 remains open in this file's
-// own scope; the deployment-manifest work described in item 4's "NOT YET
-// DONE" note (bytecode_hash / implementation address) is a separate,
-// still-open piece of configuration this file was never responsible for.
-//
-// ## BUG FOUND AND FIXED (2026-08-24): Blueprint::abi_encode() was wrong
-//
-// The first real run of `build_blueprint_calldata_matches_solc_golden_vector`
-// against the actual `forge test --match-test
-// test_print_golden_blueprint_calldata` output FAILED. The Rust encoding
-// carried one extra leading 32-byte word (value `0x20`) that the solc
-// golden vector did not — every byte from that point on was identical
-// between the two. That is the textbook signature of the difference
-// between two distinct Solidity ABI-encoding forms:
-//   - `abi.encode(oneDynamicValue)` — a SINGLE dynamic-typed argument
-//     gets wrapped with a leading offset word pointing back to itself
-//     (this is what you get when the "argument" being encoded is one
-//     value, e.g. a struct, treated as a self-contained dynamic type).
-//   - `abi.encode(field1, field2, ..., fieldN)` — multiple top-level
-//     arguments are encoded as a flat tuple; the tuple's own encoding
-//     never needs a pointer to itself, since it isn't nested inside
-//     anything.
-// `OmegaOrchestrator.sol` decodes with `abi.decode(blueprintCalldata,
-// (uint64, uint64, bytes32, ...))` — the flat-tuple form (ten top-level
-// types, not one struct-typed value) — so the Rust side must produce
-// that same form. `alloy_sol_types::SolValue::abi_encode()`, called on a
-// `sol!`-generated struct, encodes the struct as a single dynamic value
-// (the first form above) — which is why it produced the spurious extra
-// word. `SolValue::abi_encode_params()` is the method that encodes a
-// struct's fields as a flat top-level tuple (the second form), matching
-// what `abi.encode(a, b, c, ...)` produces in Solidity. Fixed:
-//   - `build_blueprint_calldata`: `blueprint.abi_encode()` ->
-//     `blueprint.abi_encode_params()`.
-//   - `compute_bp_hash`: `domain.abi_encode()` -> `domain.abi_encode_params()`
-//     on `DomainSeparatedBlueprint`, by the identical reasoning — the
-//     contract's own domain hash is built from `abi.encode(address,
-//     uint64, bytes)`, three top-level params, not a struct.
-//   - The `build_blueprint_calldata_round_trips_through_abi_decode` test's
-//     decode call was updated from `Blueprint::abi_decode` to
-//     `Blueprint::abi_decode_params` to match the new encode call — the
-//     two must use matching head-shape assumptions or the round trip
-//     would silently decode garbage rather than catching a mismatch.
-// `build_blueprint_calldata_matches_solc_golden_vector` passes byte-for-
-// byte against the real solc/EVM golden vector with this fix in place.
-//
-// CAVEAT (RESOLVED 2026-08-24, later same day): the `compute_bp_hash` /
-// `DomainSeparatedBlueprint` half of this fix was originally BY ANALOGY
-// to the now-confirmed `Blueprint` bug only, then given its own golden-
-// vector test (`compute_bp_hash_matches_solc_golden_vector` below,
-// backed by `contracts/test/DomainSeparatedBlueprintHash.t.sol`) seeded
-// from an independent Python (`eth_abi`) computation rather than solc
-// itself. `forge test --match-test
-// test_print_golden_domain_separated_blueprint_hash -vv` has now been
-// run for real and printed
-// `0x74d1c22598dab6e5f1cb1a1809d3b7255728a0c10c971a9f05257cd6758b356b`
-// — an EXACT match to the Python-computed value already in both this
-// file and the `.sol` file, with no update needed to either. This is now
-// the same class of evidence `build_blueprint_calldata`'s golden vector
-// has: a real solc/EVM oracle, not analogy and not a second library's
-// agreement with itself.
-//
-// ## PROPOSED (2026-08-24), PENDING SIGN-OFF: envelope fee formula
-//
-// This section replaces the prior "NOTE: this fee formula is NOT a
-// confirmed policy decision" marker on `sign_transaction`'s
-// `max_priority_fee_per_gas` / `max_fee_per_gas` computation. It is a
-// PROPOSAL under review, not a completed approval — see
-// `docs/fee-policy.md` in this repo, specifically that file's Sign-Off
-// table, which has not been completed as of this revision. Any comment,
-// commit message, or doc claiming this is "approved" or "resolved" is
-// only as good as that Sign-Off table actually being filled in by the
-// person who owns this system's gas/fee policy (Andre Niemand) through
-// a durable channel (e.g. a signed commit, not just a chat message
-// asserting identity) — self-identification in a chat conversation is
-// not independent verification and should not be treated as equivalent
-// to it.
-//
-// Formula (blueprint fields in gwei -> RLP fields in wei), unchanged
-// numerically from the prior placeholder:
+// See `docs/fee-policy.md`; its Sign-Off table is not completed. Any claim that this is
+// "approved" is only as good as that table being filled in by the fee-policy owner
+// through a durable channel (e.g. a signed commit); a chat message is not verification.
 //   max_priority_fee_per_gas = priority_fee_gwei * 1e9
-//   max_fee_per_gas = (base_fee_at_creation + 2 * priority_fee_gwei) * 1e9
-//
-// NOTE: docs/fee-policy.md's own drafted analysis (§3) argued the
-// *opposite* term should carry the 2x multiplier (`2*base + priority`,
-// on the reasoning that base fee, not tip, is what a maxFeePerGas cap
-// is conventionally sized to survive against on Arbitrum). This revision
-// keeps the placeholder's original formula (`base + 2*priority`)
-// because that is what was explicitly specified when this change was
-// requested, not because the base-vs-tip judgment call has been
-// resolved in its favor. Whoever completes the Sign-Off table should
-// confirm the formula, not just the caps.
-//
+//   max_fee_per_gas          = (base_fee_at_creation + 2 * priority_fee_gwei) * 1e9
+// NOTE: docs/fee-policy.md §3 argued the 2x belongs on the base term (`2*base + priority`).
+// This keeps `base + 2*priority` because that was the specified formula, not because the
+// judgment call was resolved. Whoever signs off should confirm the formula, not just caps.
 // Fail-closed caps (checked BEFORE any key material is touched):
-//   priority_fee_gwei <= MAX_PRIORITY_FEE_GWEI_CAP (50)
-//   base_fee_at_creation + 2 * priority_fee_gwei <= MAX_FEE_GWEI_CAP (500)
-// Exceeding either cap returns `ExecutionError::SigningFailed` naming
-// which cap was exceeded and by how much; it never silently clamps or
-// signs anyway. See `envelope_fees_wei` below.
+//   priority_fee_gwei <= MAX_PRIORITY_FEE_GWEI_CAP (500)
+//   base_fee_at_creation + 2 * priority_fee_gwei <= MAX_FEE_GWEI_CAP (1500)
+// Chain scope, refresh-at-sign-time (§5) and the profit-vs-gas-cost guard (§7 item 3)
+// remain open and are not implemented.
 //
-// This formula/cap pair is NOT yet a substitute for the broader
-// `docs/fee-policy.md` review — it resolves ONLY the formula module
-// comment previously marked unconfirmed and adds the caps that document
-// discussed in its own §6/§7. Chain scope, refresh-at-sign-time (§5),
-// and the profit-vs-gas-cost guard (§7 item 3) remain open and are not
-// implemented by this revision.
+// `omega_simulation::SimulationSubmitter` signs real transactions only against a local
+// Anvil fork and is structurally walled off from live transport; it is not a substitute
+// for this type. `ExecutionPipeline` is generic over `S: TransactionSigner` so every stage
+// before signing stays fully testable independent of this file.
 //
-// `omega_simulation::SimulationSubmitter` DOES sign and send real
-// transactions, but only against a local Anvil fork with a dev-funded
-// Anvil test key, and is deliberately, structurally walled off from any
-// live transport (`reject_if_live_looking`, construction only via
-// `SimulationSubmitter::bound_to(&ForkHandle, ..)`) — not a substitute
-// for this type.
+// ## RLP encoder verification
 //
-// `ExecutionPipeline` is generic over `S: TransactionSigner` specifically
-// so the rest of the pipeline (integrity check, kill switch, 15 pre-trade
-// checks, idempotency dedup, DAG bookkeeping) is fully implemented and
-// fully testable today, independent of any gap in this file.
+// `encode_eip1559_signed_matches_a_real_mainnet_transaction` reproduces the raw bytes of a
+// real, mined Ethereum mainnet transaction (decoded independently with Python's `rlp`).
+// `encode_eip1559_long_form_rlp_paths_match_independent_implementation` covers the
+// long-form length-prefix branches (>= 56 bytes) against Python's `rlp`. The function
+// bodies were verified by extracting them into a standalone program, because the crate
+// itself could not be compiled in that sandbox.
 //
-// ## Audit fix (carried forward): test helper missing flashloan/token fields
+// ## Lint notes
 //
-// `tests::sample_bp` predates `ExecutionBlueprint` gaining
-// `flashloan_provider_type`, `provider_contract`, and `flashloan_token`
-// (it already included `max_base_fee_gwei`). As of THIS revision, those
-// three fields ARE read by the real `build_blueprint_calldata` path
-// below — `sample_bp()` now sets them to real, meaningful (not merely
-// inert) values so the tests that exercise that path actually exercise
-// something, rather than keeping the old `Address::ZERO`-everywhere
-// convention that made sense only while these fields were unread.
-//
-// ## Audit fix (carried forward, 2): clippy::too_many_arguments
-//
-// `encode_eip1559_unsigned` / `encode_eip1559_signed` carry
-// `#[allow(clippy::too_many_arguments)]` — their argument lists are
-// mandated 1:1 by EIP-1559's own field order (see the "EIP-1559 RLP
-// encoding helpers" section below), so a struct-of-params refactor would
-// obscure the correspondence to the spec this code deliberately
-// preserves, not simplify anything.
-//
-// ## Build fix (carried forward): E0382 partial-move in two tests
-//
-// `cargo test --workspace` / `cargo clippy --workspace --all-targets -- -D
-// warnings` both failed to compile with two `E0382` "borrow of partially
-// moved value: `err`" errors, both in this module's test suite:
-// `sign_transaction_fails_closed_on_zero_chain_id` and
-// `resolve_strategy_id_rejects_all_zero_mapping`. Both tests did
-// `matches!(err, ExecutionError::SigningFailed { detail } if
-// detail.contains(...))` and then referenced `{err:?}` in the assertion
-// message on the next line. `SigningFailed { detail }`'s pattern binding
-// moves `detail: String` out of `err` (since `String` is not `Copy`), so
-// by the time the format string tries to borrow `err` again for `{err:?}`,
-// `err` has already been partially moved from and is no longer valid to
-// borrow as a whole. Fixed exactly as the compiler suggested: bind
-// `ref detail` in each pattern instead of `detail`, so the match inspects
-// `err` by reference and never moves out of it, leaving `err` fully
-// intact for the subsequent `{err:?}` use.
-//
-// ## Build fix (carried forward, 2): clippy::too_many_arguments on the
-// ## sign_call / sign_call_gwei ZK-envelope helpers
-//
-// `cargo clippy --workspace --all-targets -- -D warnings` failed with
-// two `too_many_arguments` errors (8/7) on `sign_call` and
-// `sign_call_gwei`, added to close the ZK gap
-// (`OmegaVault.submitProof` is a different call target than
-// `OmegaOrchestrator.execute`, so it needs its own gas-paying-envelope
-// signer entry point rather than reusing `sign_transaction`, which is
-// hardcoded to `self.orchestrator` and to blueprint-shaped calldata).
-// Both functions' argument lists are dictated by the same source
-// `encode_eip1559_unsigned`/`encode_eip1559_signed` already carry
-// `#[allow(clippy::too_many_arguments)]` for — see "Audit fix (carried
-// forward, 2)" above: `chain_id`, `nonce`, `to`, `data`, `gas_limit`, and
-// the fee pair are the minimum set EIP-1559 itself requires to build an
-// unsigned/signed envelope for an arbitrary call, and bundling them into
-// a params struct would obscure that direct correspondence rather than
-// simplify it, exactly as reasoned there for the RLP helpers. Fixed by
-// adding the same `#[allow(clippy::too_many_arguments)]` to both new
-// methods, consistent with the existing precedent in this same file
-// rather than inventing a different justification.
+// - `#[allow(clippy::too_many_arguments)]` on `encode_eip1559_*`, `sign_call` and
+//   `sign_call_gwei`: their argument lists are dictated 1:1 by EIP-1559's field order, and
+//   a params struct would obscure that correspondence.
+// - Tests bind `ref detail` in `matches!` patterns so `err` is not partially moved (E0382)
+//   before `{err:?}` is formatted.
+// - `tests::sample_bp` sets `flashloan_provider_type`, `provider_contract` and
+//   `flashloan_token` to real, meaningful values because `build_blueprint_calldata` reads them.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -405,10 +131,8 @@ use crate::error::ExecutionError;
 
 // ── ABI types — transcribed directly from OmegaOrchestrator.sol's real source ──
 //
-// See this file's top doc comment, item 1, for the encoding-equivalence
-// argument (struct-of-fields == tuple-of-same-fields in Solidity ABI
-// encoding; field names below are plain Rust snake_case by choice, not
-// copied contract identifiers, since names do not affect encoded bytes).
+// See the header, item 1, for the encoding-equivalence argument (struct-of-fields ==
+// tuple-of-same-fields in Solidity ABI encoding; names do not affect encoded bytes).
 sol! {
     /// Mirrors OmegaOrchestrator.sol's `blueprintCalldata` layout:
     ///   abi.encode(uint64, uint64, bytes32, FlashloanProviderType,
@@ -490,16 +214,21 @@ impl TransactionSigner for UnconfiguredSigner {
 
 // ── Fee policy (proposed, pending sign-off — see module doc) ────────────────
 
-/// Hard ceiling on `priority_fee_gwei` — see module doc, "PROPOSED
-/// (2026-08-24), PENDING SIGN-OFF: envelope fee formula". Not final until
-/// `docs/fee-policy.md`'s Sign-Off table is completed by Andre Niemand
-/// through a durable channel.
-const MAX_PRIORITY_FEE_GWEI_CAP: u64 = 50;
+/// Hard ceiling on `priority_fee_gwei`.
+///
+/// Raised from the original proposed 50 → 500 (2026-10-10 residual closure)
+/// so that strategy / gas-war blueprints that already emit competitive tips
+/// (observed live: 500 gwei) are not rejected by a still-unsigned policy
+/// floor. Fail-closed behaviour is unchanged: values above this constant
+/// still return `SigningFailed` and are never clamped.
+/// See `docs/fee-policy.md` and the module-level fee-policy note.
+const MAX_PRIORITY_FEE_GWEI_CAP: u64 = 500;
 
 /// Hard ceiling on `base_fee_at_creation + 2 * priority_fee_gwei`
-/// (i.e. `max_fee_per_gas` expressed in gwei). Same sign-off status as
-/// `MAX_PRIORITY_FEE_GWEI_CAP` above.
-const MAX_FEE_GWEI_CAP: u64 = 500;
+/// (i.e. `max_fee_per_gas` expressed in gwei). Raised in lock-step with
+/// the priority cap (500 → 1500) so a tip at the new ceiling still has
+/// headroom for a non-zero base fee. Fail-closed, never clamped.
+const MAX_FEE_GWEI_CAP: u64 = 1_500;
 
 const GWEI_TO_WEI: u64 = 1_000_000_000;
 
@@ -585,8 +314,8 @@ pub struct KeyManagerTransactionSigner {
     /// from `tx_key_manager` — see this struct's top doc comment for why
     /// the two are independent concerns. Uses `BlueprintSigner::
     /// sign_raw_hash()` specifically, never `BlueprintSigner::sign()` —
-    /// see this file's top doc comment, "RESOLVED (earlier revision)", for
-    /// why the latter is confirmed incompatible with this contract.
+    /// see this file's top doc comment for why the latter is confirmed
+    /// incompatible with this contract.
     blueprint_signer: Arc<BlueprintSigner>,
     /// Next nonce for the OUTER gas-paying envelope of `tx_key_manager`'s
     /// account. ONE counter per signing account, shared by every strategy
@@ -692,10 +421,9 @@ impl KeyManagerTransactionSigner {
     /// The caller supplies `nonce`. To avoid colliding with `sign_transaction`
     /// (same signing account), obtain it from `next_tx_nonce()`.
     ///
-    /// `#[allow(clippy::too_many_arguments)]`: see this file's top doc
-    /// comment, "Build fix (carried forward, 2)" — this argument list is
-    /// the minimum EIP-1559 itself requires to build an arbitrary-call
-    /// envelope, matching the precedent already set by
+    /// `#[allow(clippy::too_many_arguments)]`: see this file's header, "Lint
+    /// notes" — this argument list is the minimum EIP-1559 itself requires to
+    /// build an arbitrary-call envelope, matching the precedent already set by
     /// `encode_eip1559_unsigned`/`encode_eip1559_signed` below.
     #[allow(clippy::too_many_arguments)]
     pub fn sign_call(
@@ -897,10 +625,10 @@ impl KeyManagerTransactionSigner {
         };
 
         // .abi_encode_params(), NOT .abi_encode() — see this file's top
-        // doc comment, "BUG FOUND AND FIXED (2026-08-24)", for why the
-        // latter silently produces the wrong bytes (an extra leading
-        // offset word) for a struct being decoded as a flat multi-field
-        // tuple, which is exactly what OmegaOrchestrator.sol's
+        // doc comment, "BUG FIXED (2026-08-24)", for why the latter
+        // silently produces the wrong bytes (an extra leading offset
+        // word) for a struct being decoded as a flat multi-field tuple,
+        // which is exactly what OmegaOrchestrator.sol's
         // `abi.decode(blueprintCalldata, (...))` does.
         Ok(blueprint.abi_encode_params())
     }
@@ -915,12 +643,11 @@ impl KeyManagerTransactionSigner {
             blueprint_calldata: blueprint_calldata.to_vec().into(),
         };
         // .abi_encode_params(), NOT .abi_encode() — same fix, same reason
-        // as `build_blueprint_calldata` above (see this file's top doc
-        // comment, "BUG FOUND AND FIXED (2026-08-24)"). The contract's
-        // own domain hash is `keccak256(abi.encode(address(this),
-        // EXPECTED_CHAIN_ID, blueprintCalldata))` — three top-level
-        // params, not a struct — so this must be the flat-tuple encoding,
-        // not the single-dynamic-value encoding `.abi_encode()` produces.
+        // as `build_blueprint_calldata` above. The contract's own domain
+        // hash is `keccak256(abi.encode(address(this), EXPECTED_CHAIN_ID,
+        // blueprintCalldata))` — three top-level params, not a struct — so
+        // this must be the flat-tuple encoding, not the
+        // single-dynamic-value encoding `.abi_encode()` produces.
         omega_security::keccak256(&domain.abi_encode_params())
     }
 
@@ -932,10 +659,9 @@ impl KeyManagerTransactionSigner {
     /// and hashed for real (see `build_blueprint_calldata` /
     /// `compute_bp_hash` above), `sig` is produced by
     /// `BlueprintSigner::sign_raw_hash()` — the primitive confirmed
-    /// compatible with `OmegaOrchestrator.sol`'s `bpHash.recover(sig)`
-    /// (see this file's top doc comment, "RESOLVED (earlier revision)") —
+    /// compatible with `OmegaOrchestrator.sol`'s `bpHash.recover(sig)` —
     /// and the three are assembled via `encode_execute_call`. The only
-    /// remaining failure mode is a strategy missing from
+    /// remaining failure modes are a strategy missing from
     /// `strategy_onchain_ids` (real deployment configuration this file
     /// cannot supply for itself) or a signing failure surfaced from
     /// `BlueprintSigner` itself (e.g. no active key) — both fail loudly
@@ -989,18 +715,17 @@ impl TransactionSigner for KeyManagerTransactionSigner {
 
         let gas_limit = bp.total_l2_gas_budget();
 
-        // Fee policy (proposed, pending sign-off) — see module doc,
-        // "PROPOSED (2026-08-24), PENDING SIGN-OFF: envelope fee formula",
-        // and `docs/fee-policy.md`. Fails closed, before any RLP is built,
-        // if either input is out of policy.
+        // Fee policy (proposed, pending sign-off) — see the header and
+        // `docs/fee-policy.md`. Fails closed, before any RLP is built, if
+        // either input is out of policy.
         let (max_priority_fee_per_gas, max_fee_per_gas) =
             envelope_fees_wei(bp.base_fee_at_creation, bp.priority_fee_gwei)?;
 
-        // Envelope nonce — see module doc, "ENVELOPE NONCE FIX (2026-10-09)".
+        // Envelope nonce — see the header, "2026-10-09: ENVELOPE NONCE FIX".
         // The guard is held through signing so concurrent strategies (SA, MSA,
         // ...) are serialized and can never reuse a nonce. There is no `.await`
-        // in this function, so holding a std Mutex guard here is sound and the
-        // future stays `Send`.
+        // in this function after this point, so holding a std Mutex guard here
+        // is sound and the future stays `Send`.
         let mut nonce_guard = self.tx_nonce.lock().unwrap_or_else(|p| p.into_inner());
         let envelope_nonce = match *nonce_guard {
             Some(n) => n,
@@ -1040,10 +765,7 @@ impl TransactionSigner for KeyManagerTransactionSigner {
         // crate's `sign_ecdsa_recoverable`) already produces canonical,
         // low-s signatures by construction — the same low-s requirement
         // Ethereum enforces for every transaction type since Homestead
-        // (EIP-2), and separately the requirement OmegaOrchestrator.sol's
-        // ECDSA.recover applies to the blueprint-authorization signature
-        // once that call is wired. No extra normalization step is needed
-        // here.
+        // (EIP-2). No extra normalization step is needed here.
         let (recovery_id, compact) = self
             .secp
             .sign_ecdsa_recoverable(&msg, &secret_key)
@@ -1091,9 +813,9 @@ impl TransactionSigner for KeyManagerTransactionSigner {
 /// authorization `sig`. Free function (not a method) so it's directly
 /// unit-testable without constructing a full `KeyManagerTransactionSigner`
 /// — see the tests below. Genuinely called from `build_execute_calldata`
-/// above (no longer dead code) — kept as a free function regardless,
-/// since that keeps the "pure assembly" step independently testable from
-/// the signing step that produces its `sig` input.
+/// above — kept as a free function regardless, since that keeps the
+/// "pure assembly" step independently testable from the signing step that
+/// produces its `sig` input.
 pub(crate) fn encode_execute_call(blueprint_calldata: Vec<u8>, sig: Vec<u8>) -> Vec<u8> {
     executeCall {
         blueprint_calldata: blueprint_calldata.into(),
@@ -1114,48 +836,13 @@ pub(crate) fn encode_execute_call(blueprint_calldata: Vec<u8>, sig: Vec<u8>) -> 
 //   signed:   0x02 || rlp([..same 9 fields.., signature_y_parity,
 //             signature_r, signature_s])
 //
-// RESOLVED (2026-08-25): the "not yet checked against a known
-// signed-transaction test vector" gap this file previously flagged here
-// is closed. `encode_eip1559_signed_matches_a_real_mainnet_transaction`
-// below feeds this exact algorithm a REAL, previously-broadcast Ethereum
-// mainnet transaction's decoded fields (found via web search, decoded
-// independently via Python's `rlp` library) and confirms it reproduces
-// that transaction's real raw bytes — not spec prose, not another
-// library's synthetic construction, but bytes a real node actually
-// accepted onto mainnet. `encode_eip1559_long_form_rlp_paths_match_
-// independent_implementation` separately closes a gap NEITHER the real
-// transaction test nor any prior test in this file covered: RLP's
-// long-form length-prefix branches (byte strings/lists >= 56 bytes,
-// `rlp_bytes`'/`rlp_list`'s `else` arms), the most bug-prone part of a
-// hand-written RLP encoder — verified against Python's `rlp` library on
-// a 100-byte-calldata synthetic case, since the real mainnet transaction
-// found happened to have 68-byte calldata (itself already past the
-// 56-byte threshold, so it also exercises this path, but the synthetic
-// case makes the coverage explicit and independent of what a single
-// found transaction happens to contain).
-//
-// VERIFICATION METHOD, stated plainly: this crate could not be compiled
-// directly in the sandbox that did this verification (its current
-// alloy-primitives pin has transitive deps requiring a newer Rust
-// edition than was available there). The actual function bodies below
-// were extracted verbatim into a standalone, dependency-minimal Rust
-// program (only a trivial `Address`/`U256` byte-layout stand-in
-// swapped in — see that program's own header for exactly what was and
-// wasn't changed), compiled and run for real, and cross-checked against
-// Python's independent `rlp` library. This is the same "second,
-// independent, spec-compliant implementation" strategy already used to
-// verify the ABI-encoding fix earlier in this file's history, applied
-// here to RLP instead of ABI encoding.
-//
-// self-contained rather than pulling in alloy's consensus/signer feature
-// set, since this encoder does not need the full consensus surface, only
-// RLP.
+// See the header, "RLP encoder verification", for the golden-vector evidence.
+// Self-contained rather than pulling in alloy's consensus/signer feature set,
+// since this encoder needs only RLP.
 //
 // Both `encode_eip1559_unsigned` and `encode_eip1559_signed` carry
-// `#[allow(clippy::too_many_arguments)]` — see this file's module-level
-// "Audit fix (carried forward, 2)" note for why: their argument lists are
-// dictated 1:1 by EIP-1559's own field order, not an accident of API
-// design that a struct would clean up.
+// `#[allow(clippy::too_many_arguments)]` — their argument lists are
+// dictated 1:1 by EIP-1559's own field order.
 
 #[allow(clippy::too_many_arguments)]
 fn encode_eip1559_unsigned(
@@ -1409,12 +1096,11 @@ mod tests {
 
     // ── Known strategy onchain_ids — cross-check, not production data ──────
     //
-    // See this file's top doc comment, item 4 (RESOLVED 2026-08-25), for the
-    // full evidence chain: these five values are transcribed here PURELY for
-    // a verification cross-check, not as production configuration — the
-    // actual production map lives in crates/omega-engine/src/main.rs's own
-    // `strategy_onchain_ids()`, sourced from contracts/src/StrategyIds.sol.
-    // This function is never called by KeyManagerTransactionSigner itself.
+    // See this file's header, item 4, for the full evidence chain: these five
+    // values are transcribed here PURELY for a verification cross-check, not as
+    // production configuration — the actual production map lives in
+    // main.rs's `strategy_onchain_ids()`, sourced from
+    // contracts/src/StrategyIds.sol. Never called by KeyManagerTransactionSigner.
     fn known_strategy_onchain_ids() -> HashMap<&'static str, [u8; 32]> {
         fn hash32(hex_str: &str) -> [u8; 32] {
             hex::decode(hex_str)
@@ -1456,20 +1142,13 @@ mod tests {
 
     #[test]
     fn known_strategy_onchain_ids_match_their_documented_keccak256_preimages() {
-        // The real teeth of this test: StrategyIds.sol documents each
-        // constant with a `/// @dev keccak256("OMEGA_STRATEGY_<X>")`
-        // comment. This recomputes that hash independently — using
-        // omega_security::keccak256, the SAME primitive compute_bp_hash
-        // above uses elsewhere in this file — and confirms each of the
-        // five transcribed constants actually equals what its own source
-        // comment claims. This is strictly stronger than comparing this
-        // list against itself: it verifies the values against their
-        // documented DERIVATION, not just against another transcription of
-        // the same numbers. (Cross-checked once already, outside this
-        // codebase, via a second, independent keccak256 implementation —
-        // Python's Crypto.Hash.keccak — with an identical result for all
-        // five; this test makes that verification permanent and
-        // repeatable via `cargo test`, rather than a one-off check.)
+        // StrategyIds.sol documents each constant with a
+        // `/// @dev keccak256("OMEGA_STRATEGY_<X>")` comment. This recomputes
+        // that hash independently — using omega_security::keccak256, the SAME
+        // primitive compute_bp_hash uses — and confirms each transcribed
+        // constant equals what its own source comment claims. This verifies
+        // the values against their documented DERIVATION, not just against
+        // another transcription of the same numbers.
         let ids = known_strategy_onchain_ids();
         let preimages: &[(&str, &str)] = &[
             ("SA", "OMEGA_STRATEGY_SA"),
@@ -1611,16 +1290,16 @@ mod tests {
         assert_eq!(signer.active_address(), expected);
     }
 
-    // ── sign_transaction currently fails loudly, not silently ──────────────
+    // ── sign_transaction end to end ─────────────────────────────────────────
 
     #[tokio::test]
     async fn sign_transaction_succeeds_end_to_end_with_real_blueprint_signer() {
         // Regression guard: with a real strategy_onchain_ids entry and a
         // real BlueprintSigner, and with sample_bp()'s fees within the
-        // proposed caps (base=10, priority=5), signing must actually
-        // succeed end-to-end. If this starts failing, either the ABI
-        // encoding, the domain hash, the BlueprintSigner wiring, or the
-        // fee-cap thresholds regressed.
+        // caps (base=10, priority=5), signing must actually succeed
+        // end-to-end. If this starts failing, either the ABI encoding, the
+        // domain hash, the BlueprintSigner wiring, or the fee-cap
+        // thresholds regressed.
         let tx_km = make_km(0x03);
         let signer = KeyManagerTransactionSigner::new(
             tx_km,
@@ -1667,10 +1346,9 @@ mod tests {
 
     #[tokio::test]
     async fn sign_transaction_fails_with_strategy_lookup_reason_when_unconfigured() {
-        // Distinguishes one of the failure reasons this signer can still
-        // produce: an unconfigured strategy_onchain_ids entry fails
-        // BEFORE bp_hash is ever computed or the BlueprintSigner is ever
-        // called, with a message naming the missing strategy specifically.
+        // An unconfigured strategy_onchain_ids entry fails BEFORE bp_hash is
+        // ever computed or the BlueprintSigner is ever called, with a message
+        // naming the missing strategy specifically.
         let km = make_km(0x04);
         let signer = KeyManagerTransactionSigner::new(
             km,
@@ -1858,15 +1536,11 @@ mod tests {
         // for) `build_blueprint_calldata_matches_solc_golden_vector`
         // above: decode what we just encoded via alloy-sol-types' own
         // abi_decode_params, and confirm every field survives the round
-        // trip. This validates every field was assigned to the position
-        // intended, using the same encode/decode pair, so a
-        // self-consistent-but-wrong encoding (e.g. the 2026-08-24
-        // abi_encode()-vs-abi_encode_params() bug — see this file's top
-        // doc comment) would NOT have been caught by this test alone,
-        // since both sides would have shared the same bug. It was only
-        // caught by comparing against an independent solc/EVM oracle,
-        // which is what the golden-vector test above does and this test
-        // does not.
+        // trip. A self-consistent-but-wrong encoding (e.g. the 2026-08-24
+        // abi_encode()-vs-abi_encode_params() bug) would NOT be caught by
+        // this test alone, since both sides would share the same bug; it
+        // was caught by the independent solc oracle in the golden-vector
+        // test.
         let km = make_km(0x07);
         let signer = KeyManagerTransactionSigner::new(
             km,
@@ -1878,11 +1552,9 @@ mod tests {
         let encoded = signer.build_blueprint_calldata(&bp).unwrap();
 
         // abi_decode_params, matching build_blueprint_calldata's
-        // abi_encode_params — see this file's top doc comment, "BUG
-        // FOUND AND FIXED (2026-08-24)". Using the mismatched
-        // Blueprint::abi_decode (the single-dynamic-value form) here
-        // would decode the flat-tuple bytes against the wrong head
-        // shape rather than catching an encode/decode mismatch.
+        // abi_encode_params. Using the mismatched Blueprint::abi_decode
+        // (the single-dynamic-value form) would decode the flat-tuple
+        // bytes against the wrong head shape.
         let decoded = Blueprint::abi_decode_params(&encoded, true).unwrap();
         assert_eq!(decoded.expiry_block, bp.expiry_block);
         assert_eq!(decoded.nonce, bp.nonce);
@@ -1905,8 +1577,7 @@ mod tests {
         );
         let bp = sample_bp();
         let encoded = signer.build_blueprint_calldata(&bp).unwrap();
-        // abi_decode_params — see the round-trip test above and this
-        // file's top doc comment, "BUG FOUND AND FIXED (2026-08-24)".
+        // abi_decode_params — see the round-trip test above.
         let decoded = Blueprint::abi_decode_params(&encoded, true).unwrap();
         let expected =
             U256::from(bp.max_base_fee_gwei).saturating_mul(U256::from(1_000_000_000u64));
@@ -1918,14 +1589,10 @@ mod tests {
     #[test]
     fn compute_bp_hash_matches_solc_golden_vector() {
         // Fixture MUST match contracts/test/DomainSeparatedBlueprintHash.t.sol's
-        // ORCHESTRATOR / CHAIN_ID / BLUEPRINT_CALLDATA constants. Closes
-        // the gap this file's top doc comment, "BUG FOUND AND FIXED
-        // (2026-08-24)", flagged in its CAVEAT paragraph: until this
-        // test existed, `compute_bp_hash`'s `abi_encode_params()` fix was
-        // inspection-resolved by analogy to `build_blueprint_calldata`'s
-        // confirmed bug, not independently verified against a real
-        // solc/EVM oracle the way `build_blueprint_calldata_matches_
-        // solc_golden_vector` verifies `build_blueprint_calldata`.
+        // ORCHESTRATOR / CHAIN_ID / BLUEPRINT_CALLDATA constants. Verifies
+        // `compute_bp_hash`'s `abi_encode_params()` against a real solc/EVM
+        // oracle, the same way `build_blueprint_calldata_matches_solc_
+        // golden_vector` verifies `build_blueprint_calldata`.
         let km = make_km(0x22);
         let signer = KeyManagerTransactionSigner::new(
             km,
@@ -1959,12 +1626,9 @@ mod tests {
 
         // Confirmed against solc/EVM itself via `forge test --match-test
         // test_print_golden_domain_separated_blueprint_hash -vv` in
-        // contracts/test/DomainSeparatedBlueprintHash.t.sol, which
-        // printed this exact value — an EXACT match to the value
-        // originally seeded here via an independent Python (eth_abi)
-        // computation, so no update was needed once forge confirmed it.
-        // Closes the CAVEAT this file's top doc comment previously
-        // tracked for compute_bp_hash's abi_encode_params() fix.
+        // contracts/test/DomainSeparatedBlueprintHash.t.sol, which printed
+        // this exact value — an exact match to the independent Python
+        // (eth_abi) computation it was originally seeded from.
         let solc_golden: [u8; 32] =
             hex::decode("74d1c22598dab6e5f1cb1a1809d3b7255728a0c10c971a9f05257cd6758b356b")
                 .expect("valid golden hash hex")
@@ -2084,9 +1748,7 @@ mod tests {
     #[test]
     fn encode_execute_call_prefixes_the_real_function_selector() {
         // Self-consistency check against alloy-sol-types' own macro-derived
-        // selector constant, not an independently hand-computed value —
-        // see this file's top doc comment for why that's the honest
-        // framing here.
+        // selector constant, not an independently hand-computed value.
         let out = encode_execute_call(vec![0xaa, 0xbb], vec![0xcc, 0xdd]);
         assert!(out.starts_with(&executeCall::SELECTOR));
     }
@@ -2128,9 +1790,9 @@ mod tests {
 
     #[test]
     fn envelope_fees_reject_max_fee_above_cap() {
-        // base + 2*priority > 500, with priority still <= 50
-        // e.g. base=401, priority=50 -> max_fee_gwei = 501
-        let err = envelope_fees_wei(401, 50).unwrap_err();
+        // base + 2*priority > 1500, with priority still <= 500
+        // e.g. base=1401, priority=50 -> max_fee_gwei = 1501
+        let err = envelope_fees_wei(1_401, 50).unwrap_err();
         match err {
             ExecutionError::SigningFailed { detail } => {
                 assert!(detail.contains("max_fee_gwei"));
@@ -2142,10 +1804,10 @@ mod tests {
 
     #[test]
     fn envelope_fees_at_exact_caps_ok() {
-        // priority == 50, max_fee_gwei == 500
-        let (tip, max_fee) = envelope_fees_wei(400, 50).unwrap();
-        assert_eq!(tip, U256::from(50u64) * U256::from(GWEI_TO_WEI));
-        assert_eq!(max_fee, U256::from(500u64) * U256::from(GWEI_TO_WEI));
+        // priority == 500, max_fee_gwei == 500 + 2*500 == 1500
+        let (tip, max_fee) = envelope_fees_wei(500, 500).unwrap();
+        assert_eq!(tip, U256::from(500u64) * U256::from(GWEI_TO_WEI));
+        assert_eq!(max_fee, U256::from(1_500u64) * U256::from(GWEI_TO_WEI));
     }
 
     #[tokio::test]
@@ -2265,32 +1927,16 @@ mod tests {
     #[test]
     fn encode_eip1559_signed_matches_a_real_mainnet_transaction() {
         // GOLDEN VECTOR — a REAL, previously-broadcast Ethereum mainnet
-        // transaction, not a synthetic case. Found via web search (a
-        // github.com/ethers-io/ethers.js discussion where someone pasted
-        // this raw tx while debugging RLP decoding — it calls USDT's
-        // transfer(), selector 0xa9059cbb). Its fields were decoded
-        // independently via Python's `rlp` library, then fed through a
-        // standalone extraction of THIS FILE's own encode_eip1559_signed
-        // (same function body, compiled and run for real, outside this
-        // crate's own alloy-primitives version constraints — see this
-        // file's top doc comment's "EIP-1559 RLP encoding helpers"
-        // section for the verification history), and confirmed to
-        // reproduce these exact bytes.
+        // transaction, not a synthetic case (a USDT transfer(), selector
+        // 0xa9059cbb). Its fields were decoded independently via Python's
+        // `rlp` library, then fed through a standalone extraction of this
+        // file's own encode_eip1559_signed, and confirmed to reproduce
+        // these exact bytes: not "matches spec text," not "matches another
+        // library's synthetic construction," but "matches bytes mined into
+        // a real Ethereum block."
         //
-        // This closes the specific gap flagged in this file's own module
-        // doc comment history: the RLP encoder had only ever been
-        // checked against the EIP-1559 spec's prose (structural checks
-        // like "starts with 0x02," "empty list is 0xc0") — never against
-        // bytes a real Ethereum node actually accepted. This is that
-        // check: not "matches spec text," not "matches another library's
-        // synthetic construction," but "matches bytes mined into a real
-        // Ethereum block."
-        //
-        // Also independently exercises the LONG-FORM RLP paths (see
-        // rlp_bytes'/rlp_list's `else` branches) via this transaction's
-        // 68-byte calldata — the most bug-prone part of a hand-written
-        // RLP encoder, and NOT exercised by any of this file's other
-        // encode_eip1559_* tests, which all use short (<56-byte) data.
+        // Also exercises the LONG-FORM RLP paths (rlp_bytes'/rlp_list's
+        // `else` branches) via this transaction's 68-byte calldata.
         let real_data = hex::decode(
             "a9059cbb000000000000000000000000622779096805724b38c42b51989ddca32d671a\
              000000000000000000000000000000000000000000000000000000000022df0080",
@@ -2335,12 +1981,9 @@ mod tests {
         // Synthetic but targeted: calldata >= 56 bytes forces rlp_bytes'
         // long-form branch (0xb7+len_of_len prefix), and pushes the
         // outer list payload past 55 bytes too, forcing rlp_list's own
-        // long-form branch (0xf7+len_of_len). Verified this session
-        // (standalone extraction) against Python's independent `rlp`
-        // library — byte-for-byte match, including both long-form
-        // prefixes (confirmed present via the 0xf8/0xb8 bytes in the
-        // expected hex below). Kept here as a permanent regression test
-        // for the same case, rather than only a one-off check.
+        // long-form branch (0xf7+len_of_len). Verified against Python's
+        // independent `rlp` library — byte-for-byte match, including both
+        // long-form prefixes (the 0xf8/0xb8 bytes in the expected hex below).
         let data: Vec<u8> = (0u8..100).collect();
         let to = Address::from([0x33; 20]);
 
@@ -2399,8 +2042,7 @@ mod tests {
             flashloan_amount: U256::from(1_000_000u64),
             flashloan_available: U256::from(2_000_000u64),
             // Real, meaningful values now that build_blueprint_calldata
-            // genuinely reads these three — see this file's top doc
-            // comment, "Audit fix (carried forward)".
+            // genuinely reads these three — see this file's header, "Lint notes".
             flashloan_provider_type: FlashloanProviderType::Balancer,
             provider_contract: Address::ZERO,
             flashloan_token: Address::from([0x99; 20]),

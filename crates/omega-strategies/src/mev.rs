@@ -62,38 +62,29 @@
 // canonical `bp.compute_hash()`. Also adds `signal_id`,
 // `client_order_id`, `idempotency_key`.
 //
-// ## Capital-path marker (this revision)
+// ## Capital path (Option B) — this revision
 //
-// `flashloan_provider`/`flashloan_amount`/`flashloan_available` below
-// are all zero, matching this file's own long-standing claim that MEV
-// does not use flashloans — see the inline TODO(capital-path) comment
-// in `build_blueprint` for what that claim does and doesn't cover if
-// this strategy ever needs borrowable capital in the future.
+// MEV previously set flashloan_provider/amount/token all to zero,
+// which the engine's pre-submission check correctly rejects with
+// "invalid flashloan identity: flashloan_token and amount are zero —
+// Orchestrator has no no-flashloan execute path". Fixed by wiring
+// `omega_flashloan::select_provider` with ARBITRUM_WETH as the asset,
+// same as SA and MSA. The backrun notional (estimated_profit_wei) is
+// used as the flashloan amount so the borrow size scales with the
+// opportunity. `build_blueprint` fails closed if selection fails or the
+// amount is zero — same posture as SA/MSA.
 //
-// ## `max_base_fee_gwei` (this revision)
+// ## `max_base_fee_gwei` — floor fix (this revision)
 //
-// `ExecutionBlueprint` gained a `max_base_fee_gwei` field (compile
-// error otherwise: E0063 missing field). PLACEHOLDER VALUE, same
-// caveat as sa.rs/msa.rs/la.rs — set as `base_fee_at_creation * 3`
-// pending confirmation of the field's real intended semantics.
-//
-// ## Fix (this revision, 2): flashloan identity fields for E0063
-//
-// `ExecutionBlueprint` gained three additional fields —
-// `flashloan_provider_type`, `provider_contract`, `flashloan_token` —
-// at some point without this file being updated to match, producing
-// `error[E0063]: missing fields flashloan_provider_type, flashloan_token
-// and provider_contract in initializer of ExecutionBlueprint`. Fixed by
-// adding all three as inert placeholders (`FlashloanProviderType::
-// Balancer`, `Address::ZERO`, `Address::ZERO`) alongside the existing
-// `flashloan_provider: Address::ZERO` / no-flashloan path — the same
-// pattern `omega-execution/src/pipeline.rs`'s own test helper
-// (`tests::sample_bp`) already establishes for exactly this situation:
-// nothing in `ExecutionPipeline::execute`'s Stage 0-6 path reads any of
-// these three flashloan-identity fields when `flashloan_provider` is
-// `Address::ZERO`, so their concrete values are inert here, not a
-// product decision. This is consistent with (not in tension with) this
-// file's own long-standing "MEV does not use flashloans" claim above.
+// `max_base_fee_gwei` now goes through
+// `ExecutionBlueprint::derive_max_base_fee_gwei()` which floors the
+// result at `MIN_MAX_BASE_FEE_GWEI` (1 gwei). On Arbitrum the real base
+// fee (~0.02 gwei) truncates to 0 whole gwei, making the old inline
+// `base_fee * 3` produce 0 — and a zero maxBaseFee makes
+// OmegaOrchestrator.execute() revert with BaseFeeTooHigh on every call.
+// Same fix already applied to sa.rs; now applied here.
+// `MAX_BASE_FEE_HEADROOM_MULTIPLIER` is changed from `u64` to `f64`
+// (3.0) to match `derive_max_base_fee_gwei`'s signature.
 
 use std::sync::{
     atomic::{AtomicU64, Ordering},
@@ -106,10 +97,12 @@ use async_trait::async_trait;
 use uuid::Uuid;
 
 use omega_core::types::blueprint::{ExecutionBlueprint, StrategyId};
-use omega_core::types::flashloan_provider::FlashloanProviderType;
 use omega_core::types::lane::{Lane, Simulator};
 use omega_core::types::strategy::{OpScore, SignalState, SimResult, StrategyTrait};
 use omega_core::{GasConfig, OmegaConfig};
+use omega_flashloan::LiquidityRegistry;
+
+use crate::flashloan_select::to_blueprint_provider_type;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Constants
@@ -135,9 +128,18 @@ const ADVERSE_SELECTION_THRESHOLD: f64 = 0.5;
 /// The remaining 70% is competition buffer and slippage headroom.
 const IMPACT_CAPTURE_FRACTION: f64 = 0.30;
 
-/// Placeholder multiplier for `max_base_fee_gwei` — see module-level
-/// comment on this revision's `max_base_fee_gwei` addition.
-const MAX_BASE_FEE_HEADROOM_MULTIPLIER: u64 = 3;
+/// Multiplier for `max_base_fee_gwei` — passed to
+/// `ExecutionBlueprint::derive_max_base_fee_gwei()`, which also applies
+/// the `MIN_MAX_BASE_FEE_GWEI` floor. Changed from u64 to f64 to match
+/// that function's signature (same change already in sa.rs).
+const MAX_BASE_FEE_HEADROOM_MULTIPLIER: f64 = 3.0;
+
+/// Canonical bridged WETH on Arbitrum One.
+/// Must match Vault `profit_token` and `omega_rpc::WETH`.
+const ARBITRUM_WETH: Address = Address::new([
+    0x82, 0xaf, 0x49, 0x44, 0x7d, 0x8a, 0x07, 0xe3, 0xbd, 0x95, 0xbd, 0x0d, 0x56, 0xf3, 0x52, 0x41,
+    0x52, 0x3f, 0xba, 0xb1,
+]);
 
 // ─────────────────────────────────────────────────────────────────────────────
 // MevStrategy
@@ -149,6 +151,7 @@ pub struct MevStrategy {
     nonce: AtomicU64,
     bytecode_hash: B256,
     contract_addr: Address,
+    liquidity_registry: Arc<LiquidityRegistry>,
     gas: GasConfig,
 }
 
@@ -168,6 +171,26 @@ impl MevStrategy {
             nonce: AtomicU64::new(1),
             bytecode_hash,
             contract_addr,
+            liquidity_registry: LiquidityRegistry::new(),
+            gas: config.gas.clone(),
+        })
+    }
+
+    /// Construct with an explicit liquidity registry — used by main.rs
+    /// so MEV shares the same registry handle as SA/MSA/LA.
+    pub fn new_with_registry(
+        chain_id: u64,
+        bytecode_hash: B256,
+        contract_addr: Address,
+        liquidity_registry: Arc<LiquidityRegistry>,
+        config: &OmegaConfig,
+    ) -> Arc<Self> {
+        Arc::new(Self {
+            chain_id,
+            nonce: AtomicU64::new(1),
+            bytecode_hash,
+            contract_addr,
+            liquidity_registry,
             gas: config.gas.clone(),
         })
     }
@@ -194,7 +217,7 @@ impl MevStrategy {
 
     /// Extract the adverse selection score from the signal payload.
     ///
-    /// Reads `signal_state_hash[0]` as a proxy proxy for the score —
+    /// Reads `signal_state_hash[0]` as a proxy for the score —
     /// in production the actual score is embedded in the OracleSignal
     /// payload by omega-oracle after parsing the MEV-Share SSE event.
     /// The hash byte gives a deterministic but realistic distribution
@@ -357,7 +380,23 @@ impl StrategyTrait for MevStrategy {
             signal_id,
         );
 
-        // Partially-built blueprint for hash computation
+        // Option B: real flashloan selection (fail closed).
+        // MEV borrows WETH to fund the backrun swap; the estimated profit
+        // determines the borrow size. Fails closed if the registry has no
+        // liquidity yet — same posture as SA and MSA.
+        let flashloan_token = ARBITRUM_WETH;
+        let flashloan_amount = est_profit;
+        if flashloan_amount.is_zero() {
+            anyhow::bail!("MEV: refusing zero flashloan_amount (estimated profit is zero)");
+        }
+        let selection = omega_flashloan::select_provider(
+            &self.liquidity_registry,
+            self.chain_id,
+            flashloan_token,
+            flashloan_amount,
+        )
+        .map_err(|e| anyhow::anyhow!("MEV: flashloan selection failed: {e:?}"))?;
+
         let mut bp = ExecutionBlueprint {
             blueprint_hash: B256::ZERO, // filled below via canonical compute_hash()
             chain_id: self.chain_id,
@@ -367,31 +406,19 @@ impl StrategyTrait for MevStrategy {
             signal_state_hash: signal.state_hash,
             state_version: signal.state_version,
             signal_id,
-            // TODO(capital-path): Strategy comment claims "MEV does not use flashloans."
-            // Zero provider/amount matches that claim and resolve_flashloan_provider_id's
-            // Ok("none") path. There is still no on-chain no-flashloan / PIL-inventory
-            // execution path if this strategy ever needs borrowable capital. Do not
-            // populate a non-zero flashloan_token without either select_provider wiring
-            // or an explicit product decision that MEV remains self/externally funded
-            // outside the Orchestrator flashloan flow.
-            flashloan_provider: Address::ZERO, // MEV does not use flashloans
-            flashloan_amount: U256::ZERO,
-            flashloan_available: U256::ZERO,
-            // Fix (this revision, 2): inert placeholders — flashloan_provider
-            // is Address::ZERO (no flashloan), and omega-execution's pipeline
-            // never reads these three fields on that path. Same pattern
-            // pipeline.rs's own test helper (sample_bp) already uses for the
-            // identical case — see this file's module-level "Fix (this
-            // revision, 2)" note. Consistent with, not in tension with, this
-            // file's long-standing "MEV does not use flashloans" claim.
-            flashloan_provider_type: FlashloanProviderType::Balancer,
-            provider_contract: Address::ZERO,
-            flashloan_token: Address::ZERO,
-            // PLACEHOLDER — see module-level comment on this revision's
-            // max_base_fee_gwei addition.
-            max_base_fee_gwei: signal
-                .base_fee_gwei
-                .saturating_mul(MAX_BASE_FEE_HEADROOM_MULTIPLIER),
+            flashloan_provider: selection.contract_addr,
+            flashloan_amount,
+            flashloan_available: selection.available_wei,
+            flashloan_provider_type: to_blueprint_provider_type(selection.provider),
+            provider_contract: selection.contract_addr,
+            flashloan_token,
+            // Floored at MIN_MAX_BASE_FEE_GWEI by derive_max_base_fee_gwei():
+            // a sub-gwei Arbitrum base fee truncates to 0 gwei, and a zero
+            // ceiling would revert every execute() with BaseFeeTooHigh.
+            max_base_fee_gwei: ExecutionBlueprint::derive_max_base_fee_gwei(
+                signal.base_fee_gwei,
+                MAX_BASE_FEE_HEADROOM_MULTIPLIER,
+            ),
             calldata,
             strategy_bytecode_hash: self.bytecode_hash,
             l2_exec_gas_estimate: MEV_GAS_BUDGET,
@@ -504,10 +531,20 @@ mod tests {
     }
 
     fn make_strategy() -> Arc<MevStrategy> {
-        MevStrategy::new(
+        let liquidity_registry = LiquidityRegistry::new();
+        liquidity_registry.update(
+            42161,
+            omega_flashloan::FlashloanProvider::Balancer,
+            ARBITRUM_WETH,
+            Address::from([0xB0; 20]),
+            U256::from(10_000_000_000_000_000_000u128), // 10 ETH available
+            1,
+        );
+        MevStrategy::new_with_registry(
             42161,
             B256::from([0xAB; 32]),
             Address::from([0x11; 20]),
+            liquidity_registry,
             &OmegaConfig::default(),
         )
     }
@@ -532,8 +569,6 @@ mod tests {
         // hash_byte_0 = 100 → adverse_score ≈ 0.39 < 0.5
         let signal = test_signal(5, 100);
         let score = strategy.score(&signal).await.unwrap();
-        // State version 5 → profit multiplier 6 → ≈ 0.006 ETH
-        // min_profit at 10 gwei base = small → should score > 0
         assert!(
             score.score > 0.0 || score.expected_profit == U256::ZERO,
             "low adverse selection should not be blocked: score={}",
@@ -546,12 +581,10 @@ mod tests {
     #[tokio::test]
     async fn blueprint_sets_ofa_compliant() {
         let strategy = make_strategy();
-        // hash_byte_0 = 50 → adverse ≈ 0.196, profit should exceed min
         let signal = test_signal(9, 50);
-        // Score first to confirm it should proceed
         let score = strategy.score(&signal).await.unwrap();
         if !score.should_proceed() {
-            return; // profit below min at this fee level — skip
+            return;
         }
         let bp = strategy.build_blueprint(&signal).await.unwrap();
         assert!(
@@ -567,7 +600,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn blueprint_does_not_use_flashloan() {
+    async fn blueprint_uses_flashloan() {
         let strategy = make_strategy();
         let signal = test_signal(9, 50);
         let score = strategy.score(&signal).await.unwrap();
@@ -575,12 +608,34 @@ mod tests {
             return;
         }
         let bp = strategy.build_blueprint(&signal).await.unwrap();
-        assert_eq!(
+        assert_ne!(
             bp.flashloan_amount,
             U256::ZERO,
-            "MEV does not use flashloans"
+            "MEV must now borrow via flashloan"
         );
-        assert_eq!(bp.flashloan_provider, Address::ZERO);
+        assert_ne!(bp.flashloan_provider, Address::ZERO);
+        assert_ne!(bp.flashloan_token, Address::ZERO);
+        assert_eq!(bp.flashloan_token, ARBITRUM_WETH);
+    }
+
+    #[tokio::test]
+    async fn build_blueprint_max_base_fee_is_never_zero_at_sub_gwei_base_fee() {
+        let strategy = make_strategy();
+        // base_fee_gwei = 0 simulates Arbitrum's real ~0.02 gwei truncating to 0
+        let mut signal = test_signal(9, 50);
+        signal.base_fee_gwei = 0;
+        let score = strategy.score(&signal).await.unwrap();
+        if !score.should_proceed() {
+            return;
+        }
+        let bp = strategy.build_blueprint(&signal).await.unwrap();
+        assert!(
+            bp.max_base_fee_gwei >= ExecutionBlueprint::MIN_MAX_BASE_FEE_GWEI,
+            "max_base_fee_gwei must never be below the floor, got {}",
+            bp.max_base_fee_gwei
+        );
+        assert!(bp.max_base_fee_wei() > U256::ZERO);
+        assert!(bp.verify_hash());
     }
 
     // ── simulation ────────────────────────────────────────────────────────
@@ -623,13 +678,12 @@ mod tests {
         if !score.should_proceed() {
             return;
         }
-
         let bp1 = strategy.build_blueprint(&signal).await.unwrap();
         let bp2 = strategy.build_blueprint(&signal).await.unwrap();
         assert!(bp2.nonce > bp1.nonce, "nonces must be strictly increasing");
     }
 
-    // ── Blueprint integrity (this revision) ──────────────────────────────────
+    // ── Blueprint integrity ───────────────────────────────────────────────
 
     #[tokio::test]
     async fn build_blueprint_passes_verify_hash() {
@@ -658,28 +712,34 @@ mod tests {
         assert!(bp.verify_idempotency_key());
     }
 
+    #[tokio::test]
+    async fn build_blueprint_fails_closed_without_liquidity() {
+        let empty = LiquidityRegistry::new();
+        let s = MevStrategy::new_with_registry(
+            42161,
+            B256::from([0xAB; 32]),
+            Address::from([0x11; 20]),
+            empty,
+            &OmegaConfig::default(),
+        );
+        let signal = test_signal(9, 50);
+        let score = s.score(&signal).await.unwrap();
+        if !score.should_proceed() {
+            return;
+        }
+        let err = s
+            .build_blueprint(&signal)
+            .await
+            .expect_err("empty registry must fail closed");
+        let msg = format!("{err:?}");
+        assert!(
+            msg.contains("flashloan selection failed") || msg.contains("NoneAvailable"),
+            "unexpected error: {msg}"
+        );
+    }
+
     // ── Cross-crate constant drift guard ─────────────────────────────────────
 
-    /// Same pattern as sa.rs's `sa_slippage_within_known_risk_policy_cap` —
-    /// see that test's doc comment for the full rationale (omega-strategies
-    /// deliberately doesn't depend on omega-risk, so this mirrors the real
-    /// cap as a manually-synced local constant rather than importing it).
-    ///
-    /// MEV sits exactly at its cap today (30 == 30, same zero-headroom
-    /// shape SA had before its fix) — the equality still passes check 9
-    /// (`slippage_bps > max_slippage_bps` is a strict `>`), but it means
-    /// EITHER constant moving by even 1 bps reintroduces a MissSlippage
-    /// failure with no advance warning. This test is what now provides
-    /// that warning, on the omega-strategies side.
-    ///
-    /// Both operands below are local `const`s, so clippy's
-    /// `assertions_on_constants` lint flags this as evaluable at
-    /// compile time and suggests a `const { assert!(..) }` block.
-    /// Deliberately not taking that suggestion: this is a genuine test
-    /// (see "IF THIS TEST FAILS" framing in the sibling strategy files)
-    /// whose job is to surface as a normal `cargo test` failure if
-    /// either constant drifts, not to become a hard compile error —
-    /// that's a real behavioral choice, not a lint nuisance.
     #[allow(clippy::assertions_on_constants)]
     #[test]
     fn mev_slippage_within_known_risk_policy_cap() {
@@ -691,9 +751,7 @@ mod tests {
              cap ({MIRRORED_CONTEXT_RS_MAX_SLIPPAGE_BPS_MEV}) — every MEV blueprint \
              would fail omega_risk::checks::check_slippage (check 9, MissSlippage) \
              in production. Verify against the real MAX_SLIPPAGE_BPS_MEV in \
-             crates/omega-risk/src/context.rs before changing either value. Note: \
-             MEV sits exactly at this cap by design (zero headroom) — if that \
-             changes, update this comment too."
+             crates/omega-risk/src/context.rs before changing either value."
         );
     }
 }

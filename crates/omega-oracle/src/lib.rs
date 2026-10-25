@@ -84,6 +84,7 @@ pub mod chainlink_poll;
 pub mod la_bonus;
 pub mod per_chain;
 pub mod pyth;
+pub mod pyth_poll;
 pub mod resolution;
 pub mod twap;
 

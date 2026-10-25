@@ -10,6 +10,18 @@
 //
 // ## This revision
 //
+// Fix: `derive_max_base_fee_gwei()` now floors its result at
+// `MIN_MAX_BASE_FEE_GWEI` (1 gwei). Base fees are carried here as whole
+// gwei (`u64`). On Arbitrum the real base fee is ~0.02 gwei, which rounds
+// to 0 gwei, so `0 * buffer = 0` — and a `maxBaseFee` of 0 makes
+// `OmegaOrchestrator.execute()` revert with `BaseFeeTooHigh` on every
+// call (`block.basefee > 0` is always true). The floor keeps the guard
+// meaningful (1 gwei is ~50x Arbitrum's normal base fee) without making
+// every blueprint unexecutable. Strategies must call
+// `derive_max_base_fee_gwei()` instead of multiplying inline.
+//
+// ## Previous revision
+//
 // Added three fields to support real flashloan provider/pool selection
 // (`omega_flashloan::select_provider`, wired in from `omega-strategies`'
 // `la.rs`, which was constructing this struct with these field names
@@ -376,6 +388,13 @@ pub struct ExecutionBlueprint {
     /// set an on-chain ceiling roughly 1e9× too low, making the guard
     /// revert on every single execution.
     ///
+    /// MUST NOT be 0: a zero ceiling makes the on-chain guard revert on
+    /// every execution, since `block.basefee` is always > 0. Always
+    /// derive this via `derive_max_base_fee_gwei()`, which floors the
+    /// result at `MIN_MAX_BASE_FEE_GWEI` — a plain
+    /// `base_fee_gwei * multiplier` rounds to 0 on Arbitrum, where the
+    /// real base fee is far below 1 gwei.
+    ///
     /// NOT a substitute for `dynamic_min_profit` — this bounds only the
     /// base fee component, not priority fee/tips, L1 data fees, or blob
     /// fees, none of which are observable on-chain the same simple way
@@ -501,6 +520,16 @@ impl std::fmt::Display for IdempotencyKeyMismatch {
 impl std::error::Error for IdempotencyKeyMismatch {}
 
 impl ExecutionBlueprint {
+    /// Floor applied by `derive_max_base_fee_gwei()`, in gwei.
+    ///
+    /// Base fees are carried as whole gwei (`u64`), but Arbitrum's real
+    /// base fee is ~0.02 gwei, which truncates to 0. Without a floor,
+    /// `0 * buffer_factor = 0`, and a zero `maxBaseFee` makes
+    /// `OmegaOrchestrator.execute()` revert with `BaseFeeTooHigh` on
+    /// every call. 1 gwei is ~50x Arbitrum's typical base fee, so it
+    /// still works as a spike guard while never being unexecutable.
+    pub const MIN_MAX_BASE_FEE_GWEI: u64 = 1;
+
     /// Derives the nonce namespace key for a (strategy, chain) pair.
     ///
     /// Used by nonce managers in omega-strategies to ensure each
@@ -601,11 +630,17 @@ impl ExecutionBlueprint {
     /// guard must not underestimate, so any fractional gwei from the
     /// multiplication must round up, not truncate down.
     ///
+    /// The result is floored at `MIN_MAX_BASE_FEE_GWEI`. Without the
+    /// floor, a sub-gwei base fee (Arbitrum) truncates to 0 gwei before
+    /// this is called, `0 * buffer_factor` stays 0, and the on-chain
+    /// `maxBaseFee` guard reverts every execution with `BaseFeeTooHigh`.
+    ///
     /// Does not itself set the field — callers assign the result to
     /// `max_base_fee_gwei` when constructing the blueprint.
     #[inline]
     pub fn derive_max_base_fee_gwei(base_fee_at_creation: u64, buffer_factor: f64) -> u64 {
-        (base_fee_at_creation as f64 * buffer_factor).ceil() as u64
+        let derived = (base_fee_at_creation as f64 * buffer_factor).ceil() as u64;
+        derived.max(Self::MIN_MAX_BASE_FEE_GWEI)
     }
 
     /// Converts `max_base_fee_gwei` to wei, for encoding into the
@@ -1089,6 +1124,21 @@ mod tests {
         // 3 gwei * 1.10 = 3.3 -> must ceil to 4, not truncate to 3,
         // mirroring total_l2_gas_budget_rounds_up_not_down.
         assert_eq!(ExecutionBlueprint::derive_max_base_fee_gwei(3, 1.10), 4);
+    }
+
+    #[test]
+    fn derive_max_base_fee_gwei_is_never_zero() {
+        // Regression guard: Arbitrum's real base fee (~0.02 gwei)
+        // truncates to 0 whole gwei. Without the floor, 0 * 3.0 = 0 and
+        // OmegaOrchestrator.execute() reverts with BaseFeeTooHigh on
+        // every call (block.basefee > 0 is always true).
+        assert_eq!(
+            ExecutionBlueprint::derive_max_base_fee_gwei(0, 3.0),
+            ExecutionBlueprint::MIN_MAX_BASE_FEE_GWEI
+        );
+        assert_eq!(ExecutionBlueprint::derive_max_base_fee_gwei(0, 3.0), 1);
+        // The floor must not lower values already above it.
+        assert_eq!(ExecutionBlueprint::derive_max_base_fee_gwei(10, 3.0), 30);
     }
 
     #[test]

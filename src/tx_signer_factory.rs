@@ -8,55 +8,25 @@
 //! OMEGA_TX_SIGNER=kms               — AWS KMS (no in-memory gas key)
 //! ```
 //!
-//! KMS mode requires:
+//! KMS mode requires `AWS_KMS_KEY_ID`, AWS region/credentials, and optionally
+//! `OMEGA_TX_EXPECTED_ADDRESS=0x...` as a fail-closed address check.
 //!
-//! ```text
-//! AWS_KMS_KEY_ID=...
-//! AWS_REGION=...          (or default credential chain region)
-//! OMEGA_TX_EXPECTED_ADDRESS=0x...   optional fail-closed check
-//! ```
+//! Blueprint authorization is always the local `BlueprintSigner` built from
+//! `OMEGA_BLUEPRINT_SIGNING_KEY`, in both modes.
 //!
-//! Blueprint authorization remains local `BlueprintSigner` from
-//! `OMEGA_BLUEPRINT_SIGNING_KEY` in both modes (independent concern).
+//! ## Changelog
 //!
-//! ## C10l: `orchestrator_bp_hash` forwarding
-//!
-//! `OmegaVault` keys everything (pending profit, ZK public-inputs binding) on the
-//! Orchestrator's domain-separated `bpHash` — `keccak256(abi.encode(orchestrator,
-//! chainId, blueprintCalldata))` — NOT on `ExecutionBlueprint::compute_hash()`.
-//! `ProductionTxSigner::orchestrator_bp_hash` exposes the former so the engine can
-//! find a submitted blueprint's vault entry and prove against the right key. The
-//! `Kms` arm forwards to a method the (still unwritten) KMS adapter must also provide.
-//!
-//! ## C10k: KMS backend is feature-gated (`--features kms`), OFF by default
-//!
-//! `build_production_tx_signer`'s `"kms"` branch has always called two crates —
-//! `aws_kms_signer::AwsKmsSigner` and `aws_kms_omega_adapter::AwsKmsTransactionSigner`
-//! — that were never actually resolvable: `aws_kms_signer` doesn't exist under that
-//! name on crates.io (the closest real published crate is the differently-named,
-//! differently-shaped `evm-signer-kms`), and `aws_kms_omega_adapter`'s name matches
-//! this workspace's own internal crate convention (`omega-core`, `omega-rpc`, ...)
-//! but was never actually created as a real crate anywhere in this repo. This was
-//! invisible for a long time because an earlier revision of `main.rs` didn't declare
-//! `mod tx_signer_factory;` at all — this file was dead code, unreachable from the
-//! binary, so `cargo build` never attempted to resolve its imports. Restoring
-//! `mod tx_signer_factory;` (C10j) made the compiler look at this file for the first
-//! time and immediately hit both unresolved-crate errors (E0432/E0433).
-//!
-//! Rather than block every build on writing a real KMS adapter crate from scratch,
-//! the KMS-specific imports, the `ProductionTxSigner::Kms` variant, and the `"kms"`
-//! match arm in `build_production_tx_signer` are now behind `#[cfg(feature = "kms")]`,
-//! OFF by default. A default build only needs `OMEGA_TX_SIGNING_KEY` (the `"local"`
-//! backend) to compile and run — which is the only backend anyone using this file has
-//! actually exercised so far. `aws_config` and `aws_sdk_kms` ARE real, official AWS
-//! SDK crates and remain declared as optional dependencies gated by the same feature,
-//! so `cargo build --features kms` will still fail until a real, local
-//! `aws-kms-omega-adapter` crate (or equivalent) is written and added to the
-//! workspace — that failure is now a clear, feature-scoped compile error instead of
-//! silently blocking every build regardless of which backend is actually in use.
-//!
-//! Place this file at: `src/tx_signer_factory.rs`
-//! Add to the binary crate: `mod tx_signer_factory;`
+//! - C10p: `next_tx_nonce` restored. The submitProof keeper in `main.rs` takes nonces from
+//!   the signer's shared envelope counter (the same one `ExecutionPipeline` uses) so the
+//!   two can't collide. `peek_tx_nonce` stays removed (no callers; C10o).
+//! - C10l: `orchestrator_bp_hash` forwarding. `OmegaVault` keys pending profit and ZK
+//!   public-inputs binding on the Orchestrator's domain-separated `bpHash`, not on
+//!   `ExecutionBlueprint::compute_hash()`. The `Kms` arm forwards to a method the KMS
+//!   adapter must also provide.
+//! - C10k: the KMS backend is feature-gated (`--features kms`), OFF by default. It depends
+//!   on `aws_kms_signer` (not a real crate name) and `aws_kms_omega_adapter` (never
+//!   written), so `--features kms` fails until a real adapter crate exists. A default
+//!   build needs only the `local` backend.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -111,6 +81,29 @@ impl ProductionTxSigner {
             Self::Local(s) => s.orchestrator_bp_hash(bp, chain_id),
             #[cfg(feature = "kms")]
             Self::Kms(s) => s.orchestrator_bp_hash(bp, chain_id),
+        }
+    }
+
+    /// Seed the shared outer-envelope nonce counter.
+    ///
+    /// `pending_count` must be `eth_getTransactionCount(active_address(), "pending")`.
+    /// Call once at startup and again after any rejected/dropped send.
+    pub fn seed_tx_nonce(&self, pending_count: u64) {
+        match self {
+            Self::Local(s) => s.seed_tx_nonce(pending_count),
+            #[cfg(feature = "kms")]
+            Self::Kms(s) => s.seed_tx_nonce(pending_count),
+        }
+    }
+
+    /// Take the next nonce from the shared outer-envelope counter (used by the
+    /// `ExecutionPipeline` and the submitProof keeper, so they never collide).
+    /// Errors if the counter has not been seeded.
+    pub fn next_tx_nonce(&self) -> Result<u64, ExecutionError> {
+        match self {
+            Self::Local(s) => s.next_tx_nonce(),
+            #[cfg(feature = "kms")]
+            Self::Kms(s) => s.next_tx_nonce(),
         }
     }
 
@@ -218,7 +211,7 @@ pub async fn build_production_tx_signer(
                     "OMEGA_TX_SIGNER=kms requires this binary to be built with \
                      `--features kms` — and even then, the KMS backend currently \
                      depends on a not-yet-written local `aws-kms-omega-adapter` crate \
-                     (see this file's own C10k header comment). Build with \
+                     (see this file's own C10k changelog entry). Build with \
                      OMEGA_TX_SIGNER=local (or unset) until that adapter crate exists."
                 );
             }

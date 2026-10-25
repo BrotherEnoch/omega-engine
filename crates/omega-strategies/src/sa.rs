@@ -2,7 +2,17 @@
 //
 // Simple Arbitrage (SA) — Phase 1 strategy (spec §1.1).
 //
-// ## Audit fix (this revision)
+// ## Audit fix (this revision): max_base_fee_gwei floor
+//
+// `max_base_fee_gwei` was previously computed inline as
+// `signal.base_fee_gwei * 3`. `signal.base_fee_gwei` is whole gwei, and
+// Arbitrum's real base fee (~0.02 gwei) truncates to 0, so the product
+// was 0 and `OmegaOrchestrator.execute()` reverted with `BaseFeeTooHigh`
+// on every call (`block.basefee > 0` is always true). It now goes
+// through `ExecutionBlueprint::derive_max_base_fee_gwei()`, which floors
+// the result at `MIN_MAX_BASE_FEE_GWEI` (1 gwei).
+//
+// ## Audit fix (earlier revision)
 //
 // `blueprint_hash` was previously computed from an ad hoc, strategy-local
 // `keccak256(signal_state_hash || nonce || block_number)` — a much
@@ -30,14 +40,14 @@
 // selection fails or token/amount is zero — Orchestrator reverts on
 // `flashloanToken == address(0)`.
 //
-// ## `max_base_fee_gwei` (this revision)
+// ## `max_base_fee_gwei` (earlier revision)
 //
 // `ExecutionBlueprint` gained a `max_base_fee_gwei` field (compile
-// error otherwise: E0063 missing field). PLACEHOLDER VALUE, same
-// caveat as la.rs/msa.rs/mev.rs — set as `base_fee_at_creation * 3`
-// pending confirmation of the field's real intended semantics.
+// error otherwise: E0063 missing field). The headroom multiplier below
+// is still a placeholder pending confirmation of the field's real
+// intended semantics; the zero-floor bug above is fixed independently.
 //
-// ## Audit fix (this revision, 2): mixed-case hex literal
+// ## Audit fix (earlier revision, 2): mixed-case hex literal
 //
 // `cargo clippy --workspace --all-targets -- -D warnings` failed on
 // `clippy::mixed_case_hex_literals` at two of the individual byte
@@ -76,7 +86,7 @@ const SA_GAS_BUDGET: u64 = 200_000;
 const SA_EXTRACTION_GAS: u64 = 21_000;
 const SA_L1_DATA_GAS: u64 = 1_600;
 const SA_EXPIRY_BLOCKS: u64 = 2;
-// Fix (this revision): was 50 — did not match omega-risk::context's
+// Fix (earlier revision): was 50 — did not match omega-risk::context's
 // MAX_SLIPPAGE_BPS_SA (30), the real policy cap omega_risk::checks's
 // check 9 (MissSlippage) evaluates against
 // (`bp.slippage_bps > ctx.max_slippage_bps`). The two constants were
@@ -98,9 +108,10 @@ const SA_SLIPPAGE_BPS: u16 = 30;
 const SA_CONFIRMATION: u8 = 12;
 const SA_SPREAD_WEI: u128 = 200_000_000_000_000_000; // 0.2 ETH
 
-/// Placeholder multiplier for `max_base_fee_gwei` — see module-level
-/// comment on this revision's `max_base_fee_gwei` addition.
-const MAX_BASE_FEE_HEADROOM_MULTIPLIER: u64 = 3;
+/// Placeholder multiplier for `max_base_fee_gwei` — passed to
+/// `ExecutionBlueprint::derive_max_base_fee_gwei()`, which also applies
+/// the `MIN_MAX_BASE_FEE_GWEI` floor. See module-level comment.
+const MAX_BASE_FEE_HEADROOM_MULTIPLIER: f64 = 3.0;
 
 /// Canonical bridged WETH on Arbitrum One.
 /// Must match Vault `profit_token` and `omega_rpc::WETH`.
@@ -320,11 +331,13 @@ impl omega_core::types::strategy::StrategyTrait for SaStrategy {
             flashloan_provider_type: to_blueprint_provider_type(selection.provider),
             provider_contract: selection.contract_addr,
             flashloan_token,
-            // PLACEHOLDER — see module-level comment on this revision's
-            // max_base_fee_gwei addition.
-            max_base_fee_gwei: signal
-                .base_fee_gwei
-                .saturating_mul(MAX_BASE_FEE_HEADROOM_MULTIPLIER),
+            // Floored at MIN_MAX_BASE_FEE_GWEI by derive_max_base_fee_gwei():
+            // a sub-gwei Arbitrum base fee truncates to 0 gwei, and a zero
+            // ceiling would revert every execute() with BaseFeeTooHigh.
+            max_base_fee_gwei: ExecutionBlueprint::derive_max_base_fee_gwei(
+                signal.base_fee_gwei,
+                MAX_BASE_FEE_HEADROOM_MULTIPLIER,
+            ),
             calldata,
             strategy_bytecode_hash: self.bytecode_hash,
             l2_exec_gas_estimate: SA_GAS_BUDGET,
@@ -484,7 +497,34 @@ mod tests {
         assert_eq!(data.len(), 132);
     }
 
-    // ── Blueprint integrity (this revision) ──────────────────────────────────
+    // ── max_base_fee_gwei floor (this revision) ──────────────────────────────
+
+    #[tokio::test]
+    async fn build_blueprint_max_base_fee_is_never_zero_at_sub_gwei_base_fee() {
+        // Regression guard: on Arbitrum the real base fee (~0.02 gwei)
+        // reaches the strategy as 0 whole gwei. The old inline
+        // `base_fee_gwei * 3` produced max_base_fee_gwei == 0, making the
+        // on-chain BaseFeeTooHigh guard revert every execute().
+        let s = make_strategy();
+        let bp = s.build_blueprint(&make_signal(0)).await.unwrap();
+        assert!(
+            bp.max_base_fee_gwei >= ExecutionBlueprint::MIN_MAX_BASE_FEE_GWEI,
+            "max_base_fee_gwei must never be below the floor, got {}",
+            bp.max_base_fee_gwei
+        );
+        assert!(bp.max_base_fee_wei() > U256::ZERO);
+        assert!(bp.verify_hash());
+    }
+
+    #[tokio::test]
+    async fn build_blueprint_max_base_fee_scales_above_floor() {
+        // 5 gwei * 3.0 = 15 — above the floor, so unchanged by it.
+        let s = make_strategy();
+        let bp = s.build_blueprint(&make_signal(5)).await.unwrap();
+        assert_eq!(bp.max_base_fee_gwei, 15);
+    }
+
+    // ── Blueprint integrity (earlier revision) ───────────────────────────────
 
     #[tokio::test]
     async fn build_blueprint_passes_verify_hash() {
