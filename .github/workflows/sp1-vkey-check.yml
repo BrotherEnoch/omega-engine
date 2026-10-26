@@ -15,6 +15,10 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: sp1-vkey-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   build-and-check:
     name: Build SP1 ELF and check PROGRAM_VKEY
