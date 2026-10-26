@@ -36,9 +36,9 @@
 //                                 secret is skipped, never faked
 //   OMEGA_VAULT_SUBMIT_GAS, OMEGA_VAULT_SUBMIT_PRIORITY_GWEI,
 //   OMEGA_VAULT_SUBMIT_MAX_FEE_GWEI   submitProof gas parameters
-//   OMEGA_LOCAL_L1_DATA_FEE_GWEI  L1 data fee seeded when the ArbGasInfo poll fails on a
-//                                 non-default chain; default 1
-//   OMEGA_SEED_L1_ON_POLL_FAIL    1|true|yes: apply that seed on the default chain too
+//   OMEGA_LOCAL_L1_DATA_FEE_GWEI  local-fork L1 data fee fallback; default 1
+//   OMEGA_SEED_L1_ON_POLL_FAIL    1|true|yes: use fallback and skip ArbGasInfo polling;
+//                                 only accepted when both RPC endpoints are loopback
 //   OMEGA_FORCE_MEV_SHARE         set to any value to start the MEV-Share SSE stream even
 //                                 on a non-default chain (useful for integration testing)
 //
@@ -46,13 +46,12 @@
 //
 // ## Changelog (most recent first; see VCS for full history)
 //
-// - 2026-10-16 (noise reduction): two log-spam fixes for local/Anvil runs.
-//   (1) L2d ArbGasInfo poll: non-default chains (Anvil, Hardhat) have no ArbGasInfo
-//       precompile and return InvalidFEOpcode every 15 s. The poll now seeds the stable
-//       local L1 fee on the first failure and stays silent on subsequent failures.
-//       `seeded_local` is reset to false if a real Arbitrum poll ever succeeds, so the
-//       behaviour on Arbitrum One is unchanged. OMEGA_SEED_L1_ON_POLL_FAIL still forces
-//       seeding on the default chain if needed.
+// - 2026-10-25 (local fork RPC): an explicit local-fork L1 fallback now requires both
+//   Arbitrum RPC URLs to be loopback, seeds once, and skips ArbGasInfo polling entirely.
+//   This avoids InvalidFEOpcode on Anvil forks that preserve chain id 42161 without Nitro
+//   precompiles. Production RPC failures remain visible and never use the local estimate.
+// - 2026-10-16 (noise reduction): non-default chains seed the stable local L1 fee on the
+//   first ArbGasInfo failure and stay silent on subsequent failures.
 //   (2) MEV-Share SSE stream: only started on DEFAULT_CHAIN_ID (Arbitrum One). On any
 //       other chain the stream is skipped with a single INFO log. Set
 //       OMEGA_FORCE_MEV_SHARE=1 to override. This prevents the repeated
@@ -668,6 +667,38 @@ fn local_l1_data_fee_gwei_from_env() -> u64 {
         .ok()
         .and_then(|s| s.trim().parse::<u64>().ok())
         .unwrap_or(LOCAL_CHAIN_L1_DATA_FEE_GWEI_DEFAULT)
+}
+
+/// An explicit local-fork fallback is safe only when both RPC transports are loopback.
+/// This prevents a production endpoint from silently using a guessed L1 data fee.
+fn local_fork_l1_seed_requested() -> anyhow::Result<bool> {
+    let requested = std::env::var("OMEGA_SEED_L1_ON_POLL_FAIL")
+        .map(|value| {
+            let value = value.trim();
+            value == "1" || value.eq_ignore_ascii_case("true") || value.eq_ignore_ascii_case("yes")
+        })
+        .unwrap_or(false);
+
+    if !requested {
+        return Ok(false);
+    }
+
+    for name in ["ARBITRUM_RPC_URL", "ARBITRUM_HTTP_RPC_URL"] {
+        let endpoint = std::env::var(name).map_err(|_| {
+            anyhow::anyhow!("{name} must be set when local fork L1 fee seeding is enabled")
+        })?;
+        let url = reqwest::Url::parse(&endpoint).map_err(|error| {
+            anyhow::anyhow!("invalid {name} for local fork L1 fee seeding: {error}")
+        })?;
+        let is_loopback = matches!(url.host_str(), Some("127.0.0.1" | "localhost" | "::1"));
+        if !is_loopback {
+            anyhow::bail!(
+                "{name} must use a loopback host when OMEGA_SEED_L1_ON_POLL_FAIL is enabled"
+            );
+        }
+    }
+
+    Ok(true)
 }
 
 /// Load kill-switch thresholds from env. Evaluation lives in `omega_risk::kill_switch`;
@@ -1391,13 +1422,10 @@ async fn main() -> Result<()> {
 
     // ── L2d: ArbGasInfo L1 data fee polling + L1GasEma for CheckContext ────────
     //
-    // On non-default chains (Anvil, Hardhat, testnets) there is no ArbGasInfo
-    // precompile and every poll returns InvalidFEOpcode. We seed the stable local
-    // L1 fee on the FIRST failure and stay silent for all subsequent failures —
-    // one WARN is enough. `seeded_local` is reset to false if a real Arbitrum poll
-    // ever succeeds, so behaviour on Arbitrum One is unchanged.
-    // OMEGA_SEED_L1_ON_POLL_FAIL still forces the seed behaviour on the default
-    // chain when needed (e.g. an Arbitrum RPC that lacks the precompile).
+    // Non-default chains can seed a stable local fee on first failure. An explicit
+    // loopback-only fork setting seeds once and skips this poll entirely, since Anvil
+    // may preserve chain id 42161 without implementing Nitro's ArbGasInfo precompile.
+    // Production endpoints keep live polling and never use the local estimate.
     let l1_gas_ema = Arc::new(omega_risk::gas_model::L1GasEma::new(32));
     {
         let gas_client = rpc.clone();
@@ -1405,59 +1433,59 @@ async fn main() -> Result<()> {
         let l1_ema = Arc::clone(&l1_gas_ema);
         let chain_id_l2d = chain_id;
         let local_l1_fee_gwei = local_l1_data_fee_gwei_from_env();
-        tokio::spawn(async move {
-            let mut ticker = tokio::time::interval(Duration::from_secs(15));
-            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-            // True once we have seeded the stable local fee on a non-default chain.
-            // Prevents the same WARN firing every 15 s for the whole run.
-            let mut seeded_local = false;
-            loop {
-                ticker.tick().await;
-                match gas_client.fetch_l1_base_fee_estimate_gwei().await {
-                    Ok(gwei) => {
-                        gas_oracle.update_l1_data_fee_gwei(gwei);
-                        l1_ema.push_price(gwei);
-                        tracing::debug!(l1_data_fee_gwei = gwei, "ArbGasInfo poll: updated");
-                        // A successful poll means we are on a real Arbitrum node;
-                        // reset the flag so a later failure logs again if needed.
-                        seeded_local = false;
-                    }
-                    Err(e) => {
-                        let force_seed = std::env::var("OMEGA_SEED_L1_ON_POLL_FAIL")
-                            .map(|v| {
-                                let t = v.trim();
-                                t == "1"
-                                    || t.eq_ignore_ascii_case("true")
-                                    || t.eq_ignore_ascii_case("yes")
-                            })
-                            .unwrap_or(false);
-
-                        if chain_id_l2d != DEFAULT_CHAIN_ID || force_seed {
-                            if !seeded_local {
-                                // First failure on this non-default chain: seed and warn once.
+        if local_fork_l1_seed_requested()? {
+            gas_oracle.update_l1_data_fee_gwei(local_l1_fee_gwei);
+            l1_ema.push_price(local_l1_fee_gwei);
+            tracing::warn!(
+                chain_id = chain_id_l2d,
+                seeded_l1_data_fee_gwei = local_l1_fee_gwei,
+                "local fork mode: seeded L1 data fee; ArbGasInfo polling disabled"
+            );
+        } else {
+            tokio::spawn(async move {
+                let mut ticker = tokio::time::interval(Duration::from_secs(15));
+                ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                // True once we have seeded the stable local fee on a non-default chain.
+                // Prevents the same WARN firing every 15 s for the whole run.
+                let mut seeded_local = false;
+                loop {
+                    ticker.tick().await;
+                    match gas_client.fetch_l1_base_fee_estimate_gwei().await {
+                        Ok(gwei) => {
+                            gas_oracle.update_l1_data_fee_gwei(gwei);
+                            l1_ema.push_price(gwei);
+                            tracing::debug!(l1_data_fee_gwei = gwei, "ArbGasInfo poll: updated");
+                            // A successful poll means we are on a real Arbitrum node;
+                            // reset the flag so a later failure logs again if needed.
+                            seeded_local = false;
+                        }
+                        Err(e) => {
+                            if chain_id_l2d != DEFAULT_CHAIN_ID {
+                                if !seeded_local {
+                                    // First failure on this non-default chain: seed and warn once.
+                                    tracing::warn!(
+                                        error = %e,
+                                        seeded_l1_data_fee_gwei = local_l1_fee_gwei,
+                                        "ArbGasInfo poll failed on non-default chain — seeding stable \
+                                         local L1 data fee (subsequent failures will be silent)"
+                                    );
+                                    gas_oracle.update_l1_data_fee_gwei(local_l1_fee_gwei);
+                                    l1_ema.push_price(local_l1_fee_gwei);
+                                    seeded_local = true;
+                                }
+                                // else: already seeded, do nothing — no repeated WARN spam.
+                            } else {
                                 tracing::warn!(
                                     error = %e,
-                                    seeded_l1_data_fee_gwei = local_l1_fee_gwei,
-                                    force_seed,
-                                    "ArbGasInfo poll failed on non-default chain — seeding stable \
-                                     local L1 data fee (subsequent failures will be silent)"
+                                    "ArbGasInfo poll failed — keeping previous value"
                                 );
-                                gas_oracle.update_l1_data_fee_gwei(local_l1_fee_gwei);
-                                l1_ema.push_price(local_l1_fee_gwei);
-                                seeded_local = true;
                             }
-                            // else: already seeded, do nothing — no repeated WARN spam.
-                        } else {
-                            tracing::warn!(
-                                error = %e,
-                                "ArbGasInfo poll failed — keeping previous value"
-                            );
                         }
                     }
                 }
-            }
-        });
-        tracing::info!("L2d ArbGasInfo poll loop started (15s interval; L1GasEma window=32)");
+            });
+        }
+        tracing::info!("L2d L1 data fee source configured (L1GasEma window=32)");
     }
 
     // ── L2e: flashloan liquidity polling ───────────────────────────────────────
@@ -2051,7 +2079,9 @@ async fn main() -> Result<()> {
                         .await;
                         if let Some(ref journal) = journal7 {
                             for (r, p) in results.iter().zip(processed.iter()) {
-                                let status = if p.included {
+                                let status = if p.confirmation_unknown {
+                                    InFlightStatus::Abandoned
+                                } else if p.included {
                                     InFlightStatus::Included
                                 } else {
                                     InFlightStatus::Missed
@@ -2643,6 +2673,7 @@ async fn run_canary_loop(
             base_fee_gwei: snap.fee.base_fee_gwei,
             l1_data_fee_gwei: snap.fee.l1_data_fee_gwei,
             state_hash: snap.state_hash,
+            mev_share_events_in_window: 0,
         };
         match cnry.score(&sig).await {
             Ok(op) => tracing::debug!(score = op.score, "CANARY_PASS"),
@@ -2697,6 +2728,7 @@ async fn run_scoring_loop(
                     base_fee_gwei: snap.fee.base_fee_gwei,
                     l1_data_fee_gwei: snap.fee.l1_data_fee_gwei,
                     state_hash: snap.state_hash,
+                    mev_share_events_in_window: 0,
                 };
                 let oracle_snapshot = build_oracle_snapshot(
                     &chainlink_oracle,
@@ -3756,6 +3788,7 @@ mod hot_path_zk_provisioning_tests {
             base_fee_gwei: 5,
             l1_data_fee_gwei: 2,
             state_hash: [0x01u8; 32].into(),
+            mev_share_events_in_window: 0,
         }
     }
 
@@ -3945,6 +3978,7 @@ mod check_context_assembly_tests {
             base_fee_gwei: 7,
             l1_data_fee_gwei: 15,
             state_hash: [0xabu8; 32].into(),
+            mev_share_events_in_window: 0,
         }
     }
 

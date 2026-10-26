@@ -1,3 +1,4 @@
+# set-prod-env.ps1
 Set-Location C:\Users\silve\Documents\omega-engine
 function Load-Env($path) {
   Get-Content $path | ForEach-Object {
@@ -7,12 +8,12 @@ function Load-Env($path) {
   }
 }
 Load-Env .env.production.local
-$env:BALANCER_VAULT       = "0xBA12222222228d8Ba445958a75a0704d566BF2C8"
-$env:AAVE_POOL            = "0x794a61358D6845594F94dc1DB02A252b5b4814aD"
+$env:BALANCER_VAULT       = "0x09635F643e140090A9A8Dcd712eD6285858ceBef"
+$env:AAVE_POOL            = "0x794a61358D6843594F235190De1CcD5644eC68bB"
 $env:PROFIT_TOKEN         = "0x82aF49447D8a07e3bd95BD0d56f35241523fBab1"
-$env:ADMIN                = "0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266"
-$env:VAULT_ADDRESS        = "0x8A75eE1F4BbcEeD9491880F7A45950a66F5Dc712"
-$env:ORCHESTRATOR_ADDRESS = "0xEFEE320bAB39DC8fC91Fa9Ca29251fAcD32FE057"
+$env:ADMIN                = "0xC3B002f428a34267bA7C6d49e9Ed5FaC7BdE0F98"
+$env:VAULT_ADDRESS        = "0x8b8a1DdC0A2E7467D05f1672D867056847F3142E"
+$env:ORCHESTRATOR_ADDRESS = "0x29bED5E5c073Af9D693396cC2CE7DAfb529dd521"
 $env:ORCHESTRATOR         = $env:ORCHESTRATOR_ADDRESS
 foreach ($n in 'FLASHBOTS','BLOXROUTE','TITAN','EDEN') {
   [Environment]::SetEnvironmentVariable("OMEGA_RELAY_ENDPOINT_$n", "http://127.0.0.1:9", 'Process')

@@ -34,7 +34,7 @@ use std::sync::Arc;
 use dashmap::DashMap;
 use serde::Deserialize;
 use serde_json::json;
-use tracing::debug;
+use tracing::{debug, warn};
 
 use crate::client::BundlePayload;
 use crate::config::RelayName;
@@ -56,7 +56,7 @@ struct PendingBundle {
     blueprint_hash: String,
 }
 
-/// Result of a resolved (confirmed-included or given-up-on) bundle.
+/// Result of a bundle whose inclusion was confirmed, missed, or left unknown.
 #[derive(Debug, Clone)]
 pub struct ConfirmationResult {
     /// 0x-prefixed keccak256 hash of the bundle that was tracked.
@@ -64,9 +64,15 @@ pub struct ConfirmationResult {
     /// The relay this bundle was originally submitted through.
     pub relay: RelayName,
     /// Whether every transaction in the bundle had a successful on-chain receipt.
-    /// `false` means either a receipt showed failure, or the grace window expired
-    /// with no receipt found — this field does not distinguish those two cases.
+    /// A false value can mean a reverted transaction or a bundle that was never
+    /// included; `reverted` distinguishes an explicit failed receipt from a miss.
     pub included: bool,
+    /// Whether a transaction receipt explicitly reported failure (`status = 0x0`).
+    /// A missing receipt after the grace window is a missed bundle, not a revert.
+    pub reverted: bool,
+    /// Whether the confirmation RPC remained unavailable beyond the grace window.
+    /// Unknown outcomes must not be charged as misses or transaction failures.
+    pub confirmation_unknown: bool,
     /// Strategy identifier carried through from the original `BundlePayload`, for
     /// attributing this result back to the strategy that produced the bundle.
     pub strategy_id: String,
@@ -137,9 +143,46 @@ impl InclusionTracker {
                 continue;
             };
 
-            let included = self.check_all_included(&pending.tx_hashes).await;
+            let receipt_status = match self.check_all_included(&pending.tx_hashes).await {
+                Ok(status) => status,
+                Err(error) => {
+                    let confirmation_unknown = current_block
+                        >= pending
+                            .target_block
+                            .saturating_add(CONFIRMATION_GRACE_BLOCKS);
+                    warn!(
+                        bundle_hash = %bundle_hash,
+                        error = %error,
+                        confirmation_unknown,
+                        "confirmation RPC failed"
+                    );
+                    if confirmation_unknown {
+                        resolved.push(ConfirmationResult {
+                            bundle_hash,
+                            relay: pending.relay,
+                            included: false,
+                            reverted: false,
+                            confirmation_unknown: true,
+                            strategy_id: pending.strategy_id,
+                            nonce: pending.nonce,
+                            expected_profit_net_wei: pending.expected_profit_net_wei,
+                            blueprint_hash: pending.blueprint_hash,
+                        });
+                    } else {
+                        self.pending.insert(bundle_hash, pending);
+                    }
+                    continue;
+                }
+            };
+            let included = matches!(receipt_status, ReceiptCheck::Included);
+            let reverted = matches!(receipt_status, ReceiptCheck::Reverted);
 
-            if !included && current_block < pending.target_block + CONFIRMATION_GRACE_BLOCKS {
+            if matches!(receipt_status, ReceiptCheck::Pending)
+                && current_block
+                    < pending
+                        .target_block
+                        .saturating_add(CONFIRMATION_GRACE_BLOCKS)
+            {
                 // Not yet confirmed, but still within the grace window — re-queue rather
                 // than prematurely recording a false negative.
                 self.pending.insert(bundle_hash, pending);
@@ -159,6 +202,8 @@ impl InclusionTracker {
                 bundle_hash,
                 relay: pending.relay,
                 included,
+                reverted,
+                confirmation_unknown: false,
                 strategy_id: pending.strategy_id,
                 nonce: pending.nonce,
                 expected_profit_net_wei: pending.expected_profit_net_wei,
@@ -174,20 +219,27 @@ impl InclusionTracker {
         self.pending.len()
     }
 
-    async fn check_all_included(&self, tx_hashes: &[[u8; 32]]) -> bool {
+    async fn check_all_included(&self, tx_hashes: &[[u8; 32]]) -> RelayResult<ReceiptCheck> {
         if tx_hashes.is_empty() {
-            return false;
+            return Ok(ReceiptCheck::Pending);
         }
+        let mut missing_receipt = false;
         for h in tx_hashes {
             match self.get_receipt_status(h).await {
-                Ok(true) => continue,
-                _ => return false,
+                Ok(Some(true)) => continue,
+                Ok(Some(false)) => return Ok(ReceiptCheck::Reverted),
+                Ok(None) => missing_receipt = true,
+                Err(error) => return Err(error),
             }
         }
-        true
+        if missing_receipt {
+            Ok(ReceiptCheck::Pending)
+        } else {
+            Ok(ReceiptCheck::Included)
+        }
     }
 
-    async fn get_receipt_status(&self, tx_hash: &[u8; 32]) -> RelayResult<bool> {
+    async fn get_receipt_status(&self, tx_hash: &[u8; 32]) -> RelayResult<Option<bool>> {
         let hash_hex = format!("0x{}", hex::encode(tx_hash));
         let body = json!({
             "jsonrpc": "2.0",
@@ -204,21 +256,55 @@ impl InclusionTracker {
             .await
             .map_err(|e| RelayError::ConfirmationRpcFailed(e.to_string()))?;
 
+        let resp = resp
+            .error_for_status()
+            .map_err(|e| RelayError::ConfirmationRpcFailed(e.to_string()))?;
+
         let parsed: ReceiptRpcResponse = resp
             .json()
             .await
             .map_err(|e| RelayError::ConfirmationRpcFailed(e.to_string()))?;
 
+        if let Some(error) = parsed.error {
+            return Err(RelayError::ConfirmationRpcFailed(format!(
+                "JSON-RPC error {}: {}",
+                error.code, error.message
+            )));
+        }
+
         match parsed.result {
-            Some(receipt) => Ok(receipt.status.as_deref() == Some("0x1")),
-            None => Ok(false), // not mined yet (or never will be)
+            Some(receipt) => match receipt.status.as_deref() {
+                Some("0x1") => Ok(Some(true)),
+                Some("0x0") => Ok(Some(false)),
+                Some(status) => Err(RelayError::ConfirmationRpcFailed(format!(
+                    "unexpected receipt status {status:?}"
+                ))),
+                None => Err(RelayError::ConfirmationRpcFailed(
+                    "receipt response omitted status".to_string(),
+                )),
+            },
+            None => Ok(None), // not mined yet (or never will be)
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReceiptCheck {
+    Included,
+    Reverted,
+    Pending,
 }
 
 #[derive(Deserialize)]
 struct ReceiptRpcResponse {
     result: Option<TxReceipt>,
+    error: Option<JsonRpcError>,
+}
+
+#[derive(Deserialize)]
+struct JsonRpcError {
+    code: i64,
+    message: String,
 }
 
 #[derive(Deserialize)]
@@ -307,7 +393,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn reconcile_past_grace_window_gives_up_and_resolves_false() {
+    async fn confirmation_rpc_error_after_grace_resolves_unknown_without_leaking_pending() {
         let tracker = InclusionTracker::new("http://127.0.0.1:1"); // deliberately unreachable
         let bundle = BundlePayload {
             bundle_hash: "0xabc".into(),
@@ -316,15 +402,13 @@ mod tests {
             ..Default::default()
         };
         tracker.track(RelayName::Flashbots, &bundle).unwrap();
-        // Past target block + grace window, RPC unreachable so never confirms —
-        // must resolve as not-included rather than staying pending forever.
+        // Past target block + grace window, the RPC remains unreachable. Resolve as
+        // unknown rather than treating a transport error as a miss or retaining it forever.
         let results = tracker.reconcile(100 + CONFIRMATION_GRACE_BLOCKS).await;
         assert_eq!(results.len(), 1);
-        // `results[0]` would trip this crate's `clippy::indexing_slicing` deny
-        // (see lib.rs) even inside tests, since the test module only allows
-        // `unwrap_used`/`indexing_slicing` itself, not raw `[]` panics implicitly —
-        // use `.first().unwrap()` to stay within what's actually allowed here.
-        assert!(!results.first().unwrap().included);
-        assert_eq!(tracker.pending_count(), 0, "must not stay pending forever");
+        assert!(results
+            .first()
+            .is_some_and(|result| result.confirmation_unknown));
+        assert_eq!(tracker.pending_count(), 0, "unresolved entry is bounded");
     }
 }

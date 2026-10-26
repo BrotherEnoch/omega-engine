@@ -43,6 +43,11 @@ chrono = { version = "0.4", features = ["serde"] }
 clap = { version = "4", features = ["derive"] }
 omega-risk = { path = "../omega-risk" }
 
+omega-core = { path = "../omega-core" }
+omega-strategies = { path = "../omega-strategies" }
+omega-flashloan = { path = "../omega-flashloan" }
+alloy-primitives = { workspace = true }
+
 [dev-dependencies]
 tempfile = "3"
 

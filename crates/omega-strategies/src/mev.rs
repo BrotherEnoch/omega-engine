@@ -527,6 +527,7 @@ mod tests {
             base_fee_gwei: 10,
             l1_data_fee_gwei: 2,
             state_hash: hash,
+            mev_share_events_in_window: 0,
         }
     }
 

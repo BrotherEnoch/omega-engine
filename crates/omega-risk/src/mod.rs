@@ -26,13 +26,30 @@
 //
 //   8. Metric counters increment on pass/fail (smoke-test only — no actual Prometheus
 //      server needed; we just confirm the counters can be read without panic).
+//
+// ## Fix (this revision): compile errors and missing fields
+//
+// `GAS_SPIKE_THRESHOLD` was imported from `crate::context` but that `f64`
+// constant was removed in the audit revision that replaced it with the
+// integer-ratio pair `GAS_SPIKE_THRESHOLD_NUM` / `GAS_SPIKE_THRESHOLD_DEN`.
+// Removed from the import list; the gas-spike boundary test now derives its
+// expected threshold from the integer constants directly (same pattern as
+// `checks_tests::gas_spike_threshold_matches_named_constant_not_a_duplicate_literal`
+// in checks.rs, which already does this correctly).
+//
+// `base_bp()` was missing `nonce: u64` (added to `BlueprintFields` by the
+// checks.rs audit for check 15 nonce-replay). Added with value 1 (the first
+// valid nonce for an account whose `latest_blueprint_nonce` in `base_ctx()` is
+// 0). Also added `latest_blueprint_nonce: 0` and the account-exposure fields
+// (`current_account_exposure_wei`, `max_account_exposure_wei`) to `base_ctx()`,
+// which were added at the same time and have the same missing-field symptom.
 
 use crate::checks::{BlueprintFields, CheckResult, run_all_checks};
 use crate::circuit_breakers::{CircuitBreakerRegistry, CircuitState, EV_WINDOW_BLOCKS};
 use crate::competition::{AssetTier, competition_probability, priority_fee_gwei};
 use crate::context::{
     CheckContext, FlashloanSnapshot, OracleSnapshot,
-    CHAINLINK_STALENESS_SECS, GAS_SPIKE_THRESHOLD,
+    CHAINLINK_STALENESS_SECS, GAS_SPIKE_THRESHOLD_NUM, GAS_SPIKE_THRESHOLD_DEN,
 };
 use crate::flash_crash::FlashCrashGuard;
 use crate::gas_model::{
@@ -61,6 +78,10 @@ fn base_bp() -> BlueprintFields {
         strategy_bytecode_hash:  [0xdd; 32],
         price_impact_bps:        Some(30),
         ofa_compliant:           true,
+        // Added by checks.rs audit (check 15 nonce-replay).
+        // Value 1: first valid nonce for an account whose latest_blueprint_nonce
+        // in base_ctx() is 0 (bp.nonce=1 > ctx.latest_blueprint_nonce=0 → passes).
+        nonce:                   1,
     }
 }
 
@@ -91,6 +112,10 @@ fn base_ctx() -> CheckContext {
         strategy_bytecode_hash:      [0xdd; 32],
         risk_score:                  0.20,
         max_risk_score:              0.85,
+        // Added by checks.rs audit (checks 14 and 15).
+        current_account_exposure_wei: 0,
+        max_account_exposure_wei:     10_000_000_000_000_000_000, // 10 ETH headroom
+        latest_blueprint_nonce:       0,
     }
 }
 
@@ -450,24 +475,30 @@ fn ema_thread_safe_concurrent_pushes() {
 }
 
 // ─── 8. Gas spike boundary ───────────────────────────────────────────────────
+//
+// Fix: was `GAS_SPIKE_THRESHOLD` (the removed f64 constant). Now derives the
+// expected threshold from `GAS_SPIKE_THRESHOLD_NUM` / `GAS_SPIKE_THRESHOLD_DEN`,
+// the integer-ratio constants that replaced it — same approach used in
+// `checks_tests::gas_spike_threshold_matches_named_constant_not_a_duplicate_literal`.
 
 #[test]
 fn gas_spike_threshold_boundary_conditions() {
     let bp = base_bp(); // l1_data_fee_at_creation = 40
 
-    // Exactly 30 % increase: 40 × 1.30 = 52 — NOT strictly greater, should pass.
+    // Exactly threshold % increase: 40 × (1 + NUM/DEN) = 40 × 1.30 = 52 — must pass (not strictly >).
+    let threshold_price = 40 + (40 * GAS_SPIKE_THRESHOLD_NUM) / GAS_SPIKE_THRESHOLD_DEN;
     let mut ctx = base_ctx();
-    ctx.current_l1_gas_price_gwei = 52;
+    ctx.current_l1_gas_price_gwei = threshold_price;
     assert_eq!(run_all_checks(&bp, &ctx), CheckResult::Pass,
-        "30% delta exactly equals threshold — should pass (not strictly greater)");
+        "delta exactly equal to threshold should pass (not strictly greater)");
 
-    // 31 % increase: 40 × 1.31 = 52.4 → 53 gwei — should fail.
+    // One gwei above threshold — should fail.
     let mut ctx2 = base_ctx();
-    ctx2.current_l1_gas_price_gwei = 53;
+    ctx2.current_l1_gas_price_gwei = threshold_price + 1;
     assert_eq!(
         run_all_checks(&bp, &ctx2),
         CheckResult::Fail(omega_core::errors::DropCode::MissGasSpike),
-        "31% delta should trigger MissGasSpike"
+        "delta just above threshold should trigger MissGasSpike"
     );
 }
 

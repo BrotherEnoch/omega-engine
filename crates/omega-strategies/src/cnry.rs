@@ -5,7 +5,7 @@
 // ## Audit note (this revision)
 //
 // `build_blueprint` here never actually constructs an `ExecutionBlueprint`
-// â€” it always returns `Err(MissWhitelist)` before reaching that point, by
+// — it always returns `Err(MissWhitelist)` before reaching that point, by
 // design (CNRY must never produce a real blueprint). So none of the
 // `blueprint_hash` inconsistency issues fixed in sa.rs/la.rs/msa.rs/mev.rs
 // apply to this file's production code. The only change needed here is
@@ -14,7 +14,7 @@
 // requires `flashloan_provider_type`, `provider_contract`,
 // `flashloan_token`, and `max_base_fee_gwei` at every construction site
 // (added in `omega-core` to support real flashloan provider/pool
-// selection â€” see that crate's `types::blueprint` module doc comment).
+// selection — see that crate's `types::blueprint` module doc comment).
 // CNRY never sources a flashloan, so these are ZERO/placeholder values
 // here, same treatment as the pre-existing `signal_id`/`client_order_id`/
 // `idempotency_key` placeholders below.
@@ -34,17 +34,17 @@ use omega_core::types::lane::Lane;
 use omega_core::types::strategy::{OpScore, SignalState, SimResult, StrategyTrait};
 use omega_core::{GasConfig, OmegaConfig};
 
-// â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+// ─────────────────────────────────────────────────────────────────────────────
 // Constants
-// â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+// ─────────────────────────────────────────────────────────────────────────────
 
 const CNRY_GAS_BUDGET: u64 = 0;
 const CNRY_BYTECODE_HASH: B256 = B256::ZERO;
 const CNRY_SPREAD_WEI: u128 = 200_000_000_000_000_000; // 0.2 ETH
 
-// â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+// ─────────────────────────────────────────────────────────────────────────────
 // CnryStrategy
-// â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+// ─────────────────────────────────────────────────────────────────────────────
 
 pub struct CnryStrategy {
     chain_id: u64,
@@ -157,14 +157,14 @@ impl StrategyTrait for CnryStrategy {
     }
 }
 
-// â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+// ─────────────────────────────────────────────────────────────────────────────
 // Tests
-// â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+// ─────────────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    // Address was missing â€” fixes E0433 at lines 261 and 299
+    // Address was missing — fixes E0433 at lines 261 and 299
     use alloy_primitives::Address;
     use omega_core::types::flashloan_provider::FlashloanProviderType;
     use omega_core::OmegaConfig;
@@ -182,13 +182,14 @@ mod tests {
             base_fee_gwei: base_fee,
             l1_data_fee_gwei: 2,
             state_hash: B256::from([0x01; 32]),
+            mev_share_events_in_window: 0,
         }
     }
 
     /// Test-only blueprint literal. CNRY's real `build_blueprint` never
     /// constructs one of these (see module doc comment), so signal_id/
     /// client_order_id/idempotency_key here are just placeholders to
-    /// satisfy the struct's field list â€” not integrity-checked values.
+    /// satisfy the struct's field list — not integrity-checked values.
     /// Do not copy this pattern into code that DOES rely on
     /// verify_hash()/verify_idempotency_key(). Same treatment applies to
     /// the flashloan_provider_type/provider_contract/flashloan_token/

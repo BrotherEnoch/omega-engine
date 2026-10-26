@@ -661,6 +661,7 @@ mod tests {
             base_fee_gwei: base_fee,
             l1_data_fee_gwei: 2,
             state_hash: B256::from([0x03; 32]),
+            mev_share_events_in_window: 0,
         }
     }
 

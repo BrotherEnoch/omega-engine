@@ -124,17 +124,23 @@ pub fn log_confirmed(
     blueprint_hash: &str,
     bundle_hash: &str,
     included: bool,
+    confirmation_unknown: bool,
     provisional_realized_wei: Option<i128>,
     vault_realized_wei: Option<i128>,
     kill_tripped: bool,
 ) {
     info!(
-        audit = "blueprint_confirmed",
+        audit = if confirmation_unknown {
+            "blueprint_confirmation_unknown"
+        } else {
+            "blueprint_confirmed"
+        },
         at = %at.to_rfc3339(),
         strategy_id = %strategy_id,
         blueprint_hash = %blueprint_hash,
         bundle_hash = %bundle_hash,
         included,
+        confirmation_unknown,
         provisional_realized_wei = ?provisional_realized_wei,
         vault_realized_wei = ?vault_realized_wei,
         kill_tripped,
