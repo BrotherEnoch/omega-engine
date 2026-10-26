@@ -51,9 +51,10 @@ struct PriceAttestation {
     token_b: [u8; 20],
     price_a_per_b_1e18: u128,
     attested_at_unix: u64,
-    /// Host-validated signature (r||s). Guest treats this as binding input;
+    /// Host-validated signature (r, s). Guest treats these as binding inputs;
     /// see file header on signature verification boundary.
-    signature: [u8; 64],
+    signature_r: [u8; 32],
+    signature_s: [u8; 32],
 }
 
 #[derive(Deserialize)]
@@ -101,7 +102,11 @@ pub fn main() {
         // Signature presence (host must have verified against ORACLE_PUBKEY).
         // Non-zero signature is required so empty placeholders cannot pass.
         assert!(
-            attestation.signature.iter().any(|&b| b != 0),
+            attestation
+                .signature_r
+                .iter()
+                .chain(attestation.signature_s.iter())
+                .any(|&b| b != 0),
             "attestation signature is empty — host must supply a real signature"
         );
 
