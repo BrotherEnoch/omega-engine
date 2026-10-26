@@ -1,0 +1,76 @@
+name: SP1 vkey check
+
+on:
+  push:
+    branches:
+      - codex/isolated-sp1-vkey-build
+  workflow_dispatch:
+    inputs:
+      expected_vkey:
+        description: Expected PROGRAM_VKEY (bytes32)
+        required: true
+        type: string
+        default: 0x00d69e6f6f0106ba374a04de22d65c881dfabb5fe2e4924cf97ea29065ca39d2
+
+permissions:
+  contents: read
+
+jobs:
+  build-and-check:
+    name: Build SP1 ELF and check PROGRAM_VKEY
+    runs-on: macos-14
+    timeout-minutes: 90
+    env:
+      CARGO_TERM_COLOR: always
+      EXPECTED_VKEY: ${{ github.event.inputs.expected_vkey || '0x00d69e6f6f0106ba374a04de22d65c881dfabb5fe2e4924cf97ea29065ca39d2' }}
+    steps:
+      - name: Checkout SP1 project only
+        uses: actions/checkout@v4
+        with:
+          sparse-checkout-cone-mode: false
+          sparse-checkout: |
+            /sp1-program/**
+            !/sp1-program/**/.env
+            !/sp1-program/**/.env.*
+
+      - name: Install Protocol Buffers compiler
+        uses: arduino/setup-protoc@v3
+        with:
+          repo-token: ${{ github.token }}
+
+      - name: Install pinned SP1 toolchain
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+          source "$HOME/.cargo/env"
+          curl -L https://sp1.succinct.xyz | bash
+          "$HOME/.sp1/bin/sp1up" -v 6.4.0
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+          echo "$HOME/.sp1/bin" >> "$GITHUB_PATH"
+          "$HOME/.sp1/bin/cargo-prove" prove --version
+
+      - name: Build guest ELF
+        working-directory: sp1-program/program
+        shell: bash
+        run: |
+          set -euo pipefail
+          "$HOME/.sp1/bin/cargo-prove" prove build
+          test -s elf/riscv32im-succinct-zkvm-elf
+
+      - name: Derive and compare PROGRAM_VKEY
+        working-directory: sp1-program/program
+        shell: bash
+        env:
+          EXPECTED_VKEY: ${{ env.EXPECTED_VKEY }}
+        run: |
+          set -euo pipefail
+          [[ "$EXPECTED_VKEY" =~ ^0x[0-9a-fA-F]{64}$ ]]
+          vkey_output="$("$HOME/.sp1/bin/cargo-prove" prove vkey --elf elf/riscv32im-succinct-zkvm-elf 2>&1)"
+          printf '%s\n' "$vkey_output"
+          if ! grep -Eiq "${EXPECTED_VKEY}" <<< "$vkey_output"; then
+            echo "PROGRAM_VKEY mismatch" >&2
+            exit 1
+          fi
+          echo "PROGRAM_VKEY matches the supplied bytes32 value"
+
