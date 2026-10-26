@@ -10,7 +10,7 @@ on:
         description: Expected PROGRAM_VKEY (bytes32)
         required: true
         type: string
-        default: '0x00d69e6f6f0106ba374a04de22d65c881dfabb5fe2e4924cf97ea29065ca39d2'
+        default: '0x00b393710ddf133e1901f4bd51f7e81e74e98d2a3033eb5ddc9226589b7774cc'
 
 permissions:
   contents: read
@@ -26,7 +26,7 @@ jobs:
     timeout-minutes: 90
     env:
       CARGO_TERM_COLOR: always
-      EXPECTED_VKEY: ${{ github.event.inputs.expected_vkey || '0x00d69e6f6f0106ba374a04de22d65c881dfabb5fe2e4924cf97ea29065ca39d2' }}
+      EXPECTED_VKEY: ${{ github.event.inputs.expected_vkey || '0x00b393710ddf133e1901f4bd51f7e81e74e98d2a3033eb5ddc9226589b7774cc' }}
     steps:
       - name: Fetch only SP1 source (exclude local environment files and submodules)
         shell: bash
