@@ -10,7 +10,7 @@ on:
         description: Expected PROGRAM_VKEY (bytes32)
         required: true
         type: string
-        default: 0x00d69e6f6f0106ba374a04de22d65c881dfabb5fe2e4924cf97ea29065ca39d2
+        default: '0x00d69e6f6f0106ba374a04de22d65c881dfabb5fe2e4924cf97ea29065ca39d2'
 
 permissions:
   contents: read
