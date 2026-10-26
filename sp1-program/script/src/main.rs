@@ -89,14 +89,16 @@ fn main() {
     if !args.insecure_dev {
         // Minimal non-empty signature so the guest non-zero check can pass in
         // integration tests. Production callers must supply a real attestation.
-        let mut sig = [0u8; 64];
-        sig[0] = 1;
+        let mut signature_r = [0u8; 32];
+        signature_r[0] = 1;
+        let signature_s = [0u8; 32];
         let attestation = (
             [0x11u8; 20], // token_a
             [0x22u8; 20], // token_b
             1_000_000_000_000_000_000u128, // price 1.0 * 1e18
             1_700_000_000u64, // attested_at
-            sig,
+            signature_r,
+            signature_s,
         );
         stdin.write(&attestation);
 
