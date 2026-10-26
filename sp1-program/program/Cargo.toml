@@ -5,10 +5,7 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-omega-proof-lib = { path = "../lib" }
-alloy-sol-types = "0.8"
 sp1-zkvm = "6"
-serde = { version = "1", default-features = false, features = ["derive"] }
 
 [[bin]]
 name = "omega-proof-program"
