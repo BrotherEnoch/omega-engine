@@ -8,6 +8,7 @@ edition = "2021"
 omega-proof-lib = { path = "../lib" }
 alloy-sol-types = "0.8"
 sp1-zkvm = "6"
+serde = { version = "1", default-features = false, features = ["derive"] }
 
 [features]
 # Gates the no-op dev/test path in src/main.rs. NOT on by default. See this crate's own
@@ -22,3 +23,4 @@ insecure_dev_noop = []
 [[bin]]
 name = "omega-proof-program"
 path = "src/main.rs"
+
