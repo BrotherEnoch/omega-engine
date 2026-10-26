@@ -17,6 +17,7 @@ alloy-sol-types = "0.8"
 sp1-sdk = { version = "6", features = ["blocking"] }
 hex = "0.4"
 anyhow = "1"
+clap = { version = "4", features = ["derive"] }
 
 # Groth16 proving (required for on-chain verification -- see main.rs) needs Docker running
 # locally, per Succinct's own docs, plus >=16GB RAM. This is a runtime/environment requirement,

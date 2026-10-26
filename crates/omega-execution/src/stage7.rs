@@ -8,7 +8,7 @@
 // against real chain receipts. This module owns the *driver* and the
 // *side-effects* that must follow each `ConfirmationResult`:
 //
-//   1. Feed kill-switch outcomes (success / failure + provisional realized P&L)
+//   1. Feed confirmed success/revert outcomes and known P&L into the kill switch
 //   2. Advance NonceRegistry only on confirmed inclusion
 //   3. Structured audit logging so every trade is reconstructable
 //
@@ -23,7 +23,8 @@
 //
 // Vault lookup failures must never panic the Stage-7 task. They log at
 // `warn` and fall back to provisional expected profit so kill-switch
-// consecutive-failure accounting still advances on `included`/`missed`.
+// consecutive-failure accounting advances only on confirmed inclusion or revert.
+// Missed bundles and unknown RPC outcomes do not change that streak.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -92,6 +93,7 @@ pub struct ProcessedConfirmation {
     pub bundle_hash: String,
     pub strategy_id: String,
     pub included: bool,
+    pub confirmation_unknown: bool,
     pub nonce: u64,
     /// Provisional realized P&L fed to the kill switch (see module doc).
     pub provisional_realized_wei: Option<i128>,
@@ -114,7 +116,9 @@ fn provisional_from(
     cfg: &Stage7Config,
     vault: Option<i128>,
 ) -> Option<i128> {
-    if r.included {
+    if r.confirmation_unknown {
+        None
+    } else if r.included {
         match vault {
             Some(v) if v != 0 => Some(v),
             _ => Some(r.expected_profit_net_wei.min(i128::MAX as u128) as i128),
@@ -136,15 +140,25 @@ fn apply_one(
     let scope = scope_of(r);
     let provisional_realized = provisional_from(r, cfg, vault);
 
-    let kill_trip_reason = kill_switches
-        .record_outcome(&scope, provisional_realized, r.included)
-        .map(|reason| reason.to_string());
+    let trip = if r.confirmation_unknown {
+        None
+    } else if r.included || r.reverted {
+        kill_switches.record_outcome(&scope, provisional_realized, r.included)
+    } else {
+        // A relay-accepted bundle that never appears on chain is not proof of a
+        // reverted transaction. Keep its optional P&L accounting, but do not
+        // advance or clear the consecutive on-chain failure streak.
+        kill_switches.record_profit_only(&scope, provisional_realized)
+    };
+    let kill_trip_reason = trip.map(|reason| reason.to_string());
 
     if let Some(ref reason) = kill_trip_reason {
         error!(
             reason = %reason,
             strategy = %scope,
             included = r.included,
+            reverted = r.reverted,
+            confirmation_unknown = r.confirmation_unknown,
             nonce = r.nonce,
             bundle_hash = %r.bundle_hash,
             blueprint_hash = %r.blueprint_hash,
@@ -164,6 +178,7 @@ fn apply_one(
         &r.blueprint_hash,
         &r.bundle_hash,
         r.included,
+        r.confirmation_unknown,
         provisional_realized,
         vault,
         kill_trip_reason.is_some(),
@@ -174,6 +189,8 @@ fn apply_one(
         blueprint_hash = %r.blueprint_hash,
         strategy = %scope,
         included = r.included,
+        reverted = r.reverted,
+        confirmation_unknown = r.confirmation_unknown,
         nonce = r.nonce,
         provisional_realized_wei = ?provisional_realized,
         vault_realized_wei = ?vault,
@@ -185,6 +202,7 @@ fn apply_one(
         bundle_hash: r.bundle_hash.clone(),
         strategy_id: scope,
         included: r.included,
+        confirmation_unknown: r.confirmation_unknown,
         nonce: r.nonce,
         provisional_realized_wei: provisional_realized,
         vault_realized_wei: vault,
@@ -355,6 +373,8 @@ mod tests {
             bundle_hash: format!("0xbundle{nonce}"),
             relay: RelayName::Flashbots,
             included,
+            reverted: false,
+            confirmation_unknown: false,
             strategy_id: strategy.to_string(),
             nonce,
             expected_profit_net_wei: profit,
@@ -406,7 +426,7 @@ mod tests {
     }
 
     #[test]
-    fn consecutive_misses_can_trip_kill_switch() {
+    fn consecutive_misses_do_not_trip_revert_kill_switch() {
         let ks = KillSwitchRegistry::new(KillSwitchConfig {
             max_cumulative_loss_wei: 10u128.pow(18) * 1000,
             max_loss_per_window_wei: 10u128.pow(18) * 1000,
@@ -421,8 +441,8 @@ mod tests {
         };
         let batch: Vec<_> = (0..3).map(|i| sample_result("MEV", false, 0, i)).collect();
         let processed = process_confirmation_results(&batch, &ks, &nr, &cfg);
-        assert!(processed[2].kill_trip_reason.is_some());
-        assert!(ks.guard("MEV").is_err());
+        assert!(processed[2].kill_trip_reason.is_none());
+        assert!(ks.guard("MEV").is_ok());
     }
 
     struct FixedLookup(i128);

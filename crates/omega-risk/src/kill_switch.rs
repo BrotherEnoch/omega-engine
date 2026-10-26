@@ -448,7 +448,14 @@ impl KillSwitch {
         realized_profit_wei: Option<i128>,
         success: bool,
     ) -> Option<TripReason> {
-        self.record_outcome_at(realized_profit_wei, success, Utc::now())
+        self.record_outcome_inner(realized_profit_wei, Some(success), Utc::now())
+    }
+
+    /// Records realized P&L without changing the consecutive submission-failure streak.
+    /// Use for outcomes such as bundles that expired without a receipt: they are not
+    /// evidence that an on-chain transaction reverted or succeeded.
+    pub fn record_profit_only(&self, realized_profit_wei: Option<i128>) -> Option<TripReason> {
+        self.record_outcome_inner(realized_profit_wei, None, Utc::now())
     }
 
     /// Same as `record_outcome` but with an explicit timestamp, so the
@@ -460,13 +467,24 @@ impl KillSwitch {
         success: bool,
         now: DateTime<Utc>,
     ) -> Option<TripReason> {
+        self.record_outcome_inner(realized_profit_wei, Some(success), now)
+    }
+
+    fn record_outcome_inner(
+        &self,
+        realized_profit_wei: Option<i128>,
+        success: Option<bool>,
+        now: DateTime<Utc>,
+    ) -> Option<TripReason> {
         let mut state = self.state.lock();
 
         // Update consecutive-failure streak.
-        if success {
-            state.consecutive_failures = 0;
-        } else {
-            state.consecutive_failures = state.consecutive_failures.saturating_add(1);
+        if let Some(success) = success {
+            if success {
+                state.consecutive_failures = 0;
+            } else {
+                state.consecutive_failures = state.consecutive_failures.saturating_add(1);
+            }
         }
 
         // Update cumulative + windowed loss tracking. Only negative
@@ -706,6 +724,28 @@ impl KillSwitchRegistry {
     ) -> Option<TripReason> {
         let switch = self.get_or_create(scope);
         let result = switch.record_outcome(realized_profit_wei, success);
+
+        metrics::KILL_SWITCH_CUMULATIVE_LOSS_WEI
+            .with_label_values(&[scope])
+            .set(switch.cumulative_loss_wei() as f64);
+
+        if result.is_some() {
+            metrics::KILL_SWITCH_TRIPPED
+                .with_label_values(&[scope])
+                .set(1.0);
+        }
+
+        result
+    }
+
+    /// Records P&L while leaving the consecutive-failure streak unchanged.
+    pub fn record_profit_only(
+        &self,
+        scope: &str,
+        realized_profit_wei: Option<i128>,
+    ) -> Option<TripReason> {
+        let switch = self.get_or_create(scope);
+        let result = switch.record_profit_only(realized_profit_wei);
 
         metrics::KILL_SWITCH_CUMULATIVE_LOSS_WEI
             .with_label_values(&[scope])
