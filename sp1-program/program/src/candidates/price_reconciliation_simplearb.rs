@@ -1,20 +1,12 @@
 // sp1-program/program/src/candidates/price_reconciliation_simplearb.rs
 //
-// Reference implementation of the SimpleArb price-reconciliation claim.
-// The production guest program (main.rs) embeds this logic directly.
-// This file remains as documentation and as a host-side test vector source.
+// UNSAFE REFERENCE ONLY — not part of the guest binary and not a production
+// verifier. This arithmetic helper does not authenticate oracle signatures,
+// bind the claim to OmegaOrchestrator calldata, or account for execution costs.
+// The production guest is fail-closed until those properties are implemented.
 
 use alloy_sol_types::SolValue;
 use omega_proof_lib::PublicValuesStruct;
-
-/// Trusted oracle signer's public key, baked in at build time.
-/// CHANGING THIS VALUE CHANGES THE PROGRAM AND THEREFORE PROGRAM_VKEY.
-/// Non-zero well-known secp256k1 generator (compressed). REPLACE before production.
-pub const ORACLE_PUBKEY: [u8; 33] = [
-    0x02, 0x79, 0xbe, 0x66, 0x7e, 0xf9, 0xdc, 0xbb, 0xac, 0x55, 0xa0, 0x62, 0x95, 0xce, 0x87, 0x0b,
-    0x07, 0x02, 0x9b, 0xfc, 0xdb, 0x2d, 0xce, 0x28, 0xd9, 0x59, 0xf2, 0x81, 0x5b, 0x16, 0xf8, 0x17,
-    0x98,
-];
 
 /// Maximum age (seconds) a price attestation may have before rejection.
 pub const MAX_PRICE_STALENESS_SECS: u64 = 60;
@@ -87,3 +79,4 @@ pub fn encode_public_values(
     };
     PublicValuesStruct::abi_encode(&pv)
 }
+
