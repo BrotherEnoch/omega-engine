@@ -2878,6 +2878,7 @@ version = "0.1.0"
 dependencies = [
  "alloy-sol-types",
  "omega-proof-lib",
+ "serde",
  "sp1-zkvm",
 ]
 
