@@ -32,6 +32,7 @@ sp1_zkvm::entrypoint!(main);
 
 use alloy_sol_types::SolValue;
 use omega_proof_lib::PublicValuesStruct;
+use serde::Deserialize;
 
 /// Non-zero well-known secp256k1 generator (compressed). REPLACE with the real
 /// oracle operator pubkey before a production PROGRAM_VKEY. Changing this
@@ -44,7 +45,7 @@ const ORACLE_PUBKEY: [u8; 33] = [
 
 const MAX_PRICE_STALENESS_SECS: u64 = 60;
 
-#[derive(Clone)]
+#[derive(Clone, Deserialize)]
 struct PriceAttestation {
     token_a: [u8; 20],
     token_b: [u8; 20],
@@ -55,6 +56,7 @@ struct PriceAttestation {
     signature: [u8; 64],
 }
 
+#[derive(Deserialize)]
 struct SimpleArbClaim {
     pool_a: [u8; 20],
     pool_b: [u8; 20],
@@ -161,3 +163,4 @@ pub fn main() {
         commit_public_values(blueprint_hash, public_inputs_hash);
     }
 }
+
