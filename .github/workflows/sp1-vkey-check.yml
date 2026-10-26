@@ -24,15 +24,23 @@ jobs:
       CARGO_TERM_COLOR: always
       EXPECTED_VKEY: ${{ github.event.inputs.expected_vkey || '0x00d69e6f6f0106ba374a04de22d65c881dfabb5fe2e4924cf97ea29065ca39d2' }}
     steps:
-      - name: Checkout SP1 project only
-        uses: actions/checkout@v6
-        with:
-          persist-credentials: false
-          sparse-checkout-cone-mode: false
-          sparse-checkout: |
-            /sp1-program/**
-            !/sp1-program/**/.env
-            !/sp1-program/**/.env.*
+      - name: Fetch only SP1 source (exclude local environment files and submodules)
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          source_dir="$RUNNER_TEMP/omega-sp1"
+          mkdir -p "$source_dir"
+          cd "$source_dir"
+          git init --quiet --initial-branch=main
+          git remote add origin "https://github.com/${GITHUB_REPOSITORY}.git"
+          git config core.sparseCheckout true
+          git config core.sparseCheckoutCone false
+          printf '/sp1-program/**\n!/sp1-program/**/.env\n!/sp1-program/**/.env.*\n' > .git/info/sparse-checkout
+          auth_header="$(printf 'x-access-token:%s' "$GH_TOKEN" | base64 | tr -d '\n')"
+          git -c "http.extraheader=AUTHORIZATION: basic ${auth_header}" fetch --depth=1 --filter=blob:none origin "$GITHUB_SHA"
+          git checkout --quiet --detach FETCH_HEAD
 
       - name: Install Protocol Buffers compiler
         shell: bash
@@ -53,7 +61,7 @@ jobs:
           "$HOME/.sp1/bin/cargo-prove" prove --version
 
       - name: Build guest ELF
-        working-directory: sp1-program/program
+        working-directory: ${{ runner.temp }}/omega-sp1/sp1-program/program
         shell: bash
         run: |
           set -euo pipefail
@@ -61,7 +69,7 @@ jobs:
           test -s elf/riscv32im-succinct-zkvm-elf
 
       - name: Derive and compare PROGRAM_VKEY
-        working-directory: sp1-program/program
+        working-directory: ${{ runner.temp }}/omega-sp1/sp1-program/program
         shell: bash
         run: |
           set -euo pipefail
