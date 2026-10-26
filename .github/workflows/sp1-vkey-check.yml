@@ -25,8 +25,9 @@ jobs:
       EXPECTED_VKEY: ${{ github.event.inputs.expected_vkey || '0x00d69e6f6f0106ba374a04de22d65c881dfabb5fe2e4924cf97ea29065ca39d2' }}
     steps:
       - name: Checkout SP1 project only
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
+          persist-credentials: false
           sparse-checkout-cone-mode: false
           sparse-checkout: |
             /sp1-program/**
@@ -34,19 +35,19 @@ jobs:
             !/sp1-program/**/.env.*
 
       - name: Install Protocol Buffers compiler
-        uses: arduino/setup-protoc@v3
-        with:
-          version: "29.4"
-          repo-token: ${{ github.token }}
-
-      - name: Install pinned SP1 toolchain
         shell: bash
         run: |
           set -euo pipefail
-          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
-          source "$HOME/.cargo/env"
+          brew list --versions protobuf >/dev/null 2>&1 || brew install protobuf
+
+      - name: Install pinned SP1 toolchain
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
           curl -L https://sp1.succinct.xyz | bash
-          "$HOME/.sp1/bin/sp1up" -v 6.4.0
+          "$HOME/.sp1/bin/sp1up" --token "$GH_TOKEN" --version 6.4.0
           echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
           echo "$HOME/.sp1/bin" >> "$GITHUB_PATH"
           "$HOME/.sp1/bin/cargo-prove" prove --version
