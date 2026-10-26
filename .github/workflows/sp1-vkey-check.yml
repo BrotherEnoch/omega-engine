@@ -36,6 +36,7 @@ jobs:
       - name: Install Protocol Buffers compiler
         uses: arduino/setup-protoc@v3
         with:
+          version: "29.4"
           repo-token: ${{ github.token }}
 
       - name: Install pinned SP1 toolchain
@@ -61,8 +62,6 @@ jobs:
       - name: Derive and compare PROGRAM_VKEY
         working-directory: sp1-program/program
         shell: bash
-        env:
-          EXPECTED_VKEY: ${{ env.EXPECTED_VKEY }}
         run: |
           set -euo pipefail
           [[ "$EXPECTED_VKEY" =~ ^0x[0-9a-fA-F]{64}$ ]]
