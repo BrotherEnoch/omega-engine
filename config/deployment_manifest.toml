@@ -1,3 +1,4 @@
+# config/deployment_manifest.toml — keep in sync for live
 [[strategies]]
 strategy_id = "CNRY"
 bytecode_hash = "0xe45848115f3be7508d3813b6c46cdc4aaa34760cec783e1687e8176234e743c2"

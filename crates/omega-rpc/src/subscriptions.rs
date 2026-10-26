@@ -1,17 +1,36 @@
 // crates/omega-rpc/src/subscriptions.rs
 //
-// On-chain subscription streams for the Omega Engine signal pipeline.
+// On-chain signal streams for the Omega Engine signal pipeline.
 //
-// Each stream: acquires a subscribe token, opens a chain-ID-verified WS
-// connection via `ws_provider`, publishes parsed events to a broadcast
+// Each stream: acquires a subscribe token, opens a chain-ID-verified connection
+// via `transport::connect_verified`, publishes parsed events to a broadcast
 // channel, and reconnects with backoff on error — except FATAL errors
 // (bad URL, chain-ID mismatch; see `net::RpcClientError::is_fatal`),
 // which stop the loop immediately rather than retrying forever against
 // something that can never succeed. This mirrors client.rs's pattern.
 //
-// Audit fixes in this pass:
-//   - `ws_provider` now validates URL scheme and verifies chain_id on
-//     every (re)connect — previously nothing in this file checked either.
+// ## Transport behaviour (this revision)
+//
+// The transport comes from the URL scheme (see transport.rs):
+//
+//   stream                  ws:// | wss://               http:// | https://
+//   ----------------------  ----------------------------  -------------------------------
+//   run_pending_tx_stream   eth_subscribe(pendingTx)      NOT AVAILABLE — logs a warning
+//                                                         and returns (no mempool on HTTP)
+//   run_fee_oracle_stream   eth_subscribe(newHeads)       polls the latest block
+//   run_dex_sync_stream     eth_subscribe(logs)           eth_getLogs range polling
+//   run_lending_protocol_   eth_subscribe(logs)           eth_getLogs range polling
+//     stream
+//   run_mev_share_stream    HTTP SSE (unchanged — never used the RPC transport)
+//
+// The HTTP polling logic (cursors, range splitting, 429 backoff) lives in poll.rs;
+// its known limitations (no reorg replay for logs, bounded lookback) are listed there.
+// Polling cadence comes from OMEGA_POLL_BLOCKS_MS / OMEGA_POLL_LOGS_MS / etc. (see
+// transport.rs). Each poll call consumes a Read token from the limiter passed in.
+//
+// Audit fixes in earlier passes:
+//   - `connect_verified` (formerly `ws_provider`) validates URL scheme and verifies
+//     chain_id on every (re)connect — previously nothing in this file checked either.
 //   - `run_lending_protocol_stream` refuses to start unless chain_id is
 //     42161 (the hardcoded addresses are Arbitrum-specific) AND refuses
 //     to start while COMPOUND_V3/MORPHO/EULER_V2 remain the placeholder
@@ -36,18 +55,14 @@
 //     kind of silent failure worth surfacing. This does NOT add retry
 //     or buffering — it's an observability fix, not a delivery
 //     guarantee.
-//   - (external audit response) `run_lending_once` and
-//     `run_dex_sync_once` now skip (and warn on) any `Log` the RPC
-//     marked `removed: true` — logs the node itself is telling us were
-//     orphaned by a reorg. Forwarding a removed log as a live signal
-//     could send the LA/MSA engines chasing a liquidation or arb
-//     opportunity that the chain has already un-happened.
-//   - (this revision) removed an unnecessary `as u128` cast in
-//     `run_fee_oracle_once` — `block.header.base_fee_per_gas` is
-//     already `Option<u128>` here, so `.unwrap_or(0) as u128` was
-//     casting u128 to u128. Functionally harmless, but flagged by
-//     clippy's `unnecessary_cast` lint under this workspace's
-//     `-D warnings` clippy invocation.
+//   - (external audit response) lending and DEX handling skip (and warn
+//     on) any `Log` the RPC marked `removed: true` — logs the node itself
+//     is telling us were orphaned by a reorg. Forwarding a removed log as
+//     a live signal could send the LA/MSA engines chasing a liquidation
+//     or arb opportunity that the chain has already un-happened.
+//   - removed an unnecessary `as u128` cast in the fee oracle —
+//     `block.header.base_fee_per_gas` is already `Option<u128>` here
+//     (clippy `unnecessary_cast` under `-D warnings`).
 //
 // ## Known follow-ups NOT fixed in this pass (flagged, not silently skipped)
 //
@@ -63,9 +78,9 @@
 //     stream, checked by an external health monitor, would catch this;
 //     that monitor and its polling contract live outside this crate.
 //   - Subscription identity re-verification after reconnect: chain_id
-//     IS re-verified on every reconnect (`ws_provider`), which catches
-//     the dangerous "silently pointed at the wrong chain" case. Full
-//     subscription-ID continuity checking across a provider-side
+//     IS re-verified on every reconnect (`connect_verified`), which
+//     catches the dangerous "silently pointed at the wrong chain" case.
+//     Full subscription-ID continuity checking across a provider-side
 //     reconnect/rebalance is a reasonable further hardening step for a
 //     stateful subscription manager, not a stateless per-call helper
 //     like the ones in this file.
@@ -78,19 +93,24 @@
 //     per-stream in this file; `omega_relay::dedup::PositionKey` and
 //     `ExecutionBlueprint::idempotency_key` (omega-core) already
 //     provide dedup at later pipeline stages, but neither operates at
-//     the raw-event layer these streams produce.
+//     the raw-event layer these streams produce. (HTTP log polling
+//     never replays a range within one connection, but a reconnect
+//     restarts its cursor at the tip.)
 
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use alloy::eips::BlockNumberOrTag;
 use alloy::primitives::{Address, B256};
-use alloy::providers::{Provider, ProviderBuilder};
-use alloy::rpc::types::{Filter, Log};
+use alloy::providers::Provider;
+use alloy::rpc::types::{Block, Filter, Log};
 use futures::StreamExt;
 use tokio::sync::broadcast;
 
-use crate::net::{validate_ws_scheme, verify_chain_id, wei_to_gwei_saturating, RpcClientError};
+use crate::net::{scrub_urls, wei_to_gwei_saturating, RpcClientError};
+use crate::poll::{absorb_error, run_log_poller, Backoff};
 use crate::rate_limiter::{RpcRateLimiter, RpcRequestKind};
+use crate::transport::{connect_verified, PollConfig, RpcTransport};
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Shared helpers
@@ -107,28 +127,11 @@ fn now_unix_ms() -> u64 {
 const BACKOFF_INITIAL_MS: u64 = 1_000;
 const BACKOFF_MAX_MS: u64 = 30_000;
 
-/// Connects and verifies chain_id in one step — every subscription
-/// function in this file goes through this rather than connecting
-/// directly, so chain-ID verification can't be skipped at one call site
-/// while present at another.
-async fn ws_provider(
-    ws_url: &str,
-    expected_chain_id: u64,
-) -> Result<impl Provider, RpcClientError> {
-    validate_ws_scheme(ws_url)?;
-    let provider = ProviderBuilder::new()
-        .on_builtin(ws_url)
-        .await
-        .map_err(|e| RpcClientError::ConnectFailed(format!("WS connect: {e}")))?;
-    verify_chain_id(&provider, expected_chain_id).await?;
-    Ok(provider)
-}
-
 /// Sends an event on a broadcast channel, logging (rather than
 /// silently discarding) the case where there are no active receivers.
 ///
-/// `broadcast::Sender::send` returns `Err` exactly when there are zero
-/// live `Receiver`s — the previous code everywhere in this file did
+/// `broadcast::Sender::send` returns `Err` exactly when there are zero live
+/// `Receiver`s — the previous code everywhere in this file did
 /// `let _ = tx.send(...)`, which drops that signal on the floor. For a
 /// trading engine, "the signal pipeline has no listener" and "the
 /// signal pipeline is healthy but idle" are very different states, and
@@ -149,8 +152,13 @@ fn send_or_log<T>(tx: &broadcast::Sender<T>, event: T, stream: &'static str) {
     }
 }
 
+/// Maps a provider error to `RpcClientError::ConnectFailed` with URLs scrubbed.
+fn conn_err(context: &str, e: impl std::fmt::Display) -> RpcClientError {
+    RpcClientError::ConnectFailed(format!("{context}: {}", scrub_urls(&e.to_string())))
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
-// PendingTxStream — SA / MSA order flow
+// PendingTxStream — SA / MSA order flow (WebSocket only)
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// A pending transaction observed in the mempool.
@@ -164,12 +172,24 @@ pub struct PendingTxEvent {
 /// Subscribe to pending transactions and forward to `tx`. Runs
 /// indefinitely; reconnects on transient error, stops on a fatal one.
 /// Spawn as a Tokio task.
+///
+/// WebSocket only: over an http(s) URL there is no mempool subscription, so this logs
+/// a warning and returns immediately.
 pub async fn run_pending_tx_stream(
     ws_url: String,
     chain_id: u64,
     limiter: Arc<RpcRateLimiter>,
     tx: broadcast::Sender<PendingTxEvent>,
 ) {
+    if RpcTransport::detect(&ws_url) == RpcTransport::Http {
+        tracing::warn!(
+            "Pending tx stream not started: the RPC URL is http(s) and mempool \
+             subscriptions require a WebSocket endpoint — mempool-dependent signals \
+             are disabled"
+        );
+        return;
+    }
+
     let mut delay_ms = BACKOFF_INITIAL_MS;
     loop {
         limiter.wait_until_allowed(RpcRequestKind::Subscribe).await;
@@ -196,12 +216,12 @@ async fn run_pending_tx_once(
     chain_id: u64,
     tx: &broadcast::Sender<PendingTxEvent>,
 ) -> Result<(), RpcClientError> {
-    let provider = ws_provider(ws_url, chain_id).await?;
+    let (provider, _transport) = connect_verified(ws_url, chain_id).await?;
 
     let mut stream = provider
         .subscribe_pending_transactions()
         .await
-        .map_err(|e| RpcClientError::ConnectFailed(format!("subscribe_pending_transactions: {e}")))?
+        .map_err(|e| conn_err("subscribe_pending_transactions", e))?
         .into_stream();
 
     tracing::info!(chain_id, "Pending tx subscription active");
@@ -295,9 +315,20 @@ fn ensure_lending_addresses_configured() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Subscribe to lending protocol events on-chain. Refuses to start (see
-/// module doc comment) if `chain_id != 42161` or if placeholder
-/// addresses are still configured.
+fn lending_filter() -> Filter {
+    Filter::new().address(vec![
+        arbitrum_addrs::AAVE_V3_POOL,
+        arbitrum_addrs::COMPOUND_V3,
+        arbitrum_addrs::COMPOUND_V3_WETH,
+        arbitrum_addrs::COMPOUND_V3_USDCE,
+        arbitrum_addrs::COMPOUND_V3_USDT,
+        arbitrum_addrs::MORPHO,
+    ])
+}
+
+/// Subscribe to (WS) or poll (HTTP) lending protocol events on-chain. Refuses to
+/// start (see module doc comment) if `chain_id != 42161` or if placeholder addresses
+/// are still configured.
 pub async fn run_lending_protocol_stream(
     ws_url: String,
     chain_id: u64,
@@ -321,7 +352,7 @@ pub async fn run_lending_protocol_stream(
     let mut delay_ms = BACKOFF_INITIAL_MS;
     loop {
         limiter.wait_until_allowed(RpcRequestKind::Subscribe).await;
-        match run_lending_once(&ws_url, chain_id, &tx).await {
+        match run_lending_once(&ws_url, chain_id, &tx, &limiter).await {
             Ok(()) => {
                 tracing::warn!("Lending protocol stream ended — reconnecting");
                 delay_ms = BACKOFF_INITIAL_MS;
@@ -339,66 +370,80 @@ pub async fn run_lending_protocol_stream(
     }
 }
 
+/// Classifies and forwards one lending log. Shared by the WS and HTTP paths.
+fn forward_lending_log(tx: &broadcast::Sender<LendingProtocolEvent>, log: Log, chain_id: u64) {
+    // A reorg can orphan a log the node already delivered; the RPC
+    // marks it `removed: true` rather than silently un-sending it.
+    // Forwarding it anyway would let the LA engine chase a
+    // liquidation opportunity the chain no longer has.
+    if log.removed {
+        tracing::warn!(
+            chain_id,
+            block_number = ?log.block_number,
+            tx_hash = ?log.transaction_hash,
+            "Lending protocol log removed by reorg — not forwarding"
+        );
+        return;
+    }
+
+    let protocol = match log.address() {
+        a if a == arbitrum_addrs::AAVE_V3_POOL => LendingProtocol::AaveV3,
+        a if arbitrum_addrs::COMPOUND_V3_MARKETS.contains(&a) => LendingProtocol::CompoundV3,
+        a if a == arbitrum_addrs::MORPHO => LendingProtocol::Morpho,
+        other => {
+            tracing::warn!(addr = %other, "Unknown lending contract in log");
+            return;
+        }
+    };
+    send_or_log(
+        tx,
+        LendingProtocolEvent {
+            log,
+            protocol,
+            received_at_unix_ms: now_unix_ms(),
+            chain_id,
+        },
+        "lending_protocol",
+    );
+}
+
 async fn run_lending_once(
     ws_url: &str,
     chain_id: u64,
     tx: &broadcast::Sender<LendingProtocolEvent>,
+    limiter: &RpcRateLimiter,
 ) -> Result<(), RpcClientError> {
-    let provider = ws_provider(ws_url, chain_id).await?;
+    let (provider, transport) = connect_verified(ws_url, chain_id).await?;
+    let filter = lending_filter();
 
-    let filter = Filter::new().address(vec![
-        arbitrum_addrs::AAVE_V3_POOL,
-        arbitrum_addrs::COMPOUND_V3,
-        arbitrum_addrs::COMPOUND_V3_WETH,
-        arbitrum_addrs::COMPOUND_V3_USDCE,
-        arbitrum_addrs::COMPOUND_V3_USDT,
-        arbitrum_addrs::MORPHO,
-    ]);
-
-    let mut stream = provider
-        .subscribe_logs(&filter)
-        .await
-        .map_err(|e| RpcClientError::ConnectFailed(format!("subscribe_logs (lending): {e}")))?
-        .into_stream();
-
-    tracing::info!(chain_id, "Lending protocol subscription active");
-
-    while let Some(log) = stream.next().await {
-        // A reorg can orphan a log the node already delivered; the RPC
-        // marks it `removed: true` rather than silently un-sending it.
-        // Forwarding it anyway would let the LA engine chase a
-        // liquidation opportunity the chain no longer has.
-        if log.removed {
-            tracing::warn!(
-                chain_id,
-                block_number = ?log.block_number,
-                tx_hash = ?log.transaction_hash,
-                "Lending protocol log removed by reorg — not forwarding"
-            );
-            continue;
+    match transport {
+        RpcTransport::Http => {
+            let cfg = PollConfig::from_env();
+            run_log_poller(
+                provider.as_ref(),
+                limiter,
+                &cfg,
+                filter,
+                "lending_protocol",
+                |log| forward_lending_log(tx, log, chain_id),
+            )
+            .await
         }
+        RpcTransport::Ws => {
+            let mut stream = provider
+                .subscribe_logs(&filter)
+                .await
+                .map_err(|e| conn_err("subscribe_logs (lending)", e))?
+                .into_stream();
 
-        let protocol = match log.address() {
-            a if a == arbitrum_addrs::AAVE_V3_POOL => LendingProtocol::AaveV3,
-            a if arbitrum_addrs::COMPOUND_V3_MARKETS.contains(&a) => LendingProtocol::CompoundV3,
-            a if a == arbitrum_addrs::MORPHO => LendingProtocol::Morpho,
-            other => {
-                tracing::warn!(addr = %other, "Unknown lending contract in log");
-                continue;
+            tracing::info!(chain_id, "Lending protocol subscription active");
+
+            while let Some(log) = stream.next().await {
+                forward_lending_log(tx, log, chain_id);
             }
-        };
-        send_or_log(
-            tx,
-            LendingProtocolEvent {
-                log,
-                protocol,
-                received_at_unix_ms: now_unix_ms(),
-                chain_id,
-            },
-            "lending_protocol",
-        );
+            Ok(())
+        }
     }
-    Ok(())
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -418,7 +463,11 @@ pub struct DexSyncEvent {
 const SYNC_TOPIC: B256 =
     alloy::primitives::b256!("1c411e9a96e071241c2f21f7726b17ae89e3cab4c78be50e062b03a9fffbbad1");
 
-/// Subscribe to DEX pool Sync events.
+/// Subscribe to (WS) or poll (HTTP) DEX pool Sync events.
+///
+/// NOTE (HTTP): the filter has no address restriction, so each eth_getLogs call returns
+/// Sync events from every V2-style pool on the chain. Some free endpoints reject that
+/// as too large; the poller then halves the range, down to single blocks.
 pub async fn run_dex_sync_stream(
     ws_url: String,
     chain_id: u64,
@@ -428,7 +477,7 @@ pub async fn run_dex_sync_stream(
     let mut delay_ms = BACKOFF_INITIAL_MS;
     loop {
         limiter.wait_until_allowed(RpcRequestKind::Subscribe).await;
-        match run_dex_sync_once(&ws_url, chain_id, &tx).await {
+        match run_dex_sync_once(&ws_url, chain_id, &tx, &limiter).await {
             Ok(()) => {
                 tracing::warn!("DEX sync stream ended — reconnecting");
                 delay_ms = BACKOFF_INITIAL_MS;
@@ -446,47 +495,69 @@ pub async fn run_dex_sync_stream(
     }
 }
 
+/// Forwards one DEX Sync log. Shared by the WS and HTTP paths.
+fn forward_dex_log(tx: &broadcast::Sender<DexSyncEvent>, log: Log, chain_id: u64) {
+    // Same reorg-safety reasoning as forward_lending_log: don't forward
+    // a Sync event the node has already told us was orphaned.
+    if log.removed {
+        tracing::warn!(
+            chain_id,
+            block_number = ?log.block_number,
+            pool = %log.address(),
+            "DEX sync log removed by reorg — not forwarding"
+        );
+        return;
+    }
+
+    send_or_log(
+        tx,
+        DexSyncEvent {
+            pool: log.address(),
+            log,
+            received_at_unix_ms: now_unix_ms(),
+            chain_id,
+        },
+        "dex_sync",
+    );
+}
+
 async fn run_dex_sync_once(
     ws_url: &str,
     chain_id: u64,
     tx: &broadcast::Sender<DexSyncEvent>,
+    limiter: &RpcRateLimiter,
 ) -> Result<(), RpcClientError> {
-    let provider = ws_provider(ws_url, chain_id).await?;
+    let (provider, transport) = connect_verified(ws_url, chain_id).await?;
     let filter = Filter::new().event_signature(SYNC_TOPIC);
 
-    let mut stream = provider
-        .subscribe_logs(&filter)
-        .await
-        .map_err(|e| RpcClientError::ConnectFailed(format!("subscribe_logs (dex sync): {e}")))?
-        .into_stream();
-
-    tracing::info!(chain_id, "DEX sync subscription active");
-
-    while let Some(log) = stream.next().await {
-        // Same reorg-safety reasoning as run_lending_once: don't forward
-        // a Sync event the node has already told us was orphaned.
-        if log.removed {
-            tracing::warn!(
-                chain_id,
-                block_number = ?log.block_number,
-                pool = %log.address(),
-                "DEX sync log removed by reorg — not forwarding"
-            );
-            continue;
+    match transport {
+        RpcTransport::Http => {
+            let cfg = PollConfig::from_env();
+            run_log_poller(
+                provider.as_ref(),
+                limiter,
+                &cfg,
+                filter,
+                "dex_sync",
+                |log| forward_dex_log(tx, log, chain_id),
+            )
+            .await
         }
+        RpcTransport::Ws => {
+            let mut stream = provider
+                .subscribe_logs(&filter)
+                .await
+                .map_err(|e| conn_err("subscribe_logs (dex sync)", e))?
+                .into_stream();
 
-        send_or_log(
-            tx,
-            DexSyncEvent {
-                pool: log.address(),
-                log,
-                received_at_unix_ms: now_unix_ms(),
-                chain_id,
-            },
-            "dex_sync",
-        );
+            tracing::info!(chain_id, "DEX sync subscription active");
+
+            while let Some(log) = stream.next().await {
+                forward_dex_log(tx, log, chain_id);
+            }
+            Ok(())
+        }
     }
-    Ok(())
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -502,7 +573,7 @@ pub struct FeeOracleEvent {
     pub chain_id: u64,
 }
 
-/// Subscribe to new block headers and emit fee oracle events.
+/// Subscribe to (WS) or poll (HTTP) new block headers and emit fee oracle events.
 pub async fn run_fee_oracle_stream(
     ws_url: String,
     chain_id: u64,
@@ -512,7 +583,7 @@ pub async fn run_fee_oracle_stream(
     let mut delay_ms = BACKOFF_INITIAL_MS;
     loop {
         limiter.wait_until_allowed(RpcRequestKind::Subscribe).await;
-        match run_fee_oracle_once(&ws_url, chain_id, &tx).await {
+        match run_fee_oracle_once(&ws_url, chain_id, &tx, &limiter).await {
             Ok(()) => {
                 tracing::warn!("Fee oracle stream ended — reconnecting");
                 delay_ms = BACKOFF_INITIAL_MS;
@@ -530,38 +601,97 @@ pub async fn run_fee_oracle_stream(
     }
 }
 
+/// Builds and sends a fee oracle event for `block`. Shared by the WS and HTTP paths.
+fn emit_fee_event(tx: &broadcast::Sender<FeeOracleEvent>, block: &Block, chain_id: u64) {
+    // Saturating, not truncating — see net::wei_to_gwei_saturating.
+    // No `as u128` here: base_fee_per_gas is already Option<u128>
+    // on this Block type, so `.unwrap_or(0)` already yields u128.
+    let base_fee_gwei = wei_to_gwei_saturating(block.header.base_fee_per_gas.unwrap_or(0));
+    send_or_log(
+        tx,
+        FeeOracleEvent {
+            base_fee_gwei,
+            block_number: block.header.number,
+            received_at_unix_ms: now_unix_ms(),
+            chain_id,
+        },
+        "fee_oracle",
+    );
+}
+
 async fn run_fee_oracle_once(
     ws_url: &str,
     chain_id: u64,
     tx: &broadcast::Sender<FeeOracleEvent>,
+    limiter: &RpcRateLimiter,
 ) -> Result<(), RpcClientError> {
-    let provider = ws_provider(ws_url, chain_id).await?;
+    let (provider, transport) = connect_verified(ws_url, chain_id).await?;
 
-    let mut stream = provider
-        .subscribe_blocks()
-        .await
-        .map_err(|e| RpcClientError::ConnectFailed(format!("subscribe_blocks (fee oracle): {e}")))?
-        .into_stream();
+    match transport {
+        RpcTransport::Http => run_fee_oracle_poll(provider.as_ref(), limiter, chain_id, tx).await,
+        RpcTransport::Ws => {
+            let mut stream = provider
+                .subscribe_blocks()
+                .await
+                .map_err(|e| conn_err("subscribe_blocks (fee oracle)", e))?
+                .into_stream();
 
-    tracing::info!(chain_id, "Fee oracle subscription active");
+            tracing::info!(chain_id, "Fee oracle subscription active");
 
-    while let Some(block) = stream.next().await {
-        // Saturating, not truncating — see net::wei_to_gwei_saturating.
-        // No `as u128` here: base_fee_per_gas is already Option<u128>
-        // on this Block type, so `.unwrap_or(0)` already yields u128.
-        let base_fee_gwei = wei_to_gwei_saturating(block.header.base_fee_per_gas.unwrap_or(0));
-        send_or_log(
-            tx,
-            FeeOracleEvent {
-                base_fee_gwei,
-                block_number: block.header.number,
-                received_at_unix_ms: now_unix_ms(),
-                chain_id,
-            },
-            "fee_oracle",
-        );
+            while let Some(block) = stream.next().await {
+                emit_fee_event(tx, &block, chain_id);
+            }
+            Ok(())
+        }
     }
-    Ok(())
+}
+
+/// HTTP fee oracle: one eth_getBlockByNumber("latest") per tick; an event is emitted
+/// only when the block number advances. Only the latest block is reported — the fee
+/// model wants the current base fee, not every historical block.
+async fn run_fee_oracle_poll(
+    provider: &dyn Provider,
+    limiter: &RpcRateLimiter,
+    chain_id: u64,
+    tx: &broadcast::Sender<FeeOracleEvent>,
+) -> Result<(), RpcClientError> {
+    let cfg = PollConfig::from_env();
+    let mut backoff = Backoff::new(BACKOFF_INITIAL_MS, BACKOFF_MAX_MS);
+    let mut tick = tokio::time::interval(cfg.blocks_every);
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut last: Option<u64> = None;
+
+    tracing::info!(
+        chain_id,
+        every_ms = cfg.blocks_every.as_millis() as u64,
+        "Fee oracle polling active (HTTP transport)"
+    );
+
+    loop {
+        tick.tick().await;
+        limiter.wait_until_allowed(RpcRequestKind::Read).await;
+
+        match provider
+            .get_block_by_number(BlockNumberOrTag::Latest, false)
+            .await
+        {
+            Ok(Some(block)) => {
+                backoff.reset();
+                let n = block.header.number;
+                if last.is_some_and(|l| n <= l) {
+                    continue;
+                }
+                last = Some(n);
+                emit_fee_event(tx, &block, chain_id);
+            }
+            Ok(None) => {
+                tracing::debug!("fee oracle: latest block not returned — retrying next tick");
+            }
+            Err(e) => {
+                absorb_error("fee_oracle", e.to_string(), &mut backoff).await?;
+            }
+        }
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -638,7 +768,7 @@ const MEV_SHARE_URL: &str = "https://mev-share.flashbots.net/api/v1/events";
 const MAX_SSE_LINE_BUFFER_BYTES: usize = 1_000_000;
 
 /// Subscribe to the Flashbots MEV-Share SSE stream. Reconnects with
-/// exponential backoff on SSE drop.
+/// exponential backoff on SSE drop. Independent of the RPC transport.
 pub async fn run_mev_share_stream(tx: broadcast::Sender<MevShareEvent>) {
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(60))
@@ -762,5 +892,31 @@ mod mev_share_parse_tests {
         let ev = MevShareEvent::from_payload(serde_json::json!({}), 0);
         assert!(ev.hash.is_none());
         assert!(!ev.indicates_competition());
+    }
+}
+
+#[cfg(test)]
+mod transport_gate_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn pending_tx_stream_returns_immediately_on_http() {
+        let (tx, _rx) = broadcast::channel(4);
+        let limiter = Arc::new(RpcRateLimiter::new());
+        // Must return (not hang or loop) because there is no mempool over HTTP.
+        let result = tokio::time::timeout(
+            Duration::from_secs(2),
+            run_pending_tx_stream(
+                "https://example.invalid/rpc".to_string(),
+                42161,
+                limiter,
+                tx,
+            ),
+        )
+        .await;
+        assert!(
+            result.is_ok(),
+            "pending-tx stream must exit at once on HTTP"
+        );
     }
 }

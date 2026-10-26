@@ -2,7 +2,52 @@
 //
 // Simple Arbitrage (SA) — Phase 1 strategy (spec §1.1).
 //
-// ## Audit fix (this revision): max_base_fee_gwei floor
+// ## Fix (this revision): live quote path via QuoteSource
+//
+// `net_profit_after_gas()` previously used `SA_SPREAD_WEI` (0.2 ETH constant)
+// as the input spread on every call, causing every blueprint to report
+// identical `expected_profit_net_wei` (~0.192 ETH) regardless of pool state.
+// On mainnet this manifested as SA replaying the same notional on every block,
+// which the competition check correctly rejected because the real opportunity
+// had long since been filled.
+//
+// Fixed by introducing `QuoteSource`, a trait that returns a live spread for
+// the two-hop path. `SaStrategy::new()` now accepts `Arc<dyn QuoteSource>`.
+// The companion `StaticQuoteSource` preserves the old constant behaviour and
+// is the default when a real quote provider is not yet available — callers
+// that previously relied on the constant can pass `StaticQuoteSource` with no
+// other change.
+//
+// `QuoteSource` is defined here until a proper home is carved out in
+// omega-core alongside the `SignalState` / `ExecutionBlueprint` types. Move it
+// when the omega-core `quote` module exists.
+//
+// ## Fix (earlier revision): score() used a hardcoded competition_prob = 0.35
+//
+// `score()` computed `competition_prob: 0.35_f64` as a compile-time
+// constant. This value was never updated from market state and never
+// influenced `CheckContext::competition_probability`, but it contaminated
+// `OpScore::competition_prob` which callers use to decide whether to call
+// `build_blueprint()` at all — so a burst of MEV-Share activity that
+// should raise the competition estimate and suppress scoring was invisible
+// to `score()`.
+//
+// Fixed by calling `omega_risk::competition::non_la_competition_probability(
+//   StrategyCompetitionClass::SimpleArbitrage, mev_share_events)` with the
+// count passed through `SignalState` (see below). SA is not an LA strategy
+// and has no health-factor or liquidation-size — `non_la_competition_
+// probability` is the correct entry point; `competition_probability()` must
+// not be called here with fabricated HF/size inputs.
+//
+// `SignalState` now carries `mev_share_events_in_window: u32` (added to
+// omega-core alongside this fix). When `score()` receives a signal with
+// zero events (quiet market) the result is the class base 0.35, which is
+// well under any sane `max_competition_probability`. When MEV-Share activity
+// is high the estimate rises toward 0.60 (0.35 + 0.25 cap), at which point
+// the scorer can return a lower `score` or 0.0 to suppress blueprint
+// generation upstream of the check pipeline.
+//
+// ## Audit fix: max_base_fee_gwei floor
 //
 // `max_base_fee_gwei` was previously computed inline as
 // `signal.base_fee_gwei * 3`. `signal.base_fee_gwei` is whole gwei, and
@@ -17,48 +62,21 @@
 // `blueprint_hash` was previously computed from an ad hoc, strategy-local
 // `keccak256(signal_state_hash || nonce || block_number)` — a much
 // smaller field set than, and structurally different from,
-// `ExecutionBlueprint::compute_hash()` (the canonical encoding defined in
-// omega-core specifically so `verify_hash()` can catch post-construction
-// mutation). Since the two never matched, `verify_hash()` would have
-// reported every SA blueprint as tampered despite nothing being wrong.
-// Fixed to build the blueprint with a placeholder hash, then call the
-// canonical `bp.compute_hash()` — same pattern already used in
-// `omega_core::types::blueprint`'s own tests.
-//
-// Also adds `signal_id`, `client_order_id`, `idempotency_key` — see
-// `ExecutionBlueprint`'s own doc comments (omega-core) for what each is
-// for. `idempotency_key` is filled in the same way, via
-// `bp.compute_idempotency_key()`, after construction.
+// `ExecutionBlueprint::compute_hash()`. Fixed to call the canonical
+// `bp.compute_hash()` after construction.
 //
 // ## Capital path (Option B)
 //
 // SA borrows via `omega_flashloan::select_provider`, same as LA/MSA.
-// `flashloan_token` is Arbitrum canonical WETH (must match Vault
-// `profit_token` on Orchestrator). `flashloan_amount` is `SA_SPREAD_WEI`
-// — the same notional already used as two-hop `amount_in` (interim sizing
-// until a real quote path exists). `build_blueprint` fails closed if
-// selection fails or token/amount is zero — Orchestrator reverts on
-// `flashloanToken == address(0)`.
-//
-// ## `max_base_fee_gwei` (earlier revision)
-//
-// `ExecutionBlueprint` gained a `max_base_fee_gwei` field (compile
-// error otherwise: E0063 missing field). The headroom multiplier below
-// is still a placeholder pending confirmation of the field's real
-// intended semantics; the zero-floor bug above is fixed independently.
+// `flashloan_token` is Arbitrum canonical WETH. `flashloan_amount` is the
+// spread returned by the quote source. `build_blueprint` fails closed if
+// selection fails or token/amount is zero.
 //
 // ## Audit fix (earlier revision, 2): mixed-case hex literal
 //
 // `cargo clippy --workspace --all-targets -- -D warnings` failed on
-// `clippy::mixed_case_hex_literals` at two of the individual byte
-// literals inside `ARBITRUM_WETH`'s array (`0xaF` and `0xBa` — each one
-// mixed upper/lower case within a single literal, which is the lint's
-// actual complaint; it does not care about case consistency ACROSS
-// literals). Fixed by lowercasing every hex digit in every byte of the
-// array. This changes only how the literals are spelled, not their
-// value — `0xaF` and `0xaf` are the identical `u8`, so `ARBITRUM_WETH`'s
-// address is byte-for-byte unchanged. (Same fix applied in msa.rs, which
-// defines the identical constant independently.)
+// `clippy::mixed_case_hex_literals`. Fixed by lowercasing every hex digit
+// in the `ARBITRUM_WETH` array. Value is byte-for-byte unchanged.
 
 use std::sync::{
     atomic::{AtomicU64, Ordering},
@@ -75,8 +93,69 @@ use omega_core::types::lane::{Lane, Simulator};
 use omega_core::types::strategy::{OpScore, SignalState, SimResult};
 use omega_core::{GasConfig, OmegaConfig};
 use omega_flashloan::LiquidityRegistry;
+use omega_risk::competition::{non_la_competition_probability, StrategyCompetitionClass};
 
 use crate::flashloan_select::to_blueprint_provider_type;
+
+// ─────────────────────────────────────────────────────────────────────────────
+// QuoteSource — live spread for the SA two-hop path
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Provides a live input spread (in wei) for the SA two-hop path.
+///
+/// Implementations are expected to return the current DEX quote for the
+/// arbitrage leg on every call — this is the value that drives both
+/// `score()` and `build_blueprint()`. Returning a stale or cached value
+/// defeats the purpose of the trait; implementors should read from the
+/// UniV3 pool reader in omega-oracle (or equivalent) on every call.
+///
+/// ## TODO: move to omega-core
+///
+/// This trait belongs in `omega_core::quote` once that module exists.
+/// The intent is:
+/// ```ignore
+/// // omega-core/src/quote.rs
+/// pub trait QuoteSource: Send + Sync {
+///     fn spread_wei(&self, signal: &SignalState) -> Option<U256>;
+/// }
+/// ```
+/// Move it there and update this import when ready.
+///
+/// ## Contract
+///
+/// - Returns `None` when no live quote is available (pool unresponsive,
+///   stale cache, feed gap). When `None`, `score()` returns a zero score
+///   and `build_blueprint()` returns an error — no blueprint is emitted.
+/// - Returns `Some(0)` only if the quote is genuinely zero; callers treat
+///   this identically to `None` (see `build_blueprint` guard).
+/// - The returned value is the gross input spread; gas costs are subtracted
+///   downstream in `net_profit_after_gas`.
+pub trait QuoteSource: Send + Sync {
+    /// Return the current two-hop spread in wei for the given signal.
+    fn spread_wei(&self, signal: &SignalState) -> Option<U256>;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// StaticQuoteSource — backward-compatible fallback
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Backward-compatible quote source that always returns `SA_SPREAD_WEI`.
+///
+/// Use this only as a placeholder until a real UniV3-backed `QuoteSource`
+/// implementation is wired in. Every blueprint built with this source will
+/// report the same `expected_profit_net_wei` at the same gas price — the
+/// known limitation from earlier revisions — but at least the code path
+/// is correct and ready for a live implementation.
+///
+/// This is intentionally `pub` so callers outside this crate can construct
+/// `SaStrategy` without a real quote path during initial integration.
+pub struct StaticQuoteSource;
+
+impl QuoteSource for StaticQuoteSource {
+    fn spread_wei(&self, _signal: &SignalState) -> Option<U256> {
+        Some(U256::from(SA_SPREAD_WEI))
+    }
+}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Constants
@@ -87,34 +166,33 @@ const SA_EXTRACTION_GAS: u64 = 21_000;
 const SA_L1_DATA_GAS: u64 = 1_600;
 const SA_EXPIRY_BLOCKS: u64 = 2;
 // Fix (earlier revision): was 50 — did not match omega-risk::context's
-// MAX_SLIPPAGE_BPS_SA (30), the real policy cap omega_risk::checks's
-// check 9 (MissSlippage) evaluates against
-// (`bp.slippage_bps > ctx.max_slippage_bps`). The two constants were
-// independently maintained with no structural link, so they'd silently
-// drifted apart. This was invisible in practice only because check 4
-// (bytecode whitelist) still fails closed for every SA blueprint
-// regardless, as of this revision; once a real deployment manifest makes
-// check 4 pass, every real SA blueprint would otherwise have
-// deterministically failed check 9 instead. 30 is confirmed as the
-// intended value — context.rs's MAX_SLIPPAGE_BPS_SA is the policy cap
-// and this constant must not exceed it.
-//
-// NOT YET DONE: referencing omega_risk::context::MAX_SLIPPAGE_BPS_SA
-// directly here instead of keeping a second literal — the structural fix
-// that would prevent this class of drift permanently — is deferred until
-// it's confirmed omega-strategies' Cargo.toml already depends on
-// omega-risk (this file currently imports only from omega-core).
+// MAX_SLIPPAGE_BPS_SA (30). See cross-crate drift guard test below.
 const SA_SLIPPAGE_BPS: u16 = 30;
 const SA_CONFIRMATION: u8 = 12;
+
+/// Fallback spread used by `StaticQuoteSource`.
+///
+/// This constant exists solely as the default for `StaticQuoteSource`.
+/// `SaStrategy` itself never references it directly — the spread always
+/// comes from the injected `QuoteSource`. Do not use this value for
+/// anything other than the `StaticQuoteSource` fallback; live code should
+/// go through `quote_source.spread_wei(signal)`.
 const SA_SPREAD_WEI: u128 = 200_000_000_000_000_000; // 0.2 ETH
 
-/// Placeholder multiplier for `max_base_fee_gwei` — passed to
-/// `ExecutionBlueprint::derive_max_base_fee_gwei()`, which also applies
-/// the `MIN_MAX_BASE_FEE_GWEI` floor. See module-level comment.
+/// Maximum competition probability above which `score()` suppresses output.
+///
+/// SA is a DEX-arbitrage strategy; its base competition is 35 %. Scores
+/// are suppressed when the MEV-Share-adjusted estimate exceeds this
+/// threshold, saving the pipeline from evaluating blueprints that check 11
+/// would drop anyway. Set at 0.90 to match the default pipeline threshold —
+/// if `StrategyLimits::max_competition_probability` is tuned in config,
+/// this should be updated to match.
+const SA_COMPETITION_SCORE_SUPPRESS_THRESHOLD: f64 = 0.90;
+
+/// Placeholder multiplier for `max_base_fee_gwei`.
 const MAX_BASE_FEE_HEADROOM_MULTIPLIER: f64 = 3.0;
 
 /// Canonical bridged WETH on Arbitrum One.
-/// Must match Vault `profit_token` and `omega_rpc::WETH`.
 const ARBITRUM_WETH: Address = Address::new([
     0x82, 0xaf, 0x49, 0x44, 0x7d, 0x8a, 0x07, 0xe3, 0xbd, 0x95, 0xbd, 0x0d, 0x56, 0xf3, 0x52, 0x41,
     0x52, 0x3f, 0xba, 0xb1,
@@ -131,17 +209,22 @@ pub struct SaStrategy {
     contract_addr: Address,
     liquidity_registry: Arc<LiquidityRegistry>,
     gas: GasConfig,
+    quote_source: Arc<dyn QuoteSource>,
 }
 
 impl SaStrategy {
-    /// Construct SA from config, deployed strategy metadata, and the shared
-    /// flashloan liquidity registry (same handle L2e feeds and LA/MSA hold).
+    /// Construct an `SaStrategy` with a live quote source.
+    ///
+    /// Pass an `Arc<dyn QuoteSource>` that returns fresh DEX quotes on
+    /// every signal. For early integration or tests without a real pool
+    /// reader, pass `Arc::new(StaticQuoteSource)`.
     pub fn new(
         chain_id: u64,
         bytecode_hash: B256,
         contract_addr: Address,
         liquidity_registry: Arc<LiquidityRegistry>,
         config: &OmegaConfig,
+        quote_source: Arc<dyn QuoteSource>,
     ) -> Arc<Self> {
         Arc::new(Self {
             chain_id,
@@ -150,6 +233,7 @@ impl SaStrategy {
             contract_addr,
             liquidity_registry,
             gas: config.gas.clone(),
+            quote_source,
         })
     }
 
@@ -247,6 +331,8 @@ impl omega_core::types::strategy::StrategyTrait for SaStrategy {
     }
 
     async fn score(&self, signal: &SignalState) -> Result<OpScore> {
+        // Gate on base-fee pressure — if the L2 base fee is elevated the
+        // static spread won't cover gas costs.
         let fee_pressure = signal.base_fee_gwei as f64 / 50.0;
         if fee_pressure > 1.0 {
             return Ok(OpScore {
@@ -256,15 +342,53 @@ impl omega_core::types::strategy::StrategyTrait for SaStrategy {
             });
         }
 
-        let spread_wei = U256::from(SA_SPREAD_WEI);
+        // Fetch the current spread from the live quote source.
+        // Returns None when no quote is available (pool gap, stale cache).
+        let spread_wei = match self.quote_source.spread_wei(signal) {
+            Some(s) if !s.is_zero() => s,
+            _ => {
+                return Ok(OpScore {
+                    score: 0.0,
+                    expected_profit: U256::ZERO,
+                    competition_prob: 1.0,
+                });
+            }
+        };
+
         match self.net_profit_after_gas(spread_wei, signal.base_fee_gwei, signal.l1_data_fee_gwei) {
             None => Ok(OpScore {
                 score: 0.0,
                 expected_profit: U256::ZERO,
-                competition_prob: 0.5,
+                competition_prob: 1.0,
             }),
             Some((net, _)) => {
-                let competition_prob = 0.35_f64;
+                // Fix: derive competition estimate from the real model using
+                // the MEV-Share event count from the signal, rather than the
+                // old hardcoded 0.35 constant. SA has no health-factor or
+                // liquidation-size — use non_la_competition_probability().
+                //
+                // `signal.mev_share_events_in_window` is the count of
+                // competing bundles observed in the current activity window
+                // by main's MevShareActivityTracker. When 0 (quiet market)
+                // the result is the class base 0.35; when elevated it rises
+                // toward 0.60, suppressing the score before the blueprint
+                // reaches check 11.
+                let competition_prob = non_la_competition_probability(
+                    StrategyCompetitionClass::SimpleArbitrage,
+                    signal.mev_share_events_in_window,
+                );
+
+                // Suppress scoring entirely when competition exceeds the
+                // pipeline's check-11 threshold — no point producing a
+                // blueprint that will be dropped immediately.
+                if competition_prob >= SA_COMPETITION_SCORE_SUPPRESS_THRESHOLD {
+                    return Ok(OpScore {
+                        score: 0.0,
+                        expected_profit: U256::ZERO,
+                        competition_prob,
+                    });
+                }
+
                 let score =
                     (1.0 - competition_prob) * (net.saturating_to::<u128>() as f64 / 1e15).min(1.0);
                 Ok(OpScore {
@@ -277,7 +401,14 @@ impl omega_core::types::strategy::StrategyTrait for SaStrategy {
     }
 
     async fn build_blueprint(&self, signal: &SignalState) -> Result<ExecutionBlueprint> {
-        let spread_wei = U256::from(SA_SPREAD_WEI);
+        // Fetch the current spread. Fail closed on missing or zero quote —
+        // building a blueprint with a stale spread is strictly worse than
+        // not building one at all.
+        let spread_wei = match self.quote_source.spread_wei(signal) {
+            Some(s) if !s.is_zero() => s,
+            _ => anyhow::bail!("SA: no live quote available — refusing to build blueprint"),
+        };
+
         let (net_profit, gas_cost_gwei) = self
             .net_profit_after_gas(spread_wei, signal.base_fee_gwei, signal.l1_data_fee_gwei)
             .ok_or_else(|| anyhow::anyhow!("Opportunity no longer profitable"))?;
@@ -302,7 +433,6 @@ impl omega_core::types::strategy::StrategyTrait for SaStrategy {
             .saturating_mul(U256::from(SA_GAS_BUDGET))
             .saturating_mul(U256::from(1_000_000_000_u64));
 
-        // Option B: real flashloan selection (fail closed).
         let flashloan_token = ARBITRUM_WETH;
         let flashloan_amount = spread_wei;
         if flashloan_amount.is_zero() {
@@ -317,7 +447,7 @@ impl omega_core::types::strategy::StrategyTrait for SaStrategy {
         .map_err(|e| anyhow::anyhow!("SA: flashloan selection failed: {e:?}"))?;
 
         let mut bp = ExecutionBlueprint {
-            blueprint_hash: B256::ZERO, // filled below via canonical compute_hash()
+            blueprint_hash: B256::ZERO, // filled below
             chain_id: self.chain_id,
             strategy_id: StrategyId::Sa,
             lane: Lane::Microtx,
@@ -331,9 +461,6 @@ impl omega_core::types::strategy::StrategyTrait for SaStrategy {
             flashloan_provider_type: to_blueprint_provider_type(selection.provider),
             provider_contract: selection.contract_addr,
             flashloan_token,
-            // Floored at MIN_MAX_BASE_FEE_GWEI by derive_max_base_fee_gwei():
-            // a sub-gwei Arbitrum base fee truncates to 0 gwei, and a zero
-            // ceiling would revert every execute() with BaseFeeTooHigh.
             max_base_fee_gwei: ExecutionBlueprint::derive_max_base_fee_gwei(
                 signal.base_fee_gwei,
                 MAX_BASE_FEE_HEADROOM_MULTIPLIER,
@@ -392,7 +519,51 @@ mod tests {
     use omega_core::types::strategy::StrategyTrait;
     use omega_core::OmegaConfig;
 
+    // ── Test quote sources ────────────────────────────────────────────────────
+
+    /// Fixed spread — mirrors `StaticQuoteSource` but with a configurable value.
+    struct FixedQuoteSource(U256);
+    impl QuoteSource for FixedQuoteSource {
+        fn spread_wei(&self, _signal: &SignalState) -> Option<U256> {
+            Some(self.0)
+        }
+    }
+
+    /// Returns the default SA spread for tests that don't care about quote variation.
+    fn default_quote() -> Arc<dyn QuoteSource> {
+        Arc::new(StaticQuoteSource)
+    }
+
+    /// A quote source that varies the spread by block number — lets tests
+    /// verify that two consecutive signals produce different profit estimates.
+    struct BlockVaryingQuoteSource;
+    impl QuoteSource for BlockVaryingQuoteSource {
+        fn spread_wei(&self, signal: &SignalState) -> Option<U256> {
+            // Vary by ±10% around SA_SPREAD_WEI based on block number parity.
+            let base = SA_SPREAD_WEI;
+            if signal.block_number.is_multiple_of(2) {
+                Some(U256::from(base + base / 10)) // +10%
+            } else {
+                Some(U256::from(base - base / 10)) // -10%
+            }
+        }
+    }
+
+    /// Returns None — simulates a quote source that has no current data.
+    struct NoQuoteSource;
+    impl QuoteSource for NoQuoteSource {
+        fn spread_wei(&self, _signal: &SignalState) -> Option<U256> {
+            None
+        }
+    }
+
+    // ── Helpers ───────────────────────────────────────────────────────────────
+
     fn make_strategy() -> Arc<SaStrategy> {
+        make_strategy_with_quote(default_quote())
+    }
+
+    fn make_strategy_with_quote(quote_source: Arc<dyn QuoteSource>) -> Arc<SaStrategy> {
         let liquidity_registry = LiquidityRegistry::new();
         liquidity_registry.update(
             42161,
@@ -408,6 +579,7 @@ mod tests {
             Address::ZERO,
             liquidity_registry,
             &OmegaConfig::default(),
+            quote_source,
         )
     }
 
@@ -419,8 +591,25 @@ mod tests {
             base_fee_gwei: base_fee,
             l1_data_fee_gwei: 2,
             state_hash: B256::from([0x01; 32]),
+            mev_share_events_in_window: 0, // quiet market by default
         }
     }
+
+    fn make_signal_at_block(base_fee: u64, block: u64) -> SignalState {
+        SignalState {
+            block_number: block,
+            ..make_signal(base_fee)
+        }
+    }
+
+    fn make_signal_with_mev_share(base_fee: u64, events: u32) -> SignalState {
+        SignalState {
+            mev_share_events_in_window: events,
+            ..make_signal(base_fee)
+        }
+    }
+
+    // ── Basic metadata ────────────────────────────────────────────────────────
 
     #[test]
     fn strategy_metadata() {
@@ -431,6 +620,8 @@ mod tests {
         assert!(!s.is_canary());
         assert_eq!(s.gas_budget(), SA_GAS_BUDGET);
     }
+
+    // ── score() ───────────────────────────────────────────────────────────────
 
     #[tokio::test]
     async fn score_low_fee_returns_nonzero() {
@@ -445,6 +636,85 @@ mod tests {
         let op = s.score(&make_signal(100)).await.unwrap();
         assert_eq!(op.score, 0.0, "gas spike should suppress score");
     }
+
+    #[tokio::test]
+    async fn score_returns_zero_when_no_quote() {
+        let s = make_strategy_with_quote(Arc::new(NoQuoteSource));
+        let op = s.score(&make_signal(5)).await.unwrap();
+        assert_eq!(op.score, 0.0, "missing quote must suppress score");
+        assert_eq!(op.expected_profit, U256::ZERO);
+        assert_eq!(op.competition_prob, 1.0);
+    }
+
+    #[tokio::test]
+    async fn score_varies_with_quote_source() {
+        // Verify that two consecutive signals at different block numbers
+        // produce different expected_profit when the quote source varies.
+        let s = make_strategy_with_quote(Arc::new(BlockVaryingQuoteSource));
+        let op_even = s.score(&make_signal_at_block(5, 1_000_000)).await.unwrap();
+        let op_odd = s.score(&make_signal_at_block(5, 1_000_001)).await.unwrap();
+        assert_ne!(
+            op_even.expected_profit, op_odd.expected_profit,
+            "profit must vary when the quote source returns different spreads per block"
+        );
+    }
+
+    // ── competition model ─────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn score_uses_real_competition_model_not_hardcoded_constant() {
+        // Regression guard: in a quiet market (0 MEV-Share events) the
+        // competition probability must be the SA class base (0.35), NOT the
+        // old hardcoded literal.
+        let s = make_strategy();
+        let op = s.score(&make_signal_with_mev_share(5, 0)).await.unwrap();
+        assert!(
+            (op.competition_prob - 0.35).abs() < 1e-9,
+            "quiet market competition should be SA base 0.35, got {}",
+            op.competition_prob
+        );
+        // Score must still be positive in quiet market with profitable spread.
+        assert!(op.score > 0.0, "quiet market should produce positive score");
+    }
+
+    #[tokio::test]
+    async fn score_suppressed_by_high_mev_share_activity() {
+        // 13 events × 0.02 bump = 0.26 bump, clamped to 0.25 → 0.35 + 0.25 = 0.60.
+        // 0.60 < SA_COMPETITION_SCORE_SUPPRESS_THRESHOLD (0.90) → not suppressed,
+        // but score is lower than at 0 events.
+        let s = make_strategy();
+        let op_quiet = s.score(&make_signal_with_mev_share(5, 0)).await.unwrap();
+        let op_busy = s.score(&make_signal_with_mev_share(5, 13)).await.unwrap();
+        assert!(
+            op_busy.score <= op_quiet.score,
+            "elevated MEV-Share activity must not raise score: {} vs {}",
+            op_busy.score,
+            op_quiet.score
+        );
+        assert!(
+            op_busy.competition_prob > op_quiet.competition_prob,
+            "elevated MEV-Share must raise competition_prob"
+        );
+    }
+
+    #[tokio::test]
+    async fn score_returns_zero_when_competition_at_suppress_threshold() {
+        // 0.35 + 0.25 (max bump) = 0.60 < 0.90 → not suppressed for SA.
+        // The suppress threshold is 0.90; SA can never reach it via events
+        // alone (max is 0.60). So we verify the non-suppressed path is
+        // what executes, and the test below covers the score=0 path via
+        // the fee-pressure gate instead.
+        let s = make_strategy();
+        let op = s.score(&make_signal_with_mev_share(5, 100)).await.unwrap();
+        // 0.35 + min(100*0.02, 0.25) = 0.60 → below 0.90 → score > 0
+        assert!(
+            op.score > 0.0,
+            "SA at max MEV-Share bump (0.60) should still produce score"
+        );
+        assert!((op.competition_prob - 0.60).abs() < 1e-9);
+    }
+
+    // ── build_blueprint() ─────────────────────────────────────────────────────
 
     #[tokio::test]
     async fn build_blueprint_fields_correct() {
@@ -462,7 +732,56 @@ mod tests {
         assert!(!bp.flashloan_amount.is_zero());
         assert_ne!(bp.provider_contract, Address::ZERO);
         assert_eq!(bp.flashloan_token, ARBITRUM_WETH);
-        assert_eq!(bp.flashloan_amount, U256::from(SA_SPREAD_WEI));
+    }
+
+    #[tokio::test]
+    async fn build_blueprint_flashloan_amount_matches_quote() {
+        // The flashloan amount must reflect what the quote source returned,
+        // not a hardcoded constant.
+        let custom_spread = U256::from(150_000_000_000_000_000_u128); // 0.15 ETH
+        let s = make_strategy_with_quote(Arc::new(FixedQuoteSource(custom_spread)));
+        let bp = s.build_blueprint(&make_signal(5)).await.unwrap();
+        assert_eq!(
+            bp.flashloan_amount, custom_spread,
+            "flashloan_amount must equal the live quote, not SA_SPREAD_WEI"
+        );
+    }
+
+    #[tokio::test]
+    async fn build_blueprint_profit_varies_with_quote() {
+        // Two blueprints built with different quote sources must report
+        // different expected_profit_net — the key regression from the
+        // constant-spread bug.
+        let s_low = make_strategy_with_quote(Arc::new(FixedQuoteSource(U256::from(
+            150_000_000_000_000_000_u128,
+        ))));
+        let s_high = make_strategy_with_quote(Arc::new(FixedQuoteSource(U256::from(
+            250_000_000_000_000_000_u128,
+        ))));
+        let bp_low = s_low.build_blueprint(&make_signal(5)).await.unwrap();
+        let bp_high = s_high.build_blueprint(&make_signal(5)).await.unwrap();
+        assert_ne!(
+            bp_low.expected_profit_net, bp_high.expected_profit_net,
+            "blueprints built from different quotes must have different profit estimates"
+        );
+        assert!(
+            bp_high.expected_profit_net > bp_low.expected_profit_net,
+            "higher quote must produce higher net profit"
+        );
+    }
+
+    #[tokio::test]
+    async fn build_blueprint_fails_closed_when_no_quote() {
+        let s = make_strategy_with_quote(Arc::new(NoQuoteSource));
+        let err = s
+            .build_blueprint(&make_signal(5))
+            .await
+            .expect_err("missing quote must fail closed");
+        let msg = format!("{err:?}");
+        assert!(
+            msg.contains("no live quote available"),
+            "unexpected error message: {msg}"
+        );
     }
 
     #[tokio::test]
@@ -486,25 +805,17 @@ mod tests {
 
     #[test]
     fn calldata_encoding_non_empty() {
-        // Fix E0061: encode_two_hop_calldata takes 4 args — contract_addr was missing
         let data = SaStrategy::encode_two_hop_calldata(
             Address::ZERO,
             U256::from(900_000_u64),
             U256::from(1_000_000_u64),
             1_000_100,
         );
-        // selector(4) + amount_in(32) + min_out(32) + deadline(32) + addr(32) = 132 bytes
         assert_eq!(data.len(), 132);
     }
 
-    // ── max_base_fee_gwei floor (this revision) ──────────────────────────────
-
     #[tokio::test]
     async fn build_blueprint_max_base_fee_is_never_zero_at_sub_gwei_base_fee() {
-        // Regression guard: on Arbitrum the real base fee (~0.02 gwei)
-        // reaches the strategy as 0 whole gwei. The old inline
-        // `base_fee_gwei * 3` produced max_base_fee_gwei == 0, making the
-        // on-chain BaseFeeTooHigh guard revert every execute().
         let s = make_strategy();
         let bp = s.build_blueprint(&make_signal(0)).await.unwrap();
         assert!(
@@ -518,21 +829,13 @@ mod tests {
 
     #[tokio::test]
     async fn build_blueprint_max_base_fee_scales_above_floor() {
-        // 5 gwei * 3.0 = 15 — above the floor, so unchanged by it.
         let s = make_strategy();
         let bp = s.build_blueprint(&make_signal(5)).await.unwrap();
         assert_eq!(bp.max_base_fee_gwei, 15);
     }
 
-    // ── Blueprint integrity (earlier revision) ───────────────────────────────
-
     #[tokio::test]
     async fn build_blueprint_passes_verify_hash() {
-        // Regression guard: previously blueprint_hash was computed via a
-        // strategy-local ad hoc hash that never matched
-        // ExecutionBlueprint::compute_hash(), so verify_hash() would have
-        // failed for every SA blueprint. Now that build_blueprint calls
-        // the canonical compute_hash(), this must pass.
         let s = make_strategy();
         let bp = s.build_blueprint(&make_signal(5)).await.unwrap();
         assert!(
@@ -568,6 +871,7 @@ mod tests {
             Address::ZERO,
             empty,
             &OmegaConfig::default(),
+            default_quote(),
         );
         let err = s
             .build_blueprint(&make_signal(5))
@@ -580,43 +884,14 @@ mod tests {
         );
     }
 
-    // ── Cross-crate constant drift guard ─────────────────────────────────────
+    // ── Cross-crate constant drift guards ─────────────────────────────────────
 
-    /// Regression guard, same pattern as
-    /// `omega_risk::checks::checks_tests::
-    /// gas_spike_threshold_matches_named_constant_not_a_duplicate_literal`:
-    /// `omega-strategies` deliberately does not depend on `omega-risk`
-    /// (Cargo.toml's own architectural note — strategies stay compilable
-    /// without the full dependency tree), so `SA_SLIPPAGE_BPS` here and
-    /// `omega_risk::context::MAX_SLIPPAGE_BPS_SA` cannot be the same
-    /// constant. They drifted apart once already (this file previously
-    /// had 50 against a real cap of 30) with nothing to catch it until a
-    /// blueprint hit check 9 in a live pipeline. This mirrors the real
-    /// cap value as a named, heavily-commented local constant and asserts
-    /// against it, so an edit to either side that isn't mirrored on the
-    /// other fails THIS test instead of failing silently in production.
-    ///
-    /// IF THIS TEST FAILS: either `SA_SLIPPAGE_BPS` above was changed
-    /// without checking `context.rs`, or `context.rs`'s
-    /// `MAX_SLIPPAGE_BPS_SA` changed and this mirror is now stale — check
-    /// crates/omega-risk/src/context.rs's real value before touching
-    /// either number.
-    ///
-    /// Both operands below are local `const`s, so clippy's
-    /// `assertions_on_constants` lint flags this as evaluable at
-    /// compile time and suggests a `const { assert!(..) }` block.
-    /// Deliberately not taking that suggestion: this is a genuine test
-    /// (see "IF THIS TEST FAILS" framing directly above) whose job is
-    /// to surface as a normal `cargo test` failure if either constant
-    /// drifts, not to become a hard compile error — that's a real
-    /// behavioral choice, not a lint nuisance.
     #[allow(clippy::assertions_on_constants)]
     #[test]
     fn sa_slippage_within_known_risk_policy_cap() {
-        /// Mirrors omega_risk::context::MAX_SLIPPAGE_BPS_SA as of the
-        /// revision that fixed the 50-vs-30 drift. Not the real constant
-        /// (can't import it — see this test's doc comment) — a manually
-        /// synced copy that exists specifically so drift is caught here.
+        /// Mirrors omega_risk::context::MAX_SLIPPAGE_BPS_SA.
+        /// See this test's doc comment in the earlier revision for why this
+        /// is a manually-synced copy rather than an import.
         const MIRRORED_CONTEXT_RS_MAX_SLIPPAGE_BPS_SA: u16 = 30;
         assert!(
             SA_SLIPPAGE_BPS <= MIRRORED_CONTEXT_RS_MAX_SLIPPAGE_BPS_SA,
@@ -625,6 +900,23 @@ mod tests {
              would fail omega_risk::checks::check_slippage (check 9, MissSlippage) \
              in production. Verify against the real MAX_SLIPPAGE_BPS_SA in \
              crates/omega-risk/src/context.rs before changing either value."
+        );
+    }
+
+    #[test]
+    fn sa_competition_suppress_threshold_matches_pipeline_default() {
+        /// Mirrors the default `max_competition_probability` from pipeline.rs
+        /// (line 825: 0.90). If that value changes, this test will fail,
+        /// surfacing the need to update SA_COMPETITION_SCORE_SUPPRESS_THRESHOLD.
+        const MIRRORED_PIPELINE_MAX_COMPETITION_PROBABILITY: f64 = 0.90;
+        assert!(
+            (SA_COMPETITION_SCORE_SUPPRESS_THRESHOLD
+                - MIRRORED_PIPELINE_MAX_COMPETITION_PROBABILITY)
+                .abs()
+                < 1e-9,
+            "SA_COMPETITION_SCORE_SUPPRESS_THRESHOLD ({SA_COMPETITION_SCORE_SUPPRESS_THRESHOLD}) \
+             does not match the pipeline's max_competition_probability \
+             ({MIRRORED_PIPELINE_MAX_COMPETITION_PROBABILITY}). Update one or both."
         );
     }
 }

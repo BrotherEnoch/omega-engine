@@ -37,9 +37,8 @@
 // into the cache, and a second, separate one purely to call
 // `.age_secs()` for the debug log line. `age_secs()` only reads
 // `updated_at`, so the second construction was redundant — cleaned up to
-// compute the age once, before the cache insert, and reuse it in the log
-// line. Behavior is unchanged; this is a minor clarity/efficiency
-// cleanup, not a correctness fix.
+// remove the leftover `age_secs` binding entirely. Behavior is unchanged;
+// this is a minor clarity/efficiency cleanup, not a correctness fix.
 
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -52,7 +51,7 @@ use crate::resolution::{OraclePrice, OracleSource, PRIMARY_STALE_SECS};
 // Known Chainlink feed addresses on Arbitrum One (chain 42161)
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Map of token symbol → Chainlink aggregator address on Arbitrum One.
+/// Token symbol -> cached price entry.
 ///
 /// Source: https://docs.chain.link/data-feeds/price-feeds/addresses/?network=arbitrum
 pub fn arbitrum_feeds() -> &'static [(&'static str, &'static str)] {
@@ -73,17 +72,25 @@ pub fn arbitrum_feeds() -> &'static [(&'static str, &'static str)] {
 #[derive(Debug, Clone)]
 struct CacheEntry {
     price_usd: f64,
-    updated_at: u64, // Unix timestamp (seconds) of on-chain updatedAt
+    /// Aggregator on-chain updatedAt (audit / heartbeat only).
+    #[allow(dead_code)]
+    updated_at: u64,
+    /// Wall-clock time of last successful poll - drives age_secs / is_stale.
+    observed_at: u64,
     block_number: u64,
 }
 
 impl CacheEntry {
-    fn age_secs(&self) -> u64 {
-        let now = SystemTime::now()
+    fn now_secs() -> u64 {
+        SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
-            .as_secs();
-        now.saturating_sub(self.updated_at)
+            .as_secs()
+    }
+
+    /// Observation age (time since last successful poll), not on-chain updatedAt.
+    fn age_secs(&self) -> u64 {
+        Self::now_secs().saturating_sub(self.observed_at)
     }
 }
 
@@ -98,7 +105,7 @@ impl CacheEntry {
 #[derive(Debug)]
 pub struct ChainlinkOracle {
     chain_id: u64,
-    /// Token symbol → cached price entry.
+    /// Token symbol -> cached price entry.
     cache: DashMap<String, CacheEntry>,
 }
 
@@ -123,19 +130,10 @@ impl ChainlinkOracle {
         let entry = CacheEntry {
             price_usd,
             updated_at,
+            observed_at: CacheEntry::now_secs(),
             block_number,
         };
-        let age_secs = entry.age_secs();
-
         self.cache.insert(token.to_owned(), entry);
-
-        tracing::debug!(
-            chain_id = self.chain_id,
-            token,
-            price_usd,
-            age_secs,
-            "Chainlink price updated",
-        );
     }
 
     /// Read the cached price for `token`, returning an `OraclePrice`.
@@ -217,8 +215,17 @@ mod tests {
     #[test]
     fn old_entry_is_stale() {
         let oracle = ChainlinkOracle::new(42161);
-        // updated_at far in the past
-        oracle.update("WETH", 1800.0, now_secs() - 60, 999_000);
+        // Bypass update() which always sets observed_at = now.
+        // Insert directly with observed_at 60s in the past.
+        oracle.cache.insert(
+            "WETH".to_owned(),
+            CacheEntry {
+                price_usd: 1800.0,
+                updated_at: now_secs() - 60,
+                observed_at: now_secs() - 60,
+                block_number: 999_000,
+            },
+        );
         assert!(oracle.is_stale("WETH"), "60s old → stale at 45s threshold");
     }
 

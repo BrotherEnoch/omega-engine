@@ -31,6 +31,14 @@ struct Args {
     /// Use insecure_dev_noop guest path (never for production vkeys)
     #[arg(long, default_value_t = false)]
     insecure_dev: bool,
+
+    /// Derive and print PROGRAM_VKEY from the selected ELF without generating a proof.
+    #[arg(long, default_value_t = false)]
+    vkey_only: bool,
+
+    /// Compare the derived key against the deployment value.
+    #[arg(long)]
+    expected_vkey: Option<String>,
 }
 
 fn parse_hash32(s: &str) -> [u8; 32] {
@@ -119,9 +127,27 @@ fn main() {
     let elf = std::fs::read(&args.elf).expect("read ELF");
     let (pk, vk) = client.setup(&elf);
 
+    // Keep the adapter vkey tied to this exact ELF.
+    let derived_vkey = hex::encode(sp1_sdk::HashableKey::bytes32(&vk));
+    println!("PROGRAM_VKEY=0x{derived_vkey}");
+
+    if let Some(expected) = args.expected_vkey.as_deref() {
+        let expected = expected.trim().strip_prefix("0x").unwrap_or(expected.trim());
+        if !expected.eq_ignore_ascii_case(&derived_vkey) {
+            eprintln!("PROGRAM_VKEY does not match the supplied deployment value");
+            std::process::exit(1);
+        }
+        println!("PROGRAM_VKEY matches the supplied deployment value");
+    }
+
+    if args.vkey_only {
+        return;
+    }
+
     println!("Proving… (insecure_dev={})", args.insecure_dev);
     let proof = client
         .prove(&pk, stdin)
+        .groth16()
         .run()
         .expect("proof generation failed");
 

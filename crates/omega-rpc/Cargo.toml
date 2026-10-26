@@ -16,7 +16,7 @@ omega-health = { path = "../omega-health" }
 #
 # Required features:
 #   providers      — Provider trait, ProviderBuilder
-#   provider-ws    — FIX (this revision): wires WS support INTO
+#   provider-ws    — FIX (prior revision): wires WS support INTO
 #                     ProviderBuilder itself (ProviderBuilder::on_ws,
 #                     and alloy::providers::WsConnect re-exported from
 #                     alloy-provider's own `ws` feature). Distinct from
@@ -32,10 +32,14 @@ omega-health = { path = "../omega-health" }
 #                     alloy-provider-0.3.6/src/{builder,lib}.rs. Without
 #                     this feature, `ProviderBuilder::on_ws` and
 #                     `alloy::providers::WsConnect` do not exist at all
-#                     (E0599 / E0432) — this was the root cause of
-#                     client.rs's WS-connect failure this session, not a
-#                     bug in client.rs's own code once this feature is
-#                     enabled.
+#                     (E0599 / E0432).
+#   provider-http  — NEW (HTTP transport): enables
+#                     `ProviderBuilder::on_http`, used when the RPC URL is
+#                     http:// or https:// (zero-cost polling mode, no
+#                     paid WSS key). If cargo reports this feature name
+#                     as unknown for alloy 0.3.6, replace it with
+#                     "reqwest" (the umbrella feature that enables
+#                     alloy-provider's reqwest/HTTP transport).
 #   transport-ws   — WsConnect WebSocket transport (standalone
 #                     alloy_transport_ws re-export at
 #                     alloy::transports::ws — kept alongside
@@ -51,6 +55,7 @@ omega-health = { path = "../omega-health" }
 alloy = { workspace = true, features = [
     "providers",
     "provider-ws",
+    "provider-http",
     "transport-ws",
     "pubsub",
     "rpc-types",
@@ -84,6 +89,9 @@ dashmap = { workspace = true }
 chrono = { workspace = true }
 
 # HTTP client for MEV-Share SSE stream (§subscriptions run_mev_share_stream)
+# and for parsing the HTTP RPC URL (`reqwest::Url`) in transport.rs.
 # Streaming body support required — do NOT enable default-features (pulls in
 # native-tls which conflicts with the node deployment environment).
+# Cargo unifies features across the workspace's single reqwest 0.12 crate, so the
+# rustls-tls feature here also provides TLS for alloy's HTTP transport (https:// RPC URLs).
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream", "json"] }

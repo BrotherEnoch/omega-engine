@@ -33,6 +33,19 @@ edition = "2021"
 # deliberate departure from the §22.1 note below as `omega-flashloan`
 # already represents — not a new precedent, an extension of the one
 # already flagged.
+#
+# ## Competition model (this revision)
+#
+# Added `omega-risk` — sa.rs's `score()` now calls
+# `omega_risk::competition::non_la_competition_probability()` to derive a
+# live, MEV-Share-adjusted competition estimate rather than a hardcoded
+# 0.35 constant. This is the third deliberate departure from the §22.1
+# "injected as trait objects" note below. The competition model is a pure
+# function (stateless, no I/O) — injecting it behind a trait would add
+# indirection with no benefit; it is cheaper and clearer to call it
+# directly. omega-risk already compiles without omega-strategies in its
+# dependency graph (the direction of that dependency has not changed), so
+# this addition creates no cycle.
 
 [dependencies]
 omega-core             = { path = "../omega-core" }
@@ -40,18 +53,18 @@ omega-gas-war           = { path = "../omega-gas-war" }
 omega-loss-attribution  = { path = "../omega-loss-attribution" }
 omega-flashloan         = { path = "../omega-flashloan" }
 omega-positions         = { path = "../omega-positions" }
+omega-risk              = { path = "../omega-risk" }
 
 # ARCHITECTURAL NOTE (§22.1):
-# omega-strategies depends on omega-core, omega-gas-war, and
-# omega-loss-attribution.  It does NOT depend on omega-oracle or
-# omega-risk — those are injected as trait objects so omega-strategies
-# stays compilable without the full dependency tree. omega-rpc is also
-# excluded — strategies never call RPC directly.
-#
-# omega-flashloan and omega-positions are now real dependencies (see
-# audit-fix notes above) — this note is left in place rather than
-# rewritten so the deviation from the original §22.1 design is visible,
-# not smoothed over.
+# omega-strategies originally depended only on omega-core, omega-gas-war,
+# and omega-loss-attribution. omega-oracle and the remaining risk/rpc
+# crates are still injected as trait objects so omega-strategies stays
+# compilable without the full dependency tree. The three real (non-trait-
+# object) additions — omega-flashloan, omega-positions, omega-risk — are
+# each flagged in the audit notes above rather than smoothed over. The
+# §22.1 constraint is partially relaxed, not abandoned: oracle data and
+# RPC access remain injected as traits; only concrete shared-registry and
+# pure-function dependencies are wired directly.
 
 # EVM primitive types (shared with omega-core — no full alloy transport)
 alloy-primitives = { workspace = true }

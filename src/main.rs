@@ -1,9 +1,11 @@
 // src/main.rs — OmegaEngine v12.0 Main Entry Point
 //
 // Required env vars:
-//   ARBITRUM_RPC_URL         WebSocket RPC endpoint
-//   ARBITRUM_HTTP_RPC_URL    Plain HTTP JSON-RPC endpoint (inclusion tracking, nonce and
-//                            vault lookups use plain HTTP POSTs; the WS URL won't work)
+//   ARBITRUM_RPC_URL         Primary RPC endpoint. ws:// / wss:// (full functionality, incl.
+//                            mempool) OR http:// / https:// (zero-cost polling mode — see
+//                            "HTTP transport" below).
+//   ARBITRUM_HTTP_RPC_URL    Plain HTTP JSON-RPC endpoint (inclusion tracking, nonce, balance
+//                            and vault lookups use plain HTTP POSTs; a WS URL won't work here)
 //   VAULT_ADDRESS            OmegaVault address — feeds publicInputsHash for ZK proofs
 //   PROFIT_TOKEN             Profit token address — feeds publicInputsHash for ZK proofs
 //   ORCHESTRATOR_ADDRESS     OmegaOrchestrator address every signed tx calls execute() on
@@ -15,6 +17,27 @@
 //   OMEGA_TX_SIGNER=kms      requires AWS_KMS_KEY_ID (+ AWS creds/region);
 //                            optional OMEGA_TX_EXPECTED_ADDRESS fail-closed check
 //
+// Phase policy:
+//   This binary runs PRODUCTION PHASE 4 ONLY (REQUIRED_ACTIVE_PHASE). Any other
+//   `active_phase` in the loaded config — including Phase 0 shadow mode — halts startup.
+//   The phase comes from the config file's `active_phase`; main.rs does not itself read
+//   OMEGA_ACTIVE_PHASE or OMEGA_PRODUCTION_ACK (set-prod-env.ps1 exports them for
+//   whichever layer consumes them). The enforcement below checks the FINAL resolved value.
+//
+// HTTP transport (no paid WSS key needed):
+//   When ARBITRUM_RPC_URL starts with http:// or https://, omega-rpc runs in polling mode
+//   instead of eth_subscribe. The transport is detected from the URL scheme alone; there is
+//   no separate override. In this mode the pending-transaction (mempool) stream is NOT
+//   started — free HTTP endpoints do not expose a reliable mempool — so strategies that
+//   depend on mempool signals will not fire. Block-driven and log-driven strategies keep
+//   running with added polling latency.
+//   OMEGA_RPC_MAX_RPS         request budget for the rate limiter (default 500; minimum
+//                             enforced 25, see MIN_RPS). Set ~25-50 for free public endpoints.
+//   OMEGA_POLL_BLOCKS_MS      (read by omega-rpc) block poll interval, default 250
+//   OMEGA_POLL_LOGS_MS        (read by omega-rpc) log poll interval, default 1000
+//   OMEGA_LOGS_MAX_RANGE      (read by omega-rpc) max blocks per eth_getLogs, default 1000
+//   OMEGA_POLL_MAX_CATCHUP    (read by omega-rpc) max blocks fetched after a stall, default 50
+//
 // Optional env vars:
 //   OMEGA_CONFIG                  default: config/default.toml
 //   OMEGA_CHAIN_ID                overrides DEFAULT_CHAIN_ID (42161, Arbitrum One);
@@ -25,6 +48,11 @@
 //   OMEGA_MAX_COMPETITION_PROBABILITY, OMEGA_ROLLOUT_TIER, OMEGA_KILL_*,
 //   OMEGA_MAX_ACCOUNT_EXPOSURE_WEI   risk / kill-switch inputs (required at phase >= 1
 //                                 where noted in the loaders below)
+//   OMEGA_MIN_GAS_BALANCE_WEI     minimum ETH balance (wei) the gas-paying account must hold
+//                                 on-chain. Startup halts below this; a background monitor
+//                                 logs at error while the balance is below it. Default
+//                                 5_000_000_000_000_000 (0.005 ETH) — a starting value, not
+//                                 a risk-approved number; set it from your own gas budget.
 //   OMEGA_AAVE_V3_POOL_TAG_OVERRIDE,
 //   OMEGA_BALANCER_V2_VAULT_TAG_OVERRIDE
 //                                 override only the address TAG recorded in
@@ -36,23 +64,71 @@
 //                                 secret is skipped, never faked
 //   OMEGA_VAULT_SUBMIT_GAS, OMEGA_VAULT_SUBMIT_PRIORITY_GWEI,
 //   OMEGA_VAULT_SUBMIT_MAX_FEE_GWEI   submitProof gas parameters
-//   OMEGA_LOCAL_L1_DATA_FEE_GWEI  L1 data fee seeded when the ArbGasInfo poll fails on a
-//                                 non-default chain; default 1
-//   OMEGA_SEED_L1_ON_POLL_FAIL    1|true|yes: apply that seed on the default chain too
+//   OMEGA_LOCAL_L1_DATA_FEE_GWEI  local-fork L1 data fee fallback; default 1
+//   OMEGA_SEED_L1_ON_POLL_FAIL    1|true|yes: use fallback and skip ArbGasInfo polling;
+//                                 only accepted when both RPC endpoints are loopback
 //   OMEGA_FORCE_MEV_SHARE         set to any value to start the MEV-Share SSE stream even
 //                                 on a non-default chain (useful for integration testing)
+//   OMEGA_ALLOW_STATIC_QUOTE      1|true|yes: allow SA to be registered with the
+//                                 fixed-spread `StaticQuoteSource` on production
+//                                 Arbitrum One at phase >= 1. OFF by default: the static
+//                                 0.2 ETH spread makes every SA blueprint report an
+//                                 identical fabricated profit (see sa.rs changelog).
+//   OMEGA_ALLOW_SYNTHETIC_MSA     1|true|yes: allow MSA to be registered on production
+//                                 Arbitrum One at phase >= 1. OFF by default: msa.rs derives
+//                                 its profit from `state_version % 20` (a deterministic proxy,
+//                                 not pool state or a pending victim transaction) and sets the
+//                                 flashloan amount equal to that fabricated profit.
 //
 // (OMEGA_VAULT_SUBMIT_NONCE is no longer read — see C10p.)
 //
 // ## Changelog (most recent first; see VCS for full history)
 //
-// - 2026-10-16 (noise reduction): two log-spam fixes for local/Anvil runs.
-//   (1) L2d ArbGasInfo poll: non-default chains (Anvil, Hardhat) have no ArbGasInfo
-//       precompile and return InvalidFEOpcode every 15 s. The poll now seeds the stable
-//       local L1 fee on the first failure and stays silent on subsequent failures.
-//       `seeded_local` is reset to false if a real Arbitrum poll ever succeeds, so the
-//       behaviour on Arbitrum One is unchanged. OMEGA_SEED_L1_ON_POLL_FAIL still forces
-//       seeding on the default chain if needed.
+// - 2026-10-31 (MSA production guard): msa.rs `estimated_profit_wei` is a placeholder:
+//   `5e15 wei * (state_version % 20 + 1) * 0.35`, read from no pool and no pending
+//   transaction, and `build_blueprint` borrows exactly that amount. The live run showed the
+//   resulting sawtooth (1.75e15 … 3.5e16 wei, repeating) with profit == flashloan on every
+//   blueprint. Like SA with `StaticQuoteSource`, MSA is therefore NOT registered on
+//   production Arbitrum One at phase >= 1 unless OMEGA_ALLOW_SYNTHETIC_MSA is set. The
+//   decision is logged at error/warn. Making MSA real requires a live estimator (pending
+//   victim tx decoding + pool state) in msa.rs; main.rs cannot supply one.
+// - 2026-10-31 (phase 4 only / gas funding / MEV-Share into scoring):
+//   (1) Startup now halts unless the loaded config's `active_phase` is exactly
+//       REQUIRED_ACTIVE_PHASE (4). Phase 0 shadow mode is no longer permitted.
+//   (2) The gas-paying account is checked on-chain (`eth_getBalance` over
+//       ARBITRUM_HTTP_RPC_URL) right after the envelope-nonce seed. Startup halts when the
+//       balance is below OMEGA_MIN_GAS_BALANCE_WEI OR the lookup itself fails (fail
+//       closed — the previous run showed `pending_nonce: 0`, i.e. an account that had never
+//       transacted, with nothing verifying it could pay for gas). A background monitor then
+//       re-checks every GAS_BALANCE_MONITOR_INTERVAL and logs at error while underfunded.
+//       It only logs; it does not halt a running engine. The next live run confirmed the
+//       account held 0 wei and startup halted as designed: the fix is funding the account,
+//       not changing this check.
+//   (3) `run_scoring_loop` hard-coded `mev_share_events_in_window: 0` in the SignalState it
+//       builds, so strategy `score()` never saw MEV-Share activity (the tracker fed only
+//       CheckContext). It now reads `MevShareActivityTracker::events_in_window` for every
+//       tick, so MSA's skip threshold and SA's score suppression act on live data. The
+//       canary loop intentionally keeps 0: CNRY does not use competition.
+// - 2026-10-31 (SA QuoteSource): `SaStrategy::new` now takes a sixth argument,
+//   `Arc<dyn QuoteSource>` (sa.rs live-quote revision). L13 passes `StaticQuoteSource`
+//   until a UniV3-backed implementation exists. Because the static spread is the exact
+//   fabricated-opportunity bug sa.rs was fixed to remove, SA is NOT registered on
+//   production Arbitrum One at phase >= 1 unless OMEGA_ALLOW_STATIC_QUOTE is set; the
+//   decision is logged at error/warn. The `hot_path_zk_provisioning_tests` harness is
+//   updated for the new constructor signature.
+// - 2026-10-30 (HTTP transport): ARBITRUM_RPC_URL may now be http(s)://. main.rs detects
+//   the scheme (`rpc_url_is_http`), logs the selected transport, skips the pending-tx
+//   (mempool) stream on HTTP with a loud warning, and reads the rate-limit budget from
+//   OMEGA_RPC_MAX_RPS (`rpc_rps_from_env`, clamped to MIN_RPS because omega-rpc derives
+//   its write/subscribe bucket capacities as 10% / 4% of the budget and a budget below
+//   25 would round the subscribe bucket to zero). The omega-rpc crate (client.rs, net.rs,
+//   subscriptions.rs) must provide the HTTP path for an https:// URL to actually connect.
+// - 2026-10-25 (local fork RPC): an explicit local-fork L1 fallback now requires both
+//   Arbitrum RPC URLs to be loopback, seeds once, and skips ArbGasInfo polling entirely.
+//   This avoids InvalidFEOpcode on Anvil forks that preserve chain id 42161 without Nitro
+//   precompiles. Production RPC failures remain visible and never use the local estimate.
+// - 2026-10-16 (noise reduction): non-default chains seed the stable local L1 fee on the
+//   first ArbGasInfo failure and stay silent on subsequent failures.
 //   (2) MEV-Share SSE stream: only started on DEFAULT_CHAIN_ID (Arbitrum One). On any
 //       other chain the stream is skipped with a single INFO log. Set
 //       OMEGA_FORCE_MEV_SHARE=1 to override. This prevents the repeated
@@ -232,6 +308,53 @@ async fn fetch_pending_nonce(
         Ok(n) => Some(n),
         Err(e) => {
             tracing::warn!(error = %e, address = %address_hex, "pending nonce lookup: hex parse failed");
+            None
+        }
+    }
+}
+
+/// Reads `eth_getBalance(address, "latest")` (wei) over plain HTTP JSON-RPC.
+///
+/// Returns `None` (and logs at `warn`) on any transport/parse failure. Callers that gate
+/// execution on the result MUST treat `None` as "unknown", never as "funded".
+async fn fetch_balance_wei(
+    http: &reqwest::Client,
+    rpc_url: &str,
+    address_hex: &str,
+) -> Option<u128> {
+    let body = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "eth_getBalance",
+        "params": [address_hex, "latest"]
+    });
+    let resp = match http.post(rpc_url).json(&body).send().await {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::warn!(error = %e, address = %address_hex, "gas balance lookup: HTTP request failed");
+            return None;
+        }
+    };
+    let v: serde_json::Value = match resp.json().await {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::warn!(error = %e, address = %address_hex, "gas balance lookup: JSON decode failed");
+            return None;
+        }
+    };
+    if let Some(err) = v.get("error") {
+        tracing::warn!(rpc_error = %err, address = %address_hex, "gas balance lookup: JSON-RPC error");
+        return None;
+    }
+    let hex = v.get("result").and_then(|r| r.as_str())?;
+    let digits = hex.trim_start_matches("0x");
+    if digits.is_empty() {
+        return Some(0);
+    }
+    match u128::from_str_radix(digits, 16) {
+        Ok(n) => Some(n),
+        Err(e) => {
+            tracing::warn!(error = %e, address = %address_hex, "gas balance lookup: hex parse failed");
             None
         }
     }
@@ -470,6 +593,26 @@ mod tx_signer_factory;
 /// Fallback chain ID (Arbitrum One) used only when OMEGA_CHAIN_ID is unset.
 const DEFAULT_CHAIN_ID: u64 = 42_161;
 const DEFAULT_RPS: u32 = 500;
+
+/// The only `active_phase` this binary will run at. Phase 0 (shadow) and every other phase
+/// halt startup — see `phase_allowed`.
+const REQUIRED_ACTIVE_PHASE: u8 = 4;
+
+/// Default floor for the gas-paying account's on-chain ETH balance: 0.005 ETH. A starting
+/// value, not a risk-approved number — override with OMEGA_MIN_GAS_BALANCE_WEI.
+const MIN_GAS_BALANCE_WEI_DEFAULT: u128 = 5_000_000_000_000_000;
+
+/// How often the background monitor re-reads the gas-paying account's balance.
+const GAS_BALANCE_MONITOR_INTERVAL: Duration = Duration::from_secs(60);
+
+/// Lowest request budget accepted from OMEGA_RPC_MAX_RPS.
+///
+/// omega-rpc splits the budget into read / write / subscribe token buckets at 80% / 10% /
+/// 4% (truncated to whole tokens). Below 25 the 4% subscribe bucket truncates to ZERO
+/// capacity, and the block loop waits on a subscribe token before every (re)connect — so
+/// a smaller budget could stall the engine silently. 25 yields 20 / 2 / 1.
+const MIN_RPS: u32 = 25;
+
 const SHUTDOWN_DRAIN_S: u64 = 5;
 const DEFAULT_CONFIG: &str = "config/default.toml";
 
@@ -499,6 +642,115 @@ const LOCAL_CHAIN_L1_DATA_FEE_GWEI_DEFAULT: u64 = 1;
 const BOOTSTRAP_RELAY_SAMPLES: u32 = 20;
 /// How many of the bootstrap samples are recorded as positive.
 const BOOTSTRAP_RELAY_ACCEPTED: u32 = 18;
+
+/// True when `url` is a plain HTTP(S) JSON-RPC endpoint rather than a WebSocket one.
+///
+/// Mirrors the scheme detection used by omega-rpc's transport layer. Kept local to this
+/// binary so main.rs has no compile-time dependency on an omega-rpc symbol for a
+/// one-line scheme check.
+fn rpc_url_is_http(url: &str) -> bool {
+    let u = url.trim().to_ascii_lowercase();
+    u.starts_with("http://") || u.starts_with("https://")
+}
+
+/// Pure clamp/parse logic behind `rpc_rps_from_env`, testable without env vars.
+/// Unset / unparseable / zero → `DEFAULT_RPS`; anything below `MIN_RPS` → `MIN_RPS`.
+fn rpc_rps_from(raw: Option<&str>) -> u32 {
+    raw.and_then(|s| s.trim().parse::<u32>().ok())
+        .filter(|v| *v > 0)
+        .map(|v| v.max(MIN_RPS))
+        .unwrap_or(DEFAULT_RPS)
+}
+
+/// Request budget for the RPC rate limiter, from OMEGA_RPC_MAX_RPS.
+fn rpc_rps_from_env() -> u32 {
+    rpc_rps_from(std::env::var("OMEGA_RPC_MAX_RPS").ok().as_deref())
+}
+
+/// True only for the one phase this binary may run at. Phase 0 (shadow) is NOT allowed.
+fn phase_allowed(active_phase: u8) -> bool {
+    active_phase == REQUIRED_ACTIVE_PHASE
+}
+
+/// Pure parse logic behind `min_gas_balance_wei_from_env`, testable without env vars.
+/// Unset / unparseable / zero → the default. A zero floor would disable the check, so it is
+/// never accepted.
+fn min_gas_balance_wei_from(raw: Option<&str>) -> u128 {
+    raw.and_then(|s| s.trim().parse::<u128>().ok())
+        .filter(|v| *v > 0)
+        .unwrap_or(MIN_GAS_BALANCE_WEI_DEFAULT)
+}
+
+/// Minimum on-chain balance (wei) the gas-paying account must hold, from
+/// OMEGA_MIN_GAS_BALANCE_WEI.
+fn min_gas_balance_wei_from_env() -> u128 {
+    min_gas_balance_wei_from(std::env::var("OMEGA_MIN_GAS_BALANCE_WEI").ok().as_deref())
+}
+
+/// True when `balance_wei` is at or above the configured floor.
+fn gas_balance_sufficient(balance_wei: u128, min_wei: u128) -> bool {
+    balance_wei >= min_wei
+}
+
+/// Wall-clock Unix time in milliseconds (0 if the clock is before the epoch).
+fn current_unix_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+/// Shared policy for strategies whose current implementation derives profit from a
+/// placeholder rather than live market state.
+///
+/// Such a strategy is tolerable in shadow phase 0 or on a local fork / testnet, but not
+/// when real relays and real gas are in play on production Arbitrum One. Production
+/// (`DEFAULT_CHAIN_ID`) at phase >= 1 therefore requires an explicit opt-in
+/// (`allow_override`).
+fn placeholder_strategy_allowed(active_phase: u8, chain_id: u64, allow_override: bool) -> bool {
+    if active_phase == 0 || chain_id != DEFAULT_CHAIN_ID {
+        return true;
+    }
+    allow_override
+}
+
+/// Pure decision logic for whether SA may be registered with the fixed-spread
+/// `StaticQuoteSource`, testable without env vars.
+///
+/// `StaticQuoteSource` returns the same 0.2 ETH spread on every call, so every SA
+/// blueprint reports an identical fabricated profit and flashloan amount.
+fn static_quote_allowed(active_phase: u8, chain_id: u64, allow_override: bool) -> bool {
+    placeholder_strategy_allowed(active_phase, chain_id, allow_override)
+}
+
+/// Pure decision logic for whether MSA may be registered, testable without env vars.
+///
+/// msa.rs `estimated_profit_wei` is `5e15 wei * (state_version % 20 + 1) * 0.35` — it reads
+/// no pool and no pending victim transaction — and `build_blueprint` sets the flashloan
+/// amount equal to that fabricated profit.
+fn synthetic_msa_allowed(active_phase: u8, chain_id: u64, allow_override: bool) -> bool {
+    placeholder_strategy_allowed(active_phase, chain_id, allow_override)
+}
+
+/// True when the named env var is set to 1 / true / yes.
+fn env_flag_enabled(name: &str) -> bool {
+    std::env::var(name)
+        .map(|value| {
+            let value = value.trim();
+            value == "1" || value.eq_ignore_ascii_case("true") || value.eq_ignore_ascii_case("yes")
+        })
+        .unwrap_or(false)
+}
+
+/// True when OMEGA_ALLOW_STATIC_QUOTE is set to 1 / true / yes.
+fn allow_static_quote_from_env() -> bool {
+    env_flag_enabled("OMEGA_ALLOW_STATIC_QUOTE")
+}
+
+/// True when OMEGA_ALLOW_SYNTHETIC_MSA is set to 1 / true / yes.
+fn allow_synthetic_msa_from_env() -> bool {
+    env_flag_enabled("OMEGA_ALLOW_SYNTHETIC_MSA")
+}
 
 /// Maps a relay-client map key (lowercase relay name) to its `RelayName`. Mirrors
 /// omega-relay's private `backpressure::parse_relay_name`, which isn't reachable here.
@@ -668,6 +920,38 @@ fn local_l1_data_fee_gwei_from_env() -> u64 {
         .ok()
         .and_then(|s| s.trim().parse::<u64>().ok())
         .unwrap_or(LOCAL_CHAIN_L1_DATA_FEE_GWEI_DEFAULT)
+}
+
+/// An explicit local-fork fallback is safe only when both RPC transports are loopback.
+/// This prevents a production endpoint from silently using a guessed L1 data fee.
+fn local_fork_l1_seed_requested() -> anyhow::Result<bool> {
+    let requested = std::env::var("OMEGA_SEED_L1_ON_POLL_FAIL")
+        .map(|value| {
+            let value = value.trim();
+            value == "1" || value.eq_ignore_ascii_case("true") || value.eq_ignore_ascii_case("yes")
+        })
+        .unwrap_or(false);
+
+    if !requested {
+        return Ok(false);
+    }
+
+    for name in ["ARBITRUM_RPC_URL", "ARBITRUM_HTTP_RPC_URL"] {
+        let endpoint = std::env::var(name).map_err(|_| {
+            anyhow::anyhow!("{name} must be set when local fork L1 fee seeding is enabled")
+        })?;
+        let url = reqwest::Url::parse(&endpoint).map_err(|error| {
+            anyhow::anyhow!("invalid {name} for local fork L1 fee seeding: {error}")
+        })?;
+        let is_loopback = matches!(url.host_str(), Some("127.0.0.1" | "localhost" | "::1"));
+        if !is_loopback {
+            anyhow::bail!(
+                "{name} must use a loopback host when OMEGA_SEED_L1_ON_POLL_FAIL is enabled"
+            );
+        }
+    }
+
+    Ok(true)
 }
 
 /// Load kill-switch thresholds from env. Evaluation lives in `omega_risk::kill_switch`;
@@ -1102,6 +1386,37 @@ async fn main() -> Result<()> {
     let rpc_url = std::env::var("ARBITRUM_RPC_URL").context("ARBITRUM_RPC_URL must be set")?;
     let config_path = std::env::var("OMEGA_CONFIG").unwrap_or_else(|_| DEFAULT_CONFIG.to_string());
 
+    // Transport is decided by the URL scheme alone (see header "HTTP transport").
+    let rpc_is_http = rpc_url_is_http(&rpc_url);
+    let rpc_rps = rpc_rps_from_env();
+    if let Ok(raw) = std::env::var("OMEGA_RPC_MAX_RPS") {
+        if raw.trim().parse::<u32>().ok().filter(|v| *v > 0) != Some(rpc_rps) {
+            tracing::warn!(
+                requested = %raw,
+                effective = rpc_rps,
+                min = MIN_RPS,
+                default = DEFAULT_RPS,
+                "OMEGA_RPC_MAX_RPS was invalid or below the minimum — using the effective value"
+            );
+        }
+    }
+    tracing::info!(
+        transport = if rpc_is_http {
+            "http-polling"
+        } else {
+            "websocket"
+        },
+        rps_limit = rpc_rps,
+        "RPC transport selected from ARBITRUM_RPC_URL scheme"
+    );
+    if rpc_is_http {
+        tracing::warn!(
+            "HTTP transport: pending-transaction (mempool) stream will NOT run — \
+             mempool-dependent signals are disabled; block- and log-driven strategies \
+             continue with polling latency"
+        );
+    }
+
     let chain_id = resolve_chain_id()?;
     if chain_id != DEFAULT_CHAIN_ID {
         tracing::warn!(
@@ -1131,9 +1446,17 @@ async fn main() -> Result<()> {
     let active_phase = config.active_phase;
 
     tracing::info!(active_phase, chain_id, "Config loaded");
-    if active_phase == 0 {
-        tracing::info!("Phase 0: shadow mode — relay submission suppressed");
+
+    // Phase policy: production phase 4 ONLY. Phase 0 (shadow) and every other phase halt
+    // startup — there is no degraded or shadow fallback.
+    if !phase_allowed(active_phase) {
+        anyhow::bail!(
+            "active_phase={active_phase} is not permitted: this binary runs production \
+             phase {REQUIRED_ACTIVE_PHASE} only (no Phase 0 / shadow mode). Set \
+             `active_phase = {REQUIRED_ACTIVE_PHASE}` in {config_path}."
+        );
     }
+
     let max_account_exposure_wei =
         max_account_exposure_wei_from_env(active_phase).ok_or_else(|| {
             anyhow::anyhow!("set OMEGA_MAX_ACCOUNT_EXPOSURE_WEI > 0 when active_phase >= 1")
@@ -1161,11 +1484,10 @@ async fn main() -> Result<()> {
     tracing::info!("L15 observability running");
 
     // ── L1: RPC client ────────────────────────────────────────────────────────
-    let rpc =
-        OmegaRpcClient::connect_with_retry(RpcClientConfig::new(&rpc_url, DEFAULT_RPS, chain_id))
-            .await
-            .context("connecting to Arbitrum RPC endpoint")?
-            .with_health(as_health(find_layer(&layers, LayerId::Rpc)));
+    let rpc = OmegaRpcClient::connect_with_retry(RpcClientConfig::new(&rpc_url, rpc_rps, chain_id))
+        .await
+        .context("connecting to Arbitrum RPC endpoint")?
+        .with_health(as_health(find_layer(&layers, LayerId::Rpc)));
 
     // ── C7: validate hardcoded flashloan/liquidity addresses ───────────────────
     let address_validation = validate_deployed_contracts(&rpc, chain_id).await;
@@ -1209,29 +1531,42 @@ async fn main() -> Result<()> {
     let (mev_tx, mev_rx) = tokio::sync::broadcast::channel(256);
     let mev_share_activity = Arc::new(MevShareActivityTracker::new());
 
-    {
+    // Streams actually started, for the summary log below.
+    let mut running_streams: Vec<&'static str> = Vec::new();
+
+    // Pending-tx (mempool) stream: WebSocket only. Free HTTP endpoints expose no reliable
+    // mempool, so on HTTP it is skipped outright rather than left to fail and retry.
+    if rpc_is_http {
+        tracing::warn!(
+            "pending-tx stream SKIPPED (HTTP transport) — mempool-dependent signals disabled"
+        );
+    } else {
         let u = ws_url.clone();
         let l = Arc::clone(&limiter);
         let t = ptx_tx.clone();
         tokio::spawn(async move { run_pending_tx_stream(u, chain_id, l, t).await });
+        running_streams.push("pending_tx");
     }
     {
         let u = ws_url.clone();
         let l = Arc::clone(&limiter);
         let t = fee_tx.clone();
         tokio::spawn(async move { run_fee_oracle_stream(u, chain_id, l, t).await });
+        running_streams.push("fee_oracle");
     }
     {
         let u = ws_url.clone();
         let l = Arc::clone(&limiter);
         let t = dex_tx.clone();
         tokio::spawn(async move { run_dex_sync_stream(u, chain_id, l, t).await });
+        running_streams.push("dex_sync");
     }
     {
         let u = ws_url.clone();
         let l = Arc::clone(&limiter);
         let t = lend_tx.clone();
         tokio::spawn(async move { run_lending_protocol_stream(u, chain_id, l, t).await });
+        running_streams.push("lending_protocol");
     }
 
     // ── MEV-Share SSE stream (Arbitrum One only) ───────────────────────────────
@@ -1240,11 +1575,13 @@ async fn main() -> Result<()> {
     // either returns an unexpected response or has no relevant events, producing
     // repeated "error decoding response body" / exponential-backoff spam. We skip
     // the stream on non-default chains unless OMEGA_FORCE_MEV_SHARE is set.
+    // (This stream is plain HTTP SSE and is unaffected by the RPC transport choice.)
     let mev_share_enabled =
         chain_id == DEFAULT_CHAIN_ID || std::env::var("OMEGA_FORCE_MEV_SHARE").is_ok();
     if mev_share_enabled {
         let t = mev_tx.clone();
         tokio::spawn(async move { run_mev_share_stream(t).await });
+        running_streams.push("mev_share_sse");
         tracing::info!(chain_id, "MEV-Share SSE stream started");
     } else {
         tracing::info!(
@@ -1278,10 +1615,17 @@ async fn main() -> Result<()> {
                 }
             }
         });
-        tracing::info!("MEV-Share consumer attached (feeds CheckContext competition)");
+        tracing::info!(
+            "MEV-Share consumer attached (feeds strategy scoring SignalState and CheckContext competition)"
+        );
     }
 
-    tracing::info!("L1 RPC: 5 subscription streams running");
+    tracing::info!(
+        transport = if rpc_is_http { "http-polling" } else { "websocket" },
+        count = running_streams.len(),
+        streams = ?running_streams,
+        "L1 RPC: streams running"
+    );
 
     // ── L2: Oracle ────────────────────────────────────────────────────────────
     let twap_oracle = TwapOracle::new(chain_id);
@@ -1391,13 +1735,10 @@ async fn main() -> Result<()> {
 
     // ── L2d: ArbGasInfo L1 data fee polling + L1GasEma for CheckContext ────────
     //
-    // On non-default chains (Anvil, Hardhat, testnets) there is no ArbGasInfo
-    // precompile and every poll returns InvalidFEOpcode. We seed the stable local
-    // L1 fee on the FIRST failure and stay silent for all subsequent failures —
-    // one WARN is enough. `seeded_local` is reset to false if a real Arbitrum poll
-    // ever succeeds, so behaviour on Arbitrum One is unchanged.
-    // OMEGA_SEED_L1_ON_POLL_FAIL still forces the seed behaviour on the default
-    // chain when needed (e.g. an Arbitrum RPC that lacks the precompile).
+    // Non-default chains can seed a stable local fee on first failure. An explicit
+    // loopback-only fork setting seeds once and skips this poll entirely, since Anvil
+    // may preserve chain id 42161 without implementing Nitro's ArbGasInfo precompile.
+    // Production endpoints keep live polling and never use the local estimate.
     let l1_gas_ema = Arc::new(omega_risk::gas_model::L1GasEma::new(32));
     {
         let gas_client = rpc.clone();
@@ -1405,59 +1746,59 @@ async fn main() -> Result<()> {
         let l1_ema = Arc::clone(&l1_gas_ema);
         let chain_id_l2d = chain_id;
         let local_l1_fee_gwei = local_l1_data_fee_gwei_from_env();
-        tokio::spawn(async move {
-            let mut ticker = tokio::time::interval(Duration::from_secs(15));
-            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-            // True once we have seeded the stable local fee on a non-default chain.
-            // Prevents the same WARN firing every 15 s for the whole run.
-            let mut seeded_local = false;
-            loop {
-                ticker.tick().await;
-                match gas_client.fetch_l1_base_fee_estimate_gwei().await {
-                    Ok(gwei) => {
-                        gas_oracle.update_l1_data_fee_gwei(gwei);
-                        l1_ema.push_price(gwei);
-                        tracing::debug!(l1_data_fee_gwei = gwei, "ArbGasInfo poll: updated");
-                        // A successful poll means we are on a real Arbitrum node;
-                        // reset the flag so a later failure logs again if needed.
-                        seeded_local = false;
-                    }
-                    Err(e) => {
-                        let force_seed = std::env::var("OMEGA_SEED_L1_ON_POLL_FAIL")
-                            .map(|v| {
-                                let t = v.trim();
-                                t == "1"
-                                    || t.eq_ignore_ascii_case("true")
-                                    || t.eq_ignore_ascii_case("yes")
-                            })
-                            .unwrap_or(false);
-
-                        if chain_id_l2d != DEFAULT_CHAIN_ID || force_seed {
-                            if !seeded_local {
-                                // First failure on this non-default chain: seed and warn once.
+        if local_fork_l1_seed_requested()? {
+            gas_oracle.update_l1_data_fee_gwei(local_l1_fee_gwei);
+            l1_ema.push_price(local_l1_fee_gwei);
+            tracing::warn!(
+                chain_id = chain_id_l2d,
+                seeded_l1_data_fee_gwei = local_l1_fee_gwei,
+                "local fork mode: seeded L1 data fee; ArbGasInfo polling disabled"
+            );
+        } else {
+            tokio::spawn(async move {
+                let mut ticker = tokio::time::interval(Duration::from_secs(15));
+                ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                // True once we have seeded the stable local fee on a non-default chain.
+                // Prevents the same WARN firing every 15 s for the whole run.
+                let mut seeded_local = false;
+                loop {
+                    ticker.tick().await;
+                    match gas_client.fetch_l1_base_fee_estimate_gwei().await {
+                        Ok(gwei) => {
+                            gas_oracle.update_l1_data_fee_gwei(gwei);
+                            l1_ema.push_price(gwei);
+                            tracing::debug!(l1_data_fee_gwei = gwei, "ArbGasInfo poll: updated");
+                            // A successful poll means we are on a real Arbitrum node;
+                            // reset the flag so a later failure logs again if needed.
+                            seeded_local = false;
+                        }
+                        Err(e) => {
+                            if chain_id_l2d != DEFAULT_CHAIN_ID {
+                                if !seeded_local {
+                                    // First failure on this non-default chain: seed and warn once.
+                                    tracing::warn!(
+                                        error = %e,
+                                        seeded_l1_data_fee_gwei = local_l1_fee_gwei,
+                                        "ArbGasInfo poll failed on non-default chain — seeding stable \
+                                         local L1 data fee (subsequent failures will be silent)"
+                                    );
+                                    gas_oracle.update_l1_data_fee_gwei(local_l1_fee_gwei);
+                                    l1_ema.push_price(local_l1_fee_gwei);
+                                    seeded_local = true;
+                                }
+                                // else: already seeded, do nothing — no repeated WARN spam.
+                            } else {
                                 tracing::warn!(
                                     error = %e,
-                                    seeded_l1_data_fee_gwei = local_l1_fee_gwei,
-                                    force_seed,
-                                    "ArbGasInfo poll failed on non-default chain — seeding stable \
-                                     local L1 data fee (subsequent failures will be silent)"
+                                    "ArbGasInfo poll failed — keeping previous value"
                                 );
-                                gas_oracle.update_l1_data_fee_gwei(local_l1_fee_gwei);
-                                l1_ema.push_price(local_l1_fee_gwei);
-                                seeded_local = true;
                             }
-                            // else: already seeded, do nothing — no repeated WARN spam.
-                        } else {
-                            tracing::warn!(
-                                error = %e,
-                                "ArbGasInfo poll failed — keeping previous value"
-                            );
                         }
                     }
                 }
-            }
-        });
-        tracing::info!("L2d ArbGasInfo poll loop started (15s interval; L1GasEma window=32)");
+            });
+        }
+        tracing::info!("L2d L1 data fee source configured (L1GasEma window=32)");
     }
 
     // ── L2e: flashloan liquidity polling ───────────────────────────────────────
@@ -1678,7 +2019,8 @@ async fn main() -> Result<()> {
     // ── Relay production bootstrap ─────────────────────────────────────────────
     let confirmation_rpc_url = std::env::var("ARBITRUM_HTTP_RPC_URL").context(
         "ARBITRUM_HTTP_RPC_URL must be set — a real chain JSON-RPC HTTP endpoint for \
-         inclusion confirmation, distinct from ARBITRUM_RPC_URL's WebSocket endpoint",
+         inclusion confirmation (may be the same https:// URL as ARBITRUM_RPC_URL when \
+         running in HTTP transport mode)",
     )?;
 
     let translated = translate_relay_config(
@@ -1939,6 +2281,98 @@ async fn main() -> Result<()> {
         }
     }
 
+    // ── Gas-paying account funding check (fail closed) ──────────────────────────
+    // Every signed envelope tx and every submitProof is paid for by this account. A
+    // never-used account (pending nonce 0) with no ETH makes every bundle fail at the
+    // relay and every proof stay unposted, with nothing in the logs pointing at the
+    // cause. Halt at startup if the balance is below the floor OR cannot be read —
+    // "unknown" is never treated as "funded".
+    let min_gas_balance_wei = min_gas_balance_wei_from_env();
+    {
+        let http = reqwest::Client::new();
+        match fetch_balance_wei(&http, &confirmation_rpc_url, &signer_addr_hex).await {
+            Some(balance) if gas_balance_sufficient(balance, min_gas_balance_wei) => {
+                tracing::info!(
+                    address = %signer_addr_hex,
+                    balance_wei = balance,
+                    min_gas_balance_wei,
+                    "gas-paying account funded"
+                );
+            }
+            Some(balance) => {
+                tracing::error!(
+                    address = %signer_addr_hex,
+                    balance_wei = balance,
+                    min_gas_balance_wei,
+                    "gas-paying account UNDERFUNDED — send ETH on chain {chain_id} to this \
+                     address (or lower OMEGA_MIN_GAS_BALANCE_WEI) and restart"
+                );
+                anyhow::bail!(
+                    "gas-paying account {signer_addr_hex} holds {balance} wei, below the \
+                     required minimum of {min_gas_balance_wei} wei — fund it with ETH on chain \
+                     {chain_id} and restart"
+                );
+            }
+            None => {
+                anyhow::bail!(
+                    "could not read the ETH balance of gas-paying account {signer_addr_hex} \
+                     from ARBITRUM_HTTP_RPC_URL (see warn logs above) — refusing to start with \
+                     an unverified gas balance"
+                );
+            }
+        }
+    }
+
+    // Background monitor: the balance drains as bundles and proofs land. It logs only; it
+    // does not halt a running engine.
+    {
+        let monitor_url = confirmation_rpc_url.clone();
+        let monitor_addr = signer_addr_hex.clone();
+        let monitor_halt = halt.clone();
+        tokio::spawn(async move {
+            let http = reqwest::Client::new();
+            let mut ticker = tokio::time::interval(GAS_BALANCE_MONITOR_INTERVAL);
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            // First tick fires immediately; the startup check just ran, so skip it.
+            ticker.tick().await;
+            loop {
+                ticker.tick().await;
+                if monitor_halt.is_halted() {
+                    break;
+                }
+                match fetch_balance_wei(&http, &monitor_url, &monitor_addr).await {
+                    Some(balance) if gas_balance_sufficient(balance, min_gas_balance_wei) => {
+                        tracing::debug!(
+                            address = %monitor_addr,
+                            balance_wei = balance,
+                            "gas balance monitor: ok"
+                        );
+                    }
+                    Some(balance) => {
+                        tracing::error!(
+                            address = %monitor_addr,
+                            balance_wei = balance,
+                            min_gas_balance_wei,
+                            "gas balance monitor: gas-paying account UNDERFUNDED — bundles and \
+                             submitProof broadcasts will fail until it is topped up"
+                        );
+                    }
+                    None => {
+                        tracing::warn!(
+                            address = %monitor_addr,
+                            "gas balance monitor: balance lookup failed this cycle"
+                        );
+                    }
+                }
+            }
+        });
+        tracing::info!(
+            interval_s = GAS_BALANCE_MONITOR_INTERVAL.as_secs(),
+            min_gas_balance_wei,
+            "gas balance monitor started"
+        );
+    }
+
     let execution_pipeline = Arc::new(ExecutionPipeline::new(
         Arc::clone(&kill_switches),
         Arc::clone(&integrity_registry),
@@ -2051,7 +2485,9 @@ async fn main() -> Result<()> {
                         .await;
                         if let Some(ref journal) = journal7 {
                             for (r, p) in results.iter().zip(processed.iter()) {
-                                let status = if p.included {
+                                let status = if p.confirmation_unknown {
+                                    InFlightStatus::Abandoned
+                                } else if p.included {
                                     InFlightStatus::Included
                                 } else {
                                     InFlightStatus::Missed
@@ -2475,33 +2911,79 @@ async fn main() -> Result<()> {
     };
 
     if let Some(entry) = find_entry("SA") {
-        let sa = SaStrategy::new(
-            chain_id,
-            entry.bytecode_hash.into(),
-            entry.contract_address.into(),
-            Arc::clone(&liquidity_registry),
-            &config,
-        );
-        registry_builder = registry_builder
-            .register(sa)
-            .expect("SA registration must succeed");
-        tracing::info!("L13: SA registered (Option B + LiquidityRegistry)");
+        // SaStrategy::new takes an `Arc<dyn QuoteSource>` (sa.rs live-quote revision).
+        // No live UniV3-backed QuoteSource exists yet, so the only available source is
+        // `StaticQuoteSource` (fixed 0.2 ETH spread). That is the exact fabricated-profit
+        // bug sa.rs was fixed to remove, so it is refused on production Arbitrum One at
+        // phase >= 1 unless OMEGA_ALLOW_STATIC_QUOTE is explicitly set.
+        let allow_static = allow_static_quote_from_env();
+        if static_quote_allowed(active_phase, chain_id, allow_static) {
+            if active_phase >= 1 && chain_id == DEFAULT_CHAIN_ID {
+                tracing::warn!(
+                    "L13: SA registered with StaticQuoteSource on production Arbitrum One \
+                     because OMEGA_ALLOW_STATIC_QUOTE is set — every SA blueprint will report \
+                     the same fixed 0.2 ETH spread and flashloan amount regardless of pool state"
+                );
+            }
+            let sa = SaStrategy::new(
+                chain_id,
+                entry.bytecode_hash.into(),
+                entry.contract_address.into(),
+                Arc::clone(&liquidity_registry),
+                &config,
+                Arc::new(omega_strategies::sa::StaticQuoteSource),
+            );
+            registry_builder = registry_builder
+                .register(sa)
+                .expect("SA registration must succeed");
+            tracing::info!("L13: SA registered (Option B + LiquidityRegistry, StaticQuoteSource)");
+        } else {
+            tracing::error!(
+                active_phase,
+                chain_id,
+                "L13: SA NOT registered — no live QuoteSource implementation is wired in, and \
+                 StaticQuoteSource must not run against production Arbitrum One at phase >= 1 \
+                 (set OMEGA_ALLOW_STATIC_QUOTE=1 to override knowingly)"
+            );
+        }
     } else {
         tracing::warn!("L13: no SA entry in IntegrityRegistry — SA NOT registered");
     }
 
     if let Some(entry) = find_entry("MSA") {
-        let msa = MsaStrategy::new(
-            chain_id,
-            entry.bytecode_hash.into(),
-            entry.contract_address.into(),
-            Arc::clone(&liquidity_registry),
-            &config,
-        );
-        registry_builder = registry_builder
-            .register(msa)
-            .expect("MSA registration must succeed");
-        tracing::info!("L13: MSA registered (Option B + LiquidityRegistry)");
+        // msa.rs derives profit from `state_version % 20` (a deterministic proxy, not pool
+        // state or a pending victim transaction) and borrows exactly that fabricated amount.
+        // Refused on production Arbitrum One at phase >= 1 unless OMEGA_ALLOW_SYNTHETIC_MSA
+        // is explicitly set.
+        let allow_synthetic = allow_synthetic_msa_from_env();
+        if synthetic_msa_allowed(active_phase, chain_id, allow_synthetic) {
+            if active_phase >= 1 && chain_id == DEFAULT_CHAIN_ID {
+                tracing::warn!(
+                    "L13: MSA registered with its SYNTHETIC profit estimate on production \
+                     Arbitrum One because OMEGA_ALLOW_SYNTHETIC_MSA is set — blueprint profit \
+                     and flashloan amount come from state_version % 20, not from market state"
+                );
+            }
+            let msa = MsaStrategy::new(
+                chain_id,
+                entry.bytecode_hash.into(),
+                entry.contract_address.into(),
+                Arc::clone(&liquidity_registry),
+                &config,
+            );
+            registry_builder = registry_builder
+                .register(msa)
+                .expect("MSA registration must succeed");
+            tracing::info!("L13: MSA registered (Option B + LiquidityRegistry)");
+        } else {
+            tracing::error!(
+                active_phase,
+                chain_id,
+                "L13: MSA NOT registered — its profit estimate is synthetic (state_version % 20) \
+                 and must not drive real flashloans and gas on production Arbitrum One at \
+                 phase >= 1 (set OMEGA_ALLOW_SYNTHETIC_MSA=1 to override knowingly)"
+            );
+        }
     } else {
         tracing::warn!("L13: no MSA entry in IntegrityRegistry — MSA NOT registered");
     }
@@ -2606,6 +3088,11 @@ async fn main() -> Result<()> {
     tracing::info!(
         active_phase,
         chain_id,
+        transport = if rpc_is_http {
+            "http-polling"
+        } else {
+            "websocket"
+        },
         "OmegaEngine v12.0 running — all layers initialised",
     );
 
@@ -2636,6 +3123,8 @@ async fn run_canary_loop(
             break;
         }
         let snap = oracle.snapshot();
+        // The canary does not use the competition model, so 0 is correct here. The
+        // scoring loop below is the path that carries live MEV-Share activity.
         let sig = omega_core::SignalState {
             state_version: snap.state_version,
             chain_id,
@@ -2643,6 +3132,7 @@ async fn run_canary_loop(
             base_fee_gwei: snap.fee.base_fee_gwei,
             l1_data_fee_gwei: snap.fee.l1_data_fee_gwei,
             state_hash: snap.state_hash,
+            mev_share_events_in_window: 0,
         };
         match cnry.score(&sig).await {
             Ok(op) => tracing::debug!(score = op.score, "CANARY_PASS"),
@@ -2690,6 +3180,11 @@ async fn run_scoring_loop(
         match rx.recv().await {
             Ok(_) => {
                 let snap = oracle.snapshot();
+                // Live MEV-Share competition count for THIS tick. Previously hard-coded to 0,
+                // which made every strategy's `score()` see a permanently quiet market (MSA's
+                // 0.75 skip threshold and SA's score suppression could never act).
+                let mev_share_events_in_window =
+                    mev_share_activity.events_in_window(current_unix_ms());
                 let sig = omega_core::SignalState {
                     state_version: snap.state_version,
                     chain_id,
@@ -2697,6 +3192,7 @@ async fn run_scoring_loop(
                     base_fee_gwei: snap.fee.base_fee_gwei,
                     l1_data_fee_gwei: snap.fee.l1_data_fee_gwei,
                     state_hash: snap.state_hash,
+                    mev_share_events_in_window,
                 };
                 let oracle_snapshot = build_oracle_snapshot(
                     &chainlink_oracle,
@@ -2949,10 +3445,9 @@ async fn score_and_admit(
         current_account_exposure_wei,
         flashloan_snapshot,
         l1_gas_ema.current_buffer(),
-        competition_probability_for_primary_asset({
-            let now_ms = chrono::Utc::now().timestamp_millis().max(0) as u64;
-            mev_share_activity.events_in_window(now_ms)
-        }),
+        competition_probability_for_primary_asset(
+            mev_share_activity.events_in_window(current_unix_ms()),
+        ),
         max_competition_probability_from_env(),
         max_account_exposure_wei,
         rollout_tier_from_env(),
@@ -3385,6 +3880,241 @@ mod chain_id_and_tag_override_tests {
 }
 
 #[cfg(test)]
+mod phase_policy_tests {
+    use super::*;
+
+    #[test]
+    fn only_phase_four_is_allowed() {
+        assert!(phase_allowed(4));
+        assert_eq!(REQUIRED_ACTIVE_PHASE, 4);
+    }
+
+    #[test]
+    fn phase_zero_shadow_is_rejected() {
+        assert!(
+            !phase_allowed(0),
+            "Phase 0 / shadow mode must never be permitted"
+        );
+    }
+
+    #[test]
+    fn every_other_phase_is_rejected() {
+        for p in [1u8, 2, 3, 5, 6, 255] {
+            assert!(!phase_allowed(p), "phase {p} must be rejected");
+        }
+    }
+}
+
+#[cfg(test)]
+mod gas_account_funding_tests {
+    use super::*;
+
+    #[test]
+    fn min_gas_balance_defaults_when_unset_malformed_or_zero() {
+        assert_eq!(min_gas_balance_wei_from(None), MIN_GAS_BALANCE_WEI_DEFAULT);
+        assert_eq!(
+            min_gas_balance_wei_from(Some("abc")),
+            MIN_GAS_BALANCE_WEI_DEFAULT
+        );
+        assert_eq!(
+            min_gas_balance_wei_from(Some("-1")),
+            MIN_GAS_BALANCE_WEI_DEFAULT
+        );
+        assert_eq!(
+            min_gas_balance_wei_from(Some("0")),
+            MIN_GAS_BALANCE_WEI_DEFAULT,
+            "a zero floor would disable the check and must never be accepted"
+        );
+    }
+
+    #[test]
+    fn min_gas_balance_reads_valid_override() {
+        assert_eq!(
+            min_gas_balance_wei_from(Some(" 20000000000000000 ")),
+            20_000_000_000_000_000
+        );
+    }
+
+    #[test]
+    fn zero_balance_is_never_sufficient() {
+        assert!(!gas_balance_sufficient(0, MIN_GAS_BALANCE_WEI_DEFAULT));
+        assert!(!gas_balance_sufficient(0, 1));
+    }
+
+    #[test]
+    fn balance_just_below_floor_is_insufficient_and_at_floor_is_sufficient() {
+        assert!(!gas_balance_sufficient(
+            MIN_GAS_BALANCE_WEI_DEFAULT - 1,
+            MIN_GAS_BALANCE_WEI_DEFAULT
+        ));
+        assert!(gas_balance_sufficient(
+            MIN_GAS_BALANCE_WEI_DEFAULT,
+            MIN_GAS_BALANCE_WEI_DEFAULT
+        ));
+        assert!(gas_balance_sufficient(
+            MIN_GAS_BALANCE_WEI_DEFAULT * 10,
+            MIN_GAS_BALANCE_WEI_DEFAULT
+        ));
+    }
+}
+
+#[cfg(test)]
+mod mev_share_signal_wiring_tests {
+    use super::*;
+
+    #[test]
+    fn current_unix_ms_is_after_2024() {
+        // 2024-01-01T00:00:00Z in ms; a zero here would mean the clock read failed and every
+        // MEV-Share event would look ancient to `events_in_window`.
+        assert!(current_unix_ms() > 1_704_067_200_000);
+    }
+
+    #[test]
+    fn tracker_counts_recent_events_and_expires_old_ones() {
+        let tracker = MevShareActivityTracker::new();
+        let now = current_unix_ms();
+        tracker.record(now);
+        tracker.record(now);
+        tracker.record(now);
+        assert_eq!(tracker.events_in_window(now), 3);
+        // Past the 30 s window every event has expired.
+        assert_eq!(
+            tracker.events_in_window(now + MevShareActivityTracker::WINDOW_MS + 1),
+            0
+        );
+    }
+
+    #[test]
+    fn empty_tracker_reports_zero_events() {
+        let tracker = MevShareActivityTracker::new();
+        assert_eq!(tracker.events_in_window(current_unix_ms()), 0);
+    }
+}
+
+#[cfg(test)]
+mod static_quote_policy_tests {
+    use super::*;
+
+    #[test]
+    fn shadow_phase_always_allows_static_quote() {
+        assert!(static_quote_allowed(0, DEFAULT_CHAIN_ID, false));
+        assert!(static_quote_allowed(0, 31_337, false));
+    }
+
+    #[test]
+    fn non_default_chain_allows_static_quote_at_any_phase() {
+        assert!(static_quote_allowed(1, 31_337, false));
+        assert!(static_quote_allowed(4, 31_337, false));
+    }
+
+    #[test]
+    fn production_arbitrum_at_phase_one_or_later_refuses_static_quote_by_default() {
+        assert!(!static_quote_allowed(1, DEFAULT_CHAIN_ID, false));
+        assert!(!static_quote_allowed(4, DEFAULT_CHAIN_ID, false));
+    }
+
+    #[test]
+    fn production_arbitrum_static_quote_requires_explicit_override() {
+        assert!(static_quote_allowed(1, DEFAULT_CHAIN_ID, true));
+        assert!(static_quote_allowed(4, DEFAULT_CHAIN_ID, true));
+    }
+}
+
+#[cfg(test)]
+mod synthetic_msa_policy_tests {
+    use super::*;
+
+    #[test]
+    fn production_arbitrum_phase_four_refuses_synthetic_msa_by_default() {
+        assert!(
+            !synthetic_msa_allowed(4, DEFAULT_CHAIN_ID, false),
+            "MSA's fabricated profit must not drive real flashloans on production by default"
+        );
+        assert!(!synthetic_msa_allowed(1, DEFAULT_CHAIN_ID, false));
+    }
+
+    #[test]
+    fn production_arbitrum_synthetic_msa_requires_explicit_override() {
+        assert!(synthetic_msa_allowed(4, DEFAULT_CHAIN_ID, true));
+    }
+
+    #[test]
+    fn non_default_chain_allows_synthetic_msa() {
+        assert!(synthetic_msa_allowed(4, 31_337, false));
+    }
+
+    #[test]
+    fn shadow_phase_allows_synthetic_msa() {
+        assert!(synthetic_msa_allowed(0, DEFAULT_CHAIN_ID, false));
+    }
+
+    #[test]
+    fn sa_and_msa_share_one_policy() {
+        for phase in [0u8, 1, 4] {
+            for chain in [DEFAULT_CHAIN_ID, 31_337] {
+                for allow in [false, true] {
+                    assert_eq!(
+                        static_quote_allowed(phase, chain, allow),
+                        synthetic_msa_allowed(phase, chain, allow)
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod rpc_transport_tests {
+    use super::*;
+
+    #[test]
+    fn http_and_https_urls_select_http_transport() {
+        assert!(rpc_url_is_http("https://arb1.arbitrum.io/rpc"));
+        assert!(rpc_url_is_http("http://127.0.0.1:8545"));
+        assert!(rpc_url_is_http("  HTTPS://Example.com/KEY  "));
+    }
+
+    #[test]
+    fn ws_and_wss_urls_select_websocket_transport() {
+        assert!(!rpc_url_is_http("wss://arb-mainnet.example.com/ws/KEY"));
+        assert!(!rpc_url_is_http("ws://127.0.0.1:8546"));
+        assert!(!rpc_url_is_http(""));
+        assert!(!rpc_url_is_http("not a url"));
+    }
+
+    #[test]
+    fn rps_unset_or_invalid_falls_back_to_default() {
+        assert_eq!(rpc_rps_from(None), DEFAULT_RPS);
+        assert_eq!(rpc_rps_from(Some("abc")), DEFAULT_RPS);
+        assert_eq!(rpc_rps_from(Some("0")), DEFAULT_RPS);
+        assert_eq!(rpc_rps_from(Some("-5")), DEFAULT_RPS);
+    }
+
+    #[test]
+    fn rps_below_minimum_is_clamped_up() {
+        assert_eq!(rpc_rps_from(Some("1")), MIN_RPS);
+        assert_eq!(rpc_rps_from(Some("10")), MIN_RPS);
+        assert_eq!(rpc_rps_from(Some("24")), MIN_RPS);
+    }
+
+    #[test]
+    fn rps_at_or_above_minimum_is_used_as_is() {
+        assert_eq!(rpc_rps_from(Some("25")), 25);
+        assert_eq!(rpc_rps_from(Some(" 50 ")), 50);
+        assert_eq!(rpc_rps_from(Some("500")), 500);
+    }
+
+    #[test]
+    fn minimum_rps_yields_nonzero_subscribe_bucket() {
+        // Mirrors omega-rpc's client.rs split: read 80% / write 10% / subscribe 4%.
+        let sub_cap = (MIN_RPS as f64 * 0.04) as u32;
+        let writ_cap = (MIN_RPS as f64 * 0.10) as u32;
+        assert!(sub_cap >= 1, "subscribe bucket must never truncate to zero");
+        assert!(writ_cap >= 1, "write bucket must never truncate to zero");
+    }
+}
+
+#[cfg(test)]
 mod relay_metrics_seed_tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
 
@@ -3640,6 +4370,7 @@ mod hot_path_zk_provisioning_tests {
             [0u8; 20].into(),
             test_liquidity_registry,
             &OmegaConfig::default(),
+            Arc::new(omega_strategies::sa::StaticQuoteSource),
         );
         let strategy: Arc<dyn StrategyTrait> = Arc::new(HotSa(sa));
 
@@ -3756,6 +4487,7 @@ mod hot_path_zk_provisioning_tests {
             base_fee_gwei: 5,
             l1_data_fee_gwei: 2,
             state_hash: [0x01u8; 32].into(),
+            mev_share_events_in_window: 0,
         }
     }
 
@@ -3945,6 +4677,7 @@ mod check_context_assembly_tests {
             base_fee_gwei: 7,
             l1_data_fee_gwei: 15,
             state_hash: [0xabu8; 32].into(),
+            mev_share_events_in_window: 0,
         }
     }
 

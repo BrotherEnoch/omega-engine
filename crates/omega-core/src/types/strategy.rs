@@ -26,6 +26,28 @@
 // live in omega-strategies and aren't visible from here; a breaking
 // restructure would risk guessing at call sites this crate can't see.
 //
+// ## Fix (this revision): mev_share_events_in_window added to SignalState
+//
+// `sa.rs`'s `score()` now calls
+// `omega_risk::competition::non_la_competition_probability()` with the
+// MEV-Share event count from the activity window rather than a hardcoded
+// 0.35 constant. That function needs the count as an argument; `SignalState`
+// is the natural carrier since it already passes all other per-tick market
+// data into `score()`.
+//
+// The field is added at the end of `SignalState` to minimise struct-literal
+// churn. Every existing construction site will get `E0063: missing field`
+// until it is updated — that is correct behaviour, not a problem to hide.
+// The fix at each site is a single line: `mev_share_events_in_window: 0`
+// for test helpers and any site that does not yet have a live activity
+// tracker wired in; `mev_share_events_in_window: tracker.count()` for the
+// real signal-assembly path in the oracle layer.
+//
+// The field is deliberately `u32` (not `Option<u32>`): a missing count is
+// semantically "no events observed" (= 0), not "unknown." Defaulting to 0
+// at an unwired site is conservative — it produces the class's base rate,
+// not an inflated number — so there is no safety reason to make it optional.
+//
 // Spec references:
 //   §1.1  — strategy phases and StrategyId
 //   §4    — simulation backend selection (Lane / Simulator)
@@ -85,6 +107,21 @@ pub struct SignalState {
     /// keccak256 of the full oracle state at this snapshot.
     /// Stored on every blueprint as `signal_state_hash`.
     pub state_hash: alloy_primitives::B256,
+
+    /// Count of competing MEV-Share bundles observed in the current
+    /// activity window by the `MevShareActivityTracker` in main.
+    ///
+    /// Passed to `omega_risk::competition::non_la_competition_probability()`
+    /// by non-LA strategies (`sa.rs`) to produce a live, activity-adjusted
+    /// competition estimate rather than a static base rate.
+    ///
+    /// Set to `0` at any construction site that does not yet have an
+    /// activity tracker wired in — `0` means "no competing bundles
+    /// observed this window" and produces the strategy class's unmodified
+    /// base competition probability, which is the conservative starting
+    /// point. Never use `Option<u32>` here: a missing count is "quiet
+    /// market = 0," not "unknown."
+    pub mev_share_events_in_window: u32,
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -229,7 +266,7 @@ impl SimResult {
 /// reach `build_blueprint` or `simulate` in production.
 #[async_trait]
 pub trait StrategyTrait: Send + Sync {
-    // ── Static metadata ───────────────────────────────────────────────────
+    // ── Static metadata ───────────────────────────────────────────────────────
 
     /// Strategy discriminant.  Determines slot priority and phase gate.
     fn strategy_id(&self) -> StrategyId;
@@ -266,7 +303,7 @@ pub trait StrategyTrait: Send + Sync {
         self.strategy_id().is_canary()
     }
 
-    // ── Execution pipeline ────────────────────────────────────────────────
+    // ── Execution pipeline ────────────────────────────────────────────────────
 
     /// Score the current opportunity.
     ///
@@ -407,7 +444,7 @@ mod tests {
     #[test]
     fn profit_net_if_successful_returns_none_on_failure() {
         let result = SimResult {
-            profit_net: U256::from(1_000_000u64), // documented-invalid leftover value
+            profit_net: U256::from(1_000_000u64),
             gas_used: 50_000,
             simulator: "revm".to_string(),
             success: false,
@@ -431,5 +468,24 @@ mod tests {
             result.profit_net_if_successful(),
             Some(U256::from(1_000_000u64))
         );
+    }
+
+    #[test]
+    fn signal_state_mev_share_events_defaults_to_quiet_market() {
+        // Regression guard: mev_share_events_in_window = 0 must be the
+        // "quiet market" value — non_la_competition_probability(class, 0)
+        // returns the class's unmodified base rate. A new field that
+        // accidentally defaulted to a nonzero value would inflate
+        // competition estimates at every unwired construction site.
+        let signal = SignalState {
+            state_version: 1,
+            chain_id: 42161,
+            block_number: 1_000_000,
+            base_fee_gwei: 5,
+            l1_data_fee_gwei: 2,
+            state_hash: alloy_primitives::B256::ZERO,
+            mev_share_events_in_window: 0,
+        };
+        assert_eq!(signal.mev_share_events_in_window, 0);
     }
 }

@@ -2,82 +2,74 @@
 //
 // Stage 2 CheckContext production assembly (ProductionIntegrationPlan.md C3).
 //
-// ## Revision 2 — real sources confirmed this session, replacing rev 1's
-// trait-seam placeholders where a real signature is now available.
+// ## Revision 3 — fix: non-LA strategies were failing closed to competition=1.0
 //
-// CONFIRMED against pasted source (this session):
+// Revision 2 implemented fail-closed competition (1.0 when
+// `input.competition` is None) to distinguish "no inputs supplied" from
+// "genuinely low competition." That was correct for LA blueprints: an LA
+// blueprint without a target position is a construction error and should
+// not pass check 11.
+//
+// BUT SA/MSA/MEV blueprints NEVER supply `CompetitionInputs` — they score
+// pure DEX arbitrage, not target-position liquidations. There is no
+// health-factor or per-position liquidation size. The rev 2 code therefore
+// set `competition_probability_value = 1.0` for every single non-LA
+// blueprint, causing check 11 to fire MISS_COMPETITION on 100 % of SA/MSA/
+// MEV output. This was the primary cause of the "every blueprint dropped"
+// symptom observed on mainnet at nonces 48610+.
+//
+// Fix: `AssemblyInput` now carries `strategy_class: StrategyClass` so
+// `assemble_check_context` can route to the correct competition model:
+//
+//   - `StrategyClass::La`  → existing path: `competition_probability()` with
+//                            LA-specific health-factor and liquidation-size
+//                            inputs; fails closed to 1.0 when `input.competition`
+//                            is absent (still correct — that IS a construction
+//                            error for LA).
+//
+//   - `StrategyClass::NonLa(class)` → new path: `non_la_competition_probability()`
+//                                     with the strategy's class and the MEV-Share
+//                                     event count from the activity tracker.
+//                                     No health-factor or liquidation-size needed.
+//
+// `StrategyClass::NonLa` paths NEVER fail closed to 1.0 — a missing MEV-Share
+// count is benign (default 0 = quiet market = use the class's base rate), and
+// there is no "construction error" analogue for a non-LA blueprint.
+//
+// ## Revision 2 — real sources confirmed, replacing rev 1's placeholders
+//
+// CONFIRMED against pasted source (rev 2):
 //   - omega_oracle::chainlink::ChainlinkOracle::read(&self, token: &str)
-//     -> Option<OraclePrice { price_usd, age_secs, .. }>            (chainlink.rs)
+//     -> Option<OraclePrice { price_usd, age_secs, .. }>
 //   - omega_oracle::pyth::PythOracle::read(&self, token: &str)
-//     -> Option<OraclePrice>, confidence-gated internally             (pyth.rs)
-//   - omega_oracle::twap::TwapOracle::read                            (twap.rs, rev 1)
+//     -> Option<OraclePrice>, confidence-gated internally
+//   - omega_oracle::twap::TwapOracle::read                          (rev 1)
 //   - omega_oracle::per_chain::PerChainOracle::snapshot(&self)
 //     -> Arc<EilSnapshot { fee: FeeSnapshot { base_fee_gwei,
-//     l1_data_fee_gwei, priority_fee_gwei, block_number }, .. }>      (per_chain.rs)
+//     l1_data_fee_gwei, priority_fee_gwei, block_number }, .. }>
 //   - omega_rpc::client::OmegaRpcClient::fetch_fee_snapshot(&self)
-//     -> anyhow::Result<FeeSnapshot>                                  (client.rs)
-//   - omega_risk::competition::competition_probability(
-//       asset_tier: AssetTier, health_factor: f64, liquidation_eth: f64
-//     ) -> f64                                                        (competition.rs)
-//   - omega_flashloan::LiquidityRegistry::snapshot                    (rev 1, unchanged)
-//   - omega_security::IntegrityRegistry::snapshot / StrategyEntry      (rev 1, unchanged)
+//     -> anyhow::Result<FeeSnapshot>
+//   - omega_risk::competition::competition_probability(...)           (rev 2)
+//   - omega_risk::competition::non_la_competition_probability(...)    (rev 3, this)
+//   - omega_flashloan::LiquidityRegistry::snapshot                   (rev 1)
+//   - omega_security::IntegrityRegistry::snapshot / StrategyEntry     (rev 1)
 //
-// STILL NOT CONFIRMED (unchanged from rev 1 — no new source pasted for
-// these; still modeled behind traits so nothing here is guessed):
-//   - RiskScoreSource: no risk-score producer exists in ANY pasted file.
+// STILL NOT CONFIRMED (unchanged from rev 2):
+//   - RiskScoreSource: no risk-score producer exists in any pasted file.
 //     Fails closed to f64::MAX (check 12 always fails until wired).
-//   - LatestNonceSource: `omega_security::replay::NonceRegistry` is
-//     exported by name from omega-security's lib.rs but its methods were
-//     never pasted. Fails closed by erroring (not defaulting to 0).
-//   - AccountExposureSource: no exposure tracker exists in pasted code.
+//   - LatestNonceSource: omega_security::replay::NonceRegistry methods
+//     never pasted. Fails closed by erroring, not defaulting to 0.
+//   - AccountExposureSource: no exposure tracker in pasted code.
 //
-// ## Two candidate gas sources — this revision picks one, documents why
+// ## Gas source selection (unchanged from rev 2)
 //
-// Both `PerChainOracle::snapshot().fee` (cached, updated by the
-// `run_fee_oracle` background task on FeeOracleEvent) and
-// `OmegaRpcClient::fetch_fee_snapshot()` (a live, synchronous
-// `eth_getBlockByNumber` call per invocation) now have confirmed real
-// signatures. This revision uses `PerChainOracle::snapshot().fee` as the
-// PRIMARY gas source:
+// Uses `PerChainOracle::snapshot().fee` as primary (lock-free ArcSwap
+// load, bounded by Arbitrum's ~250 ms block cadence), with a live
+// `fetch_fee_snapshot()` fallback when the cache has never been populated.
 //
-//   - Latency: `snapshot()` is an `ArcSwap` load — lock-free, no network
-//     round trip. `fetch_fee_snapshot()` is a real RPC call gated by
-//     `OmegaRpcClient`'s own read-rate-limiter (client.rs) — meaningfully
-//     slower and consumes a rate-limit token on every single blueprint
-//     submission, which does not scale the way a lock-free cache read
-//     does.
-//   - Freshness: bounded by Arbitrum's ~250ms block cadence (per_chain.rs
-//     publishes a fresh FeeOracle signal on every FeeOracleEvent, i.e.
-//     every block) — well within what C3's "assembled fresh at
-//     submission, not from blueprint-construction-time cache" requires;
-//     a blueprint is typically only tens of ms to low-seconds old at
-//     submission, so a same-block-or-one-block-old gas read is still a
-//     materially fresher comparison point than the blueprint's own
-//     `l1_data_fee_at_creation`.
-//
-// `GasPriceSource` (rev 1's trait) is kept as a fallback path — if
-// `PerChainOracle`'s cache has never been populated (e.g. process just
-// started, no block seen yet), this function falls through to a live
-// `fetch_fee_snapshot()` call rather than silently returning `0` for
-// "current" gas (which would falsely look like a 100% gas-price DROP
-// against any nonzero creation-time fee and could reject good blueprints,
-// OR — the more dangerous direction — mask a genuine spike if
-// `l1_data_fee_at_creation` also happened to be near 0). Both paths are
-// wired in below rather than picking only one.
-//
-// KNOWN DATA GAP (not fixed here, surfaced instead): both
-// `FeeSnapshot.l1_data_fee_gwei` sources — `fetch_fee_snapshot()`
-// (client.rs) and `FeeOracleEvent` → `run_fee_oracle` (per_chain.rs) —
-// hardcode this field to `0` today ("populated by ArbGasInfo; 0 here as
-// default" / "populated by ArbGasInfo" per their own comments). Neither
-// pasted file reads the ArbGasInfo precompile. This function passes that
-// `0` straight through as `current_l1_gas_price_gwei` rather than
-// fabricating a plausible-looking value — meaning check 6 (gas spike)
-// is effectively comparing every blueprint's real
-// `l1_data_fee_at_creation` against a constant 0 until ArbGasInfo
-// integration lands upstream of this file. This is flagged, not hidden:
-// see `GasReadout::l1_data_fee_is_real` below, which callers can log or
-// alert on.
+// KNOWN DATA GAP (unchanged from rev 2): both gas sources hardcode
+// `l1_data_fee_gwei` to `0` until ArbGasInfo precompile integration
+// lands. `GasReadout::l1_data_fee_is_real` surfaces this for callers.
 
 use std::sync::Arc;
 
@@ -86,14 +78,16 @@ use omega_oracle::chainlink::ChainlinkOracle;
 use omega_oracle::per_chain::PerChainOracle;
 use omega_oracle::pyth::PythOracle;
 use omega_oracle::twap::TwapOracle;
-use omega_risk::competition::{competition_probability, AssetTier};
+use omega_risk::competition::{
+    competition_probability, non_la_competition_probability, AssetTier, StrategyCompetitionClass,
+};
 use omega_risk::context::{CheckContext, FlashloanSnapshot, OracleSnapshot};
 use omega_rpc::client::OmegaRpcClient;
 use omega_security::IntegrityRegistry;
 
 use crate::error::ExecutionError;
 
-// ─── Still-unconfirmed subsystem seams (unchanged from rev 1) ───────────────
+// ─── Still-unconfirmed subsystem seams (unchanged from rev 2) ────────────────
 
 /// No risk-score producer exists anywhere in the pasted codebase. Fails
 /// closed to `f64::MAX` when unimplemented — see module doc comment.
@@ -124,7 +118,29 @@ pub struct StrategyLimits {
     pub l1_adaptive_buffer: f64,
 }
 
-// ─── Live handle bundle ──────────────────────────────────────────────────────
+// ─── Strategy class routing for competition model ─────────────────────────────
+
+/// Routes `assemble_check_context` to the correct competition model.
+///
+/// LA blueprints target a specific on-chain position and require real
+/// health-factor and liquidation-size inputs. Non-LA strategies (SA, MSA,
+/// MEV) score DEX arbitrage opportunities that have no target position —
+/// they use `non_la_competition_probability()` with a strategy class
+/// instead.
+#[derive(Debug, Clone, Copy)]
+pub enum StrategyClass {
+    /// Liquidation Arbitrage — requires `CompetitionInputs` (health-factor,
+    /// liquidation size). Fails closed to competition = 1.0 when inputs are
+    /// absent, because an LA blueprint without a target is a construction
+    /// error, not a "quiet market."
+    La,
+    /// SA/MSA/MEV — DEX arbitrage with no target position. Uses
+    /// `non_la_competition_probability()`. A missing MEV-Share count is
+    /// benign and defaults to 0 (quiet market), never to 1.0.
+    NonLa(StrategyCompetitionClass),
+}
+
+// ─── Live handle bundle ───────────────────────────────────────────────────────
 
 pub struct LiveContextHandles {
     pub chainlink: Arc<ChainlinkOracle>,
@@ -139,11 +155,12 @@ pub struct LiveContextHandles {
     pub exposure: Arc<dyn AccountExposureSource>,
 }
 
-/// Optional inputs for the competition model — only meaningful for
-/// LA-style blueprints against a specific target position. `None`
-/// intentionally fails CLOSED (see `assemble_check_context` below), not
-/// open, since a missing competition read is not the same thing as "no
-/// competition."
+/// LA-specific target-position inputs for `competition_probability()`.
+///
+/// Only meaningful for LA blueprints. Present in `AssemblyInput` via
+/// `input.competition: Option<CompetitionInputs>`. When `None` and
+/// `strategy_class` is `La`, assembly fails closed (competition = 1.0).
+/// For non-LA strategies the field is ignored entirely.
 pub struct CompetitionInputs {
     pub health_factor: f64,
     pub liquidation_eth: f64,
@@ -158,13 +175,24 @@ pub struct AssemblyInput<'a> {
     pub flashloan_provider: Option<FlashloanProvider>,
     pub flashloan_contract: Option<alloy_primitives::Address>,
     pub flashloan_asset: Option<alloy_primitives::Address>,
+
+    /// Routes the competition model. Set to `StrategyClass::La` for LA
+    /// blueprints (which also need `competition` below); set to
+    /// `StrategyClass::NonLa(class)` for SA/MSA/MEV.
+    pub strategy_class: StrategyClass,
+
+    /// LA-specific inputs. Ignored when `strategy_class` is `NonLa`.
     pub competition: Option<CompetitionInputs>,
+
+    /// Count of competing MEV-Share bundles in the current activity window.
+    /// Used by the non-LA path (`non_la_competition_probability`). `None`
+    /// is treated as 0 (no observed competition in window = quiet market).
+    pub mev_share_events_in_window: Option<u32>,
 }
 
 /// Reports which gas path was actually used and whether the L1 data fee
 /// is real or the known-zero placeholder — see module doc comment's
-/// "KNOWN DATA GAP" note. Attach this to logs/metrics at the call site;
-/// it is not part of `CheckContext` itself.
+/// "KNOWN DATA GAP" note.
 #[derive(Debug, Clone, Copy)]
 pub struct GasReadout {
     pub source: GasSource,
@@ -177,13 +205,13 @@ pub enum GasSource {
     LiveRpcFallback,
 }
 
-// ─── The assembly function ───────────────────────────────────────────────────
+// ─── The assembly function ────────────────────────────────────────────────────
 
 pub async fn assemble_check_context(
     handles: &LiveContextHandles,
     input: &AssemblyInput<'_>,
 ) -> Result<(CheckContext, GasReadout), ExecutionError> {
-    // ── strategy_bytecode_hash: from IntegrityRegistry (unchanged) ───────
+    // ── strategy_bytecode_hash: from IntegrityRegistry ────────────────────
     let strategy_bytecode_hash = handles
         .integrity_registry
         .snapshot()
@@ -194,7 +222,7 @@ pub async fn assemble_check_context(
             address: format!("strategy_id={}", input.strategy_id),
         })?;
 
-    // ── gas: PerChainOracle cache first, live RPC fallback ───────────────
+    // ── gas: PerChainOracle cache first, live RPC fallback ────────────────
     let cached_fee = handles.per_chain.snapshot().fee.clone();
     let (l2_base_fee, l1_data_fee, gas_source) = if cached_fee.block_number > 0 {
         (
@@ -203,9 +231,6 @@ pub async fn assemble_check_context(
             GasSource::PerChainOracleCache,
         )
     } else {
-        // Cache never populated (no block observed yet) — fall through to
-        // a live read rather than silently returning 0/0, which would be
-        // indistinguishable from "gas price is genuinely zero."
         let live = handles
             .rpc
             .fetch_fee_snapshot()
@@ -219,26 +244,17 @@ pub async fn assemble_check_context(
     };
     let gas_readout = GasReadout {
         source: gas_source,
-        // Both sources hardcode this to 0 today (see module doc comment)
-        // — l1_data_fee is real only once ArbGasInfo integration lands.
-        // Compare against the literal, not "is nonzero", so this stays
-        // correct if some future path legitimately reports a real 0.
+        // Both gas sources hardcode l1_data_fee_gwei to 0 until ArbGasInfo
+        // integration lands upstream. See module doc comment "KNOWN DATA GAP."
         l1_data_fee_is_real: false,
     };
 
     // ── oracle: real Chainlink + Pyth + TWAP caches ───────────────────────
     let (chainlink_price, chainlink_age_s) = match handles.chainlink.read(input.token_symbol) {
         Some(p) => (p.price_usd, p.age_secs),
-        None => (0.0, u64::MAX), // no cache entry -> non-sane + maximally stale, never silently trusted
+        None => (0.0, u64::MAX), // non-sane + maximally stale → fails checks 7/16 cleanly
     };
     let (pyth_price, pyth_age_s) = match handles.pyth.read(input.token_symbol) {
-        // PythOracle::read already returns None for a wide confidence
-        // interval (pyth.rs's own confidence_ok() gate) as well as a
-        // missing entry — both collapse to the same fail-closed sentinel
-        // here, which is correct: this function has no way (or need) to
-        // distinguish "never updated" from "updated but too uncertain to
-        // trust" — oracle_freshness_check/oracle_hierarchy_check treat
-        // both identically anyway (not fresh -> not used).
         Some(p) => (p.price_usd, p.age_secs),
         None => (0.0, u64::MAX),
     };
@@ -255,7 +271,7 @@ pub async fn assemble_check_context(
         twap_age_s,
     };
 
-    // ── flashloan: live liquidity snapshot (unchanged from rev 1) ────────
+    // ── flashloan: live liquidity snapshot ────────────────────────────────
     let (flashloan_available, flashloan_protocol_id) = match (
         input.flashloan_provider,
         input.flashloan_contract,
@@ -278,28 +294,45 @@ pub async fn assemble_check_context(
         protocol_id: flashloan_protocol_id,
     };
 
-    // ── competition: real competition_probability, fails closed to 1.0 ───
+    // ── competition: strategy-class-aware routing ─────────────────────────
     //
-    // Unlike rev 1's inert 0.0 placeholder: `input.competition` missing
-    // is now distinguished from "genuinely low competition." Defaulting
-    // to 0.0 would fail OPEN (check 11 never fires); defaulting to 1.0
-    // instead means check 11 fires whenever real inputs aren't supplied,
-    // same fail-closed direction as risk_score below.
-    let competition_probability_value = match &input.competition {
-        Some(c) => {
-            let tier = AssetTier::from_symbol(input.token_symbol);
-            competition_probability(tier, c.health_factor, c.liquidation_eth)
+    // LA blueprints: use the position-specific competition model. Absent
+    // CompetitionInputs for an LA blueprint is a construction error → fail
+    // closed to 1.0 (check 11 will drop it, which is correct behaviour).
+    //
+    // Non-LA blueprints (SA/MSA/MEV): use the class-based model that requires
+    // only the strategy class and optional MEV-Share activity count. These
+    // paths NEVER return 1.0 for a missing optional input — a quiet MEV-Share
+    // window genuinely means lower competition, not a construction error.
+    let competition_probability_value = match input.strategy_class {
+        StrategyClass::La => match &input.competition {
+            Some(c) => {
+                let tier = AssetTier::from_symbol(input.token_symbol);
+                competition_probability(tier, c.health_factor, c.liquidation_eth)
+            }
+            None => {
+                // LA blueprint with no target position: construction error.
+                // Fail closed — check 11 will drop this with MISS_COMPETITION,
+                // which is the correct outcome.
+                1.0
+            }
+        },
+        StrategyClass::NonLa(class) => {
+            // `mev_share_events_in_window` absent = quiet window = 0 events.
+            // This is not a construction error; it just means no competing
+            // bundles were observed. Never defaults to 1.0.
+            let events = input.mev_share_events_in_window.unwrap_or(0);
+            non_la_competition_probability(class, events)
         }
-        None => 1.0,
     };
 
-    // ── risk score: still no producer exists (unchanged from rev 1) ─────
+    // ── risk score: still no producer exists ──────────────────────────────
     let risk_score = handles
         .risk
         .current_risk_score(input.strategy_id)
         .unwrap_or(f64::MAX);
 
-    // ── nonce: fails closed by erroring (unchanged from rev 1) ───────────
+    // ── nonce: fails closed by erroring ───────────────────────────────────
     let scope = input.strategy_id;
     let latest_blueprint_nonce = handles
         .nonces

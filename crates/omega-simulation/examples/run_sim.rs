@@ -1,27 +1,20 @@
 // omega-engine\crates\omega-simulation\examples\run_sim.rs
 //! Example / CLI entry point.
 //!
-//! Usage:
-//!   ARBITRUM_RPC_URL=https://... cargo run --example run_sim -- \
-//!       --cycles 50 --fork-block 245000000 --report out/report.json
+//! Usage (PowerShell):
+//!   $env:ARBITRUM_RPC_URL = "https://..."
+//!   cargo run --example run_sim -p omega-simulation -- --cycles 20 --report out/sim_report.json
 //!
-//! Swap `FixtureDetector` below for the engine's real `OpportunityDetector`
-//! implementation (from omega-core) once wiring this into the actual
-//! workspace. Until that swap happens, this binary only exercises plumbing
-//! (fork spawn, submission, reporting) with placeholder opportunities aimed
-//! at the zero address — its `net_profit_wei` output is not a meaningful
-//! profitability signal. See the warning printed at startup.
+//! Uses StrategyDetector:
+//!   - CNRY: score-only (never builds blueprints — by design)
+//!   - SA:   score → build_blueprint → submit on local Anvil fork
 
-use async_trait::async_trait;
 use clap::Parser;
 use ethers::providers::Middleware;
-use ethers::types::{Address, Bytes, U256};
-use omega_simulation::{
-    Bundle, ForkConfig, HarnessConfig, Opportunity, OpportunityDetector, OpportunityKind,
-    SimulationHarness,
-};
+use ethers::types::U256;
+use omega_core::OmegaConfig;
+use omega_simulation::{Bundle, ForkConfig, HarnessConfig, SimulationHarness, StrategyDetector};
 use std::path::PathBuf;
-use std::str::FromStr;
 
 #[derive(Parser, Debug)]
 struct Args {
@@ -36,34 +29,6 @@ struct Args {
 
     #[arg(long, default_value_t = 0)]
     signer_index: u32,
-}
-
-/// Stand-in detector: emits one plausible-looking opportunity per cycle so
-/// the harness/plumbing can be exercised end-to-end before the real
-/// omega-core detector is wired in. Replace before treating output as a
-/// real phase-gate signal.
-struct FixtureDetector {
-    dummy_pool: Address,
-    dummy_asset: Address,
-}
-
-#[async_trait]
-impl OpportunityDetector for FixtureDetector {
-    async fn next_opportunities(
-        &mut self,
-        block_number: u64,
-    ) -> omega_simulation::error::Result<Vec<Opportunity>> {
-        Ok(vec![Opportunity {
-            id: format!("fixture-{block_number}"),
-            kind: OpportunityKind::Arbitrage,
-            target_pool: self.dummy_pool,
-            flash_loan_asset: self.dummy_asset,
-            flash_loan_amount: U256::from(1_000_000_000_000_000_000u128),
-            calldata: Bytes::default(),
-            expected_profit_wei: U256::from(0),
-            gas_estimate: U256::from(300_000u64),
-        }])
-    }
 }
 
 #[tokio::main]
@@ -94,11 +59,8 @@ async fn main() -> anyhow::Result<()> {
         "fork ready, running cycles"
     );
     eprintln!(
-        "WARNING: this run uses FixtureDetector (placeholder opportunities \
-         targeting the zero address). net_profit_wei in the resulting \
-         report reflects only gas cost, not real strategy performance. \
-         Swap in the real omega-core detector before using this output as \
-         a phase-gate signal."
+        "INFO: using StrategyDetector (CNRY score-only + SA blueprints). \
+         Contract address is still a placeholder until fork deploy helper lands."
     );
 
     // Pull the fork's actual gas price rather than hardcoding one.
@@ -110,12 +72,8 @@ async fn main() -> anyhow::Result<()> {
     let max_priority_fee = gas_price / 10;
     let max_fee_per_gas = gas_price + max_priority_fee;
 
-    let detector = FixtureDetector {
-        // NOTE: replace with real deployed contract/token addresses on the
-        // forked network before treating results as meaningful.
-        dummy_pool: Address::from_str("0x0000000000000000000000000000000000000000")?,
-        dummy_asset: Address::from_str("0x0000000000000000000000000000000000000000")?,
-    };
+    let config = OmegaConfig::default();
+    let detector = StrategyDetector::new(&config);
 
     let report = harness
         .run(detector, move |opp| Bundle {

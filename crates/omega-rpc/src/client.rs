@@ -1,6 +1,6 @@
 // crates/omega-rpc/src/client.rs
 //
-// OmegaRpcClient — rate-limited WebSocket RPC client.
+// OmegaRpcClient — rate-limited RPC client (WebSocket or HTTP polling).
 //
 // ## Architectural role (§22.1)
 //
@@ -9,9 +9,19 @@
 //   (omega-oracle) or via the OracleSignal channel, never via direct
 //   RPC calls.
 //
+// ## Transport selection (this revision)
+//
+//   The transport is derived from the URL scheme (see transport.rs):
+//     ws:// | wss://      → WebSocket, block headers via eth_subscribe("newHeads")
+//     http:// | https://  → HTTP, block headers via polling the chain tip
+//   Everything else in this client (rate limiting, de-duplication, chain-ID
+//   verification, health, fee/log/code reads, raw-tx submission) is identical
+//   on both transports. See `run_block_poll_once` for how the HTTP path keeps
+//   the same BlockEvent contract (including `is_reorg_or_stale`) as the WS path.
+//
 // ## Connection model
 //
-//   Single WebSocket connection to a dedicated node (500 rps target),
+//   Single connection to a dedicated node (500 rps target),
 //   shared across every call this client makes — `get_or_connect()`
 //   lazily establishes it once and every subsequent call (block
 //   subscription, `fetch_fee_snapshot`, `fetch_logs`,
@@ -61,7 +71,9 @@
 //   was broadcast verbatim with no such check — a reorg, a duplicate
 //   delivery, or a misbehaving endpoint serving stale data was
 //   indistinguishable from genuine chain progress to every downstream
-//   consumer.
+//   consumer. On the HTTP path the flag is additionally set when a
+//   block's parent hash does not match the previously emitted block's
+//   hash (a reorg a number comparison alone cannot see).
 //
 // ## Health integration
 //
@@ -76,16 +88,21 @@
 //   connectivity was unavailable despite it working fine). On a fatal
 //   (non-retryable) error, health is set to Halted, not Degraded — a
 //   Degraded state implies "will recover on its own with retries,"
-//   which is false for a configuration error.
+//   which is false for a configuration error. On the HTTP path, health
+//   is also set to Degraded when the chain tip has not advanced for
+//   POLL_STALL_AFTER (an HTTP connection has no "socket closed" signal,
+//   so a frozen tip is the only way to notice a dead-but-reachable
+//   endpoint) and back to Healthy once it advances again.
 //
 // ## Logging (audit finding — credentials were being logged in the clear)
 //
-//   Most RPC providers embed an API key directly in the WS URL's path
+//   Most RPC providers embed an API key directly in the URL's path
 //   or query string. Every log site that previously included the raw
 //   `ws_url` now uses `net::redact_ws_url`, which keeps only the scheme
-//   and host.
+//   and host. Library error text (which can embed the full URL) goes
+//   through `net::scrub_urls`.
 //
-// ## Fix (this revision): fetch_chainlink_round
+// ## Fix (prior revision): fetch_chainlink_round
 //
 // Chainlink AggregatorV3 polling support (see
 // crates/omega-oracle/src/chainlink_poll.rs for the poll loop that calls
@@ -97,7 +114,7 @@
 // binding, ChainlinkRound, and the one method that uses them together
 // in one file is the cleaner split.
 //
-// ## Fix (this revision): E0282 in tests::sample_block
+// ## Fix (prior revision): E0282 in tests::sample_block
 //
 // `Block::default()` failed to compile with "type annotations needed
 // for `Block<_, _>`": `alloy::rpc::types::Block<T, H>` declares default
@@ -113,7 +130,7 @@
 // parameter mechanism — no need to name `Transaction`/`Header`
 // explicitly.
 //
-// ## Fix (this revision): WS connect failing — root cause was a missing
+// ## Fix (prior revision): WS connect failing — root cause was a missing
 // Cargo feature, not this file's code
 //
 // `open_provider` previously called
@@ -122,40 +139,27 @@
 // every `ws://`/`wss://` URL in this workspace's pinned alloy version
 // (0.3.6) with "invalid URL scheme: ws; expected `http` or `https`".
 //
-// Traced this session directly against alloy-provider-0.3.6's real
-// source (not guessed): `ProviderBuilder::on_ws` and
-// `alloy::providers::WsConnect` both exist and are exactly the right
-// API for this — but both are gated behind alloy-provider's own `ws`
-// Cargo feature (`#[cfg(feature = "ws")]` on both the method in
-// builder.rs and the re-export in lib.rs). This workspace's
-// `omega-rpc/Cargo.toml` had `transport-ws` enabled on the umbrella
-// `alloy` dependency, but NOT `provider-ws` — two distinct umbrella
-// features despite the similar name. `transport-ws` only enables the
-// umbrella's standalone `alloy::transports::ws` re-export of the
-// `alloy_transport_ws` crate; per the umbrella's own `full` feature
-// definition (`alloy-0.3.6/Cargo.toml`), `provider-ws` is the separate
-// feature that forwards into alloy-provider's `ws` feature and is what
-// actually makes `ProviderBuilder::on_ws` / `alloy::providers::WsConnect`
-// exist at all. Fixed at the Cargo.toml level (added `"provider-ws"` to
-// this crate's `alloy` feature list) — see that file's own comment on
-// the `alloy` dependency line for the full trace.
+// Traced directly against alloy-provider-0.3.6's real source (not
+// guessed): `ProviderBuilder::on_ws` and `alloy::providers::WsConnect`
+// both exist and are exactly the right API for this — but both are
+// gated behind alloy-provider's own `ws` Cargo feature
+// (`#[cfg(feature = "ws")]` on both the method in builder.rs and the
+// re-export in lib.rs). This workspace's `omega-rpc/Cargo.toml` had
+// `transport-ws` enabled on the umbrella `alloy` dependency, but NOT
+// `provider-ws` — two distinct umbrella features despite the similar
+// name. Fixed at the Cargo.toml level (added `"provider-ws"` to this
+// crate's `alloy` feature list).
 //
-// One further fix was needed once that feature was on and `on_ws`/
-// `WsConnect` actually resolved: `on_ws(...)` returns a provider generic
-// over `PubSubFrontend` (`RootProvider<PubSubFrontend, Ethereum>`), which
-// is a DIFFERENT `Provider<T, N>` trait instantiation from the default
-// generic parameters (`Provider<BoxTransport, Ethereum>`) that this
-// file's own `type SharedProvider = Arc<dyn Provider>` implicitly uses —
-// confirmed via a real `cargo check` producing E0277 on exactly this
-// mismatch. Fixed by calling `.boxed()` (`RootProvider::boxed`, root.rs —
-// confirmed against this workspace's real alloy-provider 0.3.6 source)
-// on the connected provider before wrapping it in `Arc`, which re-types
-// it to `RootProvider<BoxTransport, Ethereum>` — the instantiation that
-// DOES implement plain `Provider` under this file's default-generic
-// usage. See `open_provider`'s own comment below for where this is
-// applied.
+// One further fix was needed once that feature was on: `on_ws(...)`
+// returns a provider generic over `PubSubFrontend`, which is a
+// DIFFERENT `Provider<T, N>` trait instantiation from the default
+// generic parameters (`Provider<BoxTransport, Ethereum>`) that
+// `Arc<dyn Provider>` implicitly uses — confirmed via a real
+// `cargo check` producing E0277. Fixed by calling `.boxed()`
+// (`RootProvider::boxed`) before wrapping in `Arc`. That logic now
+// lives in `transport::open_provider`, applied to BOTH transports.
 //
-// ## Fix (this revision): get_code (C7 — validation against actual
+// ## Fix (prior revision): get_code (C7 — validation against actual
 // deployed contracts)
 //
 // Added `OmegaRpcClient::get_code`, a plain `eth_getCode` wrapper
@@ -163,30 +167,20 @@
 // above it (rate-limited as a read via `gated_read`, using the shared
 // connection via `get_or_connect`). This is deliberately a GENERIC
 // method on this file's core client rather than something private to
-// `flashloan_liq.rs` — `eth_getCode` is not flashloan-specific, and a
-// future validation need (e.g. confirming a strategy contract's
-// deployed bytecode from a different crate context) should be able to
-// reuse it without a new wrapper. `flashloan_liq::validate_deployed_contracts`
-// is this method's first real caller: it checks that every hardcoded
-// Aave/Balancer/WETH/USDC address in this crate actually has bytecode
-// deployed at it on the connected chain, at startup, rather than
-// trusting a transcribed address until the first real call against it
-// fails (or worse, silently returns a wrong/zero result against an EOA).
+// `flashloan_liq.rs` — `eth_getCode` is not flashloan-specific.
+// `flashloan_liq::validate_deployed_contracts` is this method's first
+// real caller.
 //
 // `provider.get_code_at(address)` is alloy-provider 0.3.6's `Provider`
-// trait method for `eth_getCode` against the latest block — this
-// mirrors `fetch_fee_snapshot`'s and `fetch_logs`'s own direct use of
-// `Provider` trait methods (`get_block_by_number`, `get_logs`) just
-// above, but has NOT been independently re-confirmed against this
-// workspace's exact pinned alloy-provider source the way `on_ws`/
-// `WsConnect`/`.boxed()` were in the fix above — flagged rather than
-// silently presented as equally certain.
+// trait method for `eth_getCode` against the latest block. (It has
+// since compiled against this workspace's pinned alloy.)
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use alloy::eips::BlockNumberOrTag;
 use alloy::primitives::{Address, Bytes, B256};
-use alloy::providers::{Provider, ProviderBuilder, WsConnect};
+use alloy::providers::Provider;
 use alloy::rpc::types::{Block, Filter, Log};
 use futures::StreamExt;
 use tokio::sync::{broadcast, Mutex};
@@ -194,9 +188,12 @@ use tokio::sync::{broadcast, Mutex};
 use omega_core::{FeeSnapshot, HealthState, LayerHealth};
 
 use crate::net::{
-    redact_ws_url, validate_ws_scheme, verify_chain_id, wei_to_gwei_saturating, RpcClientError,
+    redact_ws_url, scrub_urls, validate_rpc_url, verify_chain_id, wei_to_gwei_saturating,
+    RpcClientError,
 };
+use crate::poll::{absorb_error, decide_tip, Backoff, TipAction};
 use crate::rate_limiter::{RpcRateLimiter, RpcRequestKind};
+use crate::transport::{open_provider, PollConfig, RpcTransport};
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Constants
@@ -205,6 +202,11 @@ use crate::rate_limiter::{RpcRateLimiter, RpcRequestKind};
 const RECONNECT_DELAY_INITIAL_MS: u64 = 1_000;
 const RECONNECT_DELAY_MAX_MS: u64 = 30_000;
 const BLOCK_CHANNEL_CAPACITY: usize = 64;
+
+/// How long the HTTP block poller tolerates an unchanged chain tip before marking the
+/// RPC health layer Degraded. Arbitrum produces a block roughly every 250 ms, so 30 s
+/// without progress means the endpoint is stuck, lagging badly, or serving stale data.
+const POLL_STALL_AFTER: Duration = Duration::from_secs(30);
 
 /// How long a submitted transaction hash is remembered for duplicate
 /// detection. 30s comfortably covers a typical caller-side retry loop's
@@ -268,7 +270,9 @@ impl BlockEvent {
 /// Runtime configuration for `OmegaRpcClient`.
 #[derive(Debug, Clone)]
 pub struct RpcClientConfig {
-    /// WebSocket endpoint URL (wss:// or ws://).
+    /// RPC endpoint URL: ws:// or wss:// (WebSocket subscriptions) or
+    /// http:// or https:// (polling). The field keeps its historical name
+    /// `ws_url` so existing callers keep compiling.
     pub ws_url: String,
     /// Requests per second budget (controls rate limiter config).
     pub rps_limit: u32,
@@ -362,7 +366,7 @@ struct ConnectionState {
 // OmegaRpcClient
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Rate-limited WebSocket RPC client for the Omega Engine.
+/// Rate-limited RPC client for the Omega Engine (WebSocket or HTTP polling).
 ///
 /// Wraps a single shared alloy provider connection with:
 ///   - Token-bucket rate limiting per request kind (§22 hardware spec)
@@ -377,6 +381,8 @@ struct ConnectionState {
 #[derive(Clone)]
 pub struct OmegaRpcClient {
     config: RpcClientConfig,
+    transport: RpcTransport,
+    poll: PollConfig,
     rate_limiter: RpcRateLimiter,
     block_tx: broadcast::Sender<BlockEvent>,
     health: Option<Arc<dyn LayerHealth>>,
@@ -384,10 +390,40 @@ pub struct OmegaRpcClient {
     submission_tracker: Arc<Mutex<SubmissionTracker>>,
 }
 
+/// Builds the rate limiter for a given requests-per-second budget:
+/// 80% reads / 10% writes / 4% subscribes, truncated to whole tokens.
+///
+/// NOTE: below ~25 rps the 4% subscribe bucket truncates to zero capacity. The HTTP
+/// path never waits on a subscribe token, but the WebSocket path does before every
+/// (re)connect — keep the budget at 25 or more.
+fn limiter_for_rps(rps_limit: u32) -> RpcRateLimiter {
+    if rps_limit > 0 {
+        let read_cap = (rps_limit as f64 * 0.80) as u32;
+        let writ_cap = (rps_limit as f64 * 0.10) as u32;
+        let sub_cap = (rps_limit as f64 * 0.04) as u32;
+        RpcRateLimiter::with_config(
+            crate::rate_limiter::BucketConfig {
+                capacity: read_cap,
+                refill_per_second: read_cap,
+            },
+            crate::rate_limiter::BucketConfig {
+                capacity: writ_cap,
+                refill_per_second: writ_cap,
+            },
+            crate::rate_limiter::BucketConfig {
+                capacity: sub_cap,
+                refill_per_second: sub_cap,
+            },
+        )
+    } else {
+        RpcRateLimiter::new()
+    }
+}
+
 impl OmegaRpcClient {
     // ── Constructors ────────────────────────────────────────────────────────
 
-    /// Connect to the given WebSocket endpoint.
+    /// Connect to the given endpoint (ws://, wss://, http:// or https://).
     ///
     /// Validates the URL scheme, establishes the connection, and
     /// verifies the endpoint's actual chain ID matches
@@ -398,43 +434,25 @@ impl OmegaRpcClient {
     /// tolerate transient initial-connection failure but should still
     /// stop immediately on a fatal one.
     pub async fn connect(config: RpcClientConfig) -> Result<Self, RpcClientError> {
-        validate_ws_scheme(&config.ws_url)?;
-        let provider = open_provider(&config.ws_url).await?;
+        let transport = validate_rpc_url(&config.ws_url)?;
+        let provider = open_provider(&config.ws_url, transport).await?;
         verify_chain_id(provider.as_ref(), config.chain_id).await?;
 
         let (block_tx, _) = broadcast::channel(BLOCK_CHANNEL_CAPACITY);
-
-        let limiter = if config.rps_limit > 0 {
-            let read_cap = (config.rps_limit as f64 * 0.80) as u32;
-            let writ_cap = (config.rps_limit as f64 * 0.10) as u32;
-            let sub_cap = (config.rps_limit as f64 * 0.04) as u32;
-            RpcRateLimiter::with_config(
-                crate::rate_limiter::BucketConfig {
-                    capacity: read_cap,
-                    refill_per_second: read_cap,
-                },
-                crate::rate_limiter::BucketConfig {
-                    capacity: writ_cap,
-                    refill_per_second: writ_cap,
-                },
-                crate::rate_limiter::BucketConfig {
-                    capacity: sub_cap,
-                    refill_per_second: sub_cap,
-                },
-            )
-        } else {
-            RpcRateLimiter::new()
-        };
+        let limiter = limiter_for_rps(config.rps_limit);
 
         tracing::info!(
-            ws_url   = %redact_ws_url(&config.ws_url),
-            chain_id = config.chain_id,
-            rps      = config.rps_limit,
+            url       = %redact_ws_url(&config.ws_url),
+            transport = transport.as_str(),
+            chain_id  = config.chain_id,
+            rps       = config.rps_limit,
             "OmegaRpcClient connected",
         );
 
         Ok(Self {
             config,
+            transport,
+            poll: PollConfig::from_env(),
             rate_limiter: limiter,
             block_tx,
             health: None,
@@ -465,7 +483,7 @@ impl OmegaRpcClient {
                 Err(e) if e.is_fatal() => {
                     tracing::error!(
                         error = %e,
-                        ws_url = %redact_ws_url(&config.ws_url),
+                        url = %redact_ws_url(&config.ws_url),
                         "RPC connect failed with a FATAL, non-retryable error — giving up. \
                          This requires operator intervention (check RPC URL / chain_id config).",
                     );
@@ -475,7 +493,7 @@ impl OmegaRpcClient {
                     tracing::warn!(
                         error    = %e,
                         delay_ms,
-                        ws_url   = %redact_ws_url(&config.ws_url),
+                        url      = %redact_ws_url(&config.ws_url),
                         "RPC connect failed — retrying",
                     );
                     tokio::time::sleep(Duration::from_millis(delay_ms)).await;
@@ -513,7 +531,7 @@ impl OmegaRpcClient {
         if let Some(p) = &state.provider {
             return Ok(p.clone());
         }
-        let provider = open_provider(&self.config.ws_url).await?;
+        let provider = open_provider(&self.config.ws_url, self.transport).await?;
         verify_chain_id(provider.as_ref(), self.config.chain_id).await?;
         state.provider = Some(provider.clone());
         Ok(provider)
@@ -535,7 +553,8 @@ impl OmegaRpcClient {
         self.block_tx.subscribe()
     }
 
-    /// Start the block header subscription background task.
+    /// Start the block header background task (WebSocket subscription or HTTP
+    /// polling, depending on the URL scheme).
     ///
     /// Must be spawned as a Tokio task. Reconnects automatically with
     /// backoff on a transient error. Returns ONLY when a fatal
@@ -579,9 +598,13 @@ impl OmegaRpcClient {
     }
 
     async fn run_block_subscription_once(&self) -> Result<(), RpcClientError> {
-        self.rate_limiter
-            .wait_until_allowed(RpcRequestKind::Subscribe)
-            .await;
+        // The subscribe bucket gates WebSocket (re)connects. HTTP polling has no
+        // subscription to open, so it must not consume (or be blocked by) this bucket.
+        if self.transport == RpcTransport::Ws {
+            self.rate_limiter
+                .wait_until_allowed(RpcRequestKind::Subscribe)
+                .await;
+        }
 
         let provider = match self.get_or_connect_typed().await {
             Ok(p) => p,
@@ -599,10 +622,23 @@ impl OmegaRpcClient {
             health.set_state(HealthState::Healthy, "RPC block stream connected");
         }
 
+        if self.transport == RpcTransport::Http {
+            let result = self.run_block_poll_once(provider).await;
+            // Whatever ended the poll loop, rebuild the client (and re-verify the
+            // chain ID) on the next attempt.
+            self.invalidate_connection().await;
+            return result;
+        }
+
         let mut stream = provider
             .subscribe_blocks()
             .await
-            .map_err(|e| RpcClientError::ConnectFailed(format!("subscribe_blocks failed: {e}")))?
+            .map_err(|e| {
+                RpcClientError::ConnectFailed(format!(
+                    "subscribe_blocks failed: {}",
+                    scrub_urls(&e.to_string())
+                ))
+            })?
             .into_stream();
 
         tracing::info!("Block header subscription active");
@@ -644,6 +680,160 @@ impl OmegaRpcClient {
         self.invalidate_connection().await;
 
         Ok(())
+    }
+
+    // ── HTTP block polling ──────────────────────────────────────────────────
+
+    /// HTTP replacement for the `newHeads` subscription.
+    ///
+    /// Each tick fetches the latest block (one call). `decide_tip` (poll.rs) then
+    /// decides whether it is new, and whether intermediate blocks were missed and must
+    /// be back-filled (bounded by `OMEGA_POLL_MAX_CATCHUP`; anything older is skipped
+    /// with a warning). Emitted events carry the same `is_reorg_or_stale` contract as
+    /// the WS path, plus a parent-hash continuity check.
+    ///
+    /// Returns `Err` for any failure that is not a rate limit (rate limits are absorbed
+    /// with backoff); the caller's reconnect loop takes over. Never returns `Ok`.
+    async fn run_block_poll_once(&self, provider: Arc<dyn Provider>) -> Result<(), RpcClientError> {
+        tracing::info!(
+            every_ms = self.poll.blocks_every.as_millis() as u64,
+            max_catchup = self.poll.max_catchup_blocks,
+            "Block polling active (HTTP transport)"
+        );
+
+        let mut tick = tokio::time::interval(self.poll.blocks_every);
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+
+        let mut backoff = Backoff::new(RECONNECT_DELAY_INITIAL_MS, RECONNECT_DELAY_MAX_MS);
+        let mut last: Option<(u64, B256)> = None;
+        let mut last_progress = Instant::now();
+        let mut stalled = false;
+
+        loop {
+            tick.tick().await;
+
+            if !stalled && last_progress.elapsed() > POLL_STALL_AFTER {
+                stalled = true;
+                tracing::warn!(
+                    stalled_for_s = last_progress.elapsed().as_secs(),
+                    "chain tip has not advanced — endpoint may be stuck or serving stale data"
+                );
+                if let Some(ref health) = self.health {
+                    health.set_state(HealthState::Degraded, "RPC chain tip not advancing");
+                }
+            }
+
+            self.rate_limiter
+                .wait_until_allowed(RpcRequestKind::Read)
+                .await;
+            let latest = match provider
+                .get_block_by_number(BlockNumberOrTag::Latest, false)
+                .await
+            {
+                Ok(Some(b)) => {
+                    backoff.reset();
+                    b
+                }
+                Ok(None) => {
+                    tracing::debug!("latest block not returned — retrying next tick");
+                    continue;
+                }
+                Err(e) => {
+                    absorb_error("block_poll", e.to_string(), &mut backoff).await?;
+                    continue;
+                }
+            };
+
+            let (backfill, skipped) = match decide_tip(
+                last,
+                latest.header.number,
+                latest.header.hash,
+                self.poll.max_catchup_blocks,
+            ) {
+                TipAction::Nothing => continue,
+                TipAction::Emit { backfill, skipped } => (backfill, skipped),
+            };
+
+            if skipped > 0 {
+                tracing::warn!(
+                    skipped_blocks = skipped,
+                    "block poller fell behind — skipped blocks are NOT emitted"
+                );
+            }
+
+            if let Some((from, to)) = backfill {
+                for n in from..=to {
+                    self.rate_limiter
+                        .wait_until_allowed(RpcRequestKind::Read)
+                        .await;
+                    match provider
+                        .get_block_by_number(BlockNumberOrTag::Number(n), false)
+                        .await
+                    {
+                        Ok(Some(b)) => self.emit_polled(&b, &mut last),
+                        Ok(None) => {
+                            tracing::warn!(
+                                block_number = n,
+                                "backfill block not returned by endpoint — leaving a gap"
+                            );
+                            break;
+                        }
+                        Err(e) => {
+                            absorb_error("block_poll_backfill", e.to_string(), &mut backoff)
+                                .await?;
+                            break;
+                        }
+                    }
+                }
+            }
+
+            self.emit_polled(&latest, &mut last);
+
+            last_progress = Instant::now();
+            if stalled {
+                stalled = false;
+                tracing::info!("chain tip advancing again");
+                if let Some(ref health) = self.health {
+                    health.set_state(HealthState::Healthy, "RPC chain tip advancing");
+                }
+            }
+        }
+    }
+
+    /// Converts a polled block to a `BlockEvent`, applies the reorg/staleness checks,
+    /// updates the emit cursor, and broadcasts it.
+    fn emit_polled(&self, block: &Block, last: &mut Option<(u64, B256)>) {
+        let mut event = block_to_event(block, last.map(|(n, _)| n));
+
+        // A block that directly follows the last emitted one must build on it.
+        if let Some((prev_n, prev_hash)) = *last {
+            if block.header.number == prev_n + 1 && block.header.parent_hash != prev_hash {
+                event.is_reorg_or_stale = true;
+            }
+        }
+
+        if event.is_reorg_or_stale {
+            tracing::warn!(
+                block_number = event.number,
+                last_seen    = ?last.map(|(n, _)| n),
+                "Polled block is not a clean successor (number did not increase, or parent \
+                 hash mismatch) — possible reorg; flagged for downstream reorg handling",
+            );
+        }
+
+        tracing::debug!(
+            block_number = event.number,
+            hash         = %event.hash,
+            base_fee     = ?event.base_fee_gwei,
+            is_reorg_or_stale = event.is_reorg_or_stale,
+            "New block (polled)",
+        );
+
+        *last = Some((event.number, event.hash));
+
+        if self.block_tx.send(event).is_err() {
+            tracing::debug!("No active subscribers for block events");
+        }
     }
 
     // ── Rate-limited calls ──────────────────────────────────────────────────
@@ -769,7 +959,12 @@ impl OmegaRpcClient {
                 let _pending = provider
                     .send_raw_transaction(raw_bytes_for_send.as_ref())
                     .await
-                    .map_err(|e| anyhow::anyhow!("eth_sendRawTransaction failed: {e}"))?;
+                    .map_err(|e| {
+                        anyhow::anyhow!(
+                            "eth_sendRawTransaction failed: {}",
+                            scrub_urls(&e.to_string())
+                        )
+                    })?;
                 Ok(())
             }
         })
@@ -789,7 +984,12 @@ impl OmegaRpcClient {
             let block = provider
                 .get_block_by_number(alloy::eips::BlockNumberOrTag::Latest, false)
                 .await
-                .map_err(|e| anyhow::anyhow!("eth_getBlockByNumber failed: {e}"))?
+                .map_err(|e| {
+                    anyhow::anyhow!(
+                        "eth_getBlockByNumber failed: {}",
+                        scrub_urls(&e.to_string())
+                    )
+                })?
                 .ok_or_else(|| anyhow::anyhow!("latest block not found"))?;
 
             // Saturating conversion — see net::wei_to_gwei_saturating for
@@ -817,7 +1017,7 @@ impl OmegaRpcClient {
             provider
                 .get_logs(&filter)
                 .await
-                .map_err(|e| anyhow::anyhow!("eth_getLogs failed: {e}"))
+                .map_err(|e| anyhow::anyhow!("eth_getLogs failed: {}", scrub_urls(&e.to_string())))
         })
         .await
     }
@@ -842,19 +1042,15 @@ impl OmegaRpcClient {
     /// from "the call itself failed" is the caller's job (see
     /// `flashloan_liq::validate_deployed_contracts`, this method's
     /// first real caller, for exactly that distinction).
-    ///
-    /// See this file's own module-level "Fix (this revision): get_code"
-    /// comment for the one open question on this method: `get_code_at`'s
-    /// exact signature/behavior has not been independently re-confirmed
-    /// against this workspace's pinned alloy-provider 0.3.6 source the
-    /// way `on_ws`/`.boxed()` were.
     pub async fn get_code(&self, address: Address) -> anyhow::Result<Bytes> {
         self.gated_read(None, || async move {
             let provider = self.get_or_connect().await?;
-            provider
-                .get_code_at(address)
-                .await
-                .map_err(|e| anyhow::anyhow!("eth_getCode({address}) failed: {e}"))
+            provider.get_code_at(address).await.map_err(|e| {
+                anyhow::anyhow!(
+                    "eth_getCode({address}) failed: {}",
+                    scrub_urls(&e.to_string())
+                )
+            })
         })
         .await
     }
@@ -870,48 +1066,16 @@ impl OmegaRpcClient {
     pub fn chain_id(&self) -> u64 {
         self.config.chain_id
     }
+
+    /// Transport this client was configured with (derived from the URL scheme).
+    pub fn transport(&self) -> RpcTransport {
+        self.transport
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Helpers
 // ─────────────────────────────────────────────────────────────────────────────
-
-/// Opens a provider connection over WebSocket.
-///
-/// See this file's module-level "Fix (this revision): WS connect
-/// failing — root cause was a missing Cargo feature, not this file's
-/// code" comment for the full trace. `WsConnect::new(ws_url)` +
-/// `ProviderBuilder::on_ws` is the real, confirmed-against-source API
-/// for this in alloy-provider-0.3.6 (builder.rs's own
-/// `pub async fn on_ws(self, connect: alloy_transport_ws::WsConnect)`),
-/// gated behind alloy-provider's `ws` feature — enabled via this
-/// crate's `Cargo.toml` `provider-ws` entry on the umbrella `alloy`
-/// dependency.
-async fn open_provider(ws_url: &str) -> Result<Arc<dyn Provider>, RpcClientError> {
-    let ws = WsConnect::new(ws_url);
-    let provider = ProviderBuilder::new()
-        .on_ws(ws)
-        .await
-        .map_err(|e| RpcClientError::ConnectFailed(format!("WS connect: {e}")))?;
-    // FIX (this revision): `.on_ws(...)` returns a provider generic over
-    // `PubSubFrontend` (`RootProvider<PubSubFrontend, Ethereum>`), which
-    // implements `Provider<PubSubFrontend, Ethereum>` — a DIFFERENT trait
-    // instantiation from `Provider`'s own default type parameters
-    // (`Provider<BoxTransport, Ethereum>`, per alloy-provider's own
-    // `pub trait Provider<T: Transport + Clone = BoxTransport, N: Network
-    // = Ethereum>` declaration in provider/trait.rs). `type SharedProvider
-    // = Arc<dyn Provider>` above implicitly means the BoxTransport-typed
-    // trait object, so casting an `Arc<RootProvider<PubSubFrontend, _>>`
-    // into it fails (E0277) without first erasing the concrete transport
-    // type. `RootProvider::boxed(self) -> RootProvider<BoxTransport, N>`
-    // (root.rs — confirmed against this workspace's real alloy-provider
-    // 0.3.6 source, not guessed) does exactly that re-typing, and its
-    // result DOES implement `Provider<BoxTransport, Ethereum>` — i.e.
-    // plain `Provider` under this file's default-generic usage — so the
-    // subsequent `Arc::new(...)` cast to `Arc<dyn Provider>` succeeds.
-    let provider = provider.boxed();
-    Ok(Arc::new(provider))
-}
 
 fn block_to_event(block: &Block, last_block_number: Option<u64>) -> BlockEvent {
     // `base_fee_per_gas` is already `Option<u128>` here — no cast
@@ -958,8 +1122,7 @@ mod tests {
         // bare `Block` used there resolves to the identical
         // `Block<Transaction, Header>` instantiation via the same
         // default-parameter mechanism, with no need to name either
-        // parameter explicitly. See this file's module-level "Fix (this
-        // revision): E0282 in tests::sample_block" note.
+        // parameter explicitly.
         let mut block: Block = Block::default();
         block.header.number = number;
         block

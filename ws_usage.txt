@@ -1,0 +1,165 @@
+﻿crates\omega-control-contracts\src\ws.rs:83: /// NOTE: send this over `wss://` only. The auth token here is equivalent in
+crates\omega-manifest-gen\Cargo.toml:23: # alloy transport stack (providers, transports-ws, pubsub) — see that
+crates\omega-manifest-gen\Cargo.toml:28: # rather than pulling in alloy-provider/alloy-transport-ws directly.
+crates\omega-rpc\src\client.rs:122: // every `ws://`/`wss://` URL in this workspace's pinned alloy version
+crates\omega-rpc\src\client.rs:127: // `alloy::providers::WsConnect` both exist and are exactly the right
+crates\omega-rpc\src\client.rs:131: // `omega-rpc/Cargo.toml` had `transport-ws` enabled on the umbrella
+crates\omega-rpc\src\client.rs:132: // `alloy` dependency, but NOT `provider-ws` — two distinct umbrella
+crates\omega-rpc\src\client.rs:133: // features despite the similar name. `transport-ws` only enables the
+crates\omega-rpc\src\client.rs:136: // definition (`alloy-0.3.6/Cargo.toml`), `provider-ws` is the separate
+crates\omega-rpc\src\client.rs:138: // actually makes `ProviderBuilder::on_ws` / `alloy::providers::WsConnect`
+crates\omega-rpc\src\client.rs:139: // exist at all. Fixed at the Cargo.toml level (added `"provider-ws"` to
+crates\omega-rpc\src\client.rs:144: // `WsConnect` actually resolved: `on_ws(...)` returns a provider generic
+crates\omega-rpc\src\client.rs:145: // over `PubSubFrontend` (`RootProvider<PubSubFrontend, Ethereum>`), which
+crates\omega-rpc\src\client.rs:182: // `WsConnect`/`.boxed()` were in the fix above — flagged rather than
+crates\omega-rpc\src\client.rs:189: use alloy::providers::{Provider, ProviderBuilder, WsConnect};
+crates\omega-rpc\src\client.rs:271: /// WebSocket endpoint URL (wss:// or ws://).
+crates\omega-rpc\src\client.rs:534: pub fn subscribe_blocks(&self) -> broadcast::Receiver<BlockEvent> {
+crates\omega-rpc\src\client.rs:603: .subscribe_blocks()
+crates\omega-rpc\src\client.rs:605: .map_err(|e| RpcClientError::ConnectFailed(format!("subscribe_blocks failed: {e}")))?
+crates\omega-rpc\src\client.rs:883: /// code" comment for the full trace. `WsConnect::new(ws_url)` +
+crates\omega-rpc\src\client.rs:886: /// `pub async fn on_ws(self, connect: alloy_transport_ws::WsConnect)`),
+crates\omega-rpc\src\client.rs:888: /// crate's `Cargo.toml` `provider-ws` entry on the umbrella `alloy`
+crates\omega-rpc\src\client.rs:891: let ws = WsConnect::new(ws_url);
+crates\omega-rpc\src\client.rs:897: // `PubSubFrontend` (`RootProvider<PubSubFrontend, Ethereum>`), which
+crates\omega-rpc\src\client.rs:898: // implements `Provider<PubSubFrontend, Ethereum>` — a DIFFERENT trait
+crates\omega-rpc\src\client.rs:904: // trait object, so casting an `Arc<RootProvider<PubSubFrontend, _>>`
+crates\omega-rpc\src\lib.rs:8: //   full alloy transport stack (providers, transports-ws, pubsub).
+crates\omega-rpc\src\net.rs:82: /// Rejects a `ws_url` that doesn't start with `ws://` or `wss://` before
+crates\omega-rpc\src\net.rs:89: if ws_url.starts_with("ws://") || ws_url.starts_with("wss://") {
+crates\omega-rpc\src\net.rs:94: reason: "must start with ws:// or wss://".to_string(),
+crates\omega-rpc\src\net.rs:102: /// `wss://host/v2/<API_KEY>`); logging the raw URL at info/warn level
+crates\omega-rpc\src\net.rs:184: redact_ws_url("wss://arb-mainnet.g.alchemy.com/v2/SUPER_SECRET_KEY"),
+crates\omega-rpc\src\net.rs:185: "wss://arb-mainnet.g.alchemy.com/<redacted>"
+crates\omega-rpc\src\net.rs:188: redact_ws_url("wss://node.example.com/ws?apikey=SECRET"),
+crates\omega-rpc\src\net.rs:189: "wss://node.example.com/<redacted>"
+crates\omega-rpc\src\net.rs:196: redact_ws_url("wss://user:hunter2@node.example.com/v2/key"),
+crates\omega-rpc\src\net.rs:197: "wss://node.example.com/<redacted>"
+crates\omega-rpc\src\net.rs:204: redact_ws_url("wss://node.example.com"),
+crates\omega-rpc\src\net.rs:205: "wss://node.example.com/<redacted>"
+crates\omega-rpc\src\net.rs:217: assert!(validate_ws_scheme("wss://node.example.com/v2/key").is_ok());
+crates\omega-rpc\src\rate_limiter.rs:69: /// `eth_subscribe` (new block headers, logs, pending txs).
+crates\omega-rpc\src\rate_limiter.rs:115: pub fn subscribe_default() -> Self {
+crates\omega-rpc\src\rate_limiter.rs:239: BucketConfig::subscribe_default(),
+crates\omega-rpc\src\rate_limiter.rs:339: subscribe_tokens: g.subscribe.available(),
+crates\omega-rpc\src\rate_limiter.rs:340: subscribe_capacity: g.subscribe.capacity(),
+crates\omega-rpc\src\rate_limiter.rs:373: pub subscribe_tokens: f64,
+crates\omega-rpc\src\rate_limiter.rs:375: pub subscribe_capacity: u32,
+crates\omega-rpc\src\rate_limiter.rs:436: BucketConfig::subscribe_default(),
+crates\omega-rpc\src\rate_limiter.rs:452: BucketConfig::subscribe_default(),
+crates\omega-rpc\src\rate_limiter.rs:479: BucketConfig::subscribe_default(),
+crates\omega-rpc\src\rate_limiter.rs:504: BucketConfig::subscribe_default(),
+crates\omega-rpc\src\rate_limiter.rs:540: BucketConfig::subscribe_default(),
+crates\omega-rpc\src\rate_limiter.rs:577: BucketConfig::subscribe_default(),
+crates\omega-rpc\src\subscriptions.rs:202: .subscribe_pending_transactions()
+crates\omega-rpc\src\subscriptions.rs:204: .map_err(|e| RpcClientError::ConnectFailed(format!("subscribe_pending_transactions: {e}")))?
+crates\omega-rpc\src\subscriptions.rs:359: .subscribe_logs(&filter)
+crates\omega-rpc\src\subscriptions.rs:361: .map_err(|e| RpcClientError::ConnectFailed(format!("subscribe_logs (lending): {e}")))?
+crates\omega-rpc\src\subscriptions.rs:458: .subscribe_logs(&filter)
+crates\omega-rpc\src\subscriptions.rs:460: .map_err(|e| RpcClientError::ConnectFailed(format!("subscribe_logs (dex sync): {e}")))?
+crates\omega-rpc\src\subscriptions.rs:541: .subscribe_blocks()
+crates\omega-rpc\src\subscriptions.rs:543: .map_err(|e| RpcClientError::ConnectFailed(format!("subscribe_blocks (fee oracle): {e}")))?
+crates\omega-rpc\Cargo.toml:19: #   provider-ws    — FIX (this revision): wires WS support INTO
+crates\omega-rpc\Cargo.toml:21: #                     and alloy::providers::WsConnect re-exported from
+crates\omega-rpc\Cargo.toml:23: #                     `transport-ws` below, despite the similar name —
+crates\omega-rpc\Cargo.toml:25: #                     alloy 0.3.6 source: `transport-ws` only enables the
+crates\omega-rpc\Cargo.toml:31: #                     `pub use alloy_rpc_client::WsConnect;` inside
+crates\omega-rpc\Cargo.toml:34: #                     `alloy::providers::WsConnect` do not exist at all
+crates\omega-rpc\Cargo.toml:39: #   transport-ws   — WsConnect WebSocket transport (standalone
+crates\omega-rpc\Cargo.toml:42: #                     provider-ws since other code in this crate may
+crates\omega-rpc\Cargo.toml:45: #                     provider-ws above)
+crates\omega-rpc\Cargo.toml:46: #   pubsub         — PubSubFrontend for eth_subscribe streams
+crates\omega-rpc\Cargo.toml:53: "provider-ws",
+crates\omega-rpc\Cargo.toml:54: "transport-ws",
+crates\omega-rpc\Cargo.toml:55: "pubsub",
+omega-frontend-arch\crates\omega-control-contracts\src\error.rs:51: WsConnection(String),
+omega-frontend-arch\crates\omega-control-contracts\src\lib.rs:17: pub use ws::{WsEvent, WsRateLimit, WsConnectionStatus, layer_id_from_wire};
+omega-frontend-arch\crates\omega-control-contracts\src\ws.rs:21: // WsConnectionStatus
+omega-frontend-arch\crates\omega-control-contracts\src\ws.rs:25: pub enum WsConnectionStatus {
+omega-frontend-arch\crates\omega-frontend\src\render.rs:7: ws::WsConnectionStatus,
+omega-frontend-arch\crates\omega-frontend\src\render.rs:167: WsConnectionStatus::Connected           => (true,  "Live"),
+omega-frontend-arch\crates\omega-frontend\src\render.rs:168: WsConnectionStatus::Connecting          => (false, "Connecting…"),
+omega-frontend-arch\crates\omega-frontend\src\render.rs:169: WsConnectionStatus::Reconnecting { .. } => (false, "Reconnecting…"),
+omega-frontend-arch\crates\omega-frontend\src\render.rs:170: WsConnectionStatus::Unavailable         => (false, "WS unavailable — polling"),
+omega-frontend-arch\crates\omega-frontend\src\render.rs:171: WsConnectionStatus::Disconnected        => (false, "Disconnected"),
+omega-frontend-arch\crates\omega-frontend\src\render.rs:172: WsConnectionStatus::AuthError           => (false, "Auth error"),
+omega-frontend-arch\crates\omega-frontend\src\state.rs:10: ws::{WsConnectionStatus, WsEvent},
+omega-frontend-arch\crates\omega-frontend\src\state.rs:127: ws_status:      WsConnectionStatus,
+omega-frontend-arch\crates\omega-frontend\src\state.rs:141: ws_status:      WsConnectionStatus::Disconnected,
+omega-frontend-arch\crates\omega-frontend\src\state.rs:157: pub fn ws_status(&self) -> WsConnectionStatus { self.ws_status.clone() }
+omega-frontend-arch\crates\omega-frontend\src\state.rs:235: pub fn with_ws_status(&self, status: WsConnectionStatus) -> Self {
+omega-frontend-arch\crates\omega-frontend\src\state.rs:421: let next  = state.with_ws_status(WsConnectionStatus::Connected);
+omega-frontend-arch\crates\omega-frontend\src\state.rs:422: assert_eq!(next.ws_status(), WsConnectionStatus::Connected);
+omega-frontend-arch\crates\omega-frontend\src\sync.rs:174: pub fn set_ws_status(&mut self, status: omega_control_contracts::ws::WsConnectionStatus) {
+omega-frontend-arch\crates\omega-ui\src\sync_adapter.rs:38: .map_err(|e| FrontendError::WsConnection(format!("{e:?}")))?;
+omega-frontend-arch\crates\omega-ui\src\sync_adapter.rs:41: .map_err(|e| FrontendError::WsConnection(format!("{e:?}")))?;
+omega-frontend-arch\crates\omega-ui\src\sync_adapter.rs:45: .await.map_err(|e| FrontendError::WsConnection(format!("{e:?}")))?;
+omega-frontend-arch\crates\omega-ui\src\sync_adapter.rs:47: .map_err(|e| FrontendError::WsConnection(format!("{e:?}")))?;
+omega-frontend-arch\crates\omega-ui\src\sync_adapter.rs:49: return Err(FrontendError::WsConnection(format!("HTTP {}", resp.status())));
+omega-frontend-arch\crates\omega-ui\src\sync_adapter.rs:52: resp.text().map_err(|e| FrontendError::WsConnection(format!("{e:?}")))?
+omega-frontend-arch\crates\omega-ui\src\sync_adapter.rs:53: ).await.map_err(|e| FrontendError::WsConnection(format!("{e:?}")))?;
+omega-frontend-arch\crates\omega-ui\src\sync_adapter.rs:54: text.as_string().ok_or_else(|| FrontendError::WsConnection("not string".into()))
+omega-frontend-arch\crates\omega-ui\src\sync_adapter.rs:68: .map_err(|e| FrontendError::WsConnection(format!("{e:?}")))?;
+omega-frontend-arch\crates\omega-ui\src\sync_adapter.rs:70: .map_err(|e| FrontendError::WsConnection(format!("{e:?}")))?;
+omega-frontend-arch\crates\omega-ui\src\sync_adapter.rs:73: .map_err(|e| FrontendError::WsConnection(format!("{e:?}")))?;
+omega-frontend-arch\crates\omega-ui\src\sync_adapter.rs:77: .await.map_err(|e| FrontendError::WsConnection(format!("{e:?}")))?;
+omega-frontend-arch\crates\omega-ui\src\sync_adapter.rs:79: .map_err(|e| FrontendError::WsConnection(format!("{e:?}")))?;
+omega-frontend-arch\crates\omega-ui\src\sync_adapter.rs:81: resp.text().map_err(|e| FrontendError::WsConnection(format!("{e:?}")))?
+omega-frontend-arch\crates\omega-ui\src\sync_adapter.rs:82: ).await.map_err(|e| FrontendError::WsConnection(format!("{e:?}")))?;
+omega-frontend-arch\crates\omega-ui\src\sync_adapter.rs:83: text.as_string().ok_or_else(|| FrontendError::WsConnection("not string".into()))
+omega-frontend-arch\crates\omega-ui\src\ws_client.rs:14: ws::{WsConnectionStatus, WsEvent},
+omega-frontend-arch\crates\omega-ui\src\ws_client.rs:339: let next    = cur.with_ws_status(WsConnectionStatus::Connected);
+omega-frontend-arch\crates\omega-ui\src\ws_client.rs:363: let next    = cur.with_ws_status(WsConnectionStatus::Reconnecting { attempt });
+omega_backup_20260514_071110\crates\omega-rpc\src\client.rs:27: //   `subscribe_blocks` returns a `tokio::sync::broadcast` sender.
+omega_backup_20260514_071110\crates\omega-rpc\src\client.rs:37: use alloy::transports::ws::WsConnect;
+omega_backup_20260514_071110\crates\omega-rpc\src\client.rs:106: /// Wraps an alloy `RootProvider<PubSubFrontend>` with:
+omega_backup_20260514_071110\crates\omega-rpc\src\client.rs:129: let ws       = WsConnect::new(&config.ws_url);
+omega_backup_20260514_071110\crates\omega-rpc\src\client.rs:130: let _provider = ProviderBuilder::new().connect(WsConnect::new(ws)).await
+omega_backup_20260514_071110\crates\omega-rpc\src\client.rs:206: pub fn subscribe_blocks(&self) -> broadcast::Receiver<BlockEvent> {
+omega_backup_20260514_071110\crates\omega-rpc\src\client.rs:240: let ws       = WsConnect::new(&self.config.ws_url);
+omega_backup_20260514_071110\crates\omega-rpc\src\client.rs:241: let provider = ProviderBuilder::new().connect(WsConnect::new(config.ws_url.clone())).await
+omega_backup_20260514_071110\crates\omega-rpc\src\client.rs:252: let mut stream = provider.subscribe_blocks().await
+omega_backup_20260514_071110\crates\omega-rpc\src\client.rs:253: .map_err(|e| anyhow::anyhow!("subscribe_blocks failed: {e}"))?
+omega_backup_20260514_071110\crates\omega-rpc\src\client.rs:329: let ws       = WsConnect::new(&self.config.ws_url);
+omega_backup_20260514_071110\crates\omega-rpc\src\client.rs:330: let provider = ProviderBuilder::new().connect(WsConnect::new(config.ws_url.clone())).await
+omega_backup_20260514_071110\crates\omega-rpc\src\client.rs:357: let ws       = WsConnect::new(&self.config.ws_url);
+omega_backup_20260514_071110\crates\omega-rpc\src\client.rs:358: let provider = ProviderBuilder::new()..connect(WsConnect::new(config.ws_url.clone())).await
+omega_backup_20260514_071110\crates\omega-rpc\src\lib.rs:8: //   full alloy transport stack (providers, transports-ws, pubsub).
+omega_backup_20260514_071110\crates\omega-rpc\src\rate_limiter.rs:55: /// `eth_subscribe` (new block headers, logs, pending txs).
+omega_backup_20260514_071110\crates\omega-rpc\src\rate_limiter.rs:95: pub fn subscribe_default() -> Self {
+omega_backup_20260514_071110\crates\omega-rpc\src\rate_limiter.rs:201: BucketConfig::subscribe_default(),
+omega_backup_20260514_071110\crates\omega-rpc\src\rate_limiter.rs:287: subscribe_tokens: g.subscribe.available(),
+omega_backup_20260514_071110\crates\omega-rpc\src\rate_limiter.rs:314: pub subscribe_tokens: f64,
+omega_backup_20260514_071110\crates\omega-rpc\src\rate_limiter.rs:365: BucketConfig::subscribe_default(),
+omega_backup_20260514_071110\crates\omega-rpc\src\rate_limiter.rs:378: BucketConfig::subscribe_default(),
+omega_backup_20260514_071110\crates\omega-rpc\src\rate_limiter.rs:402: BucketConfig::subscribe_default(),
+omega_backup_20260514_071110\crates\omega-rpc\src\rate_limiter.rs:424: BucketConfig::subscribe_default(),
+omega_backup_20260514_071110\crates\omega-rpc\src\subscriptions.rs:19: //   PendingTxStream       â€” eth_subscribe("newPendingTransactions")
+omega_backup_20260514_071110\crates\omega-rpc\src\subscriptions.rs:22: //   LendingProtocolStream â€” eth_subscribe("logs") for Aave v3, Compound,
+omega_backup_20260514_071110\crates\omega-rpc\src\subscriptions.rs:26: //   DexSyncStream         â€” eth_subscribe("logs") for AMM Sync/Swap events.
+omega_backup_20260514_071110\crates\omega-rpc\src\subscriptions.rs:29: //   FeeOracleStream       â€” eth_subscribe("newHeads") for base fee updates.
+omega_backup_20260514_071110\crates\omega-rpc\src\subscriptions.rs:46: use alloy::transports::ws::WsConnect;
+omega_backup_20260514_071110\crates\omega-rpc\src\subscriptions.rs:121: .subscribe_pending_transactions()
+omega_backup_20260514_071110\crates\omega-rpc\src\subscriptions.rs:123: .map_err(|e| anyhow::anyhow!("subscribe_pending_transactions: {e}"))?
+omega_backup_20260514_071110\crates\omega-rpc\src\subscriptions.rs:237: .subscribe_logs(&filter)
+omega_backup_20260514_071110\crates\omega-rpc\src\subscriptions.rs:239: .map_err(|e| anyhow::anyhow!("subscribe_logs (lending): {e}"))?
+omega_backup_20260514_071110\crates\omega-rpc\src\subscriptions.rs:331: .subscribe_logs(&filter)
+omega_backup_20260514_071110\crates\omega-rpc\src\subscriptions.rs:333: .map_err(|e| anyhow::anyhow!("subscribe_logs (dex sync): {e}"))?
+omega_backup_20260514_071110\crates\omega-rpc\src\subscriptions.rs:406: .subscribe_blocks()
+omega_backup_20260514_071110\crates\omega-rpc\src\subscriptions.rs:408: .map_err(|e| anyhow::anyhow!("subscribe_blocks (fee oracle): {e}"))?
+omega_backup_20260514_071110\ops\control-plane\src\grpc.rs:114: let rx = self.state.subscribe_ws();
+omega_backup_20260514_071110\ops\control-plane\src\state.rs:18: //   independent receiver via `state.subscribe_ws()` and fans events out
+omega_backup_20260514_071110\ops\control-plane\src\state.rs:129: /// WebSocket connections subscribe via `state.subscribe_ws()`.
+omega_backup_20260514_071110\ops\control-plane\src\state.rs:175: pub fn subscribe_ws(&self) -> broadcast::Receiver<WsEvent> {
+ops\control-plane\src\grpc.rs:237: let rx = self.state.subscribe_ws();
+ops\control-plane\src\main.rs:905: let mut rx = state.subscribe_ws();
+ops\control-plane\src\state.rs:18: //   subscribes via `state.subscribe_ws()`.
+ops\control-plane\src\state.rs:38: //   ...` matched against the stream from `state.subscribe_ws()`) and
+ops\control-plane\src\state.rs:176: pub fn subscribe_ws(&self) -> broadcast::Receiver<WsEvent> {
+ops\control-plane\src\state.rs:270: let mut rx = state.subscribe_ws();
+src\main.rs:1907: let mut block_rx = rpc.subscribe_blocks();
+.env.example:3: ARBITRUM_RPC_URL=wss://your-dedicated-arbitrum-node:8546
+.env.example:4: BASE_RPC_URL=wss://your-dedicated-base-node:8546
+.env.example:5: ETHEREUM_RPC_URL=wss://your-dedicated-ethereum-node:8546
+Cargo.toml:159: # transport-ws/pubsub feature declarations in omega-rpc, causing
+Cargo.toml:161: alloy              = { version = "0.3", features = ["serde", "providers", "transport-ws", "pubsub", "rpc-types", "rpc-types-eth"] }

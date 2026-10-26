@@ -31,6 +31,7 @@ pub mod error;
 pub mod fork;
 pub mod harness;
 pub mod report;
+pub mod strategy_detector;
 pub mod submitter;
 pub mod traits;
 
@@ -38,6 +39,7 @@ pub use error::SimError;
 pub use fork::{ForkConfig, ForkHandle};
 pub use harness::{HarnessConfig, SimulationHarness};
 pub use report::{CycleResult, SimulationReport};
+pub use strategy_detector::StrategyDetector;
 pub use submitter::SimulationSubmitter;
 pub use traits::{
     Bundle, BundleSubmitter, Opportunity, OpportunityDetector, OpportunityKind, Receipt,

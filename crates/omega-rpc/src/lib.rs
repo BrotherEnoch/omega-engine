@@ -1,6 +1,6 @@
 // crates/omega-rpc/src/lib.rs
 //
-// omega-rpc — WebSocket RPC client and subscription multiplexer.
+// omega-rpc — RPC client and signal-stream multiplexer (WebSocket or HTTP polling).
 //
 // ## Architectural role (§22.1)
 //
@@ -12,6 +12,18 @@
 //   Dependency graph:
 //     omega-rpc ← omega-core, omega-health
 //     omega-oracle ← omega-rpc
+//
+// ## Transports (this revision)
+//
+//   The transport is chosen from the RPC URL scheme alone:
+//
+//     ws:// | wss://      WebSocket + eth_subscribe (full functionality, incl. mempool)
+//     http:// | https://  HTTP polling (no paid WSS key needed)
+//
+//   HTTP mode polls the chain tip and eth_getLogs ranges instead of subscribing.
+//   It cannot provide the pending-transaction (mempool) stream — that stream is not
+//   started over HTTP. See transport.rs (configuration), poll.rs (polling primitives
+//   and their stated limitations) and subscriptions.rs (per-stream behaviour table).
 //
 // ## Hard constraints (§4, §22 hardware spec)
 //
@@ -96,33 +108,29 @@
 // was previously just a set of re-exported constants:
 //   - `AAVE_V3_POOL`, `AAVE_PROTOCOL_DATA_PROVIDER`, `BALANCER_V2_VAULT`,
 //     `WETH`, `USDC_NATIVE` — real Arbitrum One addresses, each
-//     individually re-verified against a live source THIS session (see
-//     that file's own header) after an earlier, never-committed draft
-//     of this same module transcribed `BALANCER_V2_VAULT` wrong
-//     (truncated the trailing bytes) — caught by that verification
-//     pass, not by luck.
+//     individually re-verified against a live source (see that file's
+//     own header) after an earlier, never-committed draft of this same
+//     module transcribed `BALANCER_V2_VAULT` wrong (truncated the
+//     trailing bytes) — caught by that verification pass, not by luck.
 //   - `resolve_liquidity_addresses` — the query-target-vs-recorded-label
 //     split `main.rs`'s `OMEGA_AAVE_V3_POOL_TAG_OVERRIDE` /
 //     `OMEGA_BALANCER_V2_VAULT_TAG_OVERRIDE` env vars already document,
 //     now with one real function backing it instead of the split logic
 //     living only in main.rs's own env-parsing code.
 //   - `OmegaRpcClient::fetch_aave_available` /
-//     `OmegaRpcClient::fetch_balancer_available` — real eth_call reads
-//     (previously these were referenced by main.rs's L2e poll loop but
-//     not shown to exist anywhere in this crate). Same non-dependency
-//     discipline as chainlink_agg/arb_gas_info: these return a plain
-//     `u128`, not a `LiquiditySnapshot` or any other
-//     `omega_flashloan`-owned type — that crate's `LiquidityRegistry`
-//     wraps the returned number into its own type on the `main.rs` side,
-//     where the dependency on omega_flashloan already exists.
+//     `OmegaRpcClient::fetch_balancer_available` — real eth_call reads.
+//     Same non-dependency discipline as chainlink_agg/arb_gas_info:
+//     these return a plain `u128`, not a `LiquiditySnapshot` or any
+//     other `omega_flashloan`-owned type — that crate's
+//     `LiquidityRegistry` wraps the returned number into its own type on
+//     the `main.rs` side, where the dependency on omega_flashloan
+//     already exists.
 //   - `validate_deployed_contracts` — a real `eth_getCode` check (via
-//     the new `OmegaRpcClient::get_code`, client.rs) against every
-//     address above, run once at startup per `main.rs`'s own call site.
-//     Confirms bytecode presence, not full ABI conformance — see that
-//     function's own doc comment for the exact, deliberately-limited
-//     scope of what it checks.
+//     `OmegaRpcClient::get_code`, client.rs) against every address
+//     above, run once at startup per `main.rs`'s own call site.
+//     Confirms bytecode presence, not full ABI conformance.
 //
-// ## Fix (this revision): flashloan_liq — C10 Uniswap V3 pool coverage
+// ## Fix (prior revision): flashloan_liq — C10 Uniswap V3 pool coverage
 //
 // `flashloan_liq.rs` gained `UNISWAP_V3_WETH_USDC_POOL` (a real, verified pool
 // address — see that constant's own doc comment for the two-different-pools trap its
@@ -137,15 +145,23 @@
 // items; this crate deliberately doesn't do that, presumably so the crate's public API
 // surface is an explicit, reviewable list rather than "whatever flashloan_liq.rs
 // happens to make pub"). A real `cargo build` caught the omission
-// (`E0432: unresolved import 'omega_rpc::UNISWAP_V3_WETH_USDC_POOL'`) across four
-// consecutive tool invocations (`build`, `check`, `test`, `clippy`) before this fix
-// landed — anyone adding a new symbol to `flashloan_liq.rs` in the future needs to
-// remember this file has its own separate list to update.
+// (`E0432: unresolved import 'omega_rpc::UNISWAP_V3_WETH_USDC_POOL'`) — anyone adding a
+// new symbol to `flashloan_liq.rs` in the future needs to remember this file has its
+// own separate list to update.
+//
+// ## Change (this revision): HTTP transport
+//
+// Added `transport` (RpcTransport, PollConfig, provider construction) and `poll`
+// (HTTP polling primitives). `RpcTransport` and `PollConfig` are added to the
+// re-export list below. `net::validate_ws_scheme` is superseded by
+// `net::validate_rpc_url`; `client.rs` and `subscriptions.rs` are transport-aware.
 mod aave_positions;
 mod arb_gas_info;
 mod chainlink_agg;
 mod flashloan_liq;
 mod net;
+mod poll;
+mod transport;
 
 pub mod client;
 pub mod rate_limiter;
@@ -159,6 +175,8 @@ pub use chainlink_agg::ChainlinkRound;
 pub use client::{BlockEvent, OmegaRpcClient, RpcClientConfig};
 
 pub use net::RpcClientError;
+
+pub use transport::{PollConfig, RpcTransport};
 
 pub use rate_limiter::{BucketConfig, RateLimiterSnapshot, RpcRateLimiter, RpcRequestKind};
 

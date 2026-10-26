@@ -158,7 +158,9 @@ impl MultiRelayClient {
     pub async fn reconcile_inclusions(&self, current_block: u64) -> Vec<ConfirmationResult> {
         let results = self.inclusion_tracker.reconcile(current_block).await;
         for r in &results {
-            self.metrics.record(&r.relay, r.included);
+            if !r.confirmation_unknown {
+                self.metrics.record(&r.relay, r.included);
+            }
         }
         results
     }
