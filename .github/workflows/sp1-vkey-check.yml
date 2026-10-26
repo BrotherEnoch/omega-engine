@@ -70,7 +70,7 @@ jobs:
         run: |
           set -euo pipefail
           "$HOME/.sp1/bin/cargo-prove" prove build
-          test -s elf/riscv32im-succinct-zkvm-elf
+          test -s target/elf-compilation/riscv64im-succinct-zkvm-elf/release/omega-proof-program
 
       - name: Derive and compare PROGRAM_VKEY
         working-directory: ${{ runner.temp }}/omega-sp1/sp1-program/program
@@ -78,7 +78,7 @@ jobs:
         run: |
           set -euo pipefail
           [[ "$EXPECTED_VKEY" =~ ^0x[0-9a-fA-F]{64}$ ]]
-          vkey_output="$("$HOME/.sp1/bin/cargo-prove" prove vkey --elf elf/riscv32im-succinct-zkvm-elf 2>&1)"
+          vkey_output="$("$HOME/.sp1/bin/cargo-prove" prove vkey --elf target/elf-compilation/riscv64im-succinct-zkvm-elf/release/omega-proof-program 2>&1)"
           printf '%s\n' "$vkey_output"
           if ! grep -Eiq "${EXPECTED_VKEY}" <<< "$vkey_output"; then
             echo "PROGRAM_VKEY mismatch" >&2
