@@ -1,4 +1,4 @@
-name: SP1 vkey check
+name: SP1 proof safety gate
 
 on:
   push:
@@ -10,7 +10,6 @@ on:
         description: Expected PROGRAM_VKEY (bytes32)
         required: true
         type: string
-        default: '0x00b393710ddf133e1901f4bd51f7e81e74e98d2a3033eb5ddc9226589b7774cc'
 
 permissions:
   contents: read
@@ -21,12 +20,11 @@ concurrency:
 
 jobs:
   build-and-check:
-    name: Build SP1 ELF and check PROGRAM_VKEY
+    name: Build SP1 ELF and block unreviewed proof circuit
     runs-on: macos-14
     timeout-minutes: 90
     env:
       CARGO_TERM_COLOR: always
-      EXPECTED_VKEY: ${{ github.event.inputs.expected_vkey || '0x00b393710ddf133e1901f4bd51f7e81e74e98d2a3033eb5ddc9226589b7774cc' }}
     steps:
       - name: Fetch only SP1 source (exclude local environment files and submodules)
         shell: bash
@@ -72,11 +70,22 @@ jobs:
           "$HOME/.sp1/bin/cargo-prove" prove build
           test -s ../target/elf-compilation/riscv64im-succinct-zkvm-elf/release/omega-proof-program
 
+      - name: Enforce proof security gate
+        working-directory: ${{ runner.temp }}/omega-sp1/sp1-program/program
+        shell: bash
+        run: |
+          set -euo pipefail
+          if grep -Fq 'production_proof_path_is_reviewed() -> bool {' src/main.rs; then
+            echo "::error::SP1 proof production is intentionally disabled. Do not deploy a vkey until signature authentication and trade-to-proof binding are implemented and reviewed."
+            exit 1
+          fi
+
       - name: Derive and compare PROGRAM_VKEY
         working-directory: ${{ runner.temp }}/omega-sp1/sp1-program/program
         shell: bash
         run: |
           set -euo pipefail
+          EXPECTED_VKEY="${{ github.event.inputs.expected_vkey }}"
           [[ "$EXPECTED_VKEY" =~ ^0x[0-9a-fA-F]{64}$ ]]
           vkey_output="$("$HOME/.sp1/bin/cargo-prove" prove vkey --elf ../target/elf-compilation/riscv64im-succinct-zkvm-elf/release/omega-proof-program 2>&1)"
           printf '%s\n' "$vkey_output"
