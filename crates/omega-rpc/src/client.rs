@@ -82,7 +82,7 @@
 //
 //   Most RPC providers embed an API key directly in the WS URL's path
 //   or query string. Every log site that previously included the raw
-//   `ws_url` now uses `net::redact_ws_url`, which keeps only the scheme
+//   `http_url` now uses `net::redact_ws_url`, which keeps only the scheme
 //   and host.
 //
 // ## Fix (this revision): fetch_chainlink_round
@@ -193,7 +193,7 @@ use tokio::sync::{broadcast, Mutex};
 use omega_core::{FeeSnapshot, HealthState, LayerHealth};
 
 use crate::net::{
-    redact_ws_url, validate_ws_scheme, verify_chain_id, wei_to_gwei_saturating, RpcClientError,
+    redact_ws_url, validate_http_scheme, verify_chain_id, wei_to_gwei_saturating, RpcClientError,
 };
 use crate::rate_limiter::{RpcRateLimiter, RpcRequestKind};
 
@@ -361,7 +361,7 @@ struct ConnectionState {
 // OmegaRpcClient
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Rate-limited WebSocket RPC client for the Omega Engine.
+/// Rate-limited HTTP JSON-RPC client for the Omega Engine.
 ///
 /// Wraps a single shared alloy provider connection with:
 ///   - Token-bucket rate limiting per request kind (§22 hardware spec)
@@ -386,7 +386,7 @@ pub struct OmegaRpcClient {
 impl OmegaRpcClient {
     // ── Constructors ────────────────────────────────────────────────────────
 
-    /// Connect to the given WebSocket endpoint.
+    /// Connect to the given HTTP JSON-RPC endpoint.
     ///
     /// Validates the URL scheme, establishes the connection, and
     /// verifies the endpoint's actual chain ID matches
@@ -397,7 +397,7 @@ impl OmegaRpcClient {
     /// tolerate transient initial-connection failure but should still
     /// stop immediately on a fatal one.
     pub async fn connect(config: RpcClientConfig) -> Result<Self, RpcClientError> {
-        validate_ws_scheme(&config.http_url)?;
+        validate_http_scheme(&config.http_url)?;
         let provider = open_provider(&config.http_url).await?;
         verify_chain_id(provider.as_ref(), config.chain_id).await?;
 
