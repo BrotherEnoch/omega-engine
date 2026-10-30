@@ -14,12 +14,12 @@
 //     endpoint into a small, WRONG number â€” dangerous specifically
 //     because it's wrong in the unsafe direction (an artificially low
 //     gas cost estimate makes a trade look more profitable than it is).
-//   - validate_ws_scheme: fail immediately and clearly on an obviously
+//   - validate_http_scheme: fail immediately and clearly on an obviously
 //     wrong URL (e.g. a copy-paste of an http:// endpoint) rather than
 //     relying on whatever downstream error eventually surfaces.
 //
 // ## Fix (this revision): clippy::bool_comparison in
-// validate_ws_scheme_rejects_http
+// validate_http_scheme_rejects_http
 //
 // `assert!(!err.is_fatal() == false || err.is_fatal());` was leftover
 // edit debris â€” a tautology (`!x == false` is just `x`, so this reduces
@@ -79,19 +79,14 @@ impl RpcClientError {
 // URL validation and redaction
 // â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
-/// Rejects a `ws_url` that doesn't start with `ws://` or `wss://` before
-/// any connection attempt is made. `ProviderBuilder::on_builtin` performs
-/// its own scheme-based transport detection, but relying on whatever
-/// error eventually surfaces downstream (which may be an unrelated-
-/// looking transport error) is worse than failing immediately with a
-/// clear, specific message at the point of misconfiguration.
-pub(crate) fn validate_ws_scheme(ws_url: &str) -> Result<(), RpcClientError> {
-    if ws_url.starts_with("ws://") || ws_url.starts_with("wss://") {
+/// Rejects a JSON-RPC endpoint that is not HTTP or HTTPS before a connection attempt.
+pub(crate) fn validate_http_scheme(http_url: &str) -> Result<(), RpcClientError> {
+    if http_url.starts_with("http://") || http_url.starts_with("https://") {
         Ok(())
     } else {
         Err(RpcClientError::InvalidUrl {
-            url: redact_ws_url(ws_url),
-            reason: "must start with ws:// or wss://".to_string(),
+            url: redact_ws_url(http_url),
+            reason: "must start with http:// or https://".to_string(),
         })
     }
 }
@@ -212,14 +207,14 @@ mod tests {
     }
 
     #[test]
-    fn validate_ws_scheme_accepts_ws_and_wss() {
-        assert!(validate_ws_scheme("ws://localhost:8545").is_ok());
-        assert!(validate_ws_scheme("wss://node.example.com/v2/key").is_ok());
+    fn validate_http_scheme_accepts_ws_and_wss() {
+        assert!(validate_http_scheme("http://localhost:8545").is_ok());
+        assert!(validate_http_scheme("https://node.example.com/v2/key").is_ok());
     }
 
     #[test]
-    fn validate_ws_scheme_rejects_http() {
-        let err = validate_ws_scheme("https://node.example.com").unwrap_err();
+    fn validate_http_scheme_rejects_http() {
+        let err = validate_http_scheme("wss://node.example.com").unwrap_err();
         assert!(matches!(err, RpcClientError::InvalidUrl { .. }));
         assert!(
             err.is_fatal(),
