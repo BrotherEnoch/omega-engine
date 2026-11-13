@@ -1,3 +1,4 @@
+// apps/control-console/src/realtime.js
 import { routes } from "./contracts.js";
 import { mutate, pushError, pushEvent, store } from "./state.js";
 
@@ -7,7 +8,13 @@ let reconnectTimer = null;
 export function connectRealtime() {
   disconnectRealtime();
 
-  const base = new URL(store.apiBase);
+  let base;
+  try {
+    base = new URL(store.apiBase);
+  } catch {
+    pushError("The API address is not a valid URL. Fix it on the Connection tab.");
+    return;
+  }
   base.protocol = base.protocol === "https:" ? "wss:" : "ws:";
   base.pathname = routes.wsEvents.path;
   base.search = "";
@@ -16,18 +23,21 @@ export function connectRealtime() {
     state.connection = "connecting";
   });
 
-  socket = new WebSocket(base.toString());
+  const ws = new WebSocket(base.toString());
+  socket = ws;
 
-  socket.addEventListener("open", () => {
+  ws.addEventListener("open", () => {
+    if (ws !== socket) return;
     mutate((state) => {
       state.connection = "connected";
     });
     if (store.token) {
-      socket.send(JSON.stringify({ type: "auth", token: store.token }));
+      ws.send(JSON.stringify({ type: "auth", token: store.token }));
     }
   });
 
-  socket.addEventListener("message", (message) => {
+  ws.addEventListener("message", (message) => {
+    if (ws !== socket) return;
     try {
       const payload = JSON.parse(message.data);
       if (payload.type === "auth_ok") {
@@ -40,6 +50,7 @@ export function connectRealtime() {
         mutate((state) => {
           state.connection = "anonymous";
         });
+        pushError("The stream rejected the token. Check it on the Connection tab.");
         return;
       }
       if (payload.error === "LAG_DETECTED") {
@@ -54,21 +65,27 @@ export function connectRealtime() {
     }
   });
 
-  socket.addEventListener("close", () => {
+  // Ignore events from sockets we replaced; otherwise each replaced socket
+  // schedules a reconnect that kills the healthy one.
+  ws.addEventListener("close", () => {
+    if (ws !== socket) return;
+    socket = null;
     mutate((state) => {
       if (state.mode === "live") state.connection = "disconnected";
     });
     reconnectTimer = window.setTimeout(connectRealtime, 5000);
   });
 
-  socket.addEventListener("error", () => {
-    pushError("Realtime stream unavailable");
+  ws.addEventListener("error", () => {
+    if (ws !== socket) return;
+    pushError("Realtime stream unavailable. Retrying every 5 seconds.");
   });
 }
 
 export function disconnectRealtime() {
   if (reconnectTimer) window.clearTimeout(reconnectTimer);
   reconnectTimer = null;
-  if (socket) socket.close();
+  const old = socket;
   socket = null;
+  if (old) old.close();
 }

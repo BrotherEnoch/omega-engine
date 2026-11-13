@@ -1,8 +1,9 @@
+// apps/control-console/src/state.js
 import { mockBlacklist, mockCeiling, mockCheckpoints, mockDaoFee, mockHealth } from "./mock.js";
 
 export const store = {
   revision: 0,
-  apiBase: localStorage.getItem("omega.console.apiBase") || window.location.origin,
+  apiBase: localStorage.getItem("omega.console.apiBase") || "http://127.0.0.1:8080",
   token: localStorage.getItem("omega.console.token") || "",
   mode: "live",
   connection: "disconnected",
@@ -40,6 +41,7 @@ export function setPending(key, isPending) {
 }
 
 export function pushError(message) {
+  if (store.errors.some((e) => e.message === message)) return; // no repeats
   mutate((state) => {
     state.errors.unshift({ message, at: new Date().toISOString() });
     state.errors = state.errors.slice(0, 6);
@@ -73,9 +75,11 @@ export function useMockData(reason = "Backend unavailable") {
   });
 }
 
+const idOf = (layer) => layer.layer_id || layer.layer;
+
 function applyEventToSnapshot(state, event) {
   if (event.kind === "health_transition" && state.health) {
-    const layer = state.health.layers.find((item) => item.layer === event.layer);
+    const layer = state.health.layers.find((item) => idOf(item) === event.layer);
     if (layer) {
       layer.state = event.to;
       layer.is_operational = event.to !== "HALTED";

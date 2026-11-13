@@ -103,3 +103,7 @@ uuid = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true }
+
+[features]
+default = []
+test-helpers = []

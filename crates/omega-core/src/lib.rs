@@ -59,7 +59,10 @@
 pub mod chain;
 pub mod config;
 pub mod errors;
+pub mod phase;
 pub mod types;
+
+pub use phase::{relay_list_for_phase, strategy_allowed_at_phase, InvalidPhase, Phase};
 
 // ── Convenience re-exports ────────────────────────────────────────────────────
 // Downstream crates can write `use omega_core::ExecutionBlueprint` rather

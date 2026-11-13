@@ -56,6 +56,7 @@ impl StrategyDetector {
             liquidity_registry,
             config,
             Arc::new(omega_strategies::sa::StaticQuoteSource),
+            None, // no simulator in Phase 0.5 detector
         );
 
         Self {
@@ -74,7 +75,6 @@ impl StrategyDetector {
             base_fee_gwei,
             l1_data_fee_gwei: 2, // conservative default; improve later from oracle
             state_hash: B256::from([0x01; 32]),
-            mev_share_events_in_window: 0,
         }
     }
 }

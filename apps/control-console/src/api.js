@@ -1,3 +1,4 @@
+﻿// apps/control-console/src/api.js â€” safer JSON handling, clearer 401 message, de-duplicated errors
 import { API_BASE_KEY, TOKEN_KEY, authTier, clearHaltPath, revertCheckpointPath, routes } from "./contracts.js";
 import { mutate, pushError, setPending, store, useMockData } from "./state.js";
 
@@ -12,6 +13,9 @@ export function saveSettings({ apiBase, token }) {
 
 export async function refreshAll() {
   setPending("refreshAll", true);
+  mutate((state) => {
+    state.errors = [];
+  });
   try {
     const [health, daoFee, blacklist, ceiling, checkpoints] = await Promise.allSettled([
       request(routes.health),
@@ -32,12 +36,13 @@ export async function refreshAll() {
       if (checkpoints.status === "fulfilled") state.checkpoints = checkpoints.value;
     });
 
-    for (const result of [daoFee, blacklist, ceiling, checkpoints]) {
-      if (result.status === "rejected") pushError(result.reason.message);
-    }
+    const messages = new Set(
+      [daoFee, blacklist, ceiling, checkpoints].filter((r) => r.status === "rejected").map((r) => r.reason.message),
+    );
+    for (const message of messages) pushError(message);
   } catch (error) {
     pushError(error.message);
-    useMockData(error.message);
+    mutate((state) => { state.mode = "offline"; state.connection = "disconnected"; state.health = null; state.daoFee = null; state.blacklist = null; state.ceiling = null; state.checkpoints = []; });
   } finally {
     setPending("refreshAll", false);
   }
@@ -92,19 +97,43 @@ async function request(route, body) {
     headers["Content-Type"] = "application/json";
   }
 
-  const response = await fetch(url, {
-    method: route.method,
-    headers,
-    body: body === undefined || body === null ? undefined : JSON.stringify(body),
-  });
-
-  const text = await response.text();
-  const payload = text ? JSON.parse(text) : null;
-
-  if (!response.ok) {
-    const message = payload?.message || `${route.method} ${route.path} returned ${response.status}`;
-    throw new Error(message);
+  let response;
+  try {
+    response = await fetch(url, {
+      method: route.method,
+      headers,
+      body: body === undefined || body === null ? undefined : JSON.stringify(body),
+    });
+  } catch {
+    throw new Error(`Cannot reach ${store.apiBase}. Is omega-runtime running?`);
   }
 
+  const text = await response.text();
+  let payload = null;
+  if (text) {
+    try {
+      payload = JSON.parse(text);
+    } catch {
+      /* non-JSON body (HTML error page etc.) */
+    }
+  }
+
+  if (response.status === 401) {
+    throw new Error(
+      store.token
+        ? "Token rejected by the runtime. Check it on the Connection tab."
+        : "This action needs an API token. Add it on the Connection tab.",
+    );
+  }
+  if (response.status === 403) {
+    throw new Error(`${route.path} needs a higher-privilege (${route.auth}) token than the one saved.`);
+  }
+  if (!response.ok) {
+    throw new Error(payload?.message || `${route.method} ${route.path} returned ${response.status}`);
+  }
+  if (text && payload === null) {
+    throw new Error(`${route.path} did not return JSON. Check the API address.`);
+  }
   return payload;
 }
+

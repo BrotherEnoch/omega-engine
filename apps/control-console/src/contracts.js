@@ -1,3 +1,4 @@
+// apps/control-console/src/contracts.js
 export const API_BASE_KEY = "omega.console.apiBase";
 export const TOKEN_KEY = "omega.console.token";
 

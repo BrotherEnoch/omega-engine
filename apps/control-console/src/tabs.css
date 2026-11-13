@@ -1,0 +1,62 @@
+/* ---- tabs + additions (append to styles.css) ---- */
+.tabs {
+  display: flex;
+  gap: 4px;
+  margin-bottom: 14px;
+  border-bottom: 1px solid #25323a;
+}
+
+.tab {
+  min-height: 40px;
+  padding: 0 20px;
+  border: 0;
+  border-bottom: 2px solid transparent;
+  border-radius: 6px 6px 0 0;
+  background: transparent;
+  color: #9eacb3;
+}
+
+.tab[aria-selected="true"] {
+  border-bottom-color: #7fb2bf;
+  background: #12191e;
+  color: #f6fbfd;
+}
+
+.tab:focus-visible,
+button:focus-visible,
+input:focus-visible,
+select:focus-visible {
+  outline: 2px solid #7fb2bf;
+  outline-offset: 2px;
+}
+
+select {
+  width: 100%;
+  min-height: 36px;
+  border: 1px solid #334149;
+  border-radius: 6px;
+  padding: 0 10px;
+  background: #0e1418;
+  color: #f6fbfd;
+  font: inherit;
+}
+
+.notice {
+  margin: 0 0 14px;
+  border-left: 3px solid #ebb759;
+  border-radius: 4px;
+  padding: 8px 10px;
+  background: rgba(235, 183, 89, 0.12);
+  color: #ffdda1;
+}
+
+.errors .dismiss {
+  justify-self: start;
+  min-height: 28px;
+  padding: 0 10px;
+  font-size: 12px;
+}
+
+.panel p {
+  text-transform: none;
+}

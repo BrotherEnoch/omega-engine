@@ -1,3 +1,4 @@
+// apps/control-console/src/mock.js
 const now = () => new Date().toISOString();
 
 export const layerOrder = [

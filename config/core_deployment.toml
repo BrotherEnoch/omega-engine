@@ -1,0 +1,18 @@
+﻿# config/core_deployment.toml
+# Pinned from contracts/broadcast/DeployCore.s.sol/42161/run-latest.json
+# Source of truth for engine process env remains repo-root .env (VAULT_ADDRESS / ORCHESTRATOR_ADDRESS).
+# Do not treat this as a substitute for .env secrets.
+
+chain_id = 42161
+network  = "arbitrum-one"
+
+[core]
+vault_address         = "0x8b8a1ddc0a2e7467d05f1672d867056847f3142e"
+orchestrator_address  = "0x29bed5e5c073af9d693396cc2ce7dafb529dd521"
+sp1_adapter_address   = "0x9163fe1e8448c237d5e7cebf428eba3015841869"
+pil_treasury_address  = "0x023108300557958e6eef0dcc69e2d3804a6f13a1"
+opil_token_address    = "0xe12bda24bdb25b79caeb72df799d802be959fdb7"
+
+[source]
+broadcast = "contracts/broadcast/DeployCore.s.sol/42161/run-latest.json"
+manifest  = "config/deployment_manifest.toml"

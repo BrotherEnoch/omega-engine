@@ -2,22 +2,23 @@
 //
 // Canary (CNRY) — Phase 0 signal validator (spec §1.1).
 //
+// ## Design invariants
+//
+// - CNRY scores signals and increments an observability counter.
+// - `build_blueprint` and `simulate` ALWAYS return Err(MissWhitelist).
+//   CNRY must never emit a real ExecutionBlueprint or touch the execution
+//   pipeline. This is intentional product behaviour, not a residual gap.
+// - No flashloan, no calldata, no relay targets, no capital path.
+//
 // ## Audit note (this revision)
 //
-// `build_blueprint` here never actually constructs an `ExecutionBlueprint`
-// — it always returns `Err(MissWhitelist)` before reaching that point, by
-// design (CNRY must never produce a real blueprint). So none of the
-// `blueprint_hash` inconsistency issues fixed in sa.rs/la.rs/msa.rs/mev.rs
-// apply to this file's production code. The only change needed here is
-// keeping the one test-only blueprint literal below in sync with
-// `ExecutionBlueprint`'s required field set, since that struct now also
-// requires `flashloan_provider_type`, `provider_contract`,
-// `flashloan_token`, and `max_base_fee_gwei` at every construction site
-// (added in `omega-core` to support real flashloan provider/pool
-// selection — see that crate's `types::blueprint` module doc comment).
-// CNRY never sources a flashloan, so these are ZERO/placeholder values
-// here, same treatment as the pre-existing `signal_id`/`client_order_id`/
-// `idempotency_key` placeholders below.
+// Because production code never constructs an ExecutionBlueprint, the
+// blueprint_hash / idempotency_key consistency fixes applied to SA/MSA/LA/MEV
+// do not apply here. The only change required is keeping the test-only
+// blueprint literal in sync with ExecutionBlueprint's required field set
+// (flashloan_provider_type, provider_contract, flashloan_token,
+// max_base_fee_gwei, etc.). Those fields are ZERO/placeholder values because
+// CNRY never sources a flashloan.
 
 use std::sync::{
     atomic::{AtomicU64, Ordering},
@@ -40,7 +41,8 @@ use omega_core::{GasConfig, OmegaConfig};
 
 const CNRY_GAS_BUDGET: u64 = 0;
 const CNRY_BYTECODE_HASH: B256 = B256::ZERO;
-const CNRY_SPREAD_WEI: u128 = 200_000_000_000_000_000; // 0.2 ETH
+/// Synthetic spread used only for scoring observability (0.2 ETH).
+const CNRY_SPREAD_WEI: u128 = 200_000_000_000_000_000;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // CnryStrategy
@@ -66,6 +68,7 @@ impl CnryStrategy {
     }
 
     fn compute_score(&self, signal: &SignalState) -> OpScore {
+        // Simple fee-pressure gate: high base fee → score 0.
         let fee_pressure = signal.base_fee_gwei as f64 / 50.0;
         if fee_pressure > 1.0 {
             return OpScore {
@@ -93,7 +96,9 @@ impl CnryStrategy {
 
         let net = spread_wei.saturating_sub(cost_wei);
         let competition_prob = 0.35_f64;
-        let score = (1.0 - competition_prob) * (net.saturating_to::<u128>() as f64 / 1e15).min(1.0);
+        // Portable conversion (consistent with mev.rs / sa.rs / msa.rs / la.rs).
+        let net_f = u128::try_from(net).unwrap_or(u128::MAX) as f64;
+        let score = (1.0 - competition_prob) * (net_f / 1e15).min(1.0);
 
         OpScore {
             score: score.clamp(0.0, 1.0),
@@ -108,18 +113,23 @@ impl StrategyTrait for CnryStrategy {
     fn strategy_id(&self) -> StrategyId {
         StrategyId::Cnry
     }
+
     fn lane(&self) -> Lane {
         Lane::Microtx
     }
+
     fn hot_path_eligible(&self) -> bool {
         false
     }
+
     fn gas_budget(&self) -> u64 {
         CNRY_GAS_BUDGET
     }
+
     fn expected_bytecode_hash(&self) -> B256 {
         CNRY_BYTECODE_HASH
     }
+
     fn is_canary(&self) -> bool {
         true
     }
@@ -140,12 +150,14 @@ impl StrategyTrait for CnryStrategy {
         Ok(op)
     }
 
+    /// Always fails closed. CNRY must never produce a real blueprint.
     async fn build_blueprint(&self, _signal: &SignalState) -> Result<ExecutionBlueprint> {
         Err(anyhow::anyhow!(OmegaError::dropped(
             DropCode::MissWhitelist
         )))
     }
 
+    /// Always fails closed. CNRY must never simulate.
     async fn simulate(&self, _bp: &ExecutionBlueprint) -> Result<SimResult> {
         Err(anyhow::anyhow!(OmegaError::dropped(
             DropCode::MissWhitelist
@@ -164,7 +176,6 @@ impl StrategyTrait for CnryStrategy {
 #[cfg(test)]
 mod tests {
     use super::*;
-    // Address was missing — fixes E0433 at lines 261 and 299
     use alloy_primitives::Address;
     use omega_core::types::flashloan_provider::FlashloanProviderType;
     use omega_core::OmegaConfig;
@@ -182,19 +193,15 @@ mod tests {
             base_fee_gwei: base_fee,
             l1_data_fee_gwei: 2,
             state_hash: B256::from([0x01; 32]),
-            mev_share_events_in_window: 0,
         }
     }
 
-    /// Test-only blueprint literal. CNRY's real `build_blueprint` never
-    /// constructs one of these (see module doc comment), so signal_id/
-    /// client_order_id/idempotency_key here are just placeholders to
-    /// satisfy the struct's field list — not integrity-checked values.
-    /// Do not copy this pattern into code that DOES rely on
-    /// verify_hash()/verify_idempotency_key(). Same treatment applies to
-    /// the flashloan_provider_type/provider_contract/flashloan_token/
-    /// max_base_fee_gwei fields added in this revision: CNRY never
-    /// sources a flashloan, so these are ZERO/arbitrary placeholders.
+    /// Test-only blueprint literal.
+    ///
+    /// CNRY's real `build_blueprint` never constructs one of these (see module
+    /// doc). All identity / flashloan / fee fields are placeholders solely to
+    /// satisfy the struct's required field list. Do not copy this pattern into
+    /// any code path that calls `verify_hash()` or `verify_idempotency_key()`.
     fn test_blueprint() -> ExecutionBlueprint {
         let signal_id = Uuid::from_bytes([0x00u8; 16]);
         let client_order_id =
@@ -211,9 +218,10 @@ mod tests {
             flashloan_provider: Address::ZERO,
             flashloan_amount: U256::ZERO,
             flashloan_available: U256::ZERO,
-            flashloan_provider_type: FlashloanProviderType::Balancer,
+            flashloan_provider_type: FlashloanProviderType::Balancer, // placeholder
             provider_contract: Address::ZERO,
             flashloan_token: Address::ZERO,
+            max_base_fee_gwei: 0,
             calldata: Bytes::new(),
             strategy_bytecode_hash: B256::ZERO,
             l2_exec_gas_estimate: 0,
@@ -227,7 +235,6 @@ mod tests {
             base_fee_at_creation: 0,
             l1_data_fee_at_creation: 0,
             priority_fee_gwei: 0,
-            max_base_fee_gwei: 0,
             price_impact_bps: None,
             ofa_compliant: false,
             expiry_block: 0,
@@ -247,6 +254,8 @@ mod tests {
         assert_eq!(s.strategy_id(), StrategyId::Cnry);
         assert!(!s.hot_path_eligible());
         assert_eq!(s.gas_budget(), 0);
+        assert_eq!(s.expected_bytecode_hash(), B256::ZERO);
+        assert_eq!(s.base_min_profit_wei(), U256::ZERO);
     }
 
     #[tokio::test]
@@ -283,5 +292,13 @@ mod tests {
         let s = make_strategy();
         let bp = test_blueprint();
         assert!(s.encode_calldata(&bp).is_empty());
+    }
+
+    #[tokio::test]
+    async fn scored_count_increments() {
+        let s = make_strategy();
+        let _ = s.score(&signal(5)).await.unwrap();
+        let _ = s.score(&signal(5)).await.unwrap();
+        assert_eq!(s.scored_count(), 2);
     }
 }

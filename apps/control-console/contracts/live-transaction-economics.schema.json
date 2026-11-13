@@ -1,0 +1,48 @@
+{
+  "source": "live",
+  "tx_id": "…",
+  "tx_hash": "0x…",
+  "correlation_id": "…",
+  "strategy_id": "…",
+  "strategy_version": "…",
+  "token_pair": "WETH/USDC",
+  "chain_id": 42161,
+  "executed_at": "2026-11-03T00:00:00Z",
+  "trade_size": "…",
+  "execution_status": "success",
+  "purchase": {
+    "token": "…",
+    "quantity": "…",
+    "expected_price": "…",
+    "avg_price": "…",
+    "entry_slippage": "…",
+    "entry_price_impact": "…",
+    "dex_fees": "…"
+  },
+  "sale": { },
+  "costs": {
+    "entry_gas": "…",
+    "exit_gas": "…",
+    "approval_gas": "…",
+    "failed_tx_gas": "…",
+    "flash_loan_premium": "…",
+    "protocol_fees": "…",
+    "mev_costs": "…",
+    "bridge_costs": "…",
+    "funding_costs": "…",
+    "rebates": "…",
+    "other": [],
+    "total": "…"
+  },
+  "pnl": {
+    "gross_proceeds": "…",
+    "gross": "…",
+    "total_costs": "…",
+    "net": "…",
+    "net_roi": "…",
+    "capital_deployed": "…",
+    "status": "profit|loss|flat"
+  },
+  "reporting_currency": "USD",
+  "conversion_basis": "…"
+}

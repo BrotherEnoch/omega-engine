@@ -74,15 +74,39 @@
 //                                 Arbitrum One at phase >= 1. OFF by default: the static
 //                                 0.2 ETH spread makes every SA blueprint report an
 //                                 identical fabricated profit (see sa.rs changelog).
-//   OMEGA_ALLOW_SYNTHETIC_MSA     1|true|yes: allow MSA to be registered on production
-//                                 Arbitrum One at phase >= 1. OFF by default: msa.rs derives
-//                                 its profit from `state_version % 20` (a deterministic proxy,
-//                                 not pool state or a pending victim transaction) and sets the
-//                                 flashloan amount equal to that fabricated profit.
+//   OMEGA_ALLOW_SYNTHETIC_MSA     (currently inert — MSA is not registered by this binary,
+//                                 see the 2026-11-13 changelog entry.) Kept so the policy
+//                                 function and its tests remain in place for when MSA is
+//                                 re-wired.
 //
 // (OMEGA_VAULT_SUBMIT_NONCE is no longer read — see C10p.)
 //
 // ## Changelog (most recent first; see VCS for full history)
+//
+// - 2026-11-13 (build fix against the current omega-strategies / omega-core API): the
+//   workspace failed to compile with 8 errors in main.rs (12 under `cargo test`).
+//   (1) `TokenPriceLookup` gained a required `eth_price_usd()` method (la.rs unit fix).
+//       `OracleTokenPriceLookup` now implements it from the fresh Chainlink WETH price,
+//       falling back to fresh Pyth, else `None` (LA then fails closed).
+//   (2) `omega_core::SignalState` has NO `mev_share_events_in_window` field. The
+//       2026-10-31 "MEV-Share into scoring" change assumed one. The field is removed from
+//       every `SignalState` literal here (canary loop, scoring loop, tests). MEV-Share
+//       activity STILL reaches `CheckContext` (competition probability) via
+//       `MevShareActivityTracker` in `score_and_admit`; it does NOT reach strategy
+//       `score()` until omega-core's SignalState grows that field (a cross-crate change).
+//   (3) `SaStrategy::new` takes a 7th arg `Option<Arc<dyn SimulatorBackend>>`; passed
+//       `None` (no Anvil backend is wired here, so `simulate()` errors, as in la.rs).
+//   (4) `LaStrategy::new` now takes 9 args: a `LiquidationProtocol` (4th, AaveV3) and a
+//       trailing `Option<Arc<dyn SimulatorBackend>>` (None). The old call also passed the
+//       liquidity registry where the position registry belonged; argument order is
+//       (chain_id, bytecode_hash, contract, protocol, liquidity_registry,
+//       position_registry, &config, price_lookup, simulator).
+//   (5) `MsaStrategy::new` now requires an `Arc<dyn SandwichOracleSource>` plus the
+//       simulator, and `MevStrategy::new` no longer exists. Neither trait/constructor is
+//       visible from main.rs, so MSA and MEV are NOT registered (logged at error when a
+//       manifest entry exists) rather than guessing at an API. Both were already refused
+//       or rejected on production (see the MSA and MEV-flashloan entries below), so this
+//       removes no working path. Wire them back once msa.rs / mev.rs expose a real source.
 //
 // - 2026-10-31 (MSA production guard): msa.rs `estimated_profit_wei` is a placeholder:
 //   `5e15 wei * (state_version % 20 + 1) * 0.35`, read from no pool and no pending
@@ -104,11 +128,9 @@
 //       It only logs; it does not halt a running engine. The next live run confirmed the
 //       account held 0 wei and startup halted as designed: the fix is funding the account,
 //       not changing this check.
-//   (3) `run_scoring_loop` hard-coded `mev_share_events_in_window: 0` in the SignalState it
-//       builds, so strategy `score()` never saw MEV-Share activity (the tracker fed only
-//       CheckContext). It now reads `MevShareActivityTracker::events_in_window` for every
-//       tick, so MSA's skip threshold and SA's score suppression act on live data. The
-//       canary loop intentionally keeps 0: CNRY does not use competition.
+//   (3) [SUPERSEDED by 2026-11-13 (2)] `run_scoring_loop` was changed to feed
+//       `MevShareActivityTracker::events_in_window` into `SignalState`; that field does
+//       not exist in omega-core.
 // - 2026-10-31 (SA QuoteSource): `SaStrategy::new` now takes a sixth argument,
 //   `Arc<dyn QuoteSource>` (sa.rs live-quote revision). L13 passes `StaticQuoteSource`
 //   until a UniV3-backed implementation exists. Because the static spread is the exact
@@ -575,9 +597,12 @@ use omega_security::{
 use omega_flashloan::{FlashloanProvider, LiquidityRegistry};
 #[cfg(test)]
 use omega_security::{BlueprintSigner, KeyManager};
+// MsaStrategy / MevStrategy are intentionally NOT imported: their constructors changed
+// (MSA needs a SandwichOracleSource; MEV::new no longer exists) and main.rs cannot supply
+// either. See the 2026-11-13 changelog entry.
 use omega_strategies::{
-    registry::StrategyRegistryBuilder, CnryStrategy, LaStrategy, MevStrategy, MsaStrategy,
-    SaStrategy, StrategyRegistry,
+    registry::StrategyRegistryBuilder, CnryStrategy, LaStrategy, LiquidationProtocol, SaStrategy,
+    StrategyRegistry,
 };
 use omega_zk::{
     binding::compute_public_inputs_hash, config::ProverTierConfig, PendingProofBuffer, ProofQueue,
@@ -728,6 +753,10 @@ fn static_quote_allowed(active_phase: u8, chain_id: u64, allow_override: bool) -
 /// msa.rs `estimated_profit_wei` is `5e15 wei * (state_version % 20 + 1) * 0.35` — it reads
 /// no pool and no pending victim transaction — and `build_blueprint` sets the flashloan
 /// amount equal to that fabricated profit.
+///
+/// NOTE: currently unused outside tests because main.rs no longer registers MSA (see the
+/// 2026-11-13 changelog entry). Retained for when MSA is re-wired.
+#[allow(dead_code)]
 fn synthetic_msa_allowed(active_phase: u8, chain_id: u64, allow_override: bool) -> bool {
     placeholder_strategy_allowed(active_phase, chain_id, allow_override)
 }
@@ -748,6 +777,9 @@ fn allow_static_quote_from_env() -> bool {
 }
 
 /// True when OMEGA_ALLOW_SYNTHETIC_MSA is set to 1 / true / yes.
+///
+/// Unused until MSA is re-wired; see `synthetic_msa_allowed`.
+#[allow(dead_code)]
 fn allow_synthetic_msa_from_env() -> bool {
     env_flag_enabled("OMEGA_ALLOW_SYNTHETIC_MSA")
 }
@@ -1615,9 +1647,7 @@ async fn main() -> Result<()> {
                 }
             }
         });
-        tracing::info!(
-            "MEV-Share consumer attached (feeds strategy scoring SignalState and CheckContext competition)"
-        );
+        tracing::info!("MEV-Share consumer attached (feeds CheckContext competition probability)");
     }
 
     tracing::info!(
@@ -2875,20 +2905,33 @@ async fn main() -> Result<()> {
         }
     }
 
-    impl omega_strategies::TokenPriceLookup for OracleTokenPriceLookup {
-        fn price_usd_and_decimals(&self, token: alloy_primitives::Address) -> Option<(f64, u8)> {
-            let (symbol, decimals) = arbitrum_token_symbol(token)?;
+    impl OracleTokenPriceLookup {
+        /// Fresh Chainlink price for `symbol`, else fresh Pyth, else `None` (fail closed).
+        fn fresh_price_usd(&self, symbol: &str) -> Option<f64> {
             if let Some(p) = self.chainlink.read(symbol) {
                 if p.is_fresh() {
-                    return Some((p.price_usd, decimals));
+                    return Some(p.price_usd);
                 }
             }
             if let Some(p) = self.pyth.read(symbol) {
                 if p.is_fresh() {
-                    return Some((p.price_usd, decimals));
+                    return Some(p.price_usd);
                 }
             }
             None
+        }
+    }
+
+    impl omega_strategies::TokenPriceLookup for OracleTokenPriceLookup {
+        fn price_usd_and_decimals(&self, token: alloy_primitives::Address) -> Option<(f64, u8)> {
+            let (symbol, decimals) = arbitrum_token_symbol(token)?;
+            let price = self.fresh_price_usd(symbol)?;
+            Some((price, decimals))
+        }
+
+        fn eth_price_usd(&self) -> Option<f64> {
+            // ETH/USD is tracked under the WETH symbol (see ORACLE_SNAPSHOT_TOKEN).
+            self.fresh_price_usd(ORACLE_SNAPSHOT_TOKEN)
         }
     }
 
@@ -2925,6 +2968,8 @@ async fn main() -> Result<()> {
                      the same fixed 0.2 ETH spread and flashloan amount regardless of pool state"
                 );
             }
+            // 7th argument: no SimulatorBackend is wired here, so SA's `simulate()` will
+            // return an error until a real Anvil backend is injected.
             let sa = SaStrategy::new(
                 chain_id,
                 entry.bytecode_hash.into(),
@@ -2932,6 +2977,7 @@ async fn main() -> Result<()> {
                 Arc::clone(&liquidity_registry),
                 &config,
                 Arc::new(omega_strategies::sa::StaticQuoteSource),
+                None,
             );
             registry_builder = registry_builder
                 .register(sa)
@@ -2950,73 +2996,56 @@ async fn main() -> Result<()> {
         tracing::warn!("L13: no SA entry in IntegrityRegistry — SA NOT registered");
     }
 
-    if let Some(entry) = find_entry("MSA") {
-        // msa.rs derives profit from `state_version % 20` (a deterministic proxy, not pool
-        // state or a pending victim transaction) and borrows exactly that fabricated amount.
-        // Refused on production Arbitrum One at phase >= 1 unless OMEGA_ALLOW_SYNTHETIC_MSA
-        // is explicitly set.
-        let allow_synthetic = allow_synthetic_msa_from_env();
-        if synthetic_msa_allowed(active_phase, chain_id, allow_synthetic) {
-            if active_phase >= 1 && chain_id == DEFAULT_CHAIN_ID {
-                tracing::warn!(
-                    "L13: MSA registered with its SYNTHETIC profit estimate on production \
-                     Arbitrum One because OMEGA_ALLOW_SYNTHETIC_MSA is set — blueprint profit \
-                     and flashloan amount come from state_version % 20, not from market state"
-                );
-            }
-            let msa = MsaStrategy::new(
-                chain_id,
-                entry.bytecode_hash.into(),
-                entry.contract_address.into(),
-                Arc::clone(&liquidity_registry),
-                &config,
-            );
-            registry_builder = registry_builder
-                .register(msa)
-                .expect("MSA registration must succeed");
-            tracing::info!("L13: MSA registered (Option B + LiquidityRegistry)");
-        } else {
-            tracing::error!(
-                active_phase,
-                chain_id,
-                "L13: MSA NOT registered — its profit estimate is synthetic (state_version % 20) \
-                 and must not drive real flashloans and gas on production Arbitrum One at \
-                 phase >= 1 (set OMEGA_ALLOW_SYNTHETIC_MSA=1 to override knowingly)"
-            );
-        }
+    // MSA: NOT registered. `MsaStrategy::new` now requires an
+    // `Arc<dyn SandwichOracleSource>` (plus an optional simulator), and no implementation
+    // of that trait is reachable from main.rs. Its profit estimate was also synthetic
+    // (state_version % 20) — see synthetic_msa_allowed. Re-wire once msa.rs provides a
+    // real source.
+    if find_entry("MSA").is_some() {
+        tracing::error!(
+            active_phase,
+            chain_id,
+            "L13: MSA NOT registered — MsaStrategy::new requires a SandwichOracleSource \
+             implementation that main.rs cannot supply"
+        );
     } else {
         tracing::warn!("L13: no MSA entry in IntegrityRegistry — MSA NOT registered");
     }
 
     if let Some(entry) = find_entry("LA") {
+        // Argument order (la.rs): chain_id, bytecode_hash, contract_addr, protocol,
+        // liquidity_registry, position_registry, &config, price_lookup, simulator.
+        // Protocol is AaveV3 (ordinal 0) — the only protocol LaStrategy's calldata
+        // encoder supports without extraData. Simulator is None: LA's `simulate()` errors
+        // until a real Anvil backend is injected.
         let la = LaStrategy::new(
             chain_id,
             entry.bytecode_hash.into(),
             entry.contract_address.into(),
+            LiquidationProtocol::AaveV3,
             Arc::clone(&liquidity_registry),
             Arc::clone(&position_registry),
             &config,
             Some(la_price_lookup.clone()),
+            None,
         );
         registry_builder = registry_builder
             .register(la)
             .expect("LA registration must succeed");
-        tracing::info!("L13: LA registered from deployment manifest");
+        tracing::info!("L13: LA registered from deployment manifest (AaveV3)");
     } else {
         tracing::warn!("L13: no LA entry in IntegrityRegistry — LA NOT registered");
     }
 
-    if let Some(entry) = find_entry("MEV") {
-        let mev = MevStrategy::new(
+    // MEV: NOT registered. `MevStrategy::new` no longer exists in omega-strategies and its
+    // replacement constructor is not visible from main.rs. MEV blueprints were also being
+    // rejected by the Orchestrator (flashloan_token == 0; see changelog OPEN item).
+    if find_entry("MEV").is_some() {
+        tracing::error!(
+            active_phase,
             chain_id,
-            entry.bytecode_hash.into(),
-            entry.contract_address.into(),
-            &config,
+            "L13: MEV NOT registered — MevStrategy::new is not available in omega-strategies"
         );
-        registry_builder = registry_builder
-            .register(mev)
-            .expect("MEV registration must succeed");
-        tracing::info!("L13: MEV registered from deployment manifest");
     } else {
         tracing::warn!("L13: no MEV entry in IntegrityRegistry — MEV NOT registered");
     }
@@ -3065,7 +3094,7 @@ async fn main() -> Result<()> {
         let l1e3 = Arc::clone(&l1_gas_ema);
         let msa3 = Arc::clone(&mev_share_activity);
         let ij3 = inflight_journal.clone();
-        // New: thread signer + RPC info for nonce-conflict re-seeding.
+        // Thread signer + RPC info for nonce-conflict re-seeding.
         let signer3 = Arc::clone(&signer);
         let rpc_url3 = confirmation_rpc_url.clone();
         let addr_hex3 = signer_addr_hex.clone();
@@ -3123,8 +3152,6 @@ async fn run_canary_loop(
             break;
         }
         let snap = oracle.snapshot();
-        // The canary does not use the competition model, so 0 is correct here. The
-        // scoring loop below is the path that carries live MEV-Share activity.
         let sig = omega_core::SignalState {
             state_version: snap.state_version,
             chain_id,
@@ -3132,7 +3159,6 @@ async fn run_canary_loop(
             base_fee_gwei: snap.fee.base_fee_gwei,
             l1_data_fee_gwei: snap.fee.l1_data_fee_gwei,
             state_hash: snap.state_hash,
-            mev_share_events_in_window: 0,
         };
         match cnry.score(&sig).await {
             Ok(op) => tracing::debug!(score = op.score, "CANARY_PASS"),
@@ -3167,7 +3193,7 @@ async fn run_scoring_loop(
     l1_gas_ema: Arc<omega_risk::gas_model::L1GasEma>,
     mev_share_activity: Arc<MevShareActivityTracker>,
     inflight_journal: Option<Arc<InFlightJournal>>,
-    // New parameters for nonce-conflict re-seeding.
+    // Parameters for nonce-conflict re-seeding.
     signer: Arc<tx_signer_factory::ProductionTxSigner>,
     confirmation_rpc_url: String,
     signer_addr_hex: String,
@@ -3180,11 +3206,9 @@ async fn run_scoring_loop(
         match rx.recv().await {
             Ok(_) => {
                 let snap = oracle.snapshot();
-                // Live MEV-Share competition count for THIS tick. Previously hard-coded to 0,
-                // which made every strategy's `score()` see a permanently quiet market (MSA's
-                // 0.75 skip threshold and SA's score suppression could never act).
-                let mev_share_events_in_window =
-                    mev_share_activity.events_in_window(current_unix_ms());
+                // NOTE: omega_core::SignalState has no MEV-Share field, so strategy
+                // `score()` cannot see MEV-Share activity. It reaches the risk layer via
+                // `score_and_admit` -> CheckContext competition probability instead.
                 let sig = omega_core::SignalState {
                     state_version: snap.state_version,
                     chain_id,
@@ -3192,7 +3216,6 @@ async fn run_scoring_loop(
                     base_fee_gwei: snap.fee.base_fee_gwei,
                     l1_data_fee_gwei: snap.fee.l1_data_fee_gwei,
                     state_hash: snap.state_hash,
-                    mev_share_events_in_window,
                 };
                 let oracle_snapshot = build_oracle_snapshot(
                     &chainlink_oracle,
@@ -3290,7 +3313,7 @@ async fn score_and_admit(
     l1_gas_ema: Arc<omega_risk::gas_model::L1GasEma>,
     mev_share_activity: Arc<MevShareActivityTracker>,
     inflight_journal: Option<Arc<InFlightJournal>>,
-    // New parameters for nonce-conflict re-seeding.
+    // Parameters for nonce-conflict re-seeding.
     signer: Arc<tx_signer_factory::ProductionTxSigner>,
     confirmation_rpc_url: String,
     signer_addr_hex: String,
@@ -4335,7 +4358,7 @@ mod hot_path_zk_provisioning_tests {
     }
 
     /// Returns the harness components including `Arc<ProductionTxSigner>` for the
-    /// new `score_and_admit` parameters.
+    /// `score_and_admit` nonce-reseed parameters.
     async fn build_harness() -> (
         Arc<dyn StrategyTrait>,
         Arc<Mutex<ExecutionDag>>,
@@ -4371,6 +4394,7 @@ mod hot_path_zk_provisioning_tests {
             test_liquidity_registry,
             &OmegaConfig::default(),
             Arc::new(omega_strategies::sa::StaticQuoteSource),
+            None,
         );
         let strategy: Arc<dyn StrategyTrait> = Arc::new(HotSa(sa));
 
@@ -4487,7 +4511,6 @@ mod hot_path_zk_provisioning_tests {
             base_fee_gwei: 5,
             l1_data_fee_gwei: 2,
             state_hash: [0x01u8; 32].into(),
-            mev_share_events_in_window: 0,
         }
     }
 
@@ -4565,7 +4588,7 @@ mod hot_path_zk_provisioning_tests {
                 Arc::new(omega_risk::gas_model::L1GasEma::new(8)),
                 mev_share_activity,
                 None,
-                // New args: signer, dummy RPC URL, dummy address.
+                // Signer, dummy RPC URL, dummy address.
                 Arc::clone(&signer),
                 "http://127.0.0.1:1".to_string(),
                 format!("0x{}", hex::encode([0x01u8; 20])),
@@ -4632,9 +4655,11 @@ mod la_registration_wiring_tests {
             TEST_CHAIN_ID,
             entry.bytecode_hash.into(),
             entry.contract_address.into(),
+            LiquidationProtocol::AaveV3,
             liquidity_registry,
             position_registry,
             &OmegaConfig::default(),
+            None,
             None,
         );
     }
@@ -4677,7 +4702,6 @@ mod check_context_assembly_tests {
             base_fee_gwei: 7,
             l1_data_fee_gwei: 15,
             state_hash: [0xabu8; 32].into(),
-            mev_share_events_in_window: 0,
         }
     }
 

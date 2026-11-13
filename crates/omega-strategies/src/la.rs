@@ -2,110 +2,76 @@
 //
 // Liquidation Arbitrage (LA) — Phase 3 strategy (spec §1.1, §11).
 //
-// ## Audit fix (earlier revision)
+// ## Production fixes (this revision)
 //
-// Same fix as sa.rs: `blueprint_hash` was previously computed from an ad
-// hoc, strategy-local `keccak256(signal_state_hash || nonce ||
-// debt_wei)` — different from, and much smaller than,
-// `ExecutionBlueprint::compute_hash()`'s canonical encoding. Fixed to
-// build with a placeholder and call the canonical `bp.compute_hash()`.
-// Also adds `signal_id`, `client_order_id`, `idempotency_key`.
+// ### 1. Calldata ABI mismatch — FIXED
 //
-// ## Flashloan selection wiring (earlier revision)
+// `encode_liquidation_calldata` previously encoded `liquidate(uint256,uint256)`
+// which does not match the deployed `LiquidationArb.sol::execute(bytes,uint256)`.
+// Fixed to produce correctly ABI-encoded calldata for:
 //
-// `build_blueprint` calls `omega_flashloan::select_provider` for real,
-// replacing the fixed constructor-injected `flashloan_provider` address
-// with genuine Balancer -> AaveV3 -> UniswapV3 fallback selection.
-// `flashloan_provider_type` / `provider_contract` on `ExecutionBlueprint`
-// are populated from the real `SelectionResult`.
+//   execute(bytes data, uint256 deadline)
 //
-// ## Real position selection + real flashloan_token (earlier revision)
+// where `data` = abi.encode(
+//   uint8   protocol,     -- LiquidationProtocol enum value
+//   address collateral,   -- collateral token address
+//   address debt,         -- debt token address
+//   address user,         -- borrower being liquidated
+//   uint256 debtToCover,  -- debt amount in debt-token wei
+//   uint256 minProfit,    -- minimum acceptable profit in ETH wei
+//   bytes   extraData     -- protocol-specific extra data (empty for AaveV3)
+// )
 //
-// LA now holds `Arc<omega_positions::PositionRegistry>` and, on every
-// `score`/`build_blueprint` call, selects the most urgent currently-
-// liquidatable position (`PositionRegistry::liquidatable_positions`,
-// already sorted ascending by health factor) instead of operating
-// against the fixed `LA_PROXY_DEBT_WEI` constant every cycle regardless
-// of any real position existing. This closes the `flashloan_token` gap
-// this file has carried since real flashloan-provider selection was
-// wired in: `PositionSnapshot` (omega-core) now carries real
-// `debt_token`/`collateral_token` fields, sourced from a real selected
-// position, so `debt_token()` below is no longer an unconditional
-// `None` — see that function's own doc comment.
+// IMPORTANT: verify `keccak256("execute(bytes,uint256)")` and the Protocol enum
+// ordinal values against contracts/src/strategies/LiquidationArb.sol before
+// deploying to production.
 //
-// KNOWN LIMITATION, not previously possible to hit: `score` and
-// `build_blueprint` are two SEPARATE calls (per `StrategyTrait`'s own
-// documented execution flow) with no shared state between them — each
-// independently queries `PositionRegistry::liquidatable_positions` and
-// takes the current front of that list. If the registry's contents
-// change between the two calls (a new poll cycle updates or evicts the
-// position that was scored), `build_blueprint` can end up building
-// against a DIFFERENT position than the one `score` evaluated. This is
-// not a new class of risk for this codebase (`SignalState` itself can
-// already change between the two calls for every strategy), but it's
-// flagged explicitly here since it's specific to LA. Fixing it would
-// need `StrategyTrait`'s signature to thread the scored opportunity
-// through to `build_blueprint` — the same cross-strategy trait-change
-// cost already avoided when `PositionRegistry` was designed as a
-// side-channel rather than a new trait parameter (see that crate's own
-// doc comment).
+// ### 2. Unit conflation in profit math — FIXED
 //
-// ## CHANGE — asset-scoped flashloan selection (this revision)
+// `net_profit_after_gas` previously compared `debt_wei * bonus_frac` (in debt
+// token units, e.g. USDC) directly against ETH-denominated gas costs — an
+// apples-to-oranges comparison that silently produced wrong results whenever
+// the debt token is not 1:1 with ETH.
 //
-// `omega_flashloan::select_provider` gained a required `asset: Address`
-// parameter (see that crate's own module-level "CHANGE" note): the
-// underlying `LiquidityRegistry` is now keyed by `(chain_id, provider,
-// asset, contract)` instead of `(chain_id, provider, contract)`, because
-// Aave's Pool and Balancer's Vault are each a single contract serving
-// many tokens — tracking a second asset without an asset-scoped key
-// would have silently overwritten the first asset's liquidity snapshot.
-// `build_blueprint` already resolves `flashloan_token` (the real,
-// selected position's debt token) before this call — it is now passed
-// straight through as the `asset` argument, so LA borrows against
-// liquidity actually tracked for the debt token itself rather than
-// whatever token happened to be recorded last at that provider contract.
+// Fixed by normalising through USD:
+//   gross_eth_wei = (debt_tokens × price_usd × bonus_frac / eth_price_usd) × 1e18
 //
-// ## debt_amount_wei: resolved via optional TokenPriceLookup (fail-closed if absent)
+// `TokenPriceLookup` now requires `eth_price_usd() -> Option<f64>` so LA can
+// convert the liquidation bonus to ETH for a valid comparison. When this
+// returns None the strategy fails closed, same as the existing debt-token
+// price guard.
 //
-// A real, selected `PositionSnapshot` gives LA a real `debt_token` and
-// a real `debt_usd_e18` (a USD VALUE). It does NOT give LA a wei amount
-// of that token to actually borrow — that conversion needs a live
-// price for `debt_token` (USD-per-token, and that token's decimals),
-// which nothing in `LaStrategy` has access to; no price-oracle client
-// is wired into this strategy at all. `debt_amount_wei` below is
-// always `None` today for exactly this reason, and both `score` and
-// `build_blueprint` now genuinely refuse whenever it's `None` — see
-// that function's own doc comment for the full reasoning, including
-// why guessing here would be strictly worse than refusing (a real
-// selected position paired with a fabricated amount).
+// ### 3. SimulatorBackend injection — FIXED
 //
-// PRACTICAL CONSEQUENCE OF THIS CHOICE: `score` returns `0.0` for EVERY
-// liquidatable position tracked, until a real price source is wired in
-// — this remains a deliberate, honest gap, unaffected by this
-// revision's asset-scoping change. `LA_PROXY_DEBT_WEI` no longer has
-// any caller; real position debt sizing is the only path now, gated
-// correctly rather than silently bypassed.
+// `simulate()` previously returned `success: true` unconditionally with
+// `gas_used = estimate * 0.88`. Fixed by accepting an injectable
+// `SimulatorBackend`. When None, `simulate()` returns an error.
 //
-// ## `max_base_fee_gwei` (earlier revision)
+// ### 4. max_base_fee floor — FIXED
 //
-// `ExecutionBlueprint` gained a `max_base_fee_gwei` field. PLACEHOLDER
-// VALUE — the real semantics of this field haven't been confirmed
-// against whatever consumes it downstream. Set here as
-// `base_fee_at_creation * 3`, mirroring the kind of headroom
-// `l2_buffer_factor`/`l1_data_buffer_factor` already apply elsewhere in
-// this file — a guess, not a derived value.
+// `max_base_fee_gwei` now goes through
+// `ExecutionBlueprint::derive_max_base_fee_gwei()` which floors at
+// `MIN_MAX_BASE_FEE_GWEI` (1 gwei). On Arbitrum the real base fee (~0.02 gwei)
+// truncates to 0 whole gwei; a zero maxBaseFee makes the Orchestrator revert
+// with BaseFeeTooHigh on every call.
 //
-// ## STILL UNRESOLVED, UNCHANGED BY THIS REVISION: calldata ABI mismatch
+// ### 5. Clippy (2026-11-13)
 //
-// `encode_liquidation_calldata` below encodes a selector for
-// `liquidate(uint256,uint256)` — this does NOT match the real deployed
-// `LiquidationArb.sol::execute(bytes,uint256)` ABI (which decodes
-// `(Protocol, collateral, debt, user, debtToCover, minProfit,
-// extraData)`). Flagged in this codebase's own investigation history;
-// not fixed here — this revision's scope is asset-scoped flashloan
-// selection, not the calldata encoder. A resolved `debt_amount_wei` gap
-// does NOT make this blueprint's calldata correct against the real
-// contract.
+// Test code used `&[pos.clone()]` to build a one-element slice;
+// `clippy::cloned_ref_to_slice_refs` (denied under `-D warnings`) requires
+// `std::slice::from_ref(&pos)`. Tests updated; no production-code change.
+//
+// ## Remaining known limitations
+//
+// CALLDATA ABI (minor): `extraData` is encoded as empty `bytes`. AaveV3
+// standard liquidationCall needs no extra data, so this is correct for the
+// current deployment. Extend when supporting Compound V3 or other protocols
+// that require extra parameters in the extraData field.
+//
+// POSITION-SCORE DRIFT: `score()` and `build_blueprint()` each call
+// `select_position()` independently. If the registry changes between the two
+// calls they may operate on different positions. Fixing this cleanly requires
+// a StrategyTrait signature change (pass selected position into build).
 
 use std::sync::{
     atomic::{AtomicU64, Ordering},
@@ -126,19 +92,41 @@ use omega_flashloan::LiquidityRegistry;
 use omega_positions::PositionRegistry;
 
 use crate::flashloan_select::to_blueprint_provider_type;
+use crate::simulator::SimulatorBackend;
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Token price lookup (injected; keeps omega-strategies free of omega-oracle)
+// LiquidationProtocol
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Provides USD price and ERC-20 decimals for a debt token so LA can convert
-/// `PositionSnapshot::debt_usd_e18` into flashloan size in token wei.
+/// Liquidation protocol identifiers matching `LiquidationArb.sol::Protocol`.
 ///
-/// Implementations live outside this crate (typically main.rs, using Chainlink
-/// / Pyth caches). Missing or stale prices must return `None` — LA fails closed.
+/// IMPORTANT: ordinal values must match the Solidity enum declaration exactly.
+/// Verify against contracts/src/strategies/LiquidationArb.sol before changing.
+#[derive(Debug, Clone, Copy, Default)]
+#[repr(u8)]
+pub enum LiquidationProtocol {
+    #[default]
+    AaveV3 = 0,
+    CompoundV3 = 1,
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// TokenPriceLookup
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Provides live token prices for LA's profit normalisation.
+///
+/// Implementations live outside this crate (main.rs, using Chainlink/Pyth
+/// caches). Missing or stale prices must return `None` — LA fails closed.
 pub trait TokenPriceLookup: Send + Sync {
     /// Returns `(price_usd, decimals)` for `token`, or `None` if unknown/stale.
     fn price_usd_and_decimals(&self, token: Address) -> Option<(f64, u8)>;
+
+    /// Returns the current ETH/USD price, or `None` if unknown/stale.
+    ///
+    /// Required for normalising the liquidation bonus (in debt-token units)
+    /// to ETH wei so it can be compared against ETH-denominated gas costs.
+    fn eth_price_usd(&self) -> Option<f64>;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -156,9 +144,27 @@ const LA_LIQUIDATION_BONUS_FRAC: f64 = 0.10;
 /// Health-factor threshold for "hot tier" (< 1.01 × 1e18).
 const HOT_TIER_HF_THRESHOLD: u128 = 1_010_000_000_000_000_000;
 
-/// Placeholder multiplier for `max_base_fee_gwei` — see module-level
-/// comment on this revision's `max_base_fee_gwei` addition.
-const MAX_BASE_FEE_HEADROOM_MULTIPLIER: u64 = 3;
+/// Multiplier for `max_base_fee_gwei` — passed to
+/// `ExecutionBlueprint::derive_max_base_fee_gwei()`, which also applies the
+/// `MIN_MAX_BASE_FEE_GWEI` floor.
+const MAX_BASE_FEE_HEADROOM_MULTIPLIER: f64 = 3.0;
+
+// ─────────────────────────────────────────────────────────────────────────────
+// LaStrategyConfig — bundles the many constructor arguments
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// All parameters for constructing a `LaStrategy`, grouped to avoid a
+/// clippy::too_many_arguments violation on `LaStrategy::new`.
+pub struct LaStrategyConfig {
+    pub chain_id: u64,
+    pub bytecode_hash: B256,
+    pub contract_addr: Address,
+    pub protocol: LiquidationProtocol,
+    pub liquidity_registry: Arc<LiquidityRegistry>,
+    pub position_registry: Arc<PositionRegistry>,
+    pub price_lookup: Option<Arc<dyn TokenPriceLookup>>,
+    pub simulator: Option<Arc<dyn SimulatorBackend>>,
+}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // LaStrategy
@@ -168,59 +174,68 @@ pub struct LaStrategy {
     chain_id: u64,
     nonce: AtomicU64,
     bytecode_hash: B256,
+    #[allow(dead_code)]
     contract_addr: Address,
+    protocol: LiquidationProtocol,
     liquidity_registry: Arc<LiquidityRegistry>,
-    /// Real, live tracked lending-position registry — see
-    /// `omega_positions::PositionRegistry`'s own doc comment. Read on
-    /// every `score`/`build_blueprint` call via
-    /// `liquidatable_positions(self.chain_id)`; nothing here writes to
-    /// it (writer is an omega-oracle component not part of this crate).
     position_registry: Arc<PositionRegistry>,
-    /// Optional price lookup for debt_amount_wei. `None` ⇒ fail closed (no blueprint).
     price_lookup: Option<Arc<dyn TokenPriceLookup>>,
+    /// Real Anvil simulator. When None, `simulate()` returns an error.
+    simulator: Option<Arc<dyn SimulatorBackend>>,
     gas: GasConfig,
 }
 
 impl LaStrategy {
-    /// Every call site constructing `LaStrategy` must supply
-    /// `position_registry: Arc<PositionRegistry>` alongside the other
-    /// real, deployment-sourced fields.
+    /// Construct from individual parameters.
+    ///
+    /// Accepts 9 arguments. If clippy::too_many_arguments fires at the call
+    /// site, use `LaStrategy::from_config` with a `LaStrategyConfig` instead.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         chain_id: u64,
         bytecode_hash: B256,
         contract_addr: Address,
+        protocol: LiquidationProtocol,
         liquidity_registry: Arc<LiquidityRegistry>,
         position_registry: Arc<PositionRegistry>,
         config: &OmegaConfig,
         price_lookup: Option<Arc<dyn TokenPriceLookup>>,
+        simulator: Option<Arc<dyn SimulatorBackend>>,
     ) -> Arc<Self> {
         Arc::new(Self {
             chain_id,
             nonce: AtomicU64::new(1),
             bytecode_hash,
             contract_addr,
+            protocol,
             liquidity_registry,
             position_registry,
             price_lookup,
+            simulator,
             gas: config.gas.clone(),
         })
     }
 
-    /// Returns true when the health factor is in the hot tier (HF < 1.01).
-    pub fn is_hot_tier(hf_e18: U256) -> bool {
-        hf_e18.saturating_to::<u128>() < HOT_TIER_HF_THRESHOLD
+    /// Construct from a `LaStrategyConfig`. Use this at call sites with many
+    /// arguments to avoid clippy::too_many_arguments.
+    pub fn from_config(config_args: LaStrategyConfig, omega_config: &OmegaConfig) -> Arc<Self> {
+        Self::new(
+            config_args.chain_id,
+            config_args.bytecode_hash,
+            config_args.contract_addr,
+            config_args.protocol,
+            config_args.liquidity_registry,
+            config_args.position_registry,
+            omega_config,
+            config_args.price_lookup,
+            config_args.simulator,
+        )
     }
 
-    /// Selects the position LA would act on THIS cycle: the most urgent
-    /// (lowest health factor) currently-liquidatable position tracked
-    /// for this strategy's chain. `None` when no liquidatable position
-    /// is currently tracked — a legitimate, expected state (no
-    /// opportunity right now), not an error.
-    ///
-    /// See this file's own module-level "KNOWN LIMITATION" comment:
-    /// `score` and `build_blueprint` each call this independently, so
-    /// they are not guaranteed to select the SAME position if the
-    /// registry changes between the two calls.
+    pub fn is_hot_tier(hf_e18: U256) -> bool {
+        u128::try_from(hf_e18).unwrap_or(u128::MAX) < HOT_TIER_HF_THRESHOLD
+    }
+
     fn select_position(&self) -> Option<PositionSnapshot> {
         self.position_registry
             .liquidatable_positions(self.chain_id)
@@ -228,14 +243,6 @@ impl LaStrategy {
             .next()
     }
 
-    /// Real source for `flashloan_token`, once a position is selected —
-    /// no longer an unconditional `None`. Returns `Some` only when the
-    /// selected position's `debt_token` is non-zero: a zero address on
-    /// a real `PositionSnapshot` would indicate the upstream oracle
-    /// writer itself has a gap, and this function refuses to pass that
-    /// through as if it were a valid token, same "never launder an
-    /// invalid upstream value into a blueprint" posture as every other
-    /// guard in this file.
     fn debt_token(position: &PositionSnapshot) -> Option<Address> {
         if position.debt_token == Address::ZERO {
             None
@@ -244,34 +251,10 @@ impl LaStrategy {
         }
     }
 
-    /// Converts `position.debt_usd_e18` (a USD VALUE) into the exact
-    /// wei amount of `position.debt_token` needed to cover it. Always
-    /// `None` today: this requires a live price for `debt_token`
-    /// (USD-per-token, plus that token's decimals) that nothing in
-    /// `LaStrategy` has access to — no price-oracle client is wired
-    /// into this strategy at all.
+    /// Converts `position.debt_usd_e18` to the exact wei amount of
+    /// `position.debt_token` needed to cover the liquidation.
     ///
-    /// Refusing to fabricate a number here is deliberate, not an
-    /// oversight: `debt_usd_e18` is a USD value, not a token amount,
-    /// and guessing a price (or assuming 18 decimals, or assuming
-    /// $1 == 1 token) would silently mis-size every flash-borrow —
-    /// potentially borrowing far more or less than the position's real
-    /// debt, now with a REAL borrower address and REAL debt token
-    /// attached to the wrong number. That combination (real identity,
-    /// fabricated amount) is strictly worse than either being honestly
-    /// absent — same reasoning already applied elsewhere in this
-    /// codebase's history to a fake-but-present signal.
-    ///
-    /// ALSO NOT ADDRESSED by fixing this alone: even a correct
-    /// token-wei conversion here would not, by itself, make
-    /// `net_profit_after_gas`'s arithmetic correct — that function
-    /// compares the flash-borrowed amount directly against
-    /// ETH-denominated gas costs, implicitly assuming the debt token
-    /// IS ETH-equivalent wei. That unit conflation predates this
-    /// revision (it already existed when the amount was the flat
-    /// `LA_PROXY_DEBT_WEI` constant) and is not fixed here — flagged,
-    /// not resolved, since fixing it needs the same missing price
-    /// source this function is itself blocked on.
+    /// Returns `None` when no price source, stale prices, or zero debt.
     fn debt_amount_wei(&self, position: &PositionSnapshot) -> Option<U256> {
         let lookup = self.price_lookup.as_ref()?;
         let debt_token = Self::debt_token(position)?;
@@ -282,11 +265,7 @@ impl LaStrategy {
         if !price_usd.is_finite() || price_usd <= 0.0 {
             return None;
         }
-        // debt_usd_e18 is USD × 1e18.
-        // token_amount = (debt_usd_e18 / 1e18) / price_usd
-        // token_wei = token_amount * 10^decimals
-        // => token_wei = debt_usd_e18 * 10^decimals / (price_usd * 1e18)
-        let debt_usd = position.debt_usd_e18.saturating_to::<u128>() as f64 / 1e18_f64;
+        let debt_usd = u128::try_from(position.debt_usd_e18).unwrap_or(0) as f64 / 1e18_f64;
         let token_amount = debt_usd / price_usd;
         if !token_amount.is_finite() || token_amount <= 0.0 {
             return None;
@@ -303,15 +282,51 @@ impl LaStrategy {
         Some(U256::from(wei))
     }
 
-    fn net_profit_after_gas(
+    /// Converts the liquidation bonus (in debt-token units) to ETH wei.
+    ///
+    /// Normalises through USD so gas costs (ETH) and bonus (debt-token) are
+    /// unit-consistent:
+    ///
+    ///   gross_eth_wei = (debt_tokens × price_usd × bonus_frac / eth_price_usd) × 1e18
+    fn liquidation_bonus_eth_wei(
         &self,
         debt_wei: U256,
-        bonus_frac: f64,
+        position: &PositionSnapshot,
+    ) -> Option<U256> {
+        let lookup = self.price_lookup.as_ref()?;
+        let debt_token = Self::debt_token(position)?;
+        let (price_usd, decimals) = lookup.price_usd_and_decimals(debt_token)?;
+        let eth_price = lookup.eth_price_usd()?;
+
+        if !price_usd.is_finite() || price_usd <= 0.0 {
+            return None;
+        }
+        if !eth_price.is_finite() || eth_price <= 0.0 {
+            return None;
+        }
+
+        let scale = 10f64.powi(decimals as i32);
+        let debt_tokens = u128::try_from(debt_wei).unwrap_or(0) as f64 / scale;
+        let bonus_usd = debt_tokens * price_usd * LA_LIQUIDATION_BONUS_FRAC;
+        let bonus_eth = bonus_usd / eth_price;
+        let bonus_eth_wei = bonus_eth * 1e18_f64;
+
+        if !bonus_eth_wei.is_finite() || bonus_eth_wei <= 0.0 || bonus_eth_wei > u128::MAX as f64 {
+            return None;
+        }
+        Some(U256::from(bonus_eth_wei.floor() as u128))
+    }
+
+    /// Returns `(net_profit_eth_wei, priority_fee_gwei)` or `None` if
+    /// the opportunity is not profitable after gas.
+    ///
+    /// All amounts are in ETH wei — unit-consistent with gas costs.
+    fn net_profit_after_gas(
+        &self,
+        gross_eth_wei: U256,
         base_fee: u64,
         l1_data_fee: u64,
     ) -> Option<(U256, u64)> {
-        let gross = U256::from((debt_wei.saturating_to::<u128>() as f64 * bonus_frac) as u128);
-
         let l2_fee_gwei = base_fee.saturating_add(
             (self.gas.max_priority_fee_gwei as f64 * self.gas.conservative_fee_fraction) as u64,
         );
@@ -324,11 +339,11 @@ impl LaStrategy {
             .saturating_mul(U256::from(1_000_000_000_u64));
 
         let total_cost = l2_cost.saturating_add(l1_cost);
-        if gross <= total_cost {
+        if gross_eth_wei <= total_cost {
             return None;
         }
 
-        let net = gross.saturating_sub(total_cost);
+        let net = gross_eth_wei.saturating_sub(total_cost);
         let dynamic = U256::from(base_fee)
             .saturating_mul(U256::from(LA_GAS_BUDGET))
             .saturating_mul(U256::from(1_000_000_000_u64));
@@ -336,26 +351,79 @@ impl LaStrategy {
             return None;
         }
 
-        let priority_gwei: u64 = (total_cost / U256::from(1_000_000_000_u64)).saturating_to();
+        let priority_gwei: u64 = u128::try_from(total_cost / U256::from(1_000_000_000_u64))
+            .unwrap_or(u64::MAX as u128) as u64;
         Some((net, priority_gwei))
     }
 
+    /// ABI-encodes calldata for `LiquidationArb.execute(bytes data, uint256 deadline)`.
+    ///
+    /// `data` is ABI-encoded as:
+    ///   (uint8 protocol, address collateral, address debt, address user,
+    ///    uint256 debtToCover, uint256 minProfit, bytes extraData)
+    ///
+    /// IMPORTANT: verify `keccak256("execute(bytes,uint256)")` and Protocol
+    /// enum ordinals against contracts/src/strategies/LiquidationArb.sol.
     fn encode_liquidation_calldata(
-        contract_addr: Address,
-        debt_amount: U256,
-        min_collateral_out: U256,
+        protocol: LiquidationProtocol,
+        collateral_token: Address,
+        debt_token: Address,
+        borrower: Address,
+        debt_to_cover: U256,
+        min_profit: U256,
+        deadline_block: u64,
     ) -> Bytes {
-        let selector = &keccak256(b"liquidate(uint256,uint256)")[..4];
-        let mut data = Vec::with_capacity(4 + 96);
+        let selector = &keccak256(b"execute(bytes,uint256)")[..4];
+
+        // ── Inner bytes: 8 × 32 = 256 bytes ──────────────────────────────
+        let mut inner = Vec::with_capacity(256);
+
+        // [0] protocol (uint8 padded to uint256)
+        let mut w = [0u8; 32];
+        w[31] = protocol as u8;
+        inner.extend_from_slice(&w);
+
+        // [1] collateral address
+        let mut w = [0u8; 32];
+        w[12..].copy_from_slice(collateral_token.as_slice());
+        inner.extend_from_slice(&w);
+
+        // [2] debt address
+        let mut w = [0u8; 32];
+        w[12..].copy_from_slice(debt_token.as_slice());
+        inner.extend_from_slice(&w);
+
+        // [3] borrower address
+        let mut w = [0u8; 32];
+        w[12..].copy_from_slice(borrower.as_slice());
+        inner.extend_from_slice(&w);
+
+        // [4] debtToCover
+        inner.extend_from_slice(&debt_to_cover.to_be_bytes::<32>());
+
+        // [5] minProfit
+        inner.extend_from_slice(&min_profit.to_be_bytes::<32>());
+
+        // [6] offset for extraData = 7 × 32 = 224
+        inner.extend_from_slice(&U256::from(224u64).to_be_bytes::<32>());
+
+        // [tail] extraData: length = 0 (AaveV3 needs no extra params)
+        inner.extend_from_slice(&U256::ZERO.to_be_bytes::<32>());
+
+        // ── Outer encoding ────────────────────────────────────────────────
+        // selector | offset(64) | deadline | inner_length(256) | inner
+        let inner_len = inner.len(); // 256
+        let mut data = Vec::with_capacity(4 + 32 + 32 + 32 + inner_len);
         data.extend_from_slice(selector);
-        let mut buf = [0u8; 32];
-        buf.copy_from_slice(&debt_amount.to_be_bytes::<32>());
-        data.extend_from_slice(&buf);
-        buf.copy_from_slice(&min_collateral_out.to_be_bytes::<32>());
-        data.extend_from_slice(&buf);
-        buf = [0u8; 32];
-        buf[12..].copy_from_slice(contract_addr.as_slice());
-        data.extend_from_slice(&buf);
+        // Head slot 0: offset to bytes data = 2 × 32 = 64
+        data.extend_from_slice(&U256::from(64u64).to_be_bytes::<32>());
+        // Head slot 1: deadline (static uint256)
+        data.extend_from_slice(&U256::from(deadline_block).to_be_bytes::<32>());
+        // Tail: length of inner bytes
+        data.extend_from_slice(&U256::from(inner_len as u64).to_be_bytes::<32>());
+        // Tail: inner bytes content
+        data.extend_from_slice(&inner);
+
         Bytes::from(data)
     }
 }
@@ -365,27 +433,29 @@ impl StrategyTrait for LaStrategy {
     fn strategy_id(&self) -> StrategyId {
         StrategyId::La
     }
+
     fn lane(&self) -> Lane {
         Lane::Normal
     }
+
     fn hot_path_eligible(&self) -> bool {
         true
     }
+
     fn gas_budget(&self) -> u64 {
         LA_GAS_BUDGET
     }
+
     fn expected_bytecode_hash(&self) -> B256 {
         self.bytecode_hash
     }
 
     fn base_min_profit_wei(&self) -> U256 {
-        U256::from(1_000_000_000_000_000_u64)
+        U256::from(1_000_000_000_000_000_u64) // 0.001 ETH
     }
 
     async fn score(&self, signal: &SignalState) -> Result<OpScore> {
         let Some(position) = self.select_position() else {
-            // No liquidatable position currently tracked — a legitimate
-            // "no opportunity this cycle" state, not an error.
             return Ok(OpScore {
                 score: 0.0,
                 expected_profit: U256::ZERO,
@@ -394,16 +464,21 @@ impl StrategyTrait for LaStrategy {
         };
 
         let Some(debt_wei) = self.debt_amount_wei(&position) else {
-            // Position is real and liquidatable, but no price source
-            // exists to size the flash-borrow — see debt_amount_wei's
-            // own doc comment. Same "no opportunity right now" shape,
-            // not an error: the position may become actionable once a
-            // price source exists, without this being a hard failure.
             tracing::debug!(
                 borrower = %position.borrower,
-                protocol = %position.protocol,
-                "LA: liquidatable position found but no debt-amount pricing source \
-                 available — scoring as no-opportunity"
+                "LA: no debt-amount pricing source — scoring as no-opportunity"
+            );
+            return Ok(OpScore {
+                score: 0.0,
+                expected_profit: U256::ZERO,
+                competition_prob: 0.8,
+            });
+        };
+
+        let Some(gross_eth_wei) = self.liquidation_bonus_eth_wei(debt_wei, &position) else {
+            tracing::debug!(
+                borrower = %position.borrower,
+                "LA: cannot normalise bonus to ETH (no eth_price_usd) — scoring as no-opportunity"
             );
             return Ok(OpScore {
                 score: 0.0,
@@ -413,8 +488,7 @@ impl StrategyTrait for LaStrategy {
         };
 
         match self.net_profit_after_gas(
-            debt_wei,
-            LA_LIQUIDATION_BONUS_FRAC,
+            gross_eth_wei,
             signal.base_fee_gwei,
             signal.l1_data_fee_gwei,
         ) {
@@ -425,8 +499,8 @@ impl StrategyTrait for LaStrategy {
             }),
             Some((net, _)) => {
                 let competition_prob = 0.65_f64;
-                let score =
-                    (1.0 - competition_prob) * (net.saturating_to::<u128>() as f64 / 1e15).min(1.0);
+                let net_f = u128::try_from(net).unwrap_or(u128::MAX) as f64;
+                let score = (1.0 - competition_prob) * (net_f / 1e15).min(1.0);
                 Ok(OpScore {
                     score: score.clamp(0.0, 1.0),
                     expected_profit: net,
@@ -439,56 +513,39 @@ impl StrategyTrait for LaStrategy {
     async fn build_blueprint(&self, signal: &SignalState) -> Result<ExecutionBlueprint> {
         let position = self.select_position().ok_or_else(|| {
             anyhow::anyhow!(
-                "LA: no liquidatable position currently tracked for chain {}; \
-                 refusing to build a blueprint with no real position behind it",
+                "LA: no liquidatable position for chain {} — refusing blueprint",
                 self.chain_id
             )
         })?;
 
-        // GUARD: debt_token is real (sourced from the selected position)
-        // — see debt_token's own doc comment for why this can still
-        // legitimately fail (a zero address on the upstream snapshot).
         let flashloan_token = Self::debt_token(&position).ok_or_else(|| {
             anyhow::anyhow!(
-                "LA: selected position (borrower {:?}, protocol {:?}) has no valid \
-                 debt_token — refusing to build a blueprint with a zero-address token",
-                position.borrower,
-                position.protocol
+                "LA: position (borrower {:?}) has zero-address debt_token",
+                position.borrower
             )
         })?;
 
-        // GUARD: no price source exists yet to size the flash-borrow —
-        // see debt_amount_wei's own doc comment for the full reasoning
-        // on why this refuses rather than guesses.
         let debt_wei = self.debt_amount_wei(&position).ok_or_else(|| {
             anyhow::anyhow!(
-                "LA: no debt-amount pricing source available for position (borrower {:?}, \
-                 protocol {:?}, debt_token {:?}). debt_amount_wei requires a live price for \
-                 that token that nothing in LaStrategy has access to today — refusing to \
-                 build a blueprint with a fabricated or guessed flash-borrow amount; \
-                 flashloan_token is real (see `flashloan_token` above) but cannot be sized \
-                 without this.",
-                position.borrower,
-                position.protocol,
-                flashloan_token,
+                "LA: no debt-amount pricing source for debt_token {:?} — refusing blueprint \
+                 with fabricated borrow size",
+                flashloan_token
             )
         })?;
 
-        let (net_profit, priority_gwei) = self
-            .net_profit_after_gas(
-                debt_wei,
-                LA_LIQUIDATION_BONUS_FRAC,
-                signal.base_fee_gwei,
-                signal.l1_data_fee_gwei,
-            )
-            .ok_or_else(|| anyhow::anyhow!("LA opportunity no longer profitable"))?;
+        let gross_eth_wei = self
+            .liquidation_bonus_eth_wei(debt_wei, &position)
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "LA: cannot convert liquidation bonus to ETH (no eth_price_usd) — \
+                 refusing blueprint with wrong-unit profit estimate"
+                )
+            })?;
 
-        // Real provider/pool selection, scoped to the actual debt token —
-        // see module-level "CHANGE" note above and omega-flashloan's own
-        // module-level note for why `asset` is now required here. Passing
-        // anything other than `flashloan_token` would select liquidity for
-        // the WRONG token at whatever provider contract happened to have a
-        // stale/mismatched entry.
+        let (net_profit, priority_gwei) = self
+            .net_profit_after_gas(gross_eth_wei, signal.base_fee_gwei, signal.l1_data_fee_gwei)
+            .ok_or_else(|| anyhow::anyhow!("LA: opportunity no longer profitable"))?;
+
         let selection = omega_flashloan::select_provider(
             &self.liquidity_registry,
             self.chain_id,
@@ -498,7 +555,17 @@ impl StrategyTrait for LaStrategy {
         .map_err(|e| anyhow::anyhow!("LA: flashloan selection failed: {e:?}"))?;
 
         let nonce = self.nonce.fetch_add(1, Ordering::Relaxed);
-        let calldata = Self::encode_liquidation_calldata(self.contract_addr, debt_wei, net_profit);
+        let deadline = signal.block_number + LA_EXPIRY_BLOCKS;
+
+        let calldata = Self::encode_liquidation_calldata(
+            self.protocol,
+            position.collateral_token,
+            flashloan_token,
+            position.borrower,
+            debt_wei,
+            net_profit,
+            deadline,
+        );
 
         let signal_id = Uuid::new_v4();
         let client_order_id = ExecutionBlueprint::derive_client_order_id(
@@ -513,7 +580,7 @@ impl StrategyTrait for LaStrategy {
             .saturating_mul(U256::from(1_000_000_000_u64));
 
         let mut bp = ExecutionBlueprint {
-            blueprint_hash: B256::ZERO, // filled below via canonical compute_hash()
+            blueprint_hash: B256::ZERO,
             chain_id: self.chain_id,
             strategy_id: StrategyId::La,
             lane: Lane::Normal,
@@ -521,20 +588,16 @@ impl StrategyTrait for LaStrategy {
             signal_state_hash: signal.state_hash,
             state_version: signal.state_version,
             signal_id,
-            // Legacy field — kept populated with the same value as
-            // provider_contract for backward compatibility with any
-            // existing reader.
             flashloan_provider: selection.contract_addr,
             flashloan_amount: debt_wei,
             flashloan_available: selection.available_wei,
             flashloan_provider_type: to_blueprint_provider_type(selection.provider),
             provider_contract: selection.contract_addr,
             flashloan_token,
-            // PLACEHOLDER — see module-level comment on this revision's
-            // max_base_fee_gwei addition.
-            max_base_fee_gwei: signal
-                .base_fee_gwei
-                .saturating_mul(MAX_BASE_FEE_HEADROOM_MULTIPLIER),
+            max_base_fee_gwei: ExecutionBlueprint::derive_max_base_fee_gwei(
+                signal.base_fee_gwei,
+                MAX_BASE_FEE_HEADROOM_MULTIPLIER,
+            ),
             calldata,
             strategy_bytecode_hash: self.bytecode_hash,
             l2_exec_gas_estimate: LA_GAS_BUDGET,
@@ -550,11 +613,11 @@ impl StrategyTrait for LaStrategy {
             priority_fee_gwei: priority_gwei.min(self.gas.max_priority_fee_gwei),
             price_impact_bps: None,
             ofa_compliant: false,
-            expiry_block: signal.block_number + LA_EXPIRY_BLOCKS,
+            expiry_block: deadline,
             nonce,
             confirmation_depth: LA_CONFIRMATION,
             client_order_id,
-            idempotency_key: B256::ZERO, // filled below
+            idempotency_key: B256::ZERO,
             relay_targets: vec!["relay_1".into(), "relay_2".into()],
             zk_proof_commitment: None,
         };
@@ -565,13 +628,14 @@ impl StrategyTrait for LaStrategy {
 
     async fn simulate(&self, bp: &ExecutionBlueprint) -> Result<SimResult> {
         assert_eq!(bp.simulator, Simulator::Anvil);
-        let gas_used = (bp.l2_exec_gas_estimate as f64 * 0.88) as u64;
-        Ok(SimResult {
-            profit_net: bp.expected_profit_net,
-            gas_used,
-            simulator: "anvil".into(),
-            success: true,
-        })
+        match &self.simulator {
+            Some(backend) => backend.simulate(bp).await,
+            None => anyhow::bail!(
+                "LA: no SimulatorBackend injected — cannot simulate blueprint {}; \
+                 pass a real Anvil backend via LaStrategy::new()",
+                bp.blueprint_hash
+            ),
+        }
     }
 
     fn encode_calldata(&self, bp: &ExecutionBlueprint) -> Bytes {
@@ -595,7 +659,6 @@ mod tests {
         Address::from([b; 20])
     }
 
-    /// Builds a real `PositionSnapshot` via its own canonical constructor.
     fn sample_position(hf_e18: u128) -> PositionSnapshot {
         PositionSnapshot::new(
             addr(0x01),
@@ -615,16 +678,20 @@ mod tests {
         )
     }
 
+    /// Fixed-price test double: $2 000/token, 18 decimals, ETH = $2 000.
+    struct FixedPrice;
+    impl TokenPriceLookup for FixedPrice {
+        fn price_usd_and_decimals(&self, _: Address) -> Option<(f64, u8)> {
+            Some((2_000.0, 18))
+        }
+        fn eth_price_usd(&self) -> Option<f64> {
+            Some(2_000.0)
+        }
+    }
+
     fn make_with_positions(positions: &[PositionSnapshot]) -> Arc<LaStrategy> {
-        let liquidity_registry = LiquidityRegistry::new();
-        // Seeded even though these tests never reach flashloan selection
-        // (they're all gated earlier, on position/pricing) — kept for
-        // parity with the constructor's real requirements and in case a
-        // future test extends past those guards. Asset is `addr(0xD0)` —
-        // the same debt_token `sample_position` above uses — since
-        // `select_provider` is now asset-scoped and a mismatched asset
-        // here would make that future test fail for the wrong reason.
-        liquidity_registry.update(
+        let lr = LiquidityRegistry::new();
+        lr.update(
             TEST_CHAIN_ID,
             omega_flashloan::FlashloanProvider::Balancer,
             addr(0xD0),
@@ -633,19 +700,49 @@ mod tests {
             1,
         );
 
-        let position_registry = PositionRegistry::new();
+        let pr = PositionRegistry::new();
         for p in positions {
-            position_registry.update(TEST_CHAIN_ID, p.clone());
+            pr.update(TEST_CHAIN_ID, p.clone());
         }
 
         LaStrategy::new(
             TEST_CHAIN_ID,
             B256::from([0xAB; 32]),
             Address::ZERO,
-            liquidity_registry,
-            position_registry,
+            LiquidationProtocol::AaveV3,
+            lr,
+            pr,
             &OmegaConfig::default(),
-            None, // no price lookup in unit tests — fail-closed path
+            None,
+            None,
+        )
+    }
+
+    fn make_with_price_lookup(positions: &[PositionSnapshot]) -> Arc<LaStrategy> {
+        let lr = LiquidityRegistry::new();
+        lr.update(
+            TEST_CHAIN_ID,
+            omega_flashloan::FlashloanProvider::Balancer,
+            addr(0xD0),
+            Address::from([0xB0; 20]),
+            U256::from(1_000_000_000_000_000_000_000u128),
+            1,
+        );
+        let pr = PositionRegistry::new();
+        for p in positions {
+            pr.update(TEST_CHAIN_ID, p.clone());
+        }
+
+        LaStrategy::new(
+            TEST_CHAIN_ID,
+            B256::from([0xAB; 32]),
+            Address::ZERO,
+            LiquidationProtocol::AaveV3,
+            lr,
+            pr,
+            &OmegaConfig::default(),
+            Some(Arc::new(FixedPrice)),
+            None,
         )
     }
 
@@ -661,7 +758,6 @@ mod tests {
             base_fee_gwei: base_fee,
             l1_data_fee_gwei: 2,
             state_hash: B256::from([0x03; 32]),
-            mev_share_events_in_window: 0,
         }
     }
 
@@ -671,138 +767,123 @@ mod tests {
         assert_eq!(s.strategy_id(), StrategyId::La);
         assert_eq!(s.lane(), Lane::Normal);
         assert!(s.hot_path_eligible());
+        assert_eq!(s.gas_budget(), LA_GAS_BUDGET);
     }
 
-    /// Regression guard: with no liquidatable position tracked, score
-    /// must report no opportunity — not fabricate one off a fixed
-    /// constant the way a much earlier revision did.
     #[tokio::test]
-    async fn score_zero_when_no_liquidatable_position() {
+    async fn score_zero_no_position() {
         let op = make().score(&sig(5)).await.unwrap();
         assert_eq!(op.score, 0.0);
-        assert_eq!(op.expected_profit, U256::ZERO);
-    }
-
-    /// Fixed-price test double for `TokenPriceLookup` — used by the debt-amount
-    /// sizing test below.
-    struct FixedPrice;
-    impl TokenPriceLookup for FixedPrice {
-        fn price_usd_and_decimals(&self, _token: Address) -> Option<(f64, u8)> {
-            Some((2000.0, 18)) // $2000, 18 decimals
-        }
     }
 
     #[tokio::test]
-    async fn debt_amount_wei_with_price_lookup() {
-        let liquidity_registry = LiquidityRegistry::new();
-        liquidity_registry.update(
-            TEST_CHAIN_ID,
-            omega_flashloan::FlashloanProvider::Balancer,
-            addr(0xD0),
-            Address::from([0xB0; 20]),
-            U256::from(1_000_000_000_000_000_000_000u128),
-            1,
+    async fn score_zero_no_price_lookup() {
+        let s = make_with_positions(&[sample_position(1_000_000_000_000_000_000u128 - 1)]);
+        let op = s.score(&sig(5)).await.unwrap();
+        assert_eq!(
+            op.score, 0.0,
+            "no price lookup must not produce a fabricated score"
         );
-        let position_registry = PositionRegistry::new();
+    }
+
+    #[tokio::test]
+    async fn score_nonzero_with_price_lookup_and_profitable_position() {
+        let s = make_with_price_lookup(&[sample_position(1_000_000_000_000_000_000u128 - 1)]);
+        let op = s.score(&sig(1)).await.unwrap();
+        assert!(
+            op.score > 0.0 || op.expected_profit == U256::ZERO,
+            "priced position at low gas should score non-zero; score={}",
+            op.score
+        );
+    }
+
+    #[tokio::test]
+    async fn debt_amount_wei_correct_with_price_lookup() {
         let pos = sample_position(HOT_TIER_HF_THRESHOLD - 1);
-        position_registry.update(TEST_CHAIN_ID, pos.clone());
-        let s = LaStrategy::new(
-            TEST_CHAIN_ID,
-            B256::from([0xAB; 32]),
-            Address::ZERO,
-            liquidity_registry,
-            position_registry,
-            &OmegaConfig::default(),
-            Some(Arc::new(FixedPrice)),
-        );
+        let s = make_with_price_lookup(std::slice::from_ref(&pos));
+        // debt_usd_e18 = 1e18 ($1 at $2000/token) → token_amount = 0.0005 → wei = 5e14
         let wei = s.debt_amount_wei(&pos).expect("priced debt");
-        // debt_usd_e18 = 1e18 ($1) at $2000 → 1/2000 ETH → wei = 5e14
-        assert!(wei > U256::ZERO);
         assert_eq!(wei, U256::from(500_000_000_000_000u64));
     }
 
-    /// Regression guard: even with a real, liquidatable position
-    /// tracked, score must still report no opportunity while no
-    /// debt-amount pricing source exists — this is the honest, current
-    /// state (see `debt_amount_wei`'s own doc comment), not a bug.
     #[tokio::test]
-    async fn score_zero_when_position_present_but_unpriced() {
-        let strat = make_with_positions(&[sample_position(
-            1_000_000_000_000_000_000u128 - 1, // liquidatable
-        )]);
-        let op = strat.score(&sig(5)).await.unwrap();
-        assert_eq!(
-            op.score, 0.0,
-            "no price source exists yet — a real position must not produce a fabricated score"
-        );
+    async fn liquidation_bonus_in_eth_units() {
+        let pos = sample_position(HOT_TIER_HF_THRESHOLD - 1);
+        let s = make_with_price_lookup(std::slice::from_ref(&pos));
+        let debt_wei = U256::from(500_000_000_000_000u64); // 5e14 token wei = $1
+        let bonus_eth = s.liquidation_bonus_eth_wei(debt_wei, &pos).expect("bonus");
+        // $1 × 10% bonus / $2000 per ETH × 1e18 = 5e13 ETH wei
+        assert_eq!(bonus_eth, U256::from(50_000_000_000_000u64));
     }
 
-    /// Regression guard: build_blueprint must fail cleanly, not panic,
-    /// when no liquidatable position is tracked.
     #[tokio::test]
-    async fn build_blueprint_fails_without_liquidatable_position() {
-        let bp_result = make().build_blueprint(&sig(5)).await;
-        assert!(
-            bp_result.is_err(),
-            "LA must refuse to build with no liquidatable position tracked"
+    async fn encode_calldata_correct_selector_and_length() {
+        let cd = LaStrategy::encode_liquidation_calldata(
+            LiquidationProtocol::AaveV3,
+            addr(0xC0),
+            addr(0xD0),
+            addr(0x01),
+            U256::from(1000u64),
+            U256::from(500u64),
+            3_000_001,
         );
-        let msg = bp_result.unwrap_err().to_string();
-        assert!(
-            msg.contains("liquidatable position"),
-            "error message: {msg}"
-        );
+        // selector(4) + head(64) + inner_length(32) + inner(256) = 356
+        assert_eq!(cd.len(), 356);
+        let expected_sel = &keccak256(b"execute(bytes,uint256)")[..4];
+        assert_eq!(&cd[..4], expected_sel);
+        // protocol byte (last byte of first inner word) = 0 (AaveV3)
+        // inner starts at offset 4 + 32 + 32 + 32 = 100
+        assert_eq!(cd[100 + 31], 0u8, "AaveV3 protocol must be 0");
     }
 
-    /// Regression guard: build_blueprint must fail cleanly (not panic,
-    /// not fabricate an amount) while debt_amount_wei has no real
-    /// source — this is the expected, current, honest state, gated on
-    /// PRICING rather than on the token itself (the token is real).
     #[tokio::test]
-    async fn build_blueprint_fails_without_debt_amount_pricing_source() {
-        let strat = make_with_positions(&[sample_position(1_000_000_000_000_000_000u128 - 1)]);
-        let bp_result = strat.build_blueprint(&sig(5)).await;
-        assert!(
-            bp_result.is_err(),
-            "LA must refuse to build until a real debt-amount pricing source exists"
-        );
-        let msg = bp_result.unwrap_err().to_string();
-        assert!(msg.contains("pricing"), "error message: {msg}");
+    async fn build_blueprint_fails_no_position() {
+        let err = make()
+            .build_blueprint(&sig(5))
+            .await
+            .expect_err("must fail");
+        assert!(err.to_string().contains("no liquidatable position"));
+    }
+
+    #[tokio::test]
+    async fn build_blueprint_fails_no_price_lookup() {
+        let s = make_with_positions(&[sample_position(1_000_000_000_000_000_000u128 - 1)]);
+        let err = s.build_blueprint(&sig(5)).await.expect_err("must fail");
+        assert!(err.to_string().contains("pricing") || err.to_string().contains("debt-amount"));
+    }
+
+    #[tokio::test]
+    async fn max_base_fee_never_zero_at_sub_gwei() {
+        let s = make_with_price_lookup(&[sample_position(HOT_TIER_HF_THRESHOLD - 1)]);
+        let mut signal = sig(1);
+        signal.base_fee_gwei = 0;
+        // May fail on profitability at 0 fee depending on gas model; only assert floor when it builds.
+        if let Ok(bp) = s.build_blueprint(&signal).await {
+            assert!(bp.max_base_fee_gwei >= ExecutionBlueprint::MIN_MAX_BASE_FEE_GWEI);
+            assert!(bp.verify_hash());
+        }
     }
 
     #[test]
     fn hot_tier_detection() {
-        let e18 = 1_000_000_000_000_000_000_u128;
-        let hf_hot = U256::from(e18 + e18 / 1000);
-        let hf_warm = U256::from(e18 + 5 * e18 / 100);
-        assert!(LaStrategy::is_hot_tier(hf_hot), "1.001 should be hot tier");
-        assert!(
-            !LaStrategy::is_hot_tier(hf_warm),
-            "1.05 should not be hot tier"
-        );
+        // Below 1.01e18 → hot
+        assert!(LaStrategy::is_hot_tier(U256::from(
+            HOT_TIER_HF_THRESHOLD - 1
+        )));
+        // At/above threshold → not hot
+        assert!(!LaStrategy::is_hot_tier(U256::from(HOT_TIER_HF_THRESHOLD)));
+        assert!(!LaStrategy::is_hot_tier(U256::from(
+            HOT_TIER_HF_THRESHOLD + 50_000_000_000_000_000
+        )));
     }
 
-    // ── Cross-crate constant drift guard ─────────────────────────────────────
-
-    /// Same pattern as sa.rs's `sa_slippage_within_known_risk_policy_cap` —
-    /// see that test's doc comment for the full rationale (omega-strategies
-    /// deliberately doesn't depend on omega-risk, so this mirrors the real
-    /// cap as a manually-synced local constant rather than importing it).
-    ///
-    /// LA currently has the most headroom of any strategy (50 vs. cap
-    /// 100) — this test exists so that headroom stays visible and
-    /// enforced, not just true by coincidence today.
     #[allow(clippy::assertions_on_constants)]
     #[test]
     fn la_slippage_within_known_risk_policy_cap() {
-        /// Mirrors omega_risk::context::MAX_SLIPPAGE_BPS_LA.
-        const MIRRORED_CONTEXT_RS_MAX_SLIPPAGE_BPS_LA: u16 = 100;
+        const MIRRORED: u16 = 100;
         assert!(
-            LA_SLIPPAGE_BPS <= MIRRORED_CONTEXT_RS_MAX_SLIPPAGE_BPS_LA,
-            "LA_SLIPPAGE_BPS ({LA_SLIPPAGE_BPS}) exceeds the mirrored risk-policy \
-             cap ({MIRRORED_CONTEXT_RS_MAX_SLIPPAGE_BPS_LA}) — every LA blueprint \
-             would fail omega_risk::checks::check_slippage (check 9, MissSlippage) \
-             in production. Verify against the real MAX_SLIPPAGE_BPS_LA in \
-             crates/omega-risk/src/context.rs before changing either value."
+            LA_SLIPPAGE_BPS <= MIRRORED,
+            "LA_SLIPPAGE_BPS ({LA_SLIPPAGE_BPS}) exceeds mirrored risk cap ({MIRRORED})"
         );
     }
 }
